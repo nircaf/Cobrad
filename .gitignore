@@ -1,0 +1,9 @@
+# Ignore .edf and .EEG files
+*.edf
+*.EEG
+*.png
+*.xlsx
+.vscode
+__pycache__*/
+*.pkl
+.env
