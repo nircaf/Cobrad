@@ -43,6 +43,25 @@ os.makedirs(temp_dir, exist_ok=True)
 # make folder
 os.makedirs(f'pickles/{project_name}', exist_ok=True)
 
+def clean_df_demographics(df_demographics,patient_names):
+    # strip all values
+    df_demographics = df_demographics.map(lambda x: x.strip() if isinstance(x, str) else x)
+    # find what column has values 'נקבה'
+    sex_col_num = df_demographics.columns[df_demographics.isin(['נקבה']).any()][0]
+    # move to be first col
+    df_demographics = pd.concat([df_demographics.loc[:, [sex_col_num]], df_demographics.drop(columns=[sex_col_num])], axis=1)
+    # rename to gender
+    df_demographics.rename(columns={sex_col_num: 'Gender'}, inplace=True)
+    # what column contains patient_names at least 1
+    id_col_num = df_demographics.columns[df_demographics.isin(patient_names).any()][0]
+    # move to be first col
+    df_demographics = pd.concat([df_demographics.loc[:, [id_col_num]], df_demographics.drop(columns=[id_col_num])], axis=1)
+    # rename to ID
+    df_demographics.rename(columns={id_col_num: 'ID'}, inplace=True)
+    return df_demographics
+    df_demographics.iloc[:,0]
+
+
 def controls_match(sexes,ages,controls_ratio=4):
     # Define the age groups
     age_groups = [
@@ -60,22 +79,29 @@ def controls_match(sexes,ages,controls_ratio=4):
             if start <= age <= end:
                 break
         group_name = group.split(' ')[0]
-        # read the directory/{group}.xlsx 
-        df_demographics = pd.read_excel(f'{directory}/{group}/{group_name}.xlsx')
-        # df_demographics2 = pd.read_excel(f'{directory}/{group}/{group_name} final data.xlsx')
-        # df_demographics = pd.concat([df_demographics,df_demographics2])    
-        df_demographics.iloc[:,2] = df_demographics.iloc[:,2].apply(lambda x: 'f' if x == 'נקבה' else 'm')
-        # get df_demographics that match with sex
-        df_demographics = df_demographics[df_demographics.iloc[:,2] == sex]
         #list files in directory/{group} 
         group_files = os.listdir(f'{directory}/{group}')
         # get file that end with .edf
         group_files = [file for file in group_files if file.endswith('.edf')]
         patient_names = [file.split('_')[0] for file in group_files]
+        # read the directory/{group}.xlsx 
+        df_demographics = pd.read_excel(f'{directory}/{group}/{group_name}.xlsx', header=None)
+        df_demographics = clean_df_demographics(df_demographics,patient_names)
+        if start >= 61 and end <= 90:
+            df_demographics2 = pd.read_excel(f'{directory}/{group}/{group_name} final data.xlsx', header=None)
+            df_demographics2 = clean_df_demographics(df_demographics2,patient_names)
+            df_demographics = pd.concat([df_demographics, df_demographics2],ignore_index=True)
+        # remove duplicates column ID and nan
+        df_demographics = df_demographics.loc[:,~df_demographics.columns.duplicated()].dropna(subset=['ID'])
+        sex_col_num = 1
+        df_demographics.iloc[:, sex_col_num] = df_demographics.iloc[:, sex_col_num].apply(lambda x: 'f' if x == 'נקבה' else 'm')
+        # get df_demographics that match with sex
+        df_demographics = df_demographics[df_demographics.iloc[:,sex_col_num] == sex]
         # get the group files in the indices that match the df_demographics.iloc[:,11] with patient_names
         filtered_group_files = []
         for i in range(len(group_files)):
-            if patient_names[i] in df_demographics.iloc[:, 11].values:
+            # check if exists in all values in df_demographics
+            if patient_names[i] in df_demographics.iloc[:,0].values:
                 filtered_group_files.append(group_files[i])
             else:
                 print(f'{patient_names[i]} not in df_demographics')
@@ -108,11 +134,14 @@ def controls_match(sexes,ages,controls_ratio=4):
     good_files_df = pd.DataFrame(good_files_info)
     # remove duplicates
     good_files_df.drop_duplicates(subset='file_name', inplace=True)
+    return good_files_df
 
 def choose_controls_WNV(directory,controls_ratio=4):
     # read the WNV_merged_291224_KP.xlsx
     # list files in temps_west_nile_virus folder
     wnv_files = os.listdir(f'temps_west_nile_virus')
+    # remove .DS_Store
+    wnv_files = [file for file in wnv_files if file != '.DS_Store']
     wnv_files = [file.split('.edf')[0] for file in wnv_files]
     # also split '-'
     wnv_files = [file.split('-')[0] for file in wnv_files]
@@ -134,6 +163,8 @@ def choose_controls_WNV(directory,controls_ratio=4):
 
 def choose_controls_EDF(directory,controls_ratio=4):
     edf_files = os.listdir(f'temps_EDF')
+    # remove .DS_Store
+    edf_files = [file for file in edf_files if file != '.DS_Store']
     edf_files = [file.split('.edf')[0] for file in edf_files]
     # re get from edf_files 4 digits-3 digits like 0345-042
     edf_files = [re.search(r'\d{4}-\d{3}', file).group() if re.search(r'\d{4}-\d{3}', file) else None for file in edf_files]
@@ -528,13 +559,11 @@ if __name__ == "__main__":
     df_concents = df_concents[['ID','Signed future research']]
     df_concents.loc[:, 'patient_number'] = df_concents.loc[:, 'ID'].apply(lambda x: f'{int(x):03d}')
     if project_name == 'Controls':
-
         temp_dir += f'_{cases_project_name}'
         if cases_project_name == 'west_nile_virus':
             df = choose_controls_WNV(directory)    
         elif cases_project_name == 'EDF':
             df = choose_controls_EDF(directory)
-        filename = f'{cases_project_name}_controls.csv'
     else:
         df = list_files_and_find_duplicates(directory)
     # Set multiprocessing flag
@@ -547,6 +576,9 @@ if __name__ == "__main__":
     else:
         # Process files sequentially
         metadata_list = [process_file(row, filename,is_prod) for _, row in tqdm(df.iterrows(), total=len(df))]
+    if project_name == 'Controls':
+        # Combine all the temporary CSV files into a single CSV file
+        filename = f'{cases_project_name}_controls.csv'
     # Process temporary files in batches
     batch_size = 100  # Adjust the batch size as needed
     # make folder if not exist

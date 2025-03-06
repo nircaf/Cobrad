@@ -177,17 +177,17 @@ boxplot_columns = [col for col in combined_df.columns if 'overall' in col.lower(
 
 #%% clinical data analysis
 # split file name .[0] and then '-'[0] to get the ID
-wnv_ids = [file.split('.')[0].split('-')[0] for file in cases['file_name']]
+cases.columns
+wnv_ids = [file.split('/')[-2] for file in cases['file_path']]
 # to int
 wnv_ids = [int(id) for id in wnv_ids]
 set(wnv_ids)
 cases['ID'] = wnv_ids
 # merge the dataframes
 df_merged = pd.merge(df_wnv, cases, on='ID', how='inner')
-df_merged_outer = pd.merge(df_wnv, cases, on='ID', how='outer',indicator=True)
-# rename _merge col 'both to 'eeg' and 'left_only' to 'no eeg'
-df_merged_outer['_merge'] = df_merged_outer['_merge'].apply(lambda x: 'eeg' if x == 'both' else 'no eeg')
 wnv_files = os.listdir(f'west_nile_virus')
+# remove .DS_Store
+wnv_files = [file for file in wnv_files if 'DS_Store' not in file]
 wnv_files = [file.split('.edf')[0] for file in wnv_files]
 # also split '-'
 wnv_files = [file.split('-')[0] for file in wnv_files]
@@ -358,4 +358,4 @@ def spectogram_run():
         fig.savefig(f'figures/spectograms/{group}_spectrogram.png')
         plt.close(fig)
     
-spectogram_run()
+# spectogram_run()
