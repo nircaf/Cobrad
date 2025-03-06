@@ -41,15 +41,20 @@ df_eegs_format['patient_id'].tolist()
 def convert_eeg_to_edf(df_eegs_format):
     for index, row in df_eegs_format.iterrows():
         eeg_file_path = row['file_path']
-        edf_file_path = eeg_file_path.replace('.EEG', '.edf')
+        patient_id = eeg_file_path.split('/')[-2]
+        edf_file_path = f'{'/'.join(eeg_file_path.split("/")[:-1])}/{patient_id}.edf'
+        edf_file_path_to_remove = eeg_file_path.replace('.EEG', '.edf')
+        # remove edf_file_path_to_remove
+        os.system(f'rm -rf {edf_file_path_to_remove}')
         # os system run EEG2EDF_Matlab/EEG_to_edf('/EEG_data/', 'edf_data/')  
         os.system(f'EEG2EDF_Matlab/EEG_to_edf("{eeg_file_path}", "{edf_file_path}")')
-        # Load the .eeg file using mne
-        raw = mne.io.read_raw_eeglab(edf_file_path, preload=True)
-        
+        # use mne.io.read_raw_nihon
+        raw = mne.io.read_raw_nihon(eeg_file_path, preload=True)
         # Save the data as .edf
-        raw.export(edf_file_path, fmt='edf')
+        raw.export(edf_file_path, fmt='edf',overwrite=True)
         print(f"Converted {eeg_file_path} to {edf_file_path}")
+        continue
+        raw.plot()
 
 # Call the function
 convert_eeg_to_edf(df_eegs_format)

@@ -34,7 +34,8 @@ warnings.filterwarnings("ignore", message="Effective window size : 1.000 (s)")
 directory = '/Users/nircafri/Desktop/Scripts/Nir/cobrad/EDF'
 # directory = '/Users/nircafri/Desktop/Scripts/Nir/cobrad/west_nile_virus'
 # directory = '/Users/nircafri/Desktop/Scripts/Nir/cobrad/Controls'
-
+cases_project_name = 'west_nile_virus'
+# cases_project_name = 'EDF'
 df_wnv = pd.read_excel(f'WNV_merged_291224_KP.xlsx')
 project_name = directory.split('/')[-1]
 temp_dir = f'temps_{project_name}' 
@@ -123,7 +124,6 @@ def choose_controls_WNV(directory,controls_ratio=4):
     # print what wnv_files are not in df
     print([file for file in wnv_files if file not in df_wnv['ID'].values])
     df_wnv2 = df_wnv[df_wnv['ID'].isin(wnv_files)]
-    
     ages = df_wnv2['age']
     sexes = df_wnv2['sex']
     # Convert sexes to 'f' for female and 'm' for male
@@ -228,7 +228,9 @@ def find_consecutive_sequences(events, min_length=5):
 def plot_not_prod(raw,is_prod,filename):
     if not is_prod:
         fig = raw.plot(show=False)
-        fig.savefig(f'figures/{filename}.png')
+        # make folder if not exist
+        os.makedirs(f'figures/data_cleaning', exist_ok=True)
+        fig.savefig(f'figures/data_cleaning/{filename}.png')
         plt.close(fig)
 
 def analyze_eeg_data(raw,is_prod,filename):
@@ -236,29 +238,29 @@ def analyze_eeg_data(raw,is_prod,filename):
     # raw = raw_copy.copy()
     # Step 1: Preprocessing with PyPrep
     channels = raw.ch_names
-    # remove channels that don't have EEG in their name from raw
-    raw.drop_channels([channel for channel in raw.ch_names if 'EEG' not in channel])
-    # Get EEG channel indices
-    eeg_channels_indices = [raw.ch_names.index(channel) for channel in raw.ch_names if channel.startswith('EEG')]
-    # remove EEG from channel name
-    raw.rename_channels({channel: channel.replace('EEG', '').strip() for channel in raw.ch_names})
-    # rename channels based on eeg_utils.eeg_dict_convertion
-    raw.rename_channels(eeg_utils.eeg_dict_convertion)
+    try:
+        # remove channels that don't have EEG in their name from raw
+        raw.drop_channels([channel for channel in raw.ch_names if 'EEG' not in channel])
+        # remove EEG from channel name
+        raw.rename_channels({channel: channel.replace('EEG', '').strip() for channel in raw.ch_names})
+        # rename channels based on eeg_utils.eeg_dict_convertion
+        raw.rename_channels(eeg_utils.eeg_dict_convertion)
+    except:
+        pass
     # all channels that have EEG, their split(' ')[-1] needs to be uppercase first letter, all rest lower case
     raw.rename_channels({channel: ' '.join([part.capitalize() if i == len(channel.split(' ')) - 1 else part for i, part in enumerate(channel.split(' '))]) if 'EEG' in channel else channel for channel in raw.ch_names})
     # drop channels that are not in eeg_utils.eeg_channels
     raw.drop_channels([channel for channel in raw.ch_names if channel not in eeg_utils.eeg_channels])
-    plot_not_prod(raw,is_prod,'pre_clean')
+    plot_not_prod(raw,is_prod,'pre_clean1')
     # Clean data
     # Filter the data
     nyquist_freq = raw.info['sfreq'] / 2
     raw.filter(l_freq=1.0, h_freq=nyquist_freq - 0.1)
     raw.notch_filter(np.arange(50, nyquist_freq, 50), filter_length='auto', phase='zero')
-    plot_not_prod(raw,is_prod,'filter')
+    plot_not_prod(raw,is_prod,'filter2')
     # picks = mne.pick_types(raw.info, meg=False, eeg=True, stim=False, eog=False)
     # raw.pick(picks)
     raw.resample(256.)
-    plot_not_prod(raw,is_prod,'resample')
     # Initialize the PrepPipeline
     prep_params = {
         "ref_chs": "eeg",
@@ -270,7 +272,7 @@ def analyze_eeg_data(raw,is_prod,filename):
         prep.fit()  # Run the pipeline
     except:
         return
-    plot_not_prod(prep.raw,is_prod,'PrepPipeline')
+    plot_not_prod(prep.raw,is_prod,'PrepPipeline4')
     raw = prep.raw  # Get cleaned data
     raw.interpolate_bads()
     # raw.preload
@@ -288,7 +290,7 @@ def analyze_eeg_data(raw,is_prod,filename):
     # Create a new RawArray object
     info = epochs_clean.info  # Use the info from the epochs
     raw = mne.io.RawArray(reshaped_data, info)
-    plot_not_prod(raw,is_prod,'AutoReject')
+    plot_not_prod(raw,is_prod,'AutoReject5')
     eeg_data = raw.get_data()
     # eeg_data sklearn.preprocessing.MinMaxScaler minmax norm
     # eeg_data = MinMaxScaler().fit_transform(eeg_data)
@@ -406,7 +408,6 @@ def analyze_eeg_data(raw,is_prod,filename):
     # Compute FFT
     fft_data = np.fft.fft(eeg_data, axis=1)
     fft_freqs = np.fft.fftfreq(eeg_data.shape[1], 1/sf)
-
     # save spec_data to pickle in pickles/project_name/filename
     with open(f'pickles/{project_name}/{filename}.pkl', 'wb') as f:
         pickle.dump(raw, f)
@@ -465,20 +466,21 @@ def process_file(row,filename,is_prod):
     metadata, raw = read_edf_mne(row['file_path'])
     metadata.update(row)
     # if file temps/{row['file_name']}.csv exists
-    if os.path.exists(f'{temp_dir}/{row["file_name"]}.csv'):
+    if f'{row["file_name"]}.csv' in os.listdir(temp_dir):
         return 
     # load file name csv
     try:
         df_csv = pd.read_csv(filename)
+        # if file name in csv
+        if row['file_name'] in df_csv['file_name'].values:
+            return 
     except:
-        df_csv = pd.DataFrame(columns=['file_name'])
-    # if file name in csv
-    if row['file_name'] in df_csv['file_name'].values:
-        return 
+        pass
     if metadata:
         channels = raw.ch_names
         # Check the duration of the recording
         duration_s = raw.times[-1]  # Convert duration to milliseconds
+        duration_h = duration_s / 3600
         duration_skip = 10 * 60  # Skip recordings less than 10 minutes
         if duration_s < duration_skip:
             return
@@ -488,10 +490,13 @@ def process_file(row,filename,is_prod):
             # Split the data into 60-minute segments
             n_segments = int(np.ceil(duration_s / max_duration_s))
             for i in range(n_segments):
+                segment_filename = f'{row["file_name"]}_segment_{i + 1}.csv'
+                if os.path.exists(f'{temp_dir}/{segment_filename}'):
+                    continue
                 start = i * max_duration_s   # Convert to seconds
                 stop = min((i + 1) * max_duration_s , raw.times[-1])  # Convert to seconds
                 raw_segment = raw.copy().crop(tmin=start, tmax=stop)
-                eeg_metadata = analyze_eeg_data(raw_segment,is_prod,f'{row["file_name"]}_segment_{i + 1}')
+                eeg_metadata = analyze_eeg_data(raw_segment,is_prod,segment_filename)
                 if eeg_metadata is None:
                     print(f'Error processing segment {i + 1} of {row["file_name"]}')
                     continue
@@ -505,7 +510,7 @@ def process_file(row,filename,is_prod):
                 segment_metadata['duration_min'] = (stop - start) / 60
                 # Write segment metadata to CSV
                 df_segment = pd.DataFrame([segment_metadata])
-                df_segment.to_csv(f'{temp_dir}/{row["file_name"]}_segment_{i + 1}.csv', index=False)
+                df_segment.to_csv(f'{temp_dir}/{segment_filename}', index=False)
         else:
             eeg_metadata = analyze_eeg_data(raw,is_prod,row["file_name"])
             if eeg_metadata is None:
@@ -522,11 +527,9 @@ if __name__ == "__main__":
     df_concents = pd.read_excel("COBRAD concent sheets.xlsx")
     df_concents = df_concents[['ID','Signed future research']]
     df_concents.loc[:, 'patient_number'] = df_concents.loc[:, 'ID'].apply(lambda x: f'{int(x):03d}')
-
-
     if project_name == 'Controls':
-        cases_project_name = 'west_nile_virus'
-        cases_project_name = 'EDF'
+
+        temp_dir += f'_{cases_project_name}'
         if cases_project_name == 'west_nile_virus':
             df = choose_controls_WNV(directory)    
         elif cases_project_name == 'EDF':
@@ -535,7 +538,7 @@ if __name__ == "__main__":
     else:
         df = list_files_and_find_duplicates(directory)
     # Set multiprocessing flag
-    filename = f'all_{project_name}.csv'
+    filename = f'{project_name}.csv'
     if use_multiprocessing:
         with concurrent.futures.ThreadPoolExecutor() as executor: # max_workers=10
             futures = [executor.submit(process_file, row, filename, is_prod) for _, row in df.iterrows()]
