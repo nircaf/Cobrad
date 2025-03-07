@@ -13,6 +13,25 @@ import yasa
 from sklearn.decomposition import PCA
 import statsmodels.api as sm
 from collections import Counter
+import scienceplots
+
+# plt.style.use('science')
+# make figures prettier
+sns.set_context('talk')
+sns.set_style('white')
+# put grid in all figures
+plt.rcParams['axes.grid'] = True
+# add ticks to both sides 
+plt.rc('xtick', bottom   = True)
+plt.rc('ytick', left = True)
+plt.rc('font',  family='serif',)
+plt.rc('text',  usetex=False)
+# make labels slightly smaller 
+plt.rc('xtick', labelsize=12)
+plt.rc('ytick', labelsize=12)
+plt.rc('axes',  labelsize=12)
+plt.rc('legend',  handlelength=4.0)
+plt.rc('axes',  titlesize=14)  # Set title size to be the same as x and y labels
 
 def boxplot_plot(results_df,combined_df, col, output_dir):
     plt.figure(figsize=(10, 6))
@@ -35,12 +54,13 @@ def boxplot_plot(results_df,combined_df, col, output_dir):
     else:
         sig_symbol = 'ns'
     if sig_symbol != 'ns':
-        plt.text(0.5, max_val*1.1, 
-                f"{row['Test']}\n"
-                f"p = {row['adj_p_value']:.3e} ({sig_symbol})\n"
-                f"Cohen's d = {row['Cohen_d']:.2f}",
-                ha='center')
-        plt.title(f"{col} Comparison")
+        title_text = (
+            f"{row['Test']}\n"
+            f"p = {row['adj_p_value']:.3e} ({sig_symbol})\n"
+            f"Cohen's d = {row['Cohen_d']:.2f}\n"
+            f"{col} Comparison"
+        )
+        plt.title(title_text, ha='center')
         # Add sample size to x-axis labels
         group_counts = combined_df['Group'].value_counts()
         ax = plt.gca()
@@ -61,27 +81,29 @@ def scatter_plot_with_regression(results_df, combined_df, x_col, y_col, output_d
     y = combined_df[y_col]
     model = sm.OLS(y, X).fit()
     p_value = model.pvalues[1]  # p-value for the slope
+    r_squared = model.rsquared  # R-squared value
     # Determine significance symbol
-    if p_value < 0.001:
+    if (p_value < 0.001):
         sig_symbol = '***'
-    elif p_value < 0.01:
+    elif (p_value < 0.01):
         sig_symbol = '**'
-    elif p_value < 0.05:
+    elif (p_value < 0.05):
         sig_symbol = '*'
     else:
         sig_symbol = 'ns'
-    
     # Add significance markers
     max_y = combined_df[y_col].max()
     if sig_symbol != 'ns':
-        plt.text(0.5, max_y*1.1, 
-                 f"Slope p = {p_value:.3e} ({sig_symbol})\n"
-                 f"R^2 = {model.rsquared:.2f}",
-                 ha='center', transform=plt.gca().transAxes)
-        plt.title(f"{x_col} vs {y_col} Regression")
-        plt.xlabel(x_col)
-        plt.ylabel(y_col)
-        plt.tight_layout()
+        # Add stats results to the title
+        plt.title(
+            f"{x_col} vs {y_col} Regression\n"
+            f"Slope p = {p_value:.3e} ({sig_symbol}), R^2 = {r_squared:.2f}, n = {len(combined_df)}",
+            ha='center'
+        )
+    plt.xlabel(x_col)
+    plt.ylabel(y_col)
+    plt.tight_layout()
+    if sig_symbol != 'ns':
         # Make folder figures
         os.makedirs(f'figures/scatterplots/{output_dir}', exist_ok=True)
         plt.savefig(f"figures/scatterplots/{output_dir}/{x_col}_vs_{y_col}_regression.png")
@@ -201,18 +223,26 @@ print([file for file in wnv_files if file not in df_wnv['ID'].values])
 df_wnv2 = df_wnv[df_wnv['ID'].isin(wnv_files)]
 # avg lines with same ID
 numeric_cols = df_merged.select_dtypes(include=[np.number]).columns
+# Group by ID and calculate the mean of each numeric column
 df_wnv2 = df_merged.groupby('ID')[numeric_cols].mean()
 df_wnv2.columns.tolist()
 clinical_columns = df_wnv2.columns[3:].tolist()
+# remove boxplot_columns from clinical_columns
+clinical_columns = [col for col in clinical_columns if col not in boxplot_columns]
+# Remove columns that contain 'EEG'
+clinical_columns = [col for col in clinical_columns if 'EEG' not in col]
 # Visualization
+numeric_cols = df_wnv2.select_dtypes(include=[np.number]).columns
 # Iterate over clinical columns
 for col in clinical_columns:
     df_wnv3 = df_wnv2[df_wnv2[col].notna()].copy()
     unique_values = df_wnv3[col].unique()
-    # make sure each group has at least 2 values
-    if sum(df_wnv3[col]==0) < 2 or sum(df_wnv3[col]==1) < 2:
+    if df_wnv3.shape[0] < 3 or unique_values.shape[0] < 2:
         continue
     if len(unique_values) == 2:  # Check if binary
+        # check that there are at least 3 in each group (0,1)
+        if len(df_wnv3[df_wnv3[col] == 1]) < 3 or len(df_wnv3[df_wnv3[col] == 0]) < 3:
+            continue
         for band in boxplot_columns:
             if col == 'sex':
                 # if 1 'f' else 'm'
@@ -223,7 +253,7 @@ for col in clinical_columns:
             results_df = analyze_and_correct(df_wnv3, [band], groups=df_wnv3['Group'].unique())
             boxplot_plot(results_df, df_wnv3, band, f'{col}_boxplots')
     # If numeric non-binary
-    elif pd.api.types.is_numeric_dtype(df_wnv3[col]):
+    elif col in numeric_cols:
         for band in boxplot_columns:
             scatter_plot_with_regression({}, df_wnv3, col, band, f'{col}_scatterplots')
 #%% Topomap per group
