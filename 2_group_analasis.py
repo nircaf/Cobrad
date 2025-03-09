@@ -224,7 +224,9 @@ df_wnv2 = df_wnv[df_wnv['ID'].isin(wnv_files)]
 # avg lines with same ID
 numeric_cols = df_merged.select_dtypes(include=[np.number]).columns
 # Group by ID and calculate the mean of each numeric column
-df_wnv2 = df_merged.groupby('ID')[numeric_cols].mean()
+df_wnv2 = df_merged.groupby('ID').apply(
+    lambda x: (x[numeric_cols].multiply(x['duration_min'], axis=0)).sum() / x['duration_min'].sum()
+)
 df_wnv2.columns.tolist()
 clinical_columns = df_wnv2.columns[3:].tolist()
 # remove boxplot_columns from clinical_columns
