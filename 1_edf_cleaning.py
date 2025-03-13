@@ -531,6 +531,8 @@ def process_file(row,filename,is_prod):
                 raw_segment = raw.copy().crop(tmin=start, tmax=stop)
                 eeg_metadata = analyze_eeg_data(raw_segment,is_prod,segment_filename)
                 if eeg_metadata is None:
+                    # save empty csv file
+                    pd.DataFrame().to_csv(f'{temp_dir}/{segment_filename}', index=False)
                     print(f'Error processing segment {i + 1} of {row["file_name"]}')
                     continue
                 metadata.update(eeg_metadata)
