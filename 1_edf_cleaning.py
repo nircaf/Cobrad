@@ -31,13 +31,15 @@ warnings.filterwarnings("ignore", message="Channels contain different highpass f
 warnings.filterwarnings("ignore", message="Channels contain different lowpass filters. Lowest filter setting will be stored.")
 warnings.filterwarnings("ignore", message="Effective window size : 1.000 (s)")
 
-directory = '/Users/nircafri/Desktop/Scripts/Nir/cobrad/EDF'
-# directory = '/Users/nircafri/Desktop/Scripts/Nir/cobrad/west_nile_virus'
-# directory = '/Users/nircafri/Desktop/Scripts/Nir/cobrad/Controls'
+getcwd = os.getcwd()
+directory = os.path.join(getcwd, 'EDF')
+# directory = os.path.join(getcwd, 'Controls')
+# directory = os.path.join(getcwd, 'west_nile_virus')
+os_splittor = '\\' if 'nt' in os.name else '/'
 cases_project_name = 'west_nile_virus'
-# cases_project_name = 'EDF'
-df_wnv = pd.read_excel(f'WNV_merged_291224_KP.xlsx')
-project_name = directory.split('/')[-1]
+cases_project_name = 'EDF'
+# df_wnv = pd.read_excel(f'WNV_merged_291224_KP.xlsx')
+project_name = directory.split(os_splittor)[-1]
 temp_dir = f'temps_{project_name}' 
 os.makedirs(temp_dir, exist_ok=True)
 # make folder
@@ -200,7 +202,7 @@ def list_files_and_find_duplicates(directory):
     df.sort_values(by='size', inplace=True)
     # remove files less than 100000 bytes
     df = df[df['size'] > 100000]
-    df['file_name'] = df.file_path.apply(lambda x: x.split('/')[-1])
+    df['file_name'] = df.file_path.apply(lambda x: x.split(os_splittor)[-1])
     # file name: 0345-042 (1).edf  -> patient_number: 042
     df['patient_number'] = df.file_name.apply(lambda x: re.search(r'\d{3}-(\d{3})', x).group(1) if re.search(r'\d{3}-(\d{3})', x) else None)
     # sort by patient number
@@ -503,7 +505,7 @@ def process_file(row,filename,is_prod):
     try:
         df_csv = pd.read_csv(filename)
         # if file name in csv
-        if row['file_name'] in df_csv['file_name'].values:
+        if row['file_name'] in df_csv['file_name'].values:\
             return 
     except:
         pass
@@ -554,10 +556,6 @@ def process_file(row,filename,is_prod):
     # return metadata
 
 if __name__ == "__main__":
-    # read COBRAD concent sheets.xlsx
-    df_concents = pd.read_excel("COBRAD concent sheets.xlsx")
-    df_concents = df_concents[['ID','Signed future research']]
-    df_concents.loc[:, 'patient_number'] = df_concents.loc[:, 'ID'].apply(lambda x: f'{int(x):03d}')
     if project_name == 'Controls':
         temp_dir += f'_{cases_project_name}'
         if cases_project_name == 'west_nile_virus':
@@ -566,14 +564,21 @@ if __name__ == "__main__":
             df = choose_controls_EDF(directory)
     else:
         df = list_files_and_find_duplicates(directory)
+    # remove duplicates subset file_name
+    df.drop_duplicates(subset='file_name', inplace=True)
+    # reverse the order of the files
+    df = df.iloc[::-1]
     # Set multiprocessing flag
     filename = f'{project_name}.csv'
     if use_multiprocessing:
-        with concurrent.futures.ThreadPoolExecutor() as executor: # max_workers=10
+        print(f'Processing {len(df)} files in parallel...')
+        # Process files in parallel
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor: # max_workers=10
             futures = [executor.submit(process_file, row, filename, is_prod) for _, row in df.iterrows()]
             for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures)):
                 future.result()
     else:
+        print(f'Processing {len(df)} files sequentially...')
         # Process files sequentially
         metadata_list = [process_file(row, filename,is_prod) for _, row in tqdm(df.iterrows(), total=len(df))]
     if project_name == 'Controls':
