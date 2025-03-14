@@ -9,5 +9,5 @@ while true; do
         echo "Script is already running."
     fi
     # Wait for a specified interval before checking again
-    sleep 60
+    sleep 600
 done

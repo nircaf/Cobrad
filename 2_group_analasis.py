@@ -14,12 +14,13 @@ from sklearn.decomposition import PCA
 import statsmodels.api as sm
 from collections import Counter
 import scienceplots
+from eeg_utils import *
 
 # plt.style.use('science')
-# make figures prettier
+# make {figures_dir} prettier
 sns.set_context('talk')
 sns.set_style('white')
-# put grid in all figures
+# put grid in all {figures_dir}
 plt.rcParams['axes.grid'] = True
 # add ticks to both sides 
 plt.rc('xtick', bottom   = True)
@@ -27,11 +28,11 @@ plt.rc('ytick', left = True)
 plt.rc('font',  family='serif',)
 plt.rc('text',  usetex=False)
 # make labels slightly smaller 
-plt.rc('xtick', labelsize=12)
-plt.rc('ytick', labelsize=12)
-plt.rc('axes',  labelsize=12)
+plt.rc('xtick', labelsize=11)
+plt.rc('ytick', labelsize=11)
+plt.rc('axes',  labelsize=11)
 plt.rc('legend',  handlelength=4.0)
-plt.rc('axes',  titlesize=14)  # Set title size to be the same as x and y labels
+plt.rc('axes',  titlesize=12)  # Set title size to be the same as x and y labels
 
 def boxplot_plot(results_df,combined_df, col, output_dir):
     plt.figure(figsize=(10, 6))
@@ -66,10 +67,10 @@ def boxplot_plot(results_df,combined_df, col, output_dir):
         ax = plt.gca()
         ax.set_xticklabels([f"{label.get_text()}\nn={group_counts[label.get_text()]}" for label in ax.get_xticklabels()])
         plt.tight_layout()
-        # make folder figures
-        # make folder figures/{output_dir}
-        os.makedirs(f'figures/boxplots/{output_dir}', exist_ok=True)
-        plt.savefig(f"figures/boxplots/{output_dir}/{col}_comparison.png")
+        # make folder {figures_dir}
+        # make folder {figures_dir}/{output_dir}
+        os.makedirs(f'{figures_dir}/boxplots/{output_dir}', exist_ok=True)
+        plt.savefig(f"{figures_dir}/boxplots/{output_dir}/{col}_comparison.png")
     plt.close()
 
 def scatter_plot_with_regression(results_df, combined_df, x_col, y_col, output_dir):
@@ -104,9 +105,9 @@ def scatter_plot_with_regression(results_df, combined_df, x_col, y_col, output_d
     plt.ylabel(y_col)
     plt.tight_layout()
     if sig_symbol != 'ns':
-        # Make folder figures
-        os.makedirs(f'figures/scatterplots/{output_dir}', exist_ok=True)
-        plt.savefig(f"figures/scatterplots/{output_dir}/{x_col}_vs_{y_col}_regression.png")
+        # Make folder {figures_dir}
+        os.makedirs(f'{figures_dir}/scatterplots/{output_dir}', exist_ok=True)
+        plt.savefig(f"{figures_dir}/scatterplots/{output_dir}/{x_col}_vs_{y_col}_regression.png")
     plt.close()
     
 def analyze_and_correct(combined_df, columns_to_analyze, groups=['Control', 'WNV']):
@@ -155,114 +156,42 @@ def analyze_and_correct(combined_df, columns_to_analyze, groups=['Control', 'WNV
         results_df['Significant'] = adj_p < 0.05
 
     return results_df
-# load clinical data from WNV_merged_291224_KP.xlsx
-df_wnv = pd.read_excel('WNV_merged_291224_KP.xlsx')
-# Configuration
-patients_folder = "west_nile_virus"
-control_folder = f"{patients_folder}_controls"
 
-case_file = f"{patients_folder}.csv"
-
-# Read and prepare data
-controls = pd.read_csv(f'{control_folder}.csv')
-cases = pd.read_csv(case_file)
-# drop duplicates
-controls = controls.drop_duplicates(subset=['file_name'])
-cases = cases.drop_duplicates(subset=['file_name'])
-# Add group labels
-controls['Group'] = 'Control'
-cases['Group'] = 'WNV'
-# all columns that have EEG, their split(' ')[-1] needs to be uppercase first letter, all rest lower case
-cases.columns = [' '.join([part.capitalize() if i == len(col.split(' ')) - 1 else part for i, part in enumerate(col.split(' '))]) if 'EEG' in col else col for col in cases.columns]
-controls.columns = [' '.join([part.capitalize() if i == len(col.split(' ')) - 1 else part for i, part in enumerate(col.split(' '))]) if 'EEG' in col else col for col in controls.columns]
-# Combine datasets
-combined_df = pd.concat([controls, cases], ignore_index=True)
-combined_df['sampling_frequency']
-combined_df.columns.tolist()
-# Initialize results storage
-results = []
-cols_to_skip = ['Group', 'patient_number']
-columns_to_analyze = [col for col in combined_df.columns if col not in cols_to_skip
-                     and pd.api.types.is_numeric_dtype(combined_df[col])]
-# make folder figures/topomaps
-os.makedirs('figures/topomaps', exist_ok=True)
-# make folder figures/topomaps_p_values
-os.makedirs('figures/topomaps_p_values', exist_ok=True)
-# Define the channel locations (you need to have this information)
-montage = mne.channels.make_standard_montage('standard_1020')
-import eeg_utils
-eeg_channels = eeg_utils.eeg_channels
-eeg_dict_convertion = eeg_utils.eeg_dict_convertion
-# Iterate over each frequency band and plot the topomap
-frequency_bands = ['delta_power', 'theta_power', 'alpha_power', 'beta_power', 'gamma_power','pswe_events_per_minute_EEG','pswe_avg_length_EEG','mean_mpf','dfv_std','dfv_mean']
-boxplot_columns = [col for col in combined_df.columns if 'overall' in col.lower()]
-
-#%% clinical data analysis
-# split file name .[0] and then '-'[0] to get the ID
-cases.columns
-wnv_ids = [file.split('/')[-2] for file in cases['file_path']]
-# to int
-wnv_ids = [int(id) for id in wnv_ids]
-set(wnv_ids)
-cases['ID'] = wnv_ids
-# merge the dataframes
-df_merged = pd.merge(df_wnv, cases, on='ID', how='inner')
-wnv_files = os.listdir(f'west_nile_virus')
-# remove .DS_Store
-wnv_files = [file for file in wnv_files if 'DS_Store' not in file]
-wnv_files = [file.split('.edf')[0] for file in wnv_files]
-# also split '-'
-wnv_files = [file.split('-')[0] for file in wnv_files]
-# remove duplicates
-wnv_files = list(set(wnv_files))
-# to int
-wnv_files = [int(file) for file in wnv_files]
-# get df in column ID matches with wnv_files
-# print what wnv_files are not in df
-print([file for file in wnv_files if file not in df_wnv['ID'].values])
-df_wnv2 = df_wnv[df_wnv['ID'].isin(wnv_files)]
-# avg lines with same ID
-numeric_cols = df_merged.select_dtypes(include=[np.number]).columns
-# Group by ID and calculate the mean of each numeric column
-df_wnv2 = df_merged.groupby('ID').apply(
-    lambda x: (x[numeric_cols].multiply(x['duration_min'], axis=0)).sum() / x['duration_min'].sum()
-)
-df_wnv2.columns.tolist()
-clinical_columns = df_wnv2.columns[3:].tolist()
-# remove boxplot_columns from clinical_columns
-clinical_columns = [col for col in clinical_columns if col not in boxplot_columns]
-# Remove columns that contain 'EEG'
-clinical_columns = [col for col in clinical_columns if 'EEG' not in col]
-# Visualization
-numeric_cols = df_wnv2.select_dtypes(include=[np.number]).columns
-# Iterate over clinical columns
-for col in clinical_columns:
-    df_wnv3 = df_wnv2[df_wnv2[col].notna()].copy()
-    unique_values = df_wnv3[col].unique()
-    if df_wnv3.shape[0] < 3 or unique_values.shape[0] < 2:
-        continue
-    if len(unique_values) == 2:  # Check if binary
-        # check that there are at least 3 in each group (0,1)
-        if len(df_wnv3[df_wnv3[col] == 1]) < 3 or len(df_wnv3[df_wnv3[col] == 0]) < 3:
+def topomap_group_data( band, montage,control_data,wnv_data,output_dir):
+    # Calculate p-values for each channel
+    common_channels = control_data.columns.intersection(wnv_data.columns)
+    dict_p_values = {}
+    for common_channel in common_channels:
+        control_channel = control_data[common_channel].dropna()
+        wnv_channel = wnv_data[common_channel].dropna()
+        if len(control_channel) < 2 or len(wnv_channel) < 2:
             continue
-        for band in boxplot_columns:
-            if col == 'sex':
-                # if 1 'f' else 'm'
-                df_wnv3['Group'] = df_wnv3[col].apply(lambda x: 'f' if x == 1 else 'm')
-            else:
-                # group values based on band if =1, else f'not {band}'
-                df_wnv3['Group'] = df_wnv3[col].apply(lambda x: col if x == 1 else f'not {col}')
-            results_df = analyze_and_correct(df_wnv3, [band], groups=df_wnv3['Group'].unique())
-            boxplot_plot(results_df, df_wnv3, band, f'{col}_boxplots')
-    # If numeric non-binary
-    elif col in numeric_cols:
-        for band in boxplot_columns:
-            scatter_plot_with_regression({}, df_wnv3, col, band, f'{col}_scatterplots')
-#%% Topomap per group
-# run over controls and cases
-group_data = {}
-for group in ['Control', 'WNV']:
-    run_df = combined_df[combined_df['Group'] == group]
+        _, p = ttest_ind(control_channel, wnv_channel)
+        dict_p_values[common_channel] = p
+    df_p_values = pd.DataFrame(dict_p_values, index=[0]).T
+    reject, pvals_corrected, _, _ = smm.multipletests(df_p_values[0].values, alpha=0.05, method='fdr_bh')
+    df_p_values['pvals_corrected'] = pvals_corrected
+    if any(df_p_values['pvals_corrected'] < 0.05):
+        ch_names = df_p_values.index.tolist()
+        # Create an info object
+        info = mne.create_info(ch_names=ch_names, sfreq=256, ch_types='eeg')
+        info.set_montage(montage)
+        # Create an EvokedArray object for p-values
+        p_evoked = mne.EvokedArray(df_p_values['pvals_corrected'].values.reshape(-1, 1), info)
+        # Plot the topomap of p-values
+        fig, ax = plt.subplots()
+        vlim_max = min(0.05, df_p_values['pvals_corrected'].max())
+        im, cm = mne.viz.plot_topomap(p_evoked.data[:, 0], p_evoked.info, axes=ax, show=False, cmap='jet_r', vlim=[0, vlim_max])
+        fig.colorbar(im, ax=ax)
+        plt.title(f"{band} {output_dir} P-Value Topomap")
+        # if any value in pvals_corrected is less than 0.05
+        # make folder {figures_dir}/boxplots/{output_dir}
+        os.makedirs(f'{figures_dir}/boxplots/{output_dir}', exist_ok=True)
+        # Save the figure
+        plt.savefig(f"{figures_dir}/boxplots/{output_dir}/p_values_{band}_topomap.png")
+    plt.close()
+
+def process_group_data(group, run_df, frequency_bands, eeg_dict_convertion, eeg_channels, montage,group_data):
     # get only columns that say EEG
     eeg_df = run_df.filter(like='EEG')
     group_data[group] = {}
@@ -295,49 +224,118 @@ for group in ['Control', 'WNV']:
         evoked = mne.EvokedArray(power_values, info)
         # Plot the topomap
         fig, ax = plt.subplots()
-        im,cm  = mne.viz.plot_topomap(evoked.data[:, 0], evoked.info, axes=ax, show=False)
+        im, cm = mne.viz.plot_topomap(evoked.data[:, 0], evoked.info, axes=ax, show=False)
         fig.colorbar(im, ax=ax)
         plt.title(f"{band} Topomap")
         # Save the figure
-        os.makedirs('figures/topomaps', exist_ok=True)
-        plt.savefig(f"figures/topomaps/{group}_{band}_topomap.png")
+        os.makedirs(f'{figures_dir}/topomaps', exist_ok=True)
+        plt.savefig(f"{figures_dir}/topomaps/{group}_{band}_topomap.png")
         plt.close()
+    return group_data   
+
+
+    
+
+# df_wnv,patients_folder,control_folder,controls,cases,df_wnv2,cases_group_name = wnv_get_files()
+df_wnv,patients_folder,control_folder,controls,df_wnv2,cases_group_name = cobrad_get_files()
+figures_dir = f'{cases_group_name}_figures'
+# Add group labels
+controls['Group'] = 'Control'
+df_wnv2['Group'] = cases_group_name
+# all columns that have EEG, their split(' ')[-1] needs to be uppercase first letter, all rest lower case
+df_wnv2.columns = [' '.join([part.capitalize() if i == len(col.split(' ')) - 1 else part for i, part in enumerate(col.split(' '))]) if 'EEG' in col else col for col in df_wnv2.columns]
+controls.columns = [' '.join([part.capitalize() if i == len(col.split(' ')) - 1 else part for i, part in enumerate(col.split(' '))]) if 'EEG' in col else col for col in controls.columns]
+# Combine datasets
+combined_df = pd.concat([controls, df_wnv2], ignore_index=True)
+combined_df['sampling_frequency']
+combined_df.columns.tolist()
+# Initialize results storage
+results = []
+cols_to_skip = ['Group', 'patient_number']
+columns_to_analyze = [col for col in combined_df.columns if col not in cols_to_skip
+                     and pd.api.types.is_numeric_dtype(combined_df[col])]
+# make folder {figures_dir}/topomaps
+os.makedirs(f'{figures_dir}/topomaps', exist_ok=True)
+# Define the channel locations (you need to have this information)
+montage = mne.channels.make_standard_montage('standard_1020')
+eeg_channels = eeg_channels
+eeg_dict_convertion = eeg_dict_convertion
+# Iterate over each frequency band and plot the topomap
+frequency_bands = ['delta_power', 'theta_power', 'alpha_power', 'beta_power', 'gamma_power','pswe_events_per_minute_EEG','pswe_avg_length_EEG','mean_mpf','dfv_std','dfv_mean']
+boxplot_columns = [col for col in combined_df.columns if 'overall' in col.lower()]
+
+#%% clinical data analysis
+# split file name .[0] and then '-'[0] to get the ID
+clinical_columns_all = df_wnv2.columns[3:].tolist()
+# remove boxplot_columns from clinical_columns
+clinical_columns = [col for col in clinical_columns_all if col not in boxplot_columns]
+# Remove columns that contain 'EEG'
+clinical_columns = [col for col in clinical_columns if 'EEG' not in col]
+# Visualization
+numeric_cols = df_wnv2.select_dtypes(include=[np.number]).columns
+all_group_data = []
+# Iterate over clinical columns
+for col in clinical_columns:
+    df_wnv3 = df_wnv2[df_wnv2[col].notna()].copy()
+    unique_values = df_wnv3[col].unique()
+    print(f'Analyzing {col} with {len(unique_values)} unique values')
+    if df_wnv3.shape[0] < 3 or unique_values.shape[0] < 2:
+        continue
+    if len(unique_values) == 2:  # Check if binary
+        # check that there are at least 3 in each group (0,1)
+        if len(df_wnv3[df_wnv3[col] == 1]) < 3 or len(df_wnv3[df_wnv3[col] == 0]) < 3:
+            continue
+        for band in boxplot_columns:
+            if col == 'sex':
+                # if 1 'f' else 'm'
+                df_wnv3['Group'] = df_wnv3[col].apply(lambda x: 'f' if x == 1 else 'm')
+            elif col == 'sex, 1=male':
+                df_wnv3['Group'] = df_wnv3[col].apply(lambda x: 'm' if x == 1 else 'f')
+            else:
+                # group values based on band if =1, else f'not {band}'
+                df_wnv3['Group'] = df_wnv3[col].apply(lambda x: col if x == 1 else f'not {col}')
+            results_df = analyze_and_correct(df_wnv3, [band], groups=df_wnv3['Group'].unique())
+            boxplot_plot(results_df, df_wnv3, band, f'{col}')
+        # if frequency band is contained in the column name
+        group_data = {}
+        for value in unique_values:
+            group = col if value == 1 else f'not {col}'
+            run_df = df_wnv3[df_wnv3[col] == value]
+            group_data = process_group_data(group, run_df, frequency_bands, eeg_dict_convertion, eeg_channels, montage,group_data)
+        all_group_data.append(group_data)
+    # If numeric non-binary
+    elif col in numeric_cols:
+        for band in boxplot_columns:
+            scatter_plot_with_regression({}, df_wnv3, col, band, f'{col}_scatterplots')
+#%% Topomap per clinical column
+# Calculate p-values for each band and channel
+for group_data2 in all_group_data:
+    keys = list(group_data2.keys())
+    # output_dir  is the key which doesnt say not. if key is m, output_dir is sex
+    output_dir = [key for key in keys if 'not' not in key][0]
+    if 'm' in keys:
+        output_dir = 'sex'
+    for band in frequency_bands:
+        control_data = group_data2[keys[0]][band]
+        wnv_data = group_data2[keys[1]][band]
+        topomap_group_data(band, montage,control_data,wnv_data,output_dir)
+#%% Topomap per group CONTROLS
+# run over controls and cases
+group_data = {}
+for group in ['Control', cases_group_name]:
+    run_df = combined_df[combined_df['Group'] == group]
+    group_data = process_group_data(group, run_df, frequency_bands, eeg_dict_convertion, eeg_channels, montage,group_data)
 
 ### Topomap P-Value
 # Calculate p-values for each band and channel
 for band in frequency_bands:
     control_data = group_data['Control'][band]
-    wnv_data = group_data['WNV'][band]
-    common_channels = control_data.columns.intersection(wnv_data.columns)
-    dict_p_values = {}
-    for common_channel in common_channels:
-        control_channel = control_data[common_channel].dropna()
-        wnv_channel = wnv_data[common_channel].dropna()
-        if len(control_channel) < 2 or len(wnv_channel) < 2:
-            continue
-        _, p = ttest_ind(control_channel, wnv_channel)
-        dict_p_values[common_channel] = p
-    df_p_values = pd.DataFrame(dict_p_values, index=[0]).T
-    reject, pvals_corrected, _, _ = smm.multipletests(df_p_values[0].values, alpha=0.05, method='fdr_bh')
-    df_p_values['pvals_corrected'] = pvals_corrected
-    ch_names = df_p_values.index.tolist()
-    # Create an info object
-    info = mne.create_info(ch_names=ch_names, sfreq=256, ch_types='eeg')
-    info.set_montage(montage)
-    # Create an EvokedArray object for p-values
-    p_evoked = mne.EvokedArray(df_p_values['pvals_corrected'].values.reshape(-1, 1), info)
-    # Plot the topomap of p-values
-    fig, ax = plt.subplots()
-    vlim_max = min(0.05, df_p_values['pvals_corrected'].max())
-    im, cm = mne.viz.plot_topomap(p_evoked.data[:, 0], p_evoked.info, axes=ax, show=False, cmap='jet_r', vlim=[0, vlim_max])
-    fig.colorbar(im, ax=ax)
-    plt.title(f"{band} P-Value Topomap")
-    # Save the figure
-    plt.savefig(f"figures/topomaps_p_values/p_values_{band}_topomap.png")
-    plt.close()
+    wnv_data = group_data[cases_group_name][band]
+    # make the folder in boxplots/topomaps_p_values
+    os.makedirs(f'{figures_dir}/topomaps_p_values_vs_controls', exist_ok=True)
+    topomap_group_data(band, montage,control_data,wnv_data,'topomaps_p_values_vs_controls')
 
-
-results_df = analyze_and_correct(combined_df, columns_to_analyze)
+results_df = analyze_and_correct(combined_df, columns_to_analyze,groups=['Control', cases_group_name])
 # Save statistical results
 results_df.to_csv(f"{patients_folder}_analysis_results.csv", index=False)
 
@@ -349,7 +347,7 @@ for col in boxplot_columns:
     num_groups = curr_data['Group'].nunique()
     if num_groups < 2:
         continue
-    boxplot_plot(results_df,curr_data, col, 'boxplots')
+    boxplot_plot(results_df,curr_data, col, 'vs_controls')
 
 def mean_of_resized_arrays(arrays):
     # Get the shapes of all arrays
@@ -366,7 +364,7 @@ def mean_of_resized_arrays(arrays):
 #%% Spectrogram
 def spectogram_run():
     # Ensure the directory exists
-    os.makedirs('figures/spectograms', exist_ok=True)
+    os.makedirs(f'{figures_dir}/spectograms', exist_ok=True)
     for group in [patients_folder, control_folder]:
         # Read all pickle files from pickles/{group}
         pickle_files = [f for f in os.listdir(f'pickles/{group}') if f.endswith('.pkl')] 
@@ -387,7 +385,7 @@ def spectogram_run():
         print(pca.explained_variance_ratio_)
         # plot spectrogram
         fig = yasa.plot_spectrogram(eeg_data_pca.T[0,:], sf,win_sec=1)
-        fig.savefig(f'figures/spectograms/{group}_spectrogram.png')
+        fig.savefig(f'{figures_dir}/spectograms/{group}_spectrogram.png')
         plt.close(fig)
     
 # spectogram_run()

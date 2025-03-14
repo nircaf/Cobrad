@@ -2,7 +2,6 @@
 *.edf
 *.EEG
 *.png
-*.xlsx
 .vscode
 __pycache__*/
 *.pkl

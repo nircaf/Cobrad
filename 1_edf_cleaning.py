@@ -172,6 +172,8 @@ def choose_controls_EDF(directory,controls_ratio=4):
     edf_files = [re.search(r'\d{4}-\d{3}', file).group() if re.search(r'\d{4}-\d{3}', file) else None for file in edf_files]
     # remove duplicates
     edf_files = list(set(edf_files))
+    # remove the first letter
+    edf_files = [file[1:] for file in edf_files]
     # read excel COBRAD_clinical_24022025.xlsx
     clinical_files = pd.read_excel('COBRAD_clinical_24022025.xlsx')
     # record_id column
@@ -498,6 +500,8 @@ def analyze_eeg_data(raw,is_prod,filename):
 def process_file(row,filename,is_prod):
     metadata, raw = read_edf_mne(row['file_path'])
     metadata.update(row)
+    # make folder if not exist
+    os.makedirs(temp_dir, exist_ok=True)
     # if file temps/{row['file_name']}.csv exists
     if f'{row["file_name"]}.csv' in os.listdir(temp_dir):
         return 
