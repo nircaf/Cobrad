@@ -315,7 +315,10 @@ def analyze_eeg_data(raw,is_prod,filename):
     # raw.load_data()
     ar = AutoReject()
     epochs = mne.make_fixed_length_epochs(raw, duration=2, overlap=0.5,preload=True)
-    epochs_clean, reject_log = ar.fit_transform(epochs, return_log=True)
+    try:
+        epochs_clean, reject_log = ar.fit_transform(epochs, return_log=True)
+    except:
+        return
     # Assuming epochs_clean is an instance of mne.Epochs
     epochs_data = epochs_clean.get_data()  # Shape: (n_epochs, n_channels, n_times)
     
@@ -553,11 +556,14 @@ def process_file(row,filename,is_prod):
         else:
             eeg_metadata = analyze_eeg_data(raw,is_prod,row["file_name"])
             if eeg_metadata is None:
-                return
-            metadata.update(eeg_metadata)
-            # Write metadata to CSV
-            df = pd.DataFrame([metadata])
-            df.to_csv(f'{temp_dir}/{row["file_name"]}.csv', index=False)
+                # save empty csv file
+                pd.DataFrame().to_csv(f'{temp_dir}/{row["file_name"]}', index=False)
+                print(f'Error processing {row["file_name"]}')
+            else:
+                metadata.update(eeg_metadata)
+                # Write metadata to CSV
+                df = pd.DataFrame([metadata])
+                df.to_csv(f'{temp_dir}/{row["file_name"]}.csv', index=False)
         # return metadata
     # return metadata
 
@@ -573,7 +579,7 @@ if __name__ == "__main__":
     # remove duplicates subset file_name
     df.drop_duplicates(subset='file_name', inplace=True)
     # reverse the order of the files
-    df = df.iloc[::-1]
+    # df = df.iloc[::-1]
     # Set multiprocessing flag
     filename = f'{project_name}.csv'
     if use_multiprocessing:
