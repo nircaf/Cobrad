@@ -234,8 +234,6 @@ def process_group_data(group, run_df, frequency_bands, eeg_dict_convertion, eeg_
     return group_data   
 
 
-    
-
 # df_wnv,patients_folder,control_folder,controls,cases,df_wnv2,cases_group_name = wnv_get_files()
 df_wnv,patients_folder,control_folder,controls,df_wnv2,cases_group_name = cobrad_get_files()
 figures_dir = f'{cases_group_name}_figures'
@@ -262,15 +260,9 @@ eeg_channels = eeg_channels
 eeg_dict_convertion = eeg_dict_convertion
 # Iterate over each frequency band and plot the topomap
 frequency_bands = ['delta_power', 'theta_power', 'alpha_power', 'beta_power', 'gamma_power','pswe_events_per_minute_EEG','pswe_avg_length_EEG','mean_mpf','dfv_std','dfv_mean']
-boxplot_columns = [col for col in combined_df.columns if 'overall' in col.lower()]
 
 #%% clinical data analysis
-# split file name .[0] and then '-'[0] to get the ID
-clinical_columns_all = df_wnv2.columns[3:].tolist()
-# remove boxplot_columns from clinical_columns
-clinical_columns = [col for col in clinical_columns_all if col not in boxplot_columns]
-# Remove columns that contain 'EEG'
-clinical_columns = [col for col in clinical_columns if 'EEG' not in col]
+clinical_columns, boxplot_columns = get_clinical_and_boxplot_cols(df_wnv2=df_wnv2)
 # Visualization
 numeric_cols = df_wnv2.select_dtypes(include=[np.number]).columns
 all_group_data = []

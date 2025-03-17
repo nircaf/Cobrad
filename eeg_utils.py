@@ -118,3 +118,13 @@ def cobrad_get_files():
             pass
     cases_group_name = 'COBRAD'
     return df_wnv,patients_folder,control_folder,controls,df_wnv2,cases_group_name
+
+def get_clinical_and_boxplot_cols(df_wnv2):
+       boxplot_columns = [col for col in df_wnv2.columns if 'overall' in col.lower()]
+       # split file name .[0] and then '-'[0] to get the ID
+       clinical_columns_all = df_wnv2.columns[3:].tolist()
+       # remove boxplot_columns from clinical_columns
+       clinical_columns = [col for col in clinical_columns_all if col not in boxplot_columns]
+       # Remove columns that contain 'EEG'
+       clinical_columns = [col for col in clinical_columns if 'EEG' not in col]
+       return clinical_columns,boxplot_columns
