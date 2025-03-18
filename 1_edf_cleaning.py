@@ -321,6 +321,7 @@ def analyze_eeg_data(raw,is_prod,filename):
             prep.fit()  # Run the pipeline without writing to console
     except Exception as e:
         print(f'Error in PrepPipeline: {e}')
+        # raw.set_eeg_reference(ref_channels='average')
         return
     plot_not_prod(prep.raw,is_prod,'PrepPipeline4')
     raw = prep.raw  # Get cleaned data
@@ -547,14 +548,14 @@ def process_file(row,filename,is_prod):
             start_i = 0
             while eeg_metadata is None:
                 if max_duration_s == 0:
-                    pd.DataFrame().to_csv(f'{temp_dir}/{row["file_name"]}_segment_{start_i}.csv', index=False)
+                    pd.DataFrame().to_csv(f'{temp_dir}/{row["file_name"]}_{max_duration_s}_{start_i}.csv', index=False)
                     start_i += 1
                     max_duration_s = 60 * 60
-                    print(f'Error processing {f'{row["file_name"]}_segment_{start_i}'}')
+                    print(f'Error processing {row["file_name"]}_{max_duration_s}_{start_i}, skipping...')
                 # Split the data into 60-minute segments
                 n_segments = int(np.ceil(duration_s / max_duration_s))
                 for i in range(start_i, n_segments):
-                    segment_filename = f'{row["file_name"]}_segment_{i + 1}.csv'
+                    segment_filename = f'{row["file_name"]}_{max_duration_s}_{i + 1}.csv'
                     if os.path.exists(f'{temp_dir}/{segment_filename}'):
                         continue
                     start = i * max_duration_s  # Start time in seconds
@@ -563,8 +564,8 @@ def process_file(row,filename,is_prod):
                     eeg_metadata = analyze_eeg_data(raw_segment, is_prod, segment_filename)
                     if eeg_metadata is None:
                         # Reduce max_duration_s by 10 minutes but not below 0
+                        print(f'Error processing {row["file_name"]}_{max_duration_s}_{start_i}, retrying with max_duration_s={max_duration_s-600}...')
                         max_duration_s = max(max_duration_s - 10 * 60, 0)
-                        print(f'Error processing {row["file_name"]}, retrying with max_duration_s={max_duration_s}...')
                         break  # Exit the for loop to recalculate segments with new max_duration_s
                     # Update and write segment metadata
                     metadata.update(eeg_metadata)
@@ -603,8 +604,8 @@ if __name__ == "__main__":
         df = list_files_and_find_duplicates(directory)
     # remove duplicates subset file_name
     df.drop_duplicates(subset='file_name', inplace=True)
-    # leave only the files that contains 023
-    df = df[df['file_name'].str.contains('025')]
+    # leave only the files that contains 
+    # df = df[df['file_name'].str.contains('025')]
     # Set multiprocessing flag
     filename = f'{project_name}.csv'
     if use_multiprocessing:
