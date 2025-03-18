@@ -105,7 +105,12 @@ def cobrad_get_files():
     cases['ID'] = cases['file_name'].apply(lambda x: x.split('.')[0]).astype(str)
     # remove first letter of ID
     cases['ID'] = cases['ID'].apply(lambda x: x[1:])
-    df_merged = pd.merge(df_wnv, cases, on='ID', how='inner')
+    df_merged = pd.merge(df_wnv, cases, on='ID', how='outer',indicator=True)
+    # print outer
+    print(df_merged['_merge'].value_counts())
+    print('Only clinical data - eeg data currupted')
+    print(df_merged[df_merged['_merge'] == 'left_only']['ID'])
+    df_merged = df_merged[df_merged['_merge'] == 'both'].drop(columns='_merge')
     numeric_cols = df_merged.select_dtypes(include=[np.number]).columns
     # Group by ID and apply the weighted average function
     df_wnv2 = df_merged.groupby('ID').apply(weighted_avg, weight_col='duration_min', numeric_cols=numeric_cols).reset_index(drop=True)
@@ -118,6 +123,7 @@ def cobrad_get_files():
             pass
     cases_group_name = 'COBRAD'
     return df_wnv,patients_folder,control_folder,controls,df_wnv2,cases_group_name
+    df_merged['ID'].unique()
 
 def get_clinical_and_boxplot_cols(df_wnv2):
        boxplot_columns = [col for col in df_wnv2.columns if 'overall' in col.lower()]
