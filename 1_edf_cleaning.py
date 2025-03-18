@@ -20,6 +20,17 @@ import yasa
 # sklearn.preprocessing.MinMaxScaler
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.decomposition import PCA
+from contextlib import contextmanager
+
+@contextmanager
+def suppress_stdout():
+    with open(os.devnull, 'w') as devnull:
+        old_stdout = sys.stdout
+        sys.stdout = devnull
+        try:
+            yield
+        finally:
+            sys.stdout = old_stdout
 # sys arrent cur dir
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(os.getcwd())
@@ -30,13 +41,16 @@ use_multiprocessing = False
 warnings.filterwarnings("ignore", message="Channels contain different highpass filters. Highest filter setting will be stored.")
 warnings.filterwarnings("ignore", message="Channels contain different lowpass filters. Lowest filter setting will be stored.")
 warnings.filterwarnings("ignore", message="Effective window size : 1.000 (s)")
-
 getcwd = os.getcwd()
+
+#%% INITIALIZATION
 directory = os.path.join(getcwd, 'EDF')
 # directory = os.path.join(getcwd, 'Controls')
 os_splittor = '\\' if 'nt' in os.name else '/'
 cases_project_name = 'west_nile_virus'
 cases_project_name = 'EDF'
+
+#%% Load the data
 # df_wnv = pd.read_excel(f'WNV_merged_291224_KP.xlsx')
 project_name = directory.split(os_splittor)[-1]
 temp_dir = f'temps_{project_name}' 
@@ -303,8 +317,10 @@ def analyze_eeg_data(raw,is_prod,filename):
     }
     prep = PrepPipeline(raw, prep_params, montage="standard_1020",ransac=False)
     try:
-        prep.fit()  # Run the pipeline
-    except:
+        with suppress_stdout():
+            prep.fit()  # Run the pipeline without writing to console
+    except Exception as e:
+        print(f'Error in PrepPipeline: {e}')
         return
     plot_not_prod(prep.raw,is_prod,'PrepPipeline4')
     raw = prep.raw  # Get cleaned data
@@ -316,7 +332,8 @@ def analyze_eeg_data(raw,is_prod,filename):
     epochs = mne.make_fixed_length_epochs(raw, duration=2, overlap=0.5,preload=True)
     try:
         epochs_clean, reject_log = ar.fit_transform(epochs, return_log=True)
-    except:
+    except Exception as e:
+        print(f'Error in AutoReject: {e}')
         return
     # Assuming epochs_clean is an instance of mne.Epochs
     epochs_data = epochs_clean.get_data()  # Shape: (n_epochs, n_channels, n_times)
@@ -511,7 +528,7 @@ def process_file(row,filename,is_prod):
     try:
         df_csv = pd.read_csv(filename)
         # if file name in csv
-        if row['file_name'] in df_csv['file_name'].values:\
+        if row['file_name'] in df_csv['file_name'].values:
             return 
     except:
         pass
@@ -519,39 +536,48 @@ def process_file(row,filename,is_prod):
         channels = raw.ch_names
         # Check the duration of the recording
         duration_s = raw.times[-1]  # Convert duration to milliseconds
-        duration_h = duration_s / 3600
         duration_skip = 10 * 60  # Skip recordings less than 10 minutes
         if duration_s < duration_skip:
             return
-        # Split the data into 30-minute segments
-        max_duration_s = 60 * 60   # 60 minutes in seconds
+        # Split the data into segments
+        max_duration_s = 60 * 60  # 60 minutes in seconds
+        
         if duration_s > max_duration_s:
-            # Split the data into 60-minute segments
-            n_segments = int(np.ceil(duration_s / max_duration_s))
-            for i in range(n_segments):
-                segment_filename = f'{row["file_name"]}_segment_{i + 1}.csv'
-                if os.path.exists(f'{temp_dir}/{segment_filename}'):
-                    continue
-                start = i * max_duration_s   # Convert to seconds
-                stop = min((i + 1) * max_duration_s , raw.times[-1])  # Convert to seconds
-                raw_segment = raw.copy().crop(tmin=start, tmax=stop)
-                eeg_metadata = analyze_eeg_data(raw_segment,is_prod,segment_filename)
-                if eeg_metadata is None:
-                    # save empty csv file
-                    pd.DataFrame().to_csv(f'{temp_dir}/{segment_filename}', index=False)
-                    print(f'Error processing segment {i + 1} of {row["file_name"]}')
-                    continue
-                metadata.update(eeg_metadata)
-                # add row to metadata
-                segment_metadata = metadata.copy()
-                segment_metadata['segment'] = i + 1
-                segment_metadata['start_time'] = start
-                segment_metadata['end_time'] = stop
-                segment_metadata['duration_sec'] = stop - start
-                segment_metadata['duration_min'] = (stop - start) / 60
-                # Write segment metadata to CSV
-                df_segment = pd.DataFrame([segment_metadata])
-                df_segment.to_csv(f'{temp_dir}/{segment_filename}', index=False)
+            eeg_metadata = None
+            start_i = 0
+            while eeg_metadata is None:
+                if max_duration_s == 0:
+                    pd.DataFrame().to_csv(f'{temp_dir}/{row["file_name"]}_segment_{start_i}.csv', index=False)
+                    start_i += 1
+                    max_duration_s = 60 * 60
+                    print(f'Error processing {f'{row["file_name"]}_segment_{start_i}'}')
+                # Split the data into 60-minute segments
+                n_segments = int(np.ceil(duration_s / max_duration_s))
+                for i in range(start_i, n_segments):
+                    segment_filename = f'{row["file_name"]}_segment_{i + 1}.csv'
+                    if os.path.exists(f'{temp_dir}/{segment_filename}'):
+                        continue
+                    start = i * max_duration_s  # Start time in seconds
+                    stop = min((i + 1) * max_duration_s, raw.times[-1])  # Stop time in seconds
+                    raw_segment = raw.copy().crop(tmin=start, tmax=stop)
+                    eeg_metadata = analyze_eeg_data(raw_segment, is_prod, segment_filename)
+                    if eeg_metadata is None:
+                        # Reduce max_duration_s by 10 minutes but not below 0
+                        max_duration_s = max(max_duration_s - 10 * 60, 0)
+                        print(f'Error processing {row["file_name"]}, retrying with max_duration_s={max_duration_s}...')
+                        break  # Exit the for loop to recalculate segments with new max_duration_s
+                    # Update and write segment metadata
+                    metadata.update(eeg_metadata)
+                    segment_metadata = metadata.copy()
+                    segment_metadata['segment'] = i + 1
+                    segment_metadata['start_time'] = start
+                    segment_metadata['end_time'] = stop
+                    segment_metadata['duration_sec'] = stop - start
+                    segment_metadata['duration_min'] = (stop - start) / 60
+        
+                    # Write segment metadata to CSV
+                    df_segment = pd.DataFrame([segment_metadata])
+                    df_segment.to_csv(f'{temp_dir}/{segment_filename}', index=False)
         else:
             eeg_metadata = analyze_eeg_data(raw,is_prod,row["file_name"])
             if eeg_metadata is None:
@@ -577,8 +603,8 @@ if __name__ == "__main__":
         df = list_files_and_find_duplicates(directory)
     # remove duplicates subset file_name
     df.drop_duplicates(subset='file_name', inplace=True)
-    # reverse the order of the files
-    # df = df.iloc[::-1]
+    # leave only the files that contains 023
+    df = df[df['file_name'].str.contains('025')]
     # Set multiprocessing flag
     filename = f'{project_name}.csv'
     if use_multiprocessing:
@@ -601,8 +627,19 @@ if __name__ == "__main__":
     all_files = os.listdir(temp_dir)
     for i in range(0, len(all_files), batch_size):
         batch_files = all_files[i:i + batch_size]
-        df_batch = pd.concat([pd.read_csv(os.path.join(temp_dir, file)) for file in batch_files])
-        # Determine if the header should be written
-        write_header = not os.path.exists(filename)
-        # Append the DataFrame to the CSV file
-        df_batch.to_csv(filename, mode='a', header=write_header, index=False)
+        df_list = []
+        for file in batch_files:
+            try:
+                df = pd.read_csv(os.path.join(temp_dir, file))
+                df['csv_file_name'] = file
+                df_list.append(df)
+            except pd.errors.EmptyDataError:
+                print(f"Skipping empty file: {file}")
+        if df_list:
+            df_batch = pd.concat(df_list)
+            # move col csv_file_name to first
+            df_batch = pd.concat([df_batch['csv_file_name'], df_batch.drop(columns=['csv_file_name'])], axis=1)
+            # Determine if the header should be written
+            write_header = not os.path.exists(filename)
+            # Append the DataFrame to the CSV file
+            df_batch.to_csv(filename, mode='a', header=write_header, index=False)
