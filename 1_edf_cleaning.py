@@ -20,6 +20,17 @@ import yasa
 # sklearn.preprocessing.MinMaxScaler
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.decomposition import PCA
+from contextlib import contextmanager
+
+@contextmanager
+def suppress_stdout():
+    with open(os.devnull, 'w') as devnull:
+        old_stdout = sys.stdout
+        sys.stdout = devnull
+        try:
+            yield
+        finally:
+            sys.stdout = old_stdout
 # sys arrent cur dir
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(os.getcwd())
@@ -307,8 +318,10 @@ def analyze_eeg_data(raw,is_prod,filename):
     }
     prep = PrepPipeline(raw, prep_params, montage="standard_1020",ransac=False)
     try:
-        prep.fit()  # Run the pipeline
-    except:
+        with suppress_stdout():
+            prep.fit()  # Run the pipeline without writing to console
+    except Exception as e:
+        print(f'Error in PrepPipeline: {e}')
         return
     plot_not_prod(prep.raw,is_prod,'PrepPipeline4')
     raw = prep.raw  # Get cleaned data
@@ -320,7 +333,8 @@ def analyze_eeg_data(raw,is_prod,filename):
     epochs = mne.make_fixed_length_epochs(raw, duration=2, overlap=0.5,preload=True)
     try:
         epochs_clean, reject_log = ar.fit_transform(epochs, return_log=True)
-    except:
+    except Exception as e:
+        print(f'Error in AutoReject: {e}')
         return
     # Assuming epochs_clean is an instance of mne.Epochs
     epochs_data = epochs_clean.get_data()  # Shape: (n_epochs, n_channels, n_times)
@@ -531,10 +545,16 @@ def process_file(row,filename,is_prod):
         
         if duration_s > max_duration_s:
             eeg_metadata = None
+            start_i = 0
             while eeg_metadata is None:
+                if max_duration_s == 0:
+                    pd.DataFrame().to_csv(f'{temp_dir}/{row["file_name"]}_segment_{start_i}.csv', index=False)
+                    start_i += 1
+                    max_duration_s = 60 * 60
+                    print(f'Error processing {f'{row["file_name"]}_segment_{start_i}'}')
                 # Split the data into 60-minute segments
                 n_segments = int(np.ceil(duration_s / max_duration_s))
-                for i in range(n_segments):
+                for i in range(start_i, n_segments):
                     segment_filename = f'{row["file_name"]}_segment_{i + 1}.csv'
                     if os.path.exists(f'{temp_dir}/{segment_filename}'):
                         continue
@@ -545,6 +565,7 @@ def process_file(row,filename,is_prod):
                     if eeg_metadata is None:
                         # Reduce max_duration_s by 10 minutes but not below 0
                         max_duration_s = max(max_duration_s - 10 * 60, 0)
+                        print(f'Error processing {row["file_name"]}, retrying with max_duration_s={max_duration_s}...')
                         break  # Exit the for loop to recalculate segments with new max_duration_s
                     # Update and write segment metadata
                     metadata.update(eeg_metadata)
