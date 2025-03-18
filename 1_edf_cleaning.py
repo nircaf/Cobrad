@@ -34,7 +34,6 @@ warnings.filterwarnings("ignore", message="Effective window size : 1.000 (s)")
 getcwd = os.getcwd()
 directory = os.path.join(getcwd, 'EDF')
 # directory = os.path.join(getcwd, 'Controls')
-# directory = os.path.join(getcwd, 'west_nile_virus')
 os_splittor = '\\' if 'nt' in os.name else '/'
 cases_project_name = 'west_nile_virus'
 cases_project_name = 'EDF'
