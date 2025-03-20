@@ -5,7 +5,7 @@ from scipy.io import loadmat
 from scipy.stats import zscore
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
-
+from scipy.stats import iqr
 
 eeg_channels = ['Fp1', 'Fp2', 'F3', 'F4', 'C3', 'C4', 'P3', 'P4', 'O1', 'O2', 'F7',
        'F8', 'T3', 'T4', 'T5', 'T6', 'Fz', 'Cz', 'Pz', 'A1','A2', 'Fpz', 'Oz']
@@ -79,13 +79,19 @@ def wnv_get_files():
 #%% COBRAD
 def cobrad_get_files():
     # read sheets clinical, medications, npi-q, epworth,isi, ecpg_12 from COBRAD_clinical_24022025.xlsx
-    sheets_to_read = ['clinical', 'medications', 'npi-q', 'epworth', 'isi', 'ecog_12']
+    sheets_to_read = ['clinical', 'medications', 'npi-q', 'epworth', 'isi', 'ecog_12','Sheet4']
+    sheets_to_sum_vals = ['epworth', 'isi', 'ecog_12','Sheet4']
     dfs = pd.read_excel('COBRAD_clinical_24022025.xlsx', sheet_name=sheets_to_read)
     # Rename 'record_id' to 'ID' in each DataFrame and convert to string
     for sheet in sheets_to_read:
         dfs[sheet] = dfs[sheet].rename(columns={'record_id': 'ID'}).astype(str)
-        # drop col contain has_eeg
-        dfs[sheet] = dfs[sheet].drop(columns=[col for col in dfs[sheet].columns if 'has_eeg' in col])
+        # drop col contain has_eeg or has eeg . ignore case
+        dfs[sheet] = dfs[sheet].drop(columns=[col for col in dfs[sheet].columns if 'has eeg' in col.lower() or 'has_eeg' in col.lower()])
+        if sheet in sheets_to_sum_vals:
+            # to numeric all columns but ID
+            dfs[sheet] = pd.concat([dfs[sheet]['ID'], dfs[sheet].drop(columns='ID').apply(pd.to_numeric, errors='coerce')], axis=1)
+            dfs[sheet][f'{sheet}_sum'] = dfs[sheet].drop(columns='ID').sum(axis=1)
+
     # Merge all DataFrames on 'ID'
     df_wnv = dfs[sheets_to_read[0]]
     for sheet in sheets_to_read[1:]:
@@ -105,11 +111,26 @@ def cobrad_get_files():
     cases['ID'] = cases['file_name'].apply(lambda x: x.split('.')[0]).astype(str)
     # remove first letter of ID
     cases['ID'] = cases['ID'].apply(lambda x: x[1:])
+    # split ' ' and get first element
+    cases['ID'] = cases['ID'].apply(lambda x: x.split(' ')[0])
+    # sort id ID
+    cases = cases.sort_values(by='ID')
     df_merged = pd.merge(df_wnv, cases, on='ID', how='outer',indicator=True)
+    
+    # Get all files that end with .edf from EDF folder and subfolders
+    eeg_files = []
+    for root, dirs, files in os.walk('EDF'):
+        for file in files:
+            if file.endswith('.edf'):
+                eeg_files.append(os.path.join(root, file))
     # print outer
-    print(df_merged['_merge'].value_counts())
     print('Only clinical data - eeg data currupted')
-    print(df_merged[df_merged['_merge'] == 'left_only']['ID'])
+    failed_ids = df_merged[df_merged['_merge'] == 'left_only']['ID'].unique()
+    # check if they exist in eeg_files
+    for id_to_check in failed_ids:
+        # check if id exists contains in eeg_files
+        if any(id_to_check in file for file in eeg_files):
+            print(f'{id_to_check}')
     df_merged = df_merged[df_merged['_merge'] == 'both'].drop(columns='_merge')
     numeric_cols = df_merged.select_dtypes(include=[np.number]).columns
     # Group by ID and apply the weighted average function
@@ -122,6 +143,19 @@ def cobrad_get_files():
             # print(f'Could not convert {col} to numeric')
             pass
     cases_group_name = 'COBRAD'
+    # if 'COBRAD_descriptive.xlsx' doesnt exist
+    if not os.path.exists('COBRAD_descriptive.xlsx'):
+        # Create a dictionary to store descriptive statistics for each sheet
+        desc_stats = {}
+        for sheet in sheets_to_read:
+            # get only the ids that are in df_wnv2
+            dfs[sheet] = dfs[sheet][dfs[sheet]['ID'].isin(df_wnv2['ID'])]
+            df_desc = custom_describe(dfs[sheet])
+            desc_stats[sheet] = df_desc
+        # Save all descriptive statistics to one Excel file
+        with pd.ExcelWriter('COBRAD_descriptive.xlsx') as writer:
+            for sheet_name, df_desc in desc_stats.items():
+                df_desc.to_excel(writer, sheet_name=sheet_name)
     return df_wnv,patients_folder,control_folder,controls,df_wnv2,cases_group_name
     df_merged['ID'].unique()
 
@@ -134,3 +168,38 @@ def get_clinical_and_boxplot_cols(df_wnv2):
        # Remove columns that contain 'EEG'
        clinical_columns = [col for col in clinical_columns if 'EEG' not in col]
        return clinical_columns,boxplot_columns
+   
+# Custom descriptive statistics function
+def custom_describe(df):
+    # Convert columns with object dtype to more relevant types
+    for col in df.select_dtypes(include=['object']).columns:
+        try:
+            df[col] = pd.to_datetime(df[col])
+        except (ValueError, TypeError):
+            try:
+                df[col] = pd.to_numeric(df[col])
+            except ValueError:
+                pass  # If conversion fails, keep the column as object
+    stats = {}
+    numeric_columns = df.select_dtypes(include=[np.number]).columns
+    for col in df.columns:
+        # if col values are numeric cases.select_dtypes(include=[np.number]).columns
+        if col in numeric_columns:
+            stats[col] = {
+                'count': df[col].count(),
+                'mean': df[col].mean(),
+                'std': df[col].std(),
+                'median': df[col].median(),
+                'unique': df[col].nunique(),
+                'min': df[col].min(),
+                'max': df[col].max(),
+                'iqr': iqr(df[col].dropna())  # IQR requires non-null values
+            }
+        else:  # Non-numeric columns (e.g., record_id)
+            stats[col] = {
+                'count': df[col].count(),
+                'unique': df[col].nunique()
+            }
+    df_ret = pd.DataFrame(stats)
+    # round 2
+    return df_ret.round(2)

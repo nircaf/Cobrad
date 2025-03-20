@@ -45,7 +45,7 @@ getcwd = os.getcwd()
 
 #%% INITIALIZATION
 directory = os.path.join(getcwd, 'EDF')
-# directory = os.path.join(getcwd, 'Controls')
+directory = os.path.join(getcwd, 'Controls')
 os_splittor = '\\' if 'nt' in os.name else '/'
 cases_project_name = 'west_nile_virus'
 cases_project_name = 'EDF'
@@ -321,7 +321,6 @@ def analyze_eeg_data(raw,is_prod,filename):
             prep.fit()  # Run the pipeline without writing to console
     except Exception as e:
         print(f'Error in PrepPipeline: {e}')
-        # raw.set_eeg_reference(ref_channels='average')
         return
     plot_not_prod(prep.raw,is_prod,'PrepPipeline4')
     raw = prep.raw  # Get cleaned data
@@ -414,13 +413,11 @@ def analyze_eeg_data(raw,is_prod,filename):
         pswe_percentage = (pswe_total_duration / total_duration) * 100
         pswe_events_per_minute = len(pswe_durations) / (total_duration / 60)
         pswe_avg_length = np.mean(pswe_durations) if len(pswe_durations) > 0 else 0
-
         pswe_stats.append({
             'pswe_percentage': pswe_percentage,
             'pswe_events_per_minute': pswe_events_per_minute,
             'pswe_avg_length': pswe_avg_length
         })
-
         # Collect overall PSWE durations
         overall_pswe_durations.extend(pswe_durations)
 
@@ -565,7 +562,7 @@ def process_file(row,filename,is_prod):
                     if eeg_metadata is None:
                         # Reduce max_duration_s by 10 minutes but not below 0
                         print(f'Error processing {row["file_name"]}_{max_duration_s}_{start_i}, retrying with max_duration_s={max_duration_s-600}...')
-                        max_duration_s = max(max_duration_s - 10 * 60, 0)
+                        max_duration_s = max(max_duration_s - 5 * 60, 0)
                         break  # Exit the for loop to recalculate segments with new max_duration_s
                     # Update and write segment metadata
                     metadata.update(eeg_metadata)
@@ -605,7 +602,7 @@ if __name__ == "__main__":
     # remove duplicates subset file_name
     df.drop_duplicates(subset='file_name', inplace=True)
     # leave only the files that contains 
-    # df = df[df['file_name'].str.contains('025')]
+    # df = df[df['file_name'].str.contains('028')]
     # Set multiprocessing flag
     filename = f'{project_name}.csv'
     if use_multiprocessing:
@@ -626,6 +623,8 @@ if __name__ == "__main__":
     batch_size = 100  # Adjust the batch size as needed
     # make folder if not exist
     all_files = os.listdir(temp_dir)
+    # remove .DS_Store
+    all_files = [file for file in all_files if file != '.DS_Store']
     for i in range(0, len(all_files), batch_size):
         batch_files = all_files[i:i + batch_size]
         df_list = []

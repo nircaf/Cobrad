@@ -35,13 +35,24 @@ plt.rc('legend',  handlelength=4.0)
 plt.rc('axes',  titlesize=12)  # Set title size to be the same as x and y labels
 
 def boxplot_plot(results_df,combined_df, col, output_dir):
+    # Function to remove outliers based on 5 standard deviations
+    def remove_outliers(df, col, group_col, threshold=5):
+        def filter_group(group):
+            mean = group[col].mean()
+            std = group[col].std()
+            return group[np.abs(group[col] - mean) <= threshold * std]
+        
+        return df.groupby(group_col).apply(filter_group).reset_index(drop=True)
+
+    # Remove outliers from each group
+    cleaned_df = remove_outliers(combined_df, col, 'Group')
+
+    # Plot the cleaned data
     plt.figure(figsize=(10, 6))
-    sns.boxplot(x='Group', y=col, data=combined_df, showfliers=False)
+    sns.boxplot(x='Group', y=col, data=cleaned_df, showfliers=False)
     # Add stripplot
-    sns.stripplot(x='Group', y=col, data=combined_df, 
-                 alpha=0.5, jitter=True, color='black')
+    sns.stripplot(x='Group', y=col, data=cleaned_df, alpha=0.5, jitter=True, color='black')
     # Add significance markers
-    max_val = combined_df[col].max()
     filtered_df = results_df[results_df['Variable'] == col]
     if filtered_df.empty:
         return
@@ -67,8 +78,6 @@ def boxplot_plot(results_df,combined_df, col, output_dir):
         ax = plt.gca()
         ax.set_xticklabels([f"{label.get_text()}\nn={group_counts[label.get_text()]}" for label in ax.get_xticklabels()])
         plt.tight_layout()
-        # make folder {figures_dir}
-        # make folder {figures_dir}/{output_dir}
         os.makedirs(f'{figures_dir}/boxplots/{output_dir}', exist_ok=True)
         plt.savefig(f"{figures_dir}/boxplots/{output_dir}/{col}_comparison.png")
     plt.close()
@@ -186,9 +195,9 @@ def topomap_group_data( band, montage,control_data,wnv_data,output_dir):
         plt.title(f"{band} {output_dir} P-Value Topomap")
         # if any value in pvals_corrected is less than 0.05
         # make folder {figures_dir}/boxplots/{output_dir}
-        os.makedirs(f'{figures_dir}/boxplots/{output_dir}', exist_ok=True)
+        os.makedirs(f'{figures_dir}/topomaps_p_values_vs_controls/{output_dir}', exist_ok=True)
         # Save the figure
-        plt.savefig(f"{figures_dir}/boxplots/{output_dir}/p_values_{band}_topomap.png")
+        plt.savefig(f"{figures_dir}/topomaps_p_values_vs_controls/{output_dir}/p_values_{band}_topomap.png")
     plt.close()
 
 def process_group_data(group, run_df, frequency_bands, eeg_dict_convertion, eeg_channels, montage,group_data):
@@ -233,9 +242,10 @@ def process_group_data(group, run_df, frequency_bands, eeg_dict_convertion, eeg_
         plt.close()
     return group_data   
 
-
+#%% Choose project
 # df_wnv,patients_folder,control_folder,controls,cases,df_wnv2,cases_group_name = wnv_get_files()
 df_wnv,patients_folder,control_folder,controls,df_wnv2,cases_group_name = cobrad_get_files()
+#%% Initialize variables
 figures_dir = f'{cases_group_name}_figures'
 # Add group labels
 controls['Group'] = 'Control'
@@ -323,8 +333,6 @@ for group in ['Control', cases_group_name]:
 for band in frequency_bands:
     control_data = group_data['Control'][band]
     wnv_data = group_data[cases_group_name][band]
-    # make the folder in boxplots/topomaps_p_values
-    os.makedirs(f'{figures_dir}/topomaps_p_values_vs_controls', exist_ok=True)
     topomap_group_data(band, montage,control_data,wnv_data,'topomaps_p_values_vs_controls')
 
 results_df = analyze_and_correct(combined_df, columns_to_analyze,groups=['Control', cases_group_name])
