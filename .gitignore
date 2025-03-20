@@ -6,5 +6,7 @@
 __pycache__*/
 *.pkl
 .env
-.DS_Store
+*.DS_Store
 venv/
+# xlsx that start with ~
+~$*.xlsx
