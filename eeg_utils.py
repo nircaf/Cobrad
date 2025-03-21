@@ -95,9 +95,7 @@ def cobrad_get_files():
     # Merge all DataFrames on 'ID'
     df_wnv = dfs[sheets_to_read[0]]
     for sheet in sheets_to_read[1:]:
-        df_wnv = pd.merge(df_wnv, dfs[sheet], on='ID', how='inner')
-    # rename record_id to ID
-    df_wnv = df_wnv.rename(columns={'record_id':'ID'}).astype(str)
+        df_wnv = pd.merge(df_wnv, dfs[sheet], on='ID', how='outer')
     patients_folder = "EDF"
     control_folder = f"{patients_folder}_controls"
     case_file = f"{patients_folder}.csv"
@@ -108,7 +106,7 @@ def cobrad_get_files():
         lambda x: (x[numeric_cols].multiply(x['duration_min'], axis=0)).sum(skipna=False) / x['duration_min'].sum(skipna=False)
     ).reset_index()
     cases = pd.read_csv(case_file)
-    cases['ID'] = cases['file_name'].apply(lambda x: x.split('.')[0]).astype(str)
+    cases['ID'] = cases['csv_file_name'].apply(lambda x: x.split('.')[0]).astype(str)
     # remove first letter of ID
     cases['ID'] = cases['ID'].apply(lambda x: x[1:])
     # split ' ' and get first element
@@ -156,8 +154,13 @@ def cobrad_get_files():
         with pd.ExcelWriter('COBRAD_descriptive.xlsx') as writer:
             for sheet_name, df_desc in desc_stats.items():
                 df_desc.to_excel(writer, sheet_name=sheet_name)
+    # df_wnv save to csv
+    df_wnv.to_csv('COBRAD_features.csv',index=False)
     return df_wnv,patients_folder,control_folder,controls,df_wnv2,cases_group_name
     df_merged['ID'].unique()
+    df_merged['_merge'].unique()
+    df_merged[df_merged['_merge'] == 'right_only']['ID'].unique()
+    df_wnv2['ID'].unique()
 
 def get_clinical_and_boxplot_cols(df_wnv2):
        boxplot_columns = [col for col in df_wnv2.columns if 'overall' in col.lower()]
@@ -168,6 +171,12 @@ def get_clinical_and_boxplot_cols(df_wnv2):
        # Remove columns that contain 'EEG'
        clinical_columns = [col for col in clinical_columns if 'EEG' not in col]
        return clinical_columns,boxplot_columns
+
+def save_raw_data(df, col, figures_dir):
+    # Ensure the directory exists
+    os.makedirs(f'{figures_dir}/raw_data', exist_ok=True)
+    # Save the DataFrame to a CSV file
+    df.to_csv(f'{figures_dir}/raw_data/{col}_raw_data.csv', index=False)
    
 # Custom descriptive statistics function
 def custom_describe(df):
