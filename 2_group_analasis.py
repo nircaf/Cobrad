@@ -34,7 +34,7 @@ plt.rc('axes',  labelsize=11)
 plt.rc('legend',  handlelength=4.0)
 plt.rc('axes',  titlesize=12)  # Set title size to be the same as x and y labels
 
-def boxplot_plot(results_df,combined_df, col, output_dir):
+def boxplot_plot(results_df, combined_df, col, output_dir):
     # Function to remove outliers based on 5 standard deviations
     def remove_outliers(df, col, group_col, threshold=5):
         def filter_group(group):
@@ -65,23 +65,58 @@ def boxplot_plot(results_df,combined_df, col, output_dir):
         sig_symbol = '*'
     else:
         sig_symbol = 'ns'
-    if sig_symbol != 'ns':
-        title_text = (
-            f"{row['Test']}\n"
-            f"p = {row['adj_p_value']:.3e} ({sig_symbol})\n"
-            f"Cohen's d = {row['Cohen_d']:.2f}\n"
-            f"{col} Comparison"
-        )
-        plt.title(title_text, ha='center')
-        # Add sample size to x-axis labels
-        group_counts = combined_df['Group'].value_counts()
-        ax = plt.gca()
-        ax.set_xticklabels([f"{label.get_text()}\nn={group_counts[label.get_text()]}" for label in ax.get_xticklabels()])
-        plt.tight_layout()
-        os.makedirs(f'{figures_dir}/boxplots/{output_dir}', exist_ok=True)
-        plt.savefig(f"{figures_dir}/boxplots/{output_dir}/{col}_comparison.png")
+    # if sig_symbol != 'ns':
+    title_text = (
+        f"{row['Test']}\n"
+        f"p = {row['adj_p_value']:.3e} ({sig_symbol})\n"
+        f"Cohen's d = {row['Cohen_d']:.2f}\n"
+        f"{col} Comparison"
+    )
+    plt.title(title_text, ha='center')
+    # Add sample size to x-axis labels
+    group_counts = combined_df['Group'].value_counts()
+    ax = plt.gca()
+    ax.set_xticklabels([f"{label.get_text()}\nn={group_counts[label.get_text()]}" for label in ax.get_xticklabels()])
+    plt.tight_layout()
+    os.makedirs(f'{figures_dir}/boxplots/{output_dir}', exist_ok=True)
+    plt.savefig(f"{figures_dir}/boxplots/{output_dir}/{col}_comparison.png")
     plt.close()
-
+    # Plot histograms for each group and both groups together
+    plt.figure(figsize=(10, 6))
+    sns.histplot(data=cleaned_df, x=col, hue='Group', element='step', stat='density', common_norm=False)
+    for group in cleaned_df['Group'].unique():
+        group_data = cleaned_df[cleaned_df['Group'] == group][col]
+        stats_text = (
+            f"N = {len(group_data)}, "
+            f"Mean = {group_data.mean():.2f}, "
+            f"Median = {group_data.median():.2f}, "
+            f"Max = {group_data.max():.2f}, "
+            f"Min = {group_data.min():.2f}, "
+            f"Std = {group_data.std():.2f}"
+        )
+        plt.annotate(stats_text, xy=(0.05, 0.95), xycoords='axes fraction', fontsize=10,
+                     verticalalignment='top', bbox=dict(boxstyle='round,pad=0.3', edgecolor='black', facecolor='white'))
+    plt.title(f"{col} Histogram by Group")
+    os.makedirs(f'{figures_dir}/hist/{output_dir}', exist_ok=True)
+    plt.savefig(f"{figures_dir}/hist/{output_dir}/{col}_hist_by_group.png")
+    plt.close()
+    plt.figure(figsize=(10, 6))
+    sns.histplot(data=cleaned_df, x=col, element='step', stat='density')
+    combined_data = cleaned_df[col]
+    stats_text = (
+        f"N = {len(combined_data)}, "
+        f"Mean = {combined_data.mean():.2f}, "
+        f"Median = {combined_data.median():.2f}, "
+        f"Max = {combined_data.max():.2f}, "
+        f"Min = {combined_data.min():.2f}, "
+        f"Std = {combined_data.std():.2f}"
+    )
+    plt.annotate(stats_text, xy=(0.05, 0.95), xycoords='axes fraction', fontsize=10,
+                 verticalalignment='top', bbox=dict(boxstyle='round,pad=0.3', edgecolor='black', facecolor='white'))
+    plt.title(f"{col} Histogram Combined")
+    plt.savefig(f"{figures_dir}/hist/{output_dir}/{col}_hist_combined.png")
+    plt.close()
+    
 def scatter_plot_with_regression(results_df, combined_df, x_col, y_col, output_dir):
     plt.figure(figsize=(10, 6))
     sns.scatterplot(x=x_col, y=y_col, data=combined_df, alpha=0.5, color='black')
@@ -113,10 +148,49 @@ def scatter_plot_with_regression(results_df, combined_df, x_col, y_col, output_d
     plt.xlabel(x_col)
     plt.ylabel(y_col)
     plt.tight_layout()
-    if sig_symbol != 'ns':
-        # Make folder {figures_dir}
-        os.makedirs(f'{figures_dir}/scatterplots/{output_dir}', exist_ok=True)
-        plt.savefig(f"{figures_dir}/scatterplots/{output_dir}/{x_col}_vs_{y_col}_regression.png")
+    # Make folder {figures_dir}
+    os.makedirs(f'{figures_dir}/scatterplots/{output_dir}', exist_ok=True)
+    plt.savefig(f"{figures_dir}/scatterplots/{output_dir}/{y_col}_regression.png")
+    plt.close()
+
+    # Plot histogram of X
+    plt.figure(figsize=(10, 6))
+    sns.histplot(combined_df[x_col], color='blue', kde=True, stat='density', element='step')
+    x_stats = (
+        f"N = {len(combined_df[x_col])}, "
+        f"Mean = {combined_df[x_col].mean():.2f}, "
+        f"Median = {combined_df[x_col].median():.2f}, "
+        f"Max = {combined_df[x_col].max():.2f}, "
+        f"Min = {combined_df[x_col].min():.2f}, "
+        f"Std = {combined_df[x_col].std():.2f}"
+    )
+    plt.annotate(x_stats, xy=(0.05, 0.95), xycoords='axes fraction', fontsize=10,
+                 verticalalignment='top', bbox=dict(boxstyle='round,pad=0.3', edgecolor='black', facecolor='white'))
+    plt.title(f"Histogram of {x_col}")
+    plt.xlabel("Value")
+    plt.ylabel("Density")
+    plt.tight_layout()
+    plt.savefig(f"{figures_dir}/scatterplots/{output_dir}/{x_col}_histogram.png")
+    plt.close()
+
+    # Plot histogram of Y
+    plt.figure(figsize=(10, 6))
+    sns.histplot(combined_df[y_col], color='red', kde=True, stat='density', element='step')
+    y_stats = (
+        f"N = {len(combined_df[y_col])}, "
+        f"Mean = {combined_df[y_col].mean():.2f}, "
+        f"Median = {combined_df[y_col].median():.2f}, "
+        f"Max = {combined_df[y_col].max():.2f}, "
+        f"Min = {combined_df[y_col].min():.2f}, "
+        f"Std = {combined_df[y_col].std():.2f}"
+    )
+    plt.annotate(y_stats, xy=(0.05, 0.95), xycoords='axes fraction', fontsize=10,
+                 verticalalignment='top', bbox=dict(boxstyle='round,pad=0.3', edgecolor='black', facecolor='white'))
+    plt.title(f"Histogram of {y_col}")
+    plt.xlabel("Value")
+    plt.ylabel("Density")
+    plt.tight_layout()
+    plt.savefig(f"{figures_dir}/scatterplots/{output_dir}/{y_col}_histogram.png")
     plt.close()
     
 def analyze_and_correct(combined_df, columns_to_analyze, groups=['Control', 'WNV']):
@@ -175,7 +249,7 @@ def topomap_group_data( band, montage,control_data,wnv_data,output_dir):
         wnv_channel = wnv_data[common_channel].dropna()
         if len(control_channel) < 2 or len(wnv_channel) < 2:
             continue
-        _, p = ttest_ind(control_channel, wnv_channel)
+        _, p = stats.mannwhitneyu(control_channel, wnv_channel)
         dict_p_values[common_channel] = p
     df_p_values = pd.DataFrame(dict_p_values, index=[0]).T
     reject, pvals_corrected, _, _ = smm.multipletests(df_p_values[0].values, alpha=0.05, method='fdr_bh')
@@ -195,9 +269,9 @@ def topomap_group_data( band, montage,control_data,wnv_data,output_dir):
         plt.title(f"{band} {output_dir} P-Value Topomap")
         # if any value in pvals_corrected is less than 0.05
         # make folder {figures_dir}/boxplots/{output_dir}
-        os.makedirs(f'{figures_dir}/topomaps_p_values_vs_controls/{output_dir}', exist_ok=True)
+        os.makedirs(f'{figures_dir}/topomaps_p_values/{output_dir}', exist_ok=True)
         # Save the figure
-        plt.savefig(f"{figures_dir}/topomaps_p_values_vs_controls/{output_dir}/p_values_{band}_topomap.png")
+        plt.savefig(f"{figures_dir}/topomaps_p_values/{output_dir}/p_values_{band}_topomap.png")
     plt.close()
 
 def process_group_data(group, run_df, frequency_bands, eeg_dict_convertion, eeg_channels, montage,group_data):
@@ -280,6 +354,8 @@ all_group_data = []
 for col in clinical_columns:
     df_wnv3 = df_wnv2[df_wnv2[col].notna()].copy()
     unique_values = df_wnv3[col].unique()
+    # Save the raw data
+    save_raw_data(df_wnv3, col, figures_dir)
     print(f'Analyzing {col} with {len(unique_values)} unique values')
     if df_wnv3.shape[0] < 3 or unique_values.shape[0] < 2:
         continue
@@ -308,7 +384,7 @@ for col in clinical_columns:
     # If numeric non-binary
     elif col in numeric_cols:
         for band in boxplot_columns:
-            scatter_plot_with_regression({}, df_wnv3, col, band, f'{col}_scatterplots')
+            scatter_plot_with_regression({}, df_wnv3, col, band, f'{col}')
 #%% Topomap per clinical column
 # Calculate p-values for each band and channel
 for group_data2 in all_group_data:
@@ -333,7 +409,7 @@ for group in ['Control', cases_group_name]:
 for band in frequency_bands:
     control_data = group_data['Control'][band]
     wnv_data = group_data[cases_group_name][band]
-    topomap_group_data(band, montage,control_data,wnv_data,'topomaps_p_values_vs_controls')
+    topomap_group_data(band, montage,control_data,wnv_data,'vs_controls')
 
 results_df = analyze_and_correct(combined_df, columns_to_analyze,groups=['Control', cases_group_name])
 # Save statistical results
