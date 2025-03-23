@@ -63,8 +63,8 @@ def get_eeg_features(selected_feature):
     return sorted(eeg_features)
 
 # Function to load raw data for a given feature
-def load_raw_data(feature):
-    raw_data_file = os.path.join(root_dir, "raw_data", f"{feature}_raw_data.csv")
+def load_raw_data():
+    raw_data_file = os.path.join(root_dir, "raw_data", f"raw_data.csv")
     if os.path.exists(raw_data_file):
         return pd.read_csv(raw_data_file)
     else:
@@ -90,10 +90,25 @@ else:
     # User selects an EEG feature
     selected_eeg_feature = st.selectbox("Select EEG Feature", eeg_features)
     
-
+    # Descriptive data on the selected feature
+    # Load and display raw data
+    raw_data = load_raw_data()
+    feature_data = raw_data[selected_feature]
+    # show N with dropna
+    st.markdown(f"### **{selected_feature}**")
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Mean", f"{feature_data.mean():.2f}")
+    col2.metric("Median", f"{feature_data.median():.2f}")
+    col3.metric("Std Dev", f"{feature_data.std():.2f}")
+    col4, col5 ,col6 = st.columns(3)
+    col4.metric("Minimum", f"{feature_data.min():.2f}")
+    col5.metric("Maximum", f"{feature_data.max():.2f}")
+    # col 6 is N with dropna
+    col6.metric("N", f"{feature_data.dropna().count()}")
+    st.write(f"Number of samples: {feature_data.dropna().count()}")
     # Display figures
     st.header(f"Figures for {selected_feature} - {selected_eeg_feature}")
-    
+
     figures_found = False
     for plot_type in plot_types:
         # Determine the folder to look in
@@ -114,18 +129,16 @@ else:
         # Construct expected filename
         figure_file = f"{prefix}{selected_eeg_feature}{suffix}"
         figure_path = os.path.join(folder, figure_file)
-        
-        st.subheader(plot_type["name"].capitalize())
-        st.image(figure_path, caption=figure_file, use_column_width=True)
-        figures_found = True
+        # if figure exists, display it
+        if os.path.exists(figure_path):
+            st.subheader(plot_type["name"].capitalize())
+            st.image(figure_path, caption=figure_file, use_column_width=True)
+            figures_found = True
     
     if not figures_found:
         st.info(f"No figures found for {selected_feature} with EEG feature {selected_eeg_feature}.")
-
-    # Load and display raw data
-    raw_data = load_raw_data(selected_feature)
     if raw_data is not None:
         st.header(f"Raw Data for {selected_feature}")
-        st.markdown(raw_data.to_html(escape=False), unsafe_allow_html=True)
+        st.dataframe(raw_data)
     else:
         st.warning(f"No raw data found for {selected_feature}.")

@@ -172,11 +172,11 @@ def get_clinical_and_boxplot_cols(df_wnv2):
        clinical_columns = [col for col in clinical_columns if 'EEG' not in col]
        return clinical_columns,boxplot_columns
 
-def save_raw_data(df, col, figures_dir):
+def save_raw_data(df, figures_dir):
     # Ensure the directory exists
     os.makedirs(f'{figures_dir}/raw_data', exist_ok=True)
     # Save the DataFrame to a CSV file
-    df.to_csv(f'{figures_dir}/raw_data/{col}_raw_data.csv', index=False)
+    df.to_csv(f'{figures_dir}/raw_data/raw_data.csv', index=False)
    
 # Custom descriptive statistics function
 def custom_describe(df):

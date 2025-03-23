@@ -355,7 +355,6 @@ for col in clinical_columns:
     df_wnv3 = df_wnv2[df_wnv2[col].notna()].copy()
     unique_values = df_wnv3[col].unique()
     # Save the raw data
-    save_raw_data(df_wnv3, col, figures_dir)
     print(f'Analyzing {col} with {len(unique_values)} unique values')
     if df_wnv3.shape[0] < 3 or unique_values.shape[0] < 2:
         continue
@@ -385,6 +384,7 @@ for col in clinical_columns:
     elif col in numeric_cols:
         for band in boxplot_columns:
             scatter_plot_with_regression({}, df_wnv3, col, band, f'{col}')
+save_raw_data(df_wnv3, figures_dir)
 #%% Topomap per clinical column
 # Calculate p-values for each band and channel
 for group_data2 in all_group_data:
