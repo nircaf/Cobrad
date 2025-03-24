@@ -13,8 +13,8 @@ import yasa
 from sklearn.decomposition import PCA
 import statsmodels.api as sm
 from collections import Counter
-import scienceplots
-from eeg_utils import *
+from utils.eeg_utils import *
+
 
 # plt.style.use('science')
 # make {figures_dir} prettier
@@ -84,7 +84,7 @@ def boxplot_plot(results_df, combined_df, col, output_dir):
     # Plot histograms for each group and both groups together
     plt.figure(figsize=(10, 6))
     sns.histplot(data=cleaned_df, x=col, hue='Group', element='step', stat='density', common_norm=False)
-    for group in cleaned_df['Group'].unique():
+    for i, group in enumerate(cleaned_df['Group'].unique()):
         group_data = cleaned_df[cleaned_df['Group'] == group][col]
         stats_text = (
             f"N = {len(group_data)}, "
@@ -94,8 +94,8 @@ def boxplot_plot(results_df, combined_df, col, output_dir):
             f"Min = {group_data.min():.2f}, "
             f"Std = {group_data.std():.2f}"
         )
-        plt.annotate(stats_text, xy=(0.05, 0.95), xycoords='axes fraction', fontsize=10,
-                     verticalalignment='top', bbox=dict(boxstyle='round,pad=0.3', edgecolor='black', facecolor='white'))
+        plt.annotate(stats_text, xy=(0.55, 0.95 - i * 0.1), xycoords='axes fraction', fontsize=10,
+                 verticalalignment='top', bbox=dict(boxstyle='round,pad=0.3', edgecolor='black', facecolor='white'))
     plt.title(f"{col} Histogram by Group")
     os.makedirs(f'{figures_dir}/hist/{output_dir}', exist_ok=True)
     plt.savefig(f"{figures_dir}/hist/{output_dir}/{col}_hist_by_group.png")
@@ -136,15 +136,12 @@ def scatter_plot_with_regression(results_df, combined_df, x_col, y_col, output_d
         sig_symbol = '*'
     else:
         sig_symbol = 'ns'
-    # Add significance markers
-    max_y = combined_df[y_col].max()
-    if sig_symbol != 'ns':
-        # Add stats results to the title
-        plt.title(
-            f"{x_col} vs {y_col} Regression\n"
-            f"Slope p = {p_value:.3e} ({sig_symbol}), R^2 = {r_squared:.2f}, n = {len(combined_df)}",
-            ha='center'
-        )
+    # Add stats results to the title
+    plt.title(
+        f"{x_col} vs {y_col} Regression\n"
+        f"Slope p = {p_value:.3e} ({sig_symbol}), R^2 = {r_squared:.2f}, n = {len(combined_df)}",
+        ha='center'
+    )
     plt.xlabel(x_col)
     plt.ylabel(y_col)
     plt.tight_layout()
@@ -254,24 +251,24 @@ def topomap_group_data( band, montage,control_data,wnv_data,output_dir):
     df_p_values = pd.DataFrame(dict_p_values, index=[0]).T
     reject, pvals_corrected, _, _ = smm.multipletests(df_p_values[0].values, alpha=0.05, method='fdr_bh')
     df_p_values['pvals_corrected'] = pvals_corrected
-    if any(df_p_values['pvals_corrected'] < 0.05):
-        ch_names = df_p_values.index.tolist()
-        # Create an info object
-        info = mne.create_info(ch_names=ch_names, sfreq=256, ch_types='eeg')
-        info.set_montage(montage)
-        # Create an EvokedArray object for p-values
-        p_evoked = mne.EvokedArray(df_p_values['pvals_corrected'].values.reshape(-1, 1), info)
-        # Plot the topomap of p-values
-        fig, ax = plt.subplots()
-        vlim_max = min(0.05, df_p_values['pvals_corrected'].max())
-        im, cm = mne.viz.plot_topomap(p_evoked.data[:, 0], p_evoked.info, axes=ax, show=False, cmap='jet_r', vlim=[0, vlim_max])
-        fig.colorbar(im, ax=ax)
-        plt.title(f"{band} {output_dir} P-Value Topomap")
-        # if any value in pvals_corrected is less than 0.05
-        # make folder {figures_dir}/boxplots/{output_dir}
-        os.makedirs(f'{figures_dir}/topomaps_p_values/{output_dir}', exist_ok=True)
-        # Save the figure
-        plt.savefig(f"{figures_dir}/topomaps_p_values/{output_dir}/p_values_{band}_topomap.png")
+    # if any(df_p_values['pvals_corrected'] < 0.05):
+    ch_names = df_p_values.index.tolist()
+    # Create an info object
+    info = mne.create_info(ch_names=ch_names, sfreq=256, ch_types='eeg')
+    info.set_montage(montage)
+    # Create an EvokedArray object for p-values
+    p_evoked = mne.EvokedArray(df_p_values['pvals_corrected'].values.reshape(-1, 1), info)
+    # Plot the topomap of p-values
+    fig, ax = plt.subplots()
+    vlim_max = min(0.05, df_p_values['pvals_corrected'].max())
+    im, cm = mne.viz.plot_topomap(p_evoked.data[:, 0], p_evoked.info, axes=ax, show=False, cmap='jet_r', vlim=[0, vlim_max])
+    fig.colorbar(im, ax=ax)
+    plt.title(f"{band} {output_dir} P-Value Topomap")
+    # if any value in pvals_corrected is less than 0.05
+    # make folder {figures_dir}/boxplots/{output_dir}
+    os.makedirs(f'{figures_dir}/topomaps_p_values/{output_dir}', exist_ok=True)
+    # Save the figure
+    plt.savefig(f"{figures_dir}/topomaps_p_values/{output_dir}/p_values_{band}_topomap.png")
     plt.close()
 
 def process_group_data(group, run_df, frequency_bands, eeg_dict_convertion, eeg_channels, montage,group_data):
@@ -343,7 +340,7 @@ montage = mne.channels.make_standard_montage('standard_1020')
 eeg_channels = eeg_channels
 eeg_dict_convertion = eeg_dict_convertion
 # Iterate over each frequency band and plot the topomap
-frequency_bands = ['delta_power', 'theta_power', 'alpha_power', 'beta_power', 'gamma_power','pswe_events_per_minute_EEG','pswe_avg_length_EEG','mean_mpf','dfv_std','dfv_mean']
+frequency_bands = ['delta_power', 'theta_power', 'alpha_power', 'beta_power', 'gamma_power','pswe_events_per_minute','pswe_avg_length','mean_mpf','dfv_std','dfv_mean']
 
 #%% clinical data analysis
 clinical_columns, boxplot_columns = get_clinical_and_boxplot_cols(df_wnv2=df_wnv2)
@@ -378,7 +375,7 @@ for col in clinical_columns:
         for value in unique_values:
             group = col if value == 1 else f'not {col}'
             run_df = df_wnv3[df_wnv3[col] == value]
-            group_data = process_group_data(group, run_df, frequency_bands, eeg_dict_convertion, eeg_channels, montage,group_data)
+            group_data = process_group_data(group, run_df, frequency_bands, eeg_dict_convertion, eeg_channels, montage, group_data)
         all_group_data.append(group_data)
     # If numeric non-binary
     elif col in numeric_cols:

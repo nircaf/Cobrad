@@ -1,7 +1,7 @@
 import streamlit as st
 import os
 import pandas as pd
-
+import json
 # streamlit run 4_streamlit_view.py
 # Define the root directory where figures are stored
 root_dir = "COBRAD_figures"
@@ -81,6 +81,11 @@ if not features:
 
 # User selects a feature
 selected_feature = st.selectbox("Select Feature", features)
+raw_data = load_raw_data()
+# load utils/cobrad_clinical.json
+with open("utils/cobrad_clinical.json", "r") as f:
+    clinical_columns_data = json.load(f)
+    clinical_columns_data = pd.DataFrame(clinical_columns_data, index=["description"]).T
 
 # Get available EEG features for the selected feature
 eeg_features = get_eeg_features(selected_feature)
@@ -92,10 +97,11 @@ else:
     
     # Descriptive data on the selected feature
     # Load and display raw data
-    raw_data = load_raw_data()
     feature_data = raw_data[selected_feature]
     # show N with dropna
-    st.markdown(f"### **{selected_feature}**")
+    selected_feature_str = selected_feature.replace("_", " ")
+    st.markdown(f"### **{selected_feature_str}**")
+    st.write(clinical_columns_data.loc[selected_feature, "description"])
     col1, col2, col3 = st.columns(3)
     col1.metric("Mean", f"{feature_data.mean():.2f}")
     col2.metric("Median", f"{feature_data.median():.2f}")
@@ -105,9 +111,8 @@ else:
     col5.metric("Maximum", f"{feature_data.max():.2f}")
     # col 6 is N with dropna
     col6.metric("N", f"{feature_data.dropna().count()}")
-    st.write(f"Number of samples: {feature_data.dropna().count()}")
     # Display figures
-    st.header(f"Figures for {selected_feature} - {selected_eeg_feature}")
+    st.header(f"Figures for {selected_feature_str} - {selected_eeg_feature.replace('_', ' ').capitalize()}")
 
     figures_found = False
     for plot_type in plot_types:
