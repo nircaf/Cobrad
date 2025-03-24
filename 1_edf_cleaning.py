@@ -10,7 +10,7 @@ import re
 from multiprocessing import Pool, cpu_count
 from tqdm import tqdm
 import concurrent.futures
-import eeg_utils
+import utils.eeg_utils as eeg_utils
 from scipy.signal import spectrogram
 import pickle
 from autoreject import AutoReject
