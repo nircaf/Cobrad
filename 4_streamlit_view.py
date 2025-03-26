@@ -4,7 +4,6 @@ import pandas as pd
 import json
 # streamlit run 4_streamlit_view.py
 # Define the root directory where figures are stored
-root_dir = "COBRAD_figures"
 
 # Define plot types with their properties
 # - name: folder name
@@ -69,10 +68,14 @@ def load_raw_data():
         return pd.read_csv(raw_data_file)
     else:
         return None
-
+# ask user to choose if COBRAD or WNV
+user_choice = st.selectbox("Select Dataset", ["COBRAD", "WNV"])
+if user_choice == "COBRAD":
+    root_dir = "COBRAD_figures"
+else:
+    root_dir = "WNV_figures"
 # Streamlit app
 st.title("COBRAD Figures Dashboard")
-
 # Get list of features
 features = get_features()
 if not features:
@@ -97,7 +100,7 @@ else:
     
     # Descriptive data on the selected feature
     # Load and display raw data
-    feature_data = raw_data[selected_feature]
+    feature_data = raw_data[selected_feature].dropna()
     # show N with dropna
     selected_feature_str = selected_feature.replace("_", " ")
     st.markdown(f"### **{selected_feature_str}**")
@@ -144,6 +147,8 @@ else:
         st.info(f"No figures found for {selected_feature} with EEG feature {selected_eeg_feature}.")
     if raw_data is not None:
         st.header(f"Raw Data for {selected_feature}")
-        st.dataframe(raw_data)
+        # show raw data[selected_feature] 
+        st.write(raw_data[selected_feature])
+
     else:
         st.warning(f"No raw data found for {selected_feature}.")
