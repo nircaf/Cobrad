@@ -363,7 +363,8 @@ def main():
     st.title("EEG vs Clinical Features Visualization")
     # Iterate over each frequency band and plot the topomap
     frequency_bands = ['delta_power', 'theta_power', 'alpha_power', 'beta_power', 'gamma_power','pswe_events_per_minute','pswe_avg_length','mean_mpf','dfv_std','dfv_mean']
-
+    # remove from df_wnv2 columns that contain dates
+    df_wnv2 = df_wnv2.drop(columns=[col for col in df_wnv2.columns if 'date' in col.lower()])
     #%% clinical data analysis
     clinical_columns, boxplot_columns = get_clinical_and_boxplot_cols(df_wnv2=df_wnv2)
     # Identify the separation point between clinical and EEG features
