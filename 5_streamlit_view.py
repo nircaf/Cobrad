@@ -411,7 +411,6 @@ def main():
     elif feature_type == "EEG Feature":
         selected_feature = st.sidebar.radio("Select an EEG feature:", eeg_features)
         plot_title = f"Plots of {selected_feature} vs All Clinical Features"
-        boxplot_columns = clinical_columns
     else:
         selected_feature = st.sidebar.radio("Select a Clinical feature:", marked_clinical_features)
         # map back to key of dict_features
