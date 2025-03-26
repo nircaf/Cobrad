@@ -6,6 +6,14 @@ from scipy.stats import zscore
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 from scipy.stats import iqr
+import mne
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy import stats
+from statsmodels.stats.multitest import multipletests
+import statsmodels.stats.multitest as smm
+from scipy.signal import spectrogram
+import statsmodels.api as sm
 
 eeg_channels = ['Fp1', 'Fp2', 'F3', 'F4', 'C3', 'C4', 'P3', 'P4', 'O1', 'O2', 'F7',
        'F8', 'T3', 'T4', 'T5', 'T6', 'Fz', 'Cz', 'Pz', 'A1','A2', 'Fpz', 'Oz']
@@ -30,6 +38,288 @@ eeg_dict_convertion = {
        'T3-T5': 'T3',
        'T5-O1': 'T5'
 }
+
+def stat_text_get(group_data, col=None):
+    lower_bound = -1e-20
+    upper_bound = 1e20
+    if col is None:
+        stats_text = (
+            f"N = {len(group_data)}, "
+            f"Mean = {np.clip(group_data.mean(), lower_bound, upper_bound):.2e}, "
+            f"Median = {np.clip(group_data.median(), lower_bound, upper_bound):.2e}, "
+            f"Max = {np.clip(group_data.max(), lower_bound, upper_bound):.2e}, "
+            f"Min = {np.clip(group_data.min(), lower_bound, upper_bound):.2e}, "
+            f"Std = {np.clip(group_data.std(), lower_bound, upper_bound):.2e}"
+        )
+    else:
+        stats_text = (
+            f"N = {len(group_data)}, "
+            f"Mean = {np.clip(group_data[col].mean(), lower_bound, upper_bound):.2e}, "
+            f"Median = {np.clip(group_data[col].median(), lower_bound, upper_bound):.2e}, "
+            f"Max = {np.clip(group_data[col].max(), lower_bound, upper_bound):.2e}, "
+            f"Min = {np.clip(group_data[col].min(), lower_bound, upper_bound):.2e}, "
+            f"Std = {np.clip(group_data[col].std(), lower_bound, upper_bound):.2e}"
+        )
+    return stats_text
+
+def boxplot_plot(results_df, combined_df, col, output_dir,figures_dir):
+    # Function to remove outliers based on 5 standard deviations
+    def remove_outliers(df, col, group_col, threshold=5):
+        def filter_group(group):
+            mean = group[col].mean()
+            std = group[col].std()
+            return group[np.abs(group[col] - mean) <= threshold * std]
+        
+        return df.groupby(group_col).apply(filter_group).reset_index(drop=True)
+
+    # Remove outliers from each group
+    cleaned_df = remove_outliers(combined_df, col, 'Group')
+
+    # Plot the cleaned data
+    plt.figure(figsize=(10, 6))
+    sns.boxplot(x='Group', y=col, data=cleaned_df, showfliers=False)
+    # Add stripplot
+    sns.stripplot(x='Group', y=col, data=cleaned_df, alpha=0.5, jitter=True, color='black')
+    # Add significance markers
+    filtered_df = results_df[results_df['Variable'] == col]
+    if filtered_df.empty:
+        return
+    row = results_df[results_df['Variable'] == col].iloc[0]
+    if row['adj_p_value'] < 0.001:
+        sig_symbol = '***'
+    elif row['adj_p_value'] < 0.01:
+        sig_symbol = '**'
+    elif row['adj_p_value'] < 0.05:
+        sig_symbol = '*'
+    else:
+        sig_symbol = 'ns'
+    # if sig_symbol != 'ns':
+    title_text = (
+        f"{row['Test']}\n"
+        f"p = {row['adj_p_value']:.3e} ({sig_symbol})\n"
+        f"Cohen's d = {row['Cohen_d']:.2f}\n"
+        f"{col} Comparison"
+    )
+    if sig_symbol != 'ns':
+        plt.title(title_text, ha='center')
+        # Add sample size to x-axis labels
+        group_counts = combined_df['Group'].value_counts()
+        ax = plt.gca()
+        ax.set_xticklabels([f"{label.get_text()}\nn={group_counts[label.get_text()]}" for label in ax.get_xticklabels()])
+        plt.tight_layout()
+        os.makedirs(f'{figures_dir}/boxplots/{output_dir}', exist_ok=True)
+        plt.savefig(f"{figures_dir}/boxplots/{output_dir}/{col}_comparison.png")
+        plt.close()
+        # Plot histograms for each group and both groups together
+        plt.figure(figsize=(10, 6))
+        sns.histplot(data=cleaned_df, x=col, hue='Group', element='step', stat='density', common_norm=False)
+        for i, group in enumerate(cleaned_df['Group'].unique()):
+            group_data = cleaned_df[cleaned_df['Group'] == group][col]
+            stats_text = stat_text_get(group_data)
+            plt.annotate(stats_text, xy=(0.25, 0.95 - i * 0.1), xycoords='axes fraction', fontsize=10,
+                    verticalalignment='top', bbox=dict(boxstyle='round,pad=0.3', edgecolor='black', facecolor='white'))
+        plt.title(f"{col} Histogram by Group")
+        os.makedirs(f'{figures_dir}/hist/{output_dir}', exist_ok=True)
+        plt.savefig(f"{figures_dir}/hist/{output_dir}/{col}_hist_by_group.png")
+        plt.close()
+        plt.figure(figsize=(10, 6))
+        sns.histplot(data=cleaned_df, x=col, element='step', stat='density')
+        combined_data = cleaned_df[col]
+        stats_text = stat_text_get(combined_data)
+        plt.annotate(stats_text, xy=(0.25, 0.95), xycoords='axes fraction', fontsize=10,
+                    verticalalignment='top', bbox=dict(boxstyle='round,pad=0.3', edgecolor='black', facecolor='white'))
+        plt.title(f"{col} Histogram Combined")
+        plt.savefig(f"{figures_dir}/hist/{output_dir}/{col}_hist_combined.png")
+        plt.close()
+    
+def scatter_plot_with_regression(results_df, combined_df, x_col, y_col, output_dir,figures_dir):
+    plt.figure(figsize=(10, 6))
+    sns.scatterplot(x=x_col, y=y_col, data=combined_df, alpha=0.5, color='black')
+    sns.regplot(x=x_col, y=y_col, data=combined_df, scatter=False, color='blue')
+    # Perform linear regression
+    X = sm.add_constant(combined_df[x_col])
+    y = combined_df[y_col]
+    model = sm.OLS(y, X).fit()
+    p_value = model.pvalues[1]  # p-value for the slope
+    r_squared = model.rsquared  # R-squared value
+    # Determine significance symbol
+    if (p_value < 0.001):
+        sig_symbol = '***'
+    elif (p_value < 0.01):
+        sig_symbol = '**'
+    elif (p_value < 0.05):
+        sig_symbol = '*'
+    else:
+        sig_symbol = 'ns'
+    if sig_symbol != 'ns':
+
+        # Add stats results to the title
+        plt.title(
+            f"{x_col} vs {y_col} Regression\n"
+            f"Slope p = {p_value:.3e} ({sig_symbol}), R^2 = {r_squared:.2f}, n = {len(combined_df)}",
+            ha='center'
+        )
+        plt.xlabel(x_col)
+        plt.ylabel(y_col)
+        plt.tight_layout()
+        # Make folder {figures_dir}
+        os.makedirs(f'{figures_dir}/scatterplots/{output_dir}', exist_ok=True)
+        plt.savefig(f"{figures_dir}/scatterplots/{output_dir}/{y_col}_regression.png")
+        plt.close()
+
+        # Plot histogram of X
+        plt.figure(figsize=(10, 6))
+        sns.histplot(combined_df[x_col], color='blue', kde=True, stat='density', element='step')
+        x_stats = stat_text_get(combined_df, x_col)
+        plt.annotate(x_stats, xy=(0.05, 0.95), xycoords='axes fraction', fontsize=10,
+                    verticalalignment='top', bbox=dict(boxstyle='round,pad=0.3', edgecolor='black', facecolor='white'))
+        plt.title(f"Histogram of {x_col}")
+        plt.xlabel("Value")
+        plt.ylabel("Density")
+        plt.tight_layout()
+        plt.savefig(f"{figures_dir}/scatterplots/{output_dir}/{x_col}_histogram.png")
+        plt.close()
+
+        # Plot histogram of Y
+        plt.figure(figsize=(10, 6))
+        sns.histplot(combined_df[y_col], color='red', kde=True, stat='density', element='step')
+        y_stats = stat_text_get(combined_df, y_col)
+        plt.annotate(y_stats, xy=(0.05, 0.95), xycoords='axes fraction', fontsize=10,
+                    verticalalignment='top', bbox=dict(boxstyle='round,pad=0.3', edgecolor='black', facecolor='white'))
+        plt.title(f"Histogram of {y_col}")
+        plt.xlabel("Value")
+        plt.ylabel("Density")
+        plt.tight_layout()
+        plt.savefig(f"{figures_dir}/scatterplots/{output_dir}/{y_col}_histogram.png")
+        plt.close()
+    
+def analyze_and_correct(combined_df, columns_to_analyze, groups=['Control', 'WNV']):
+    def analyze_groups(combined_df, col, groups):
+        results = []
+        for i, group1 in enumerate(groups):
+            for group2 in groups[i+1:]:
+                control_data = combined_df[combined_df['Group'] == group1][col].dropna()
+                case_data = combined_df[combined_df['Group'] == group2][col].dropna()
+                if len(control_data) < 2 or len(case_data) < 2:
+                    continue
+                # Normality test
+                _, normal_p = stats.normaltest(combined_df[col].dropna())
+                # Choose appropriate test
+                if normal_p < 0.05:  # Non-parametric
+                    stat, p = stats.mannwhitneyu(control_data, case_data)
+                    test_used = "Mann-Whitney U"
+                else:  # Parametric
+                    stat, p = stats.ttest_ind(control_data, case_data)
+                    test_used = "T-test"
+                # Effect size
+                cohen_d = (case_data.mean() - control_data.mean()) / np.sqrt((
+                    (len(case_data)-1)*case_data.std()**2 + 
+                    (len(control_data)-1)*control_data.std()**2) / 
+                    (len(case_data) + len(control_data) - 2))
+                results.append({
+                    'Variable': col,
+                    'Group1': group1,
+                    'Group2': group2,
+                    'Test': test_used,
+                    'Statistic': stat,
+                    'p_value': p,
+                    'Cohen_d': cohen_d
+                })
+        return results
+
+    all_results = []    
+    # Statistical analysis
+    for col in columns_to_analyze:
+        results = analyze_groups(combined_df, col, groups)
+        if results:
+            all_results.extend(results)
+
+    # Create results DataFrame
+    results_df = pd.DataFrame(all_results)
+
+    # Multiple testing correction
+    if not results_df.empty:
+        rej, adj_p, _, _ = multipletests(results_df['p_value'], method='fdr_bh')
+        results_df['adj_p_value'] = adj_p
+        results_df['Significant'] = adj_p < 0.05
+
+    return results_df
+
+def topomap_group_data( band, montage,control_data,wnv_data,output_dir,figures_dir):
+    # Calculate p-values for each channel
+    common_channels = control_data.columns.intersection(wnv_data.columns)
+    dict_p_values = {}
+    for common_channel in common_channels:
+        control_channel = control_data[common_channel].dropna()
+        wnv_channel = wnv_data[common_channel].dropna()
+        if len(control_channel) < 2 or len(wnv_channel) < 2:
+            continue
+        _, p = stats.mannwhitneyu(control_channel, wnv_channel)
+        dict_p_values[common_channel] = p
+    df_p_values = pd.DataFrame(dict_p_values, index=[0]).T
+    reject, pvals_corrected, _, _ = smm.multipletests(df_p_values[0].values, alpha=0.05, method='fdr_bh')
+    df_p_values['pvals_corrected'] = pvals_corrected
+    if any(df_p_values['pvals_corrected'] < 0.05):
+        ch_names = df_p_values.index.tolist()
+        # Create an info object
+        info = mne.create_info(ch_names=ch_names, sfreq=256, ch_types='eeg')
+        info.set_montage(montage)
+        # Create an EvokedArray object for p-values
+        p_evoked = mne.EvokedArray(df_p_values['pvals_corrected'].values.reshape(-1, 1), info)
+        # Plot the topomap of p-values
+        fig, ax = plt.subplots()
+        vlim_max = min(0.05, df_p_values['pvals_corrected'].max())
+        im, cm = mne.viz.plot_topomap(p_evoked.data[:, 0], p_evoked.info, axes=ax, show=False, cmap='jet_r', vlim=[0, vlim_max])
+        fig.colorbar(im, ax=ax)
+        plt.title(f"{band} {output_dir} P-Value Topomap")
+        # if any value in pvals_corrected is less than 0.05
+        # make folder {figures_dir}/boxplots/{output_dir}
+        os.makedirs(f'{figures_dir}/topomaps_p_values/{output_dir}', exist_ok=True)
+        # Save the figure
+        plt.savefig(f"{figures_dir}/topomaps_p_values/{output_dir}/p_values_{band}_topomap.png")
+        plt.close()
+
+def process_group_data(group, run_df, frequency_bands, eeg_dict_convertion, eeg_channels, montage,group_data):
+    # get only columns that say EEG
+    eeg_df = run_df.filter(like='EEG')
+    group_data[group] = {}
+    for band in frequency_bands:
+        # get the columns which have the band name
+        power_df = eeg_df.filter(like=band)
+        # column name split ' '[-1]
+        power_df.columns = power_df.columns.str.split(' ').str[-1]
+        power_df.columns = [eeg_dict_convertion[col] if col in eeg_dict_convertion else col for col in power_df.columns]
+        # leave only the eeg channels
+        # Get the channels that exist in the DataFrame
+        existing_channels = [ch for ch in eeg_channels if ch in power_df.columns]
+        # Filter the DataFrame to include only the existing channels
+        power_df = power_df[existing_channels]
+        # drop columns more than half of the values are NaN
+        power_df = power_df.dropna(axis=1, thresh=power_df.shape[0]//2)
+        # drop duplicates columns
+        power_df.columns
+        # change column names to only be the channel. if not
+        # Extract the power values for the current band
+        # power_values = power_df[band].values
+        ch_names = power_df.columns.tolist()
+        # Create an info object
+        info = mne.create_info(ch_names=ch_names, sfreq=256, ch_types='eeg')
+        info.set_montage(montage)
+        power_values = power_df.T.values
+        group_data[group][band] = power_df
+
+        # Create an EvokedArray object
+        evoked = mne.EvokedArray(power_values, info)
+        # Plot the topomap
+        fig, ax = plt.subplots()
+        im, cm = mne.viz.plot_topomap(evoked.data[:, 0], evoked.info, axes=ax, show=False)
+        fig.colorbar(im, ax=ax)
+        # plt.title(f"{band} Topomap")
+        # # Save the figure
+        # os.makedirs(f'{figures_dir}/topomaps', exist_ok=True)
+        # plt.savefig(f"{figures_dir}/topomaps/{group}_{band}_topomap.png")
+        # plt.close()
+    return group_data 
 
 def weighted_avg(df, weight_col, numeric_cols):
     # Calculate weighted average for numeric columns, ignoring NaNs
@@ -76,11 +366,12 @@ def wnv_get_files():
     df_wnv2 = df_merged.groupby('ID').apply(weighted_avg, weight_col='duration_min', numeric_cols=numeric_cols).reset_index(drop=True)
     cases_group_name = 'WNV'
     return df_wnv,patients_folder,control_folder,controls,df_wnv2,cases_group_name
+
 #%% COBRAD
 def cobrad_get_files():
     # read sheets clinical, medications, npi-q, epworth,isi, ecpg_12 from COBRAD_clinical_24022025.xlsx
     sheets_to_read = ['clinical', 'medications', 'npi-q', 'epworth', 'isi', 'ecog_12','Sheet4']
-    sheets_to_sum_vals = ['epworth', 'isi', 'ecog_12','Sheet4']
+    sheets_to_sum_vals = ['epworth', 'isi', 'ecog_12','Sheet4','npi-q']
     dfs = pd.read_excel('COBRAD_clinical_24022025.xlsx', sheet_name=sheets_to_read)
     # Rename 'record_id' to 'ID' in each DataFrame and convert to string
     for sheet in sheets_to_read:
@@ -155,7 +446,6 @@ def cobrad_get_files():
             for sheet_name, df_desc in desc_stats.items():
                 df_desc.to_excel(writer, sheet_name=sheet_name)
     # df_wnv save to csv
-    df_wnv.to_csv('COBRAD_features.csv',index=False)
     return df_wnv,patients_folder,control_folder,controls,df_wnv2,cases_group_name
     df_merged['ID'].unique()
     df_merged['_merge'].unique()
