@@ -376,6 +376,7 @@ def main():
     # Split columns into clinical and EEG features
     clinical_features = [col for col in df_wnv2.columns[:separator_index] if col != 'Group']
     eeg_features = [col for col in df_wnv2.columns[separator_index:] if col != 'Group']
+    clinical_features_numeric = [col for col in clinical_features if pd.api.types.is_numeric_dtype(df_wnv2[col])]
     
     boxplots_folder = f"{project_name}_figures/boxplots"
     scatterplots_folder = f"{project_name}_figures/scatterplots"
@@ -411,6 +412,7 @@ def main():
     elif feature_type == "EEG Feature":
         selected_feature = st.sidebar.radio("Select an EEG feature:", eeg_features)
         plot_title = f"Plots of {selected_feature} vs All Clinical Features"
+        boxplot_columns = clinical_features_numeric
     else:
         selected_feature = st.sidebar.radio("Select a Clinical feature:", marked_clinical_features)
         # map back to key of dict_features
