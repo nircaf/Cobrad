@@ -348,7 +348,15 @@ def vs_controls_run(project_name):
     else:
         st.write(f"No scatterplots found in {scatterplots_dir}")
 
-
+def ml_plots_get_images(project_name, selected_feature):
+    ml_plots_dir = f"{project_name}_figures/ml_plots"
+    if os.path.exists(ml_plots_dir):
+        # get all files in f"{project_name}_figures/ml_plots/{selected_feature}"
+        ml_plot_files = [f for f in os.listdir(os.path.join(ml_plots_dir, selected_feature)) if f.endswith('.png')]
+        for file in ml_plot_files:
+            st.image(os.path.join(ml_plots_dir, selected_feature, file), caption=file)
+    else:
+        st.write(f"No ML plots found in {ml_plots_dir}")
 
 # Streamlit App
 def main():
@@ -399,7 +407,7 @@ def main():
     
     # Sidebar for feature selection
     st.sidebar.header("Feature Selection")
-    feature_type = st.sidebar.selectbox("Select feature type to plot against the other type:", ("Clinical Feature", "EEG Feature","vs_Controls","Pair Plot"))
+    feature_type = st.sidebar.selectbox("Select feature type to plot against the other type:", ("Clinical Feature", "EEG Feature","ml_plots", "vs_Controls","Pair Plot"))
     
     if feature_type == "vs_Controls":
         vs_controls_run(project_name)
@@ -408,6 +416,13 @@ def main():
         selected_features = st.sidebar.multiselect("Select features for pairplot:", clinical_features + eeg_features)
         if selected_features:
             pairplot_columns(df_wnv2, selected_features)
+        return
+    elif feature_type == "ml_plots":
+        # get the names of folders that are in {figures_dir}/ml_plots
+        ml_plots_features = [f for f in os.listdir(f"{project_name}_figures/ml_plots") if os.path.isdir(os.path.join(f"{project_name}_figures/ml_plots", f))]
+        selected_feature = st.sidebar.radio("Select a feature for ML plots:", ml_plots_features)
+        if selected_feature:
+            ml_plots_get_images(project_name, selected_feature)
         return
     elif feature_type == "EEG Feature":
         selected_feature = st.sidebar.radio("Select an EEG feature:", eeg_features)

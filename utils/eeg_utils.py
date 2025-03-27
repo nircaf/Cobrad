@@ -370,7 +370,7 @@ def wnv_get_files():
 #%% COBRAD
 def cobrad_get_files():
     # read sheets clinical, medications, npi-q, epworth,isi, ecpg_12 from COBRAD_clinical_24022025.xlsx
-    sheets_to_read = ['clinical', 'medications', 'npi-q', 'epworth', 'isi', 'ecog_12','Sheet4']
+    sheets_to_read = ['clinical', 'medications', 'npi-q', 'epworth', 'isi', 'ecog_12','Sheet4','seizures']
     sheets_to_sum_vals = ['epworth', 'isi', 'ecog_12','Sheet4','npi-q']
     dfs = pd.read_excel('COBRAD_clinical_24022025.xlsx', sheet_name=sheets_to_read)
     # Rename 'record_id' to 'ID' in each DataFrame and convert to string
