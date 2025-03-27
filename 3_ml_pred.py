@@ -52,9 +52,9 @@ def plot_model_performance(y_true, y_pred, y_prob, model_name, dataset_name,outp
     plt.ylabel('True Positive Rate')
     plt.title(f'ROC Curve - {dataset_name} - {model_name}')
     plt.legend(loc="lower right")
-    if roc_auc > .9:
-        os.makedirs(f'{dataset_name}_figures/ml_plots/{output_folder}', exist_ok=True)
-        plt.savefig(f'{dataset_name}_figures/ml_plots/{output_folder}/{dataset_name}_{model_name}_roc_curve.png')
+    # if roc_auc > .9:
+    os.makedirs(f'{dataset_name}_figures/ml_plots/{output_folder}', exist_ok=True)
+    plt.savefig(f'{dataset_name}_figures/ml_plots/{output_folder}/{dataset_name}_{model_name}_roc_curve.png')
     plt.close()
 
 def prepare_data_vs_controls(cases_df, controls_df = None, target_col='target'):
@@ -151,16 +151,16 @@ def train_classical_ml(X_train, y_train, X_test, y_test, dataset_name,output_fol
     # Get the number of samples in each group
     n_train = len(y_train)
     n_test = len(y_test)
-    if acc_rf > .9:
-        plt.figure(figsize=(12, 8))  # Increase figure size for better visibility
-        plt.title(f"Top 10 Feature Importances (Train N={n_train}, Test N={n_test}, Accuracy={acc_rf:.2f})")
-        plt.bar(range(top_n), top_importances, align="center")
-        plt.xticks(range(top_n), top_features, rotation=90)
-        plt.xlim([-1, top_n])
-        plt.tight_layout()  # Adjust layout to ensure everything fits without overlap
-        os.makedirs(f'{dataset_name}_figures/ml_plots/{output_folder}', exist_ok=True)
-        plt.savefig(f'{dataset_name}_figures/ml_plots/{output_folder}/{dataset_name}_Random_Forest_top_{top_n}_feature_importance.png')
-        plt.close()
+    # if acc_rf > .9:
+    plt.figure(figsize=(12, 8))  # Increase figure size for better visibility
+    plt.title(f"Top 10 Feature Importances (Train N={n_train}, Test N={n_test}, Accuracy={acc_rf:.2f})")
+    plt.bar(range(top_n), top_importances, align="center")
+    plt.xticks(range(top_n), top_features, rotation=90)
+    plt.xlim([-1, top_n])
+    plt.tight_layout()  # Adjust layout to ensure everything fits without overlap
+    os.makedirs(f'{dataset_name}_figures/ml_plots/{output_folder}', exist_ok=True)
+    plt.savefig(f'{dataset_name}_figures/ml_plots/{output_folder}/{dataset_name}_Random_Forest_top_{top_n}_feature_importance.png')
+    plt.close()
 
     return {
         'Logistic_Regression': (acc_lr, auc_lr, y_pred_lr, y_prob_lr),
@@ -305,5 +305,5 @@ def train_w_x_y(X, y, dataset_name,output_folder):
 
 if __name__ == "__main__":
     # Process both datasets
-    process_dataset('WNV')
-    # process_dataset('COBRAD')
+    # process_dataset('WNV')
+    process_dataset('COBRAD')
