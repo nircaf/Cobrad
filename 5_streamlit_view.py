@@ -398,7 +398,7 @@ def main():
             dict_features[feature] = feature_name
         else:
             feature_name = f"_{feature}_".lower()
-            # marked_clinical_features.append(feature_name)
+            marked_clinical_features.append(feature_name)
             dict_features[feature] = feature_name
     
     if not clinical_features or not eeg_features:
