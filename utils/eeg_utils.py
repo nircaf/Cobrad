@@ -382,6 +382,9 @@ def cobrad_get_files():
             # to numeric all columns but ID
             dfs[sheet] = pd.concat([dfs[sheet]['ID'], dfs[sheet].drop(columns='ID').apply(pd.to_numeric, errors='coerce')], axis=1)
             dfs[sheet][f'{sheet}_sum'] = dfs[sheet].drop(columns='ID').sum(axis=1)
+            if sheet =='seizures':
+                # replace -9 with np.nan
+                dfs[sheet] = dfs[sheet].replace(-9, np.nan)
         # add the name of sheet at beggining of column all cols but ID
         dfs[sheet].columns = [f'{sheet}_{col}' if col != 'ID' else col for col in dfs[sheet].columns]
 
