@@ -382,11 +382,14 @@ def cobrad_get_files():
             # to numeric all columns but ID
             dfs[sheet] = pd.concat([dfs[sheet]['ID'], dfs[sheet].drop(columns='ID').apply(pd.to_numeric, errors='coerce')], axis=1)
             dfs[sheet][f'{sheet}_sum'] = dfs[sheet].drop(columns='ID').sum(axis=1)
+        # add the name of sheet at beggining of column all cols but ID
+        dfs[sheet].columns = [f'{sheet}_{col}' if col != 'ID' else col for col in dfs[sheet].columns]
 
     # Merge all DataFrames on 'ID'
     df_wnv = dfs[sheets_to_read[0]]
     for sheet in sheets_to_read[1:]:
         df_wnv = pd.merge(df_wnv, dfs[sheet], on='ID', how='outer')
+
     patients_folder = "EDF"
     control_folder = f"{patients_folder}_controls"
     case_file = f"{patients_folder}.csv"
@@ -424,6 +427,10 @@ def cobrad_get_files():
     numeric_cols = df_merged.select_dtypes(include=[np.number]).columns
     # Group by ID and apply the weighted average function
     df_wnv2 = df_merged.groupby('ID').apply(weighted_avg, weight_col='duration_min', numeric_cols=numeric_cols).reset_index(drop=True)
+    # remove highpass, lowpass, n_samples, size, patient_number
+    cols_to_drop = ['highpass', 'lowpass', 'n_samples', 'size', 'patient_number','duration_sec']
+    # drop if conatins any of the cols_to_drop
+    df_wnv2 = df_wnv2.drop(columns=[col for col in df_wnv2.columns if any([drop in col for drop in cols_to_drop])])
     # numeric strings to float or int
     for col in df_wnv2.columns:
         try:
