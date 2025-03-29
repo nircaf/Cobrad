@@ -422,8 +422,8 @@ def cobrad_get_files(num_samples_per_patient=0):
     df_wnv = dfs[sheets_to_read[0]]
     for sheet in sheets_to_read[1:]:
         df_wnv = pd.merge(df_wnv, dfs[sheet], on='ID', how='outer')
-    # df_wnv replace '.' in column names with '_'
-    df_wnv.columns = df_wnv.columns.str.replace('.', '_')
+    # df_wnv replace '.' in column names with '_' and replace '<' and '>' with ''
+    df_wnv.columns = df_wnv.columns.str.replace('.', '_').str.replace('<', '').str.replace('>', '')
     patients_folder = "EDF"
     control_folder = f"{patients_folder}_controls"
     case_file = f"{patients_folder}.csv"
