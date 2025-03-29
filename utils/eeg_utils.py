@@ -14,7 +14,7 @@ from statsmodels.stats.multitest import multipletests
 import statsmodels.stats.multitest as smm
 from scipy.signal import spectrogram
 import statsmodels.api as sm
-
+import streamlit as st
 eeg_channels = ['Fp1', 'Fp2', 'F3', 'F4', 'C3', 'C4', 'P3', 'P4', 'O1', 'O2', 'F7',
        'F8', 'T3', 'T4', 'T5', 'T6', 'Fz', 'Cz', 'Pz', 'A1','A2', 'Fpz', 'Oz']
 
@@ -62,7 +62,7 @@ def stat_text_get(group_data, col=None):
         )
     return stats_text
 
-def boxplot_plot(results_df, combined_df, col, output_dir,figures_dir):
+def boxplot_plot(results_df, combined_df, col, output_dir,figures_dir=None,is_streamlit=False):
     # Function to remove outliers based on 5 standard deviations
     def remove_outliers(df, col, group_col, threshold=5):
         def filter_group(group):
@@ -107,8 +107,12 @@ def boxplot_plot(results_df, combined_df, col, output_dir,figures_dir):
         ax = plt.gca()
         ax.set_xticklabels([f"{label.get_text()}\nn={group_counts[label.get_text()]}" for label in ax.get_xticklabels()])
         plt.tight_layout()
-        os.makedirs(f'{figures_dir}/boxplots/{output_dir}', exist_ok=True)
-        plt.savefig(f"{figures_dir}/boxplots/{output_dir}/{col}_comparison.png")
+        if is_streamlit:
+            st.write(f"Boxplot of {col} by Group")
+            st.pyplot(plt)
+        else:
+            os.makedirs(f'{figures_dir}/boxplots/{output_dir}', exist_ok=True)
+            plt.savefig(f"{figures_dir}/boxplots/{output_dir}/{col}_comparison.png")
         plt.close()
         # Plot histograms for each group and both groups together
         plt.figure(figsize=(10, 6))
@@ -119,8 +123,12 @@ def boxplot_plot(results_df, combined_df, col, output_dir,figures_dir):
             plt.annotate(stats_text, xy=(0.25, 0.95 - i * 0.1), xycoords='axes fraction', fontsize=10,
                     verticalalignment='top', bbox=dict(boxstyle='round,pad=0.3', edgecolor='black', facecolor='white'))
         plt.title(f"{col} Histogram by Group")
-        os.makedirs(f'{figures_dir}/hist/{output_dir}', exist_ok=True)
-        plt.savefig(f"{figures_dir}/hist/{output_dir}/{col}_hist_by_group.png")
+        if is_streamlit:
+            st.write(f"Histogram of {col} by Group")
+            st.pyplot(plt)
+        else:
+            os.makedirs(f'{figures_dir}/hist/{output_dir}', exist_ok=True)
+            plt.savefig(f"{figures_dir}/hist/{output_dir}/{col}_hist_by_group.png")
         plt.close()
         plt.figure(figsize=(10, 6))
         sns.histplot(data=cleaned_df, x=col, element='step', stat='density')
@@ -129,10 +137,14 @@ def boxplot_plot(results_df, combined_df, col, output_dir,figures_dir):
         plt.annotate(stats_text, xy=(0.25, 0.95), xycoords='axes fraction', fontsize=10,
                     verticalalignment='top', bbox=dict(boxstyle='round,pad=0.3', edgecolor='black', facecolor='white'))
         plt.title(f"{col} Histogram Combined")
-        plt.savefig(f"{figures_dir}/hist/{output_dir}/{col}_hist_combined.png")
+        if is_streamlit:
+            st.write(f"Histogram of {col}")
+            st.pyplot(plt)
+        else:
+            plt.savefig(f"{figures_dir}/hist/{output_dir}/{col}_hist_combined.png")
         plt.close()
     
-def scatter_plot_with_regression(results_df, combined_df, x_col, y_col, output_dir,figures_dir):
+def scatter_plot_with_regression(results_df, combined_df, x_col, y_col, output_dir,figures_dir= None,is_streamlit=False):
     plt.figure(figsize=(10, 6))
     sns.scatterplot(x=x_col, y=y_col, data=combined_df, alpha=0.5, color='black')
     sns.regplot(x=x_col, y=y_col, data=combined_df, scatter=False, color='blue')
@@ -163,8 +175,12 @@ def scatter_plot_with_regression(results_df, combined_df, x_col, y_col, output_d
         plt.ylabel(y_col)
         plt.tight_layout()
         # Make folder {figures_dir}
-        os.makedirs(f'{figures_dir}/scatterplots/{output_dir}', exist_ok=True)
-        plt.savefig(f"{figures_dir}/scatterplots/{output_dir}/{y_col}_regression.png")
+        if is_streamlit:
+            st.write(f"Scatterplot of {x_col} vs {y_col}")
+            st.pyplot(plt)
+        else:
+            os.makedirs(f'{figures_dir}/scatterplots/{output_dir}', exist_ok=True)
+            plt.savefig(f"{figures_dir}/scatterplots/{output_dir}/{y_col}_regression.png")
         plt.close()
 
         # Plot histogram of X
@@ -177,7 +193,11 @@ def scatter_plot_with_regression(results_df, combined_df, x_col, y_col, output_d
         plt.xlabel("Value")
         plt.ylabel("Density")
         plt.tight_layout()
-        plt.savefig(f"{figures_dir}/scatterplots/{output_dir}/{x_col}_histogram.png")
+        if is_streamlit:
+            st.write(f"Histogram of {x_col}")
+            st.pyplot(plt)
+        else:
+            plt.savefig(f"{figures_dir}/scatterplots/{output_dir}/{x_col}_histogram.png")
         plt.close()
 
         # Plot histogram of Y
@@ -190,7 +210,11 @@ def scatter_plot_with_regression(results_df, combined_df, x_col, y_col, output_d
         plt.xlabel("Value")
         plt.ylabel("Density")
         plt.tight_layout()
-        plt.savefig(f"{figures_dir}/scatterplots/{output_dir}/{y_col}_histogram.png")
+        if is_streamlit:
+            st.write(f"Histogram of {y_col}")
+            st.pyplot(plt)
+        else:
+            plt.savefig(f"{figures_dir}/scatterplots/{output_dir}/{y_col}_histogram.png")
         plt.close()
     
 def analyze_and_correct(combined_df, columns_to_analyze, groups=['Control', 'WNV']):
@@ -245,7 +269,7 @@ def analyze_and_correct(combined_df, columns_to_analyze, groups=['Control', 'WNV
 
     return results_df
 
-def topomap_group_data( band, montage,control_data,wnv_data,output_dir,figures_dir):
+def topomap_group_data( band, montage,control_data,wnv_data,output_dir,figures_dir,is_streamlit=False):
     # Calculate p-values for each channel
     common_channels = control_data.columns.intersection(wnv_data.columns)
     dict_p_values = {}
@@ -274,9 +298,13 @@ def topomap_group_data( band, montage,control_data,wnv_data,output_dir,figures_d
         plt.title(f"{band} {output_dir} P-Value Topomap")
         # if any value in pvals_corrected is less than 0.05
         # make folder {figures_dir}/boxplots/{output_dir}
-        os.makedirs(f'{figures_dir}/topomaps_p_values/{output_dir}', exist_ok=True)
         # Save the figure
-        plt.savefig(f"{figures_dir}/topomaps_p_values/{output_dir}/p_values_{band}_topomap.png")
+        if is_streamlit:
+            st.write(f"Topomap for {band} {output_dir} P-Value")
+            st.pyplot(plt)
+        else:
+            os.makedirs(f'{figures_dir}/topomaps_p_values/{output_dir}', exist_ok=True)
+            plt.savefig(f"{figures_dir}/topomaps_p_values/{output_dir}/p_values_{band}_topomap.png")
         plt.close()
 
 def process_group_data(group, run_df, frequency_bands, eeg_dict_convertion, eeg_channels, montage,group_data):
@@ -368,7 +396,7 @@ def wnv_get_files():
     return df_wnv,patients_folder,control_folder,controls,df_wnv2,cases_group_name
 
 #%% COBRAD
-def cobrad_get_files():
+def cobrad_get_files(num_samples_per_patient=0):
     # read sheets clinical, medications, npi-q, epworth,isi, ecpg_12 from COBRAD_clinical_24022025.xlsx
     sheets_to_read = ['clinical', 'medications', 'npi-q', 'epworth', 'isi', 'ecog_12','Sheet4','seizures']
     sheets_to_sum_vals = ['epworth', 'isi', 'ecog_12','Sheet4','npi-q','seizures']
@@ -425,15 +453,21 @@ def cobrad_get_files():
     for id_to_check in failed_ids:
         # check if id exists contains in eeg_files
         if any(id_to_check in file for file in eeg_files):
-            print(f'{id_to_check}')
+            # print(f'{id_to_check}')
+            pass
     df_merged = df_merged[df_merged['_merge'] == 'both'].drop(columns='_merge')
     numeric_cols = df_merged.select_dtypes(include=[np.number]).columns
+    if num_samples_per_patient:
+        # Get per ID randomly number of rows equal to num_samples_per_patient
+        df_merged = df_merged.groupby('ID').apply(lambda x: x.sample(n=num_samples_per_patient, random_state=1)).reset_index(drop=True)
     # Group by ID and apply the weighted average function
     df_wnv2 = df_merged.groupby('ID').apply(weighted_avg, weight_col='duration_min', numeric_cols=numeric_cols).reset_index(drop=True)
     # remove highpass, lowpass, n_samples, size, patient_number
     cols_to_drop = ['highpass', 'lowpass', 'n_samples', 'size', 'patient_number','duration_sec']
     # drop if conatins any of the cols_to_drop
     df_wnv2 = df_wnv2.drop(columns=[col for col in df_wnv2.columns if any([drop in col for drop in cols_to_drop])])
+    # replace all nan with np.nan ignore case
+    df_wnv2 = df_wnv2.applymap(lambda x: np.nan if isinstance(x, str) and 'nan' in x.lower() else x)
     # numeric strings to float or int
     for col in df_wnv2.columns:
         try:
