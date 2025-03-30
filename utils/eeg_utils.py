@@ -62,7 +62,7 @@ def stat_text_get(group_data, col=None):
         )
     return stats_text
 
-def boxplot_plot(results_df, combined_df, col, output_dir,figures_dir=None,is_streamlit=False):
+def boxplot_plot(results_df, combined_df, col, output_dir,figures_dir=None,is_streamlit=False,analysis_type=None):
     # Function to remove outliers based on 5 standard deviations
     def remove_outliers(df, col, group_col, threshold=5):
         def filter_group(group):
@@ -100,7 +100,7 @@ def boxplot_plot(results_df, combined_df, col, output_dir,figures_dir=None,is_st
         f"Cohen's d = {row['Cohen_d']:.2f}\n"
         f"{col} Comparison"
     )
-    if sig_symbol != 'ns':
+    if sig_symbol != 'ns' or analysis_type == 'Full':
         plt.title(title_text, ha='center')
         # Add sample size to x-axis labels
         group_counts = combined_df['Group'].value_counts()
@@ -144,7 +144,7 @@ def boxplot_plot(results_df, combined_df, col, output_dir,figures_dir=None,is_st
             plt.savefig(f"{figures_dir}/hist/{output_dir}/{col}_hist_combined.png")
         plt.close()
     
-def scatter_plot_with_regression(results_df, combined_df, x_col, y_col, output_dir,figures_dir= None,is_streamlit=False):
+def scatter_plot_with_regression(results_df, combined_df, x_col, y_col, output_dir,figures_dir= None,is_streamlit=False,analysis_type=None):
     plt.figure(figsize=(10, 6))
     sns.scatterplot(x=x_col, y=y_col, data=combined_df, alpha=0.5, color='black')
     sns.regplot(x=x_col, y=y_col, data=combined_df, scatter=False, color='blue')
@@ -163,8 +163,7 @@ def scatter_plot_with_regression(results_df, combined_df, x_col, y_col, output_d
         sig_symbol = '*'
     else:
         sig_symbol = 'ns'
-    if sig_symbol != 'ns':
-
+    if sig_symbol != 'ns' or analysis_type == 'Full':
         # Add stats results to the title
         plt.title(
             f"{x_col} vs {y_col} Regression\n"
