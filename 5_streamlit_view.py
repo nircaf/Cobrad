@@ -73,7 +73,15 @@ def pairplot_columns(df, columns, hue=None):
     df_cleaned = df[columns + ([hue] if hue else [])].dropna()
 
     # Create the pairplot
-    pairplot = sns.pairplot(df_cleaned, hue=hue, diag_kind='kde', corner=True)
+    pairplot = sns.pairplot(df_cleaned, hue=hue, diag_kind='kde')
+    # lower paitplot add line
+    pairplot.map_lower(sns.scatterplot, alpha=0.5)
+    # Add regression line to the lower triangle
+    for i in range(len(columns)):
+        for j in range(i):
+            x = df_cleaned[columns[i]]
+            y = df_cleaned[columns[j]]
+            sns.regplot(x=x, y=y, ax=pairplot.axes[i, j], scatter=False, color='red', line_kws={'alpha': 0.5})
     pairplot.fig.suptitle("Pairplot of Selected Columns", y=1.02)
     st.pyplot(pairplot)
 
@@ -119,9 +127,7 @@ def main():
     else:
         # Load WNV data
         df_wnv, patients_folder, control_folder, controls, df_wnv2, cases_group_name = wnv_get_files()
-    # ask user if they want only significant, or full.
-    st.sidebar.header("Select Analysis Type")
-    analysis_type = st.sidebar.selectbox("Select Analysis Type", ["Significant", "Full"])
+
     st.title("EEG vs Clinical Features")
     # Iterate over each frequency band and plot the topomap
     frequency_bands = ['delta_power', 'theta_power', 'alpha_power', 'beta_power', 'gamma_power','pswe_events_per_minute','pswe_avg_length','mean_mpf','dfv_std','dfv_mean']
@@ -143,6 +149,16 @@ def main():
     boxplots_folder = f"{project_name}_figures/boxplots"
     scatterplots_folder = f"{project_name}_figures/scatterplots"
     
+    # Sidebar for feature selection
+    st.sidebar.header("Feature Selection")
+    feature_type = st.sidebar.selectbox("Select feature type to plot against the other type:", ("Clinical Feature", "EEG Feature","ml_plots", "vs_Controls","Pair Plot"))
+    if feature_type == "Clinical Feature" or feature_type == "EEG Feature":
+        # ask user if they want only significant, or full.
+        st.sidebar.header("Select Analysis Type")
+        analysis_type = st.sidebar.selectbox("Select Analysis Type", ["Significant", "Full"])
+    else:
+        analysis_type = "Full"
+        
     marked_clinical_features = []
     dict_features = {}
     cols_to_skip = ['ID','annotations','bad_channels','Group','patient_number']
@@ -162,10 +178,7 @@ def main():
         st.error("Could not identify clinical or EEG features based on the 'overall_' separator.")
         return
     
-    # Sidebar for feature selection
-    st.sidebar.header("Feature Selection")
-    feature_type = st.sidebar.selectbox("Select feature type to plot against the other type:", ("Clinical Feature", "EEG Feature","ml_plots", "vs_Controls","Pair Plot"))
-    
+
     if feature_type == "vs_Controls":
         vs_controls_run(project_name)
         return
