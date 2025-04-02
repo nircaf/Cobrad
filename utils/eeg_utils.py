@@ -114,35 +114,36 @@ def boxplot_plot(results_df, combined_df, col, output_dir,figures_dir=None,is_st
             os.makedirs(f'{figures_dir}/boxplots/{output_dir}', exist_ok=True)
             plt.savefig(f"{figures_dir}/boxplots/{output_dir}/{col}_comparison.png")
         plt.close()
-        # Plot histograms for each group and both groups together
-        plt.figure(figsize=(10, 6))
-        sns.histplot(data=cleaned_df, x=col, hue='Group', element='step', stat='density', common_norm=False)
-        for i, group in enumerate(cleaned_df['Group'].unique()):
-            group_data = cleaned_df[cleaned_df['Group'] == group][col]
-            stats_text = stat_text_get(group_data)
-            plt.annotate(stats_text, xy=(0.25, 0.95 - i * 0.1), xycoords='axes fraction', fontsize=10,
-                    verticalalignment='top', bbox=dict(boxstyle='round,pad=0.3', edgecolor='black', facecolor='white'))
-        plt.title(f"{col} Histogram by Group")
-        if is_streamlit:
-            st.write(f"Histogram of {col} by Group")
-            st.pyplot(plt)
-        else:
-            os.makedirs(f'{figures_dir}/hist/{output_dir}', exist_ok=True)
-            plt.savefig(f"{figures_dir}/hist/{output_dir}/{col}_hist_by_group.png")
-        plt.close()
-        plt.figure(figsize=(10, 6))
-        sns.histplot(data=cleaned_df, x=col, element='step', stat='density')
-        combined_data = cleaned_df[col]
-        stats_text = stat_text_get(combined_data)
-        plt.annotate(stats_text, xy=(0.25, 0.95), xycoords='axes fraction', fontsize=10,
-                    verticalalignment='top', bbox=dict(boxstyle='round,pad=0.3', edgecolor='black', facecolor='white'))
-        plt.title(f"{col} Histogram Combined")
-        if is_streamlit:
-            st.write(f"Histogram of {col}")
-            st.pyplot(plt)
-        else:
-            plt.savefig(f"{figures_dir}/hist/{output_dir}/{col}_hist_combined.png")
-        plt.close()
+        if sig_symbol != 'ns':
+            # Plot histograms for each group and both groups together
+            plt.figure(figsize=(10, 6))
+            sns.histplot(data=cleaned_df, x=col, hue='Group', element='step', stat='density', common_norm=False)
+            for i, group in enumerate(cleaned_df['Group'].unique()):
+                group_data = cleaned_df[cleaned_df['Group'] == group][col]
+                stats_text = stat_text_get(group_data)
+                plt.annotate(stats_text, xy=(0.25, 0.95 - i * 0.1), xycoords='axes fraction', fontsize=10,
+                        verticalalignment='top', bbox=dict(boxstyle='round,pad=0.3', edgecolor='black', facecolor='white'))
+            plt.title(f"{col} Histogram by Group")
+            if is_streamlit:
+                st.write(f"Histogram of {col} by Group")
+                st.pyplot(plt)
+            else:
+                os.makedirs(f'{figures_dir}/hist/{output_dir}', exist_ok=True)
+                plt.savefig(f"{figures_dir}/hist/{output_dir}/{col}_hist_by_group.png")
+            plt.close()
+            plt.figure(figsize=(10, 6))
+            sns.histplot(data=cleaned_df, x=col, element='step', stat='density')
+            combined_data = cleaned_df[col]
+            stats_text = stat_text_get(combined_data)
+            plt.annotate(stats_text, xy=(0.25, 0.95), xycoords='axes fraction', fontsize=10,
+                        verticalalignment='top', bbox=dict(boxstyle='round,pad=0.3', edgecolor='black', facecolor='white'))
+            plt.title(f"{col} Histogram Combined")
+            if is_streamlit:
+                st.write(f"Histogram of {col}")
+                st.pyplot(plt)
+            else:
+                plt.savefig(f"{figures_dir}/hist/{output_dir}/{col}_hist_combined.png")
+            plt.close()
     
 def scatter_plot_with_regression(results_df, combined_df, x_col, y_col, output_dir,figures_dir= None,is_streamlit=False,analysis_type=None):
     plt.figure(figsize=(10, 6))
@@ -181,40 +182,40 @@ def scatter_plot_with_regression(results_df, combined_df, x_col, y_col, output_d
             os.makedirs(f'{figures_dir}/scatterplots/{output_dir}', exist_ok=True)
             plt.savefig(f"{figures_dir}/scatterplots/{output_dir}/{y_col}_regression.png")
         plt.close()
+        if sig_symbol != 'ns':
+            # Plot histogram of X
+            plt.figure(figsize=(10, 6))
+            sns.histplot(combined_df[x_col], color='blue', kde=True, stat='density', element='step')
+            x_stats = stat_text_get(combined_df, x_col)
+            plt.annotate(x_stats, xy=(0.05, 0.95), xycoords='axes fraction', fontsize=10,
+                        verticalalignment='top', bbox=dict(boxstyle='round,pad=0.3', edgecolor='black', facecolor='white'))
+            plt.title(f"Histogram of {x_col}")
+            plt.xlabel("Value")
+            plt.ylabel("Density")
+            plt.tight_layout()
+            if is_streamlit:
+                st.write(f"Histogram of {x_col}")
+                st.pyplot(plt)
+            else:
+                plt.savefig(f"{figures_dir}/scatterplots/{output_dir}/{x_col}_histogram.png")
+            plt.close()
 
-        # Plot histogram of X
-        plt.figure(figsize=(10, 6))
-        sns.histplot(combined_df[x_col], color='blue', kde=True, stat='density', element='step')
-        x_stats = stat_text_get(combined_df, x_col)
-        plt.annotate(x_stats, xy=(0.05, 0.95), xycoords='axes fraction', fontsize=10,
-                    verticalalignment='top', bbox=dict(boxstyle='round,pad=0.3', edgecolor='black', facecolor='white'))
-        plt.title(f"Histogram of {x_col}")
-        plt.xlabel("Value")
-        plt.ylabel("Density")
-        plt.tight_layout()
-        if is_streamlit:
-            st.write(f"Histogram of {x_col}")
-            st.pyplot(plt)
-        else:
-            plt.savefig(f"{figures_dir}/scatterplots/{output_dir}/{x_col}_histogram.png")
-        plt.close()
-
-        # Plot histogram of Y
-        plt.figure(figsize=(10, 6))
-        sns.histplot(combined_df[y_col], color='red', kde=True, stat='density', element='step')
-        y_stats = stat_text_get(combined_df, y_col)
-        plt.annotate(y_stats, xy=(0.05, 0.95), xycoords='axes fraction', fontsize=10,
-                    verticalalignment='top', bbox=dict(boxstyle='round,pad=0.3', edgecolor='black', facecolor='white'))
-        plt.title(f"Histogram of {y_col}")
-        plt.xlabel("Value")
-        plt.ylabel("Density")
-        plt.tight_layout()
-        if is_streamlit:
-            st.write(f"Histogram of {y_col}")
-            st.pyplot(plt)
-        else:
-            plt.savefig(f"{figures_dir}/scatterplots/{output_dir}/{y_col}_histogram.png")
-        plt.close()
+            # Plot histogram of Y
+            plt.figure(figsize=(10, 6))
+            sns.histplot(combined_df[y_col], color='red', kde=True, stat='density', element='step')
+            y_stats = stat_text_get(combined_df, y_col)
+            plt.annotate(y_stats, xy=(0.05, 0.95), xycoords='axes fraction', fontsize=10,
+                        verticalalignment='top', bbox=dict(boxstyle='round,pad=0.3', edgecolor='black', facecolor='white'))
+            plt.title(f"Histogram of {y_col}")
+            plt.xlabel("Value")
+            plt.ylabel("Density")
+            plt.tight_layout()
+            if is_streamlit:
+                st.write(f"Histogram of {y_col}")
+                st.pyplot(plt)
+            else:
+                plt.savefig(f"{figures_dir}/scatterplots/{output_dir}/{y_col}_histogram.png")
+            plt.close()
     
 def analyze_and_correct(combined_df, columns_to_analyze, groups=['Control', 'WNV']):
     def analyze_groups(combined_df, col, groups):
@@ -400,13 +401,27 @@ def wnv_get_files():
 def cobrad_get_files(num_samples_per_patient=0):
     # read sheets clinical, medications, npi-q, epworth,isi, ecpg_12 from COBRAD_clinical_24022025.xlsx
     sheets_to_read = ['clinical', 'medications', 'npi-q', 'epworth', 'isi', 'ecog_12','Sheet4','seizures']
-    sheets_to_sum_vals = ['epworth', 'isi', 'ecog_12','Sheet4','npi-q','seizures']
+    sheets_to_sum_vals = ['epworth', 'isi', 'ecog_12','Sheet4','npi-q','seizures', 'medications']
     dfs = pd.read_excel('COBRAD_clinical_24022025.xlsx', sheet_name=sheets_to_read)
     # Rename 'record_id' to 'ID' in each DataFrame and convert to string
     for sheet in sheets_to_read:
         dfs[sheet] = dfs[sheet].rename(columns={'record_id': 'ID'}).astype(str)
         # drop col contain has_eeg or has eeg . ignore case
         dfs[sheet] = dfs[sheet].drop(columns=[col for col in dfs[sheet].columns if 'has eeg' in col.lower() or 'has_eeg' in col.lower()])
+        # One-hot encode drugs in the medications sheet
+        if sheet == 'medications':
+            # Extract the drug names no 'nan'
+            drug_names = dfs[sheet]['name_drug_1'].dropna().unique()
+            # remove 'nan'
+            drug_names = [drug for drug in drug_names if 'nan' not in drug]
+            # Create one-hot encoded columns for each drug
+            for drug in drug_names:
+                dfs[sheet][f'{drug}'] = dfs[sheet]['name_drug_1'].apply(lambda x: 1 if x == drug else 0)
+            # Keep only the ID and one-hot encoded drug columns
+            drug_columns = [f'{drug}' for drug in drug_names]
+            dfs[sheet] = dfs[sheet][['ID'] + drug_columns]  
+            # merge columns per ID
+            dfs[sheet] = dfs[sheet].groupby('ID').sum().reset_index()      
         if sheet in sheets_to_sum_vals:
             # to numeric all columns but ID
             dfs[sheet] = pd.concat([dfs[sheet]['ID'], dfs[sheet].drop(columns='ID').apply(pd.to_numeric, errors='coerce')], axis=1)
@@ -548,3 +563,9 @@ def custom_describe(df):
     df_ret = pd.DataFrame(stats)
     # round 2
     return df_ret.round(2)
+
+# if name == main
+if __name__ == '__main__':
+    # Example usage
+    df_wnv,patients_folder,control_folder,controls,df_wnv2,cases_group_name = cobrad_get_files(num_samples_per_patient=0)
+    print(df_wnv2.head())
