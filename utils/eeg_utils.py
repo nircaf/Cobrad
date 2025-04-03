@@ -15,6 +15,7 @@ import statsmodels.stats.multitest as smm
 from scipy.signal import spectrogram
 import statsmodels.api as sm
 import streamlit as st
+import json
 eeg_channels = ['Fp1', 'Fp2', 'F3', 'F4', 'C3', 'C4', 'P3', 'P4', 'O1', 'O2', 'F7',
        'F8', 'T3', 'T4', 'T5', 'T6', 'Fz', 'Cz', 'Pz', 'A1','A2', 'Fpz', 'Oz']
 
@@ -36,7 +37,11 @@ eeg_dict_convertion = {
        'Fp1-F7': 'Fpz',
        'F7-T3': 'F7',
        'T3-T5': 'T3',
-       'T5-O1': 'T5'
+       'T5-O1': 'T5',
+       'EOG1+': 'eog',
+       'EOG2+': 'eog',
+       'ECG1+': 'ecg',
+        'ECG2+': 'ecg',
 }
 
 def stat_text_get(group_data, col=None):
@@ -62,7 +67,7 @@ def stat_text_get(group_data, col=None):
         )
     return stats_text
 
-def boxplot_plot(results_df, combined_df, col, output_dir,figures_dir=None,is_streamlit=False,analysis_type=None):
+def boxplot_plot(results_df, combined_df, col, output_dir,figures_dir=None,is_streamlit=False,analysis_type=None, show_histograms=False):
     # Function to remove outliers based on 5 standard deviations
     def remove_outliers(df, col, group_col, threshold=5):
         def filter_group(group):
@@ -114,7 +119,7 @@ def boxplot_plot(results_df, combined_df, col, output_dir,figures_dir=None,is_st
             os.makedirs(f'{figures_dir}/boxplots/{output_dir}', exist_ok=True)
             plt.savefig(f"{figures_dir}/boxplots/{output_dir}/{col}_comparison.png")
         plt.close()
-        if sig_symbol != 'ns':
+        if show_histograms:
             # Plot histograms for each group and both groups together
             plt.figure(figsize=(10, 6))
             sns.histplot(data=cleaned_df, x=col, hue='Group', element='step', stat='density', common_norm=False)
@@ -144,8 +149,9 @@ def boxplot_plot(results_df, combined_df, col, output_dir,figures_dir=None,is_st
             else:
                 plt.savefig(f"{figures_dir}/hist/{output_dir}/{col}_hist_combined.png")
             plt.close()
+    return results_df
     
-def scatter_plot_with_regression(results_df, combined_df, x_col, y_col, output_dir,figures_dir= None,is_streamlit=False,analysis_type=None):
+def scatter_plot_with_regression(results_df, combined_df, x_col, y_col, output_dir,figures_dir= None,is_streamlit=False,analysis_type=None, show_histograms=False):
     plt.figure(figsize=(10, 6))
     sns.scatterplot(x=x_col, y=y_col, data=combined_df, alpha=0.5, color='black')
     sns.regplot(x=x_col, y=y_col, data=combined_df, scatter=False, color='blue')
@@ -182,7 +188,7 @@ def scatter_plot_with_regression(results_df, combined_df, x_col, y_col, output_d
             os.makedirs(f'{figures_dir}/scatterplots/{output_dir}', exist_ok=True)
             plt.savefig(f"{figures_dir}/scatterplots/{output_dir}/{y_col}_regression.png")
         plt.close()
-        if sig_symbol != 'ns':
+        if show_histograms:
             # Plot histogram of X
             plt.figure(figsize=(10, 6))
             sns.histplot(combined_df[x_col], color='blue', kde=True, stat='density', element='step')
@@ -421,7 +427,22 @@ def cobrad_get_files(num_samples_per_patient=0):
             drug_columns = [f'{drug}' for drug in drug_names]
             dfs[sheet] = dfs[sheet][['ID'] + drug_columns]  
             # merge columns per ID
-            dfs[sheet] = dfs[sheet].groupby('ID').sum().reset_index()      
+            dfs[sheet] = dfs[sheet].groupby('ID').sum().reset_index()   
+            # dict how many ID take a drug
+            drug_counts = dfs[sheet].drop(columns='ID').sum().to_dict() 
+            # only above 3
+            drug_counts = {k: v for k, v in drug_counts.items() if v > 3}  
+            # read utils/drug_groups.json
+            with open('utils/drug_groups.json', 'r') as f:
+                drug_groups = json.load(f)
+            for key_number_groups in drug_groups:
+                for key_group, value_group in drug_groups[key_number_groups].items():
+                    # value_group remove /n and stip
+                    value_group = [group.strip() for group in value_group]
+                    # get the columns that contain the key_group
+                    columns = [col for col in dfs[sheet].columns if any(group in col for group in value_group)]
+                    # sum the columns and create a new column with the name of the group
+                    dfs[sheet][f'{key_number_groups}_groups_{key_group}'] = dfs[sheet][columns].sum(axis=1)
         if sheet in sheets_to_sum_vals:
             # to numeric all columns but ID
             dfs[sheet] = pd.concat([dfs[sheet]['ID'], dfs[sheet].drop(columns='ID').apply(pd.to_numeric, errors='coerce')], axis=1)

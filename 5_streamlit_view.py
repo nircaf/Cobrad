@@ -15,6 +15,7 @@ from statsmodels.stats.multitest import multipletests
 import statsmodels.stats.multitest as smm
 from scipy.signal import spectrogram
 import statsmodels.api as sm
+from collections import Counter
 
 # Set plotting styles as specified
 sns.set_context('talk')
@@ -51,7 +52,22 @@ plt.rc('axes',  titlesize=12)  # Set title size to be the same as x and y labels
 montage = mne.channels.make_standard_montage('standard_1020')
 
 
-def pairplot_columns(df, columns, hue=None):
+def multiselect_pairplot(all_features):
+    # groups are based on common split('_')[0] of all features
+    feature_groups = [col.split('_')[0] for col in all_features]
+    # Count occurrences of each group
+    group_counts = Counter(feature_groups)
+    # Separate groups with at least 8 occurrences
+    valid_groups = {group for group, count in group_counts.items() if count >= 8}
+    columns = []
+    for group in valid_groups:
+        # let sidebar multiselect for group
+        st.sidebar.write(f"Group: {group}")
+        group_columns = [col for col in all_features if col.startswith(group)]
+        columns.extend(st.sidebar.multiselect("Select features for pairplot:", group_columns))
+    return columns
+
+def pairplot_columns(df, clinical_features, eeg_features, hue=None, output_dir=None):
     """
     Creates a pairplot for the specified columns in the DataFrame.
 
@@ -64,26 +80,42 @@ def pairplot_columns(df, columns, hue=None):
     Returns:
         None
     """
-    # Ensure the columns exist in the DataFrame
-    missing_columns = [col for col in columns if col not in df.columns]
-    if missing_columns:
-        raise ValueError(f"The following columns are missing in the DataFrame: {missing_columns}")
+    st.sidebar.subheader("Select Clinical Features")
+    columns = multiselect_pairplot(clinical_features)
+    st.sidebar.subheader("Select EEG Features")
+    columns.extend(multiselect_pairplot(eeg_features))
+    if columns:
+        # Ensure the columns exist in the DataFrame
+        missing_columns = [col for col in columns if col not in df.columns]
+        if missing_columns:
+            raise ValueError(f"The following columns are missing in the DataFrame: {missing_columns}")
 
-    # Drop rows with NaN values in the specified columns
-    df_cleaned = df[columns + ([hue] if hue else [])].dropna()
+        # Drop rows with NaN values in the specified columns
+        df_cleaned = df[columns + ([hue] if hue else [])].dropna()
 
-    # Create the pairplot
-    pairplot = sns.pairplot(df_cleaned, hue=hue, diag_kind='kde')
-    # lower paitplot add line
-    pairplot.map_lower(sns.scatterplot, alpha=0.5)
-    # Add regression line to the lower triangle
-    for i in range(len(columns)):
-        for j in range(i):
-            x = df_cleaned[columns[i]]
-            y = df_cleaned[columns[j]]
-            sns.regplot(x=x, y=y, ax=pairplot.axes[i, j], scatter=False, color='red', line_kws={'alpha': 0.5})
-    pairplot.fig.suptitle("Pairplot of Selected Columns", y=1.02)
-    st.pyplot(pairplot)
+        # Create the pairplot
+        pairplot = sns.pairplot(df_cleaned, hue=hue, diag_kind='kde')
+        
+        # Lower pairplot add scatterplot
+        pairplot.map_lower(sns.scatterplot, alpha=0.5)
+        
+        # Add regression line to the lower triangle
+        for i in range(len(columns)):
+            for j in range(i):
+                # Extract the correct data for x and y
+                x = df_cleaned[columns[j]]
+                y = df_cleaned[columns[i]]
+                
+                # Add regression line to the lower triangle
+                sns.regplot(x=x, y=y, ax=pairplot.axes[i, j], scatter=False, color='red', line_kws={'alpha': 0.5})
+        
+        # Add a title and adjust layout to prevent text cutoff
+        pairplot.fig.suptitle("Pairplot of Selected Columns", y=1.02)
+        pairplot.fig.tight_layout()  # Automatically adjust subplots to fit within the figure area
+        pairplot.fig.subplots_adjust(top=0.95)  # Add extra space at the top for the title
+        
+        # Display the plot in Streamlit
+        st.pyplot(pairplot)
 
 def vs_controls_run(project_name):
     scatterplots_dir = f"{project_name}_figures/topomaps_p_values/vs_controls"
@@ -131,10 +163,11 @@ def main():
     st.title("EEG vs Clinical Features")
     # Iterate over each frequency band and plot the topomap
     frequency_bands = ['delta_power', 'theta_power', 'alpha_power', 'beta_power', 'gamma_power','pswe_events_per_minute','pswe_avg_length','mean_mpf','dfv_std','dfv_mean']
-    # remove from df_wnv2 columns that contain dates
-    df_wnv2 = df_wnv2.drop(columns=[col for col in df_wnv2.columns if 'date' in col.lower()])
+    cols_to_drop = ['annotations', 'bad_channels', 'patient_number', 'csv_file_name', 'file_name', 'file_path', 'signal_labels', 'number_of_signals', 'sampling_frequency', 'sampling_rate', 'duration_min']
+    # Remove specified columns and those containing dates from df_wnv2
+    df_wnv2 = df_wnv2.drop(columns=[col for col in df_wnv2.columns if col in cols_to_drop or 'date' in col.lower()])
     #%% clinical data analysis
-    clinical_columns, boxplot_columns = get_clinical_and_boxplot_cols(df_wnv2=df_wnv2)
+    clinical_features, boxplot_columns = get_clinical_and_boxplot_cols(df_wnv2=df_wnv2)
     # Identify the separation point between clinical and EEG features
     separator_index = next((i for i, col in enumerate(df_wnv2.columns) if 'overall_' in col), None)
     if separator_index is None:
@@ -142,7 +175,6 @@ def main():
         return
     
     # Split columns into clinical and EEG features
-    clinical_features = [col for col in df_wnv2.columns[:separator_index] if col != 'Group']
     eeg_features = [col for col in df_wnv2.columns[separator_index:] if col != 'Group']
     clinical_features_numeric = [col for col in clinical_features if pd.api.types.is_numeric_dtype(df_wnv2[col])]
     
@@ -183,9 +215,7 @@ def main():
         vs_controls_run(project_name)
         return
     elif feature_type == "Pair Plot":
-        selected_features = st.sidebar.multiselect("Select features for pairplot:", clinical_features + eeg_features)
-        if selected_features:
-            pairplot_columns(df_wnv2, selected_features)
+        pairplot_columns(df_wnv2, clinical_features, eeg_features)
         return
     elif feature_type == "ml_plots":
         # get the names of folders that are in {figures_dir}/ml_plots
@@ -199,6 +229,7 @@ def main():
         plot_title = f"Plots of {selected_feature} vs All Clinical Features"
         boxplot_columns = clinical_features_numeric
     else:
+        clinical_features_correlation = st.sidebar.checkbox("Show Clinical Features Correlation", value=False)
         selected_feature = st.sidebar.radio("Select a Clinical feature:", marked_clinical_features)
         # map back to key of dict_features
         selected_feature = [key for key, value in dict_features.items() if value == selected_feature][0]
@@ -215,6 +246,12 @@ def main():
     # col 6 is N with dropna
     col6.metric("N", f"{feature_data.dropna().count()}")
     numeric_colunms = df_wnv2.select_dtypes(include=[np.number]).columns
+    # sidebar checkbox - Clinical Features Correlation
+    # if EEG Fearture
+    if feature_type == "Clinical Feature":
+        if clinical_features_correlation:
+            # from clinical columns get
+            boxplot_columns = boxplot_columns + clinical_features - selected_feature
     # Display selected feature and plots
     if selected_feature:
         st.header(plot_title)

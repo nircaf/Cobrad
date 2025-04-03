@@ -1,0 +1,28 @@
+{
+    "3_groups": {
+        "Neurological/Psychiatric": ["Donepezil", "Memox", "Miro", "Gabapentin", "Brintellix", "Rivastigmine", "Wellbutrin", "Lamictal", "Lamotrigine", "Duloxetine", "Memantine", "Cipralex", "Paroxitine", "Fluoxetine", "Sertraline", "Escitalopram", "Lyrica", "Clonex", "Viepax", "Zolpidem Tartrate", "Keppra", "Levetiracetam", "Ritalin", "Bupropion Hydrochloride", "Depalept", "Zanex", "Leponex", "Cymbalta"],
+        "Cardiovascular": ["Simvastatin", "Cardiloc", "Crestor", "Plavix", "Atorvastatin", "valsartan", "prasugrel", "Norvasc", "Losartan", "Ramipril", "Candesartan", "Vasodip", "Carvedilol", "Bisoprolol", "Aspirin", "Tadalafil", "Pravastatin", "Rosuvastatin", "Micropirin", "Lotan plus", "Diovan", "Normiten"],
+        "Metabolic/Nutritional/Supplements": ["Vitamin D", "Magnesium supplement", "Potassium supplement", "Metformin", "Omega 3", "Calcium Carbonate Vitamin D3", "Vitamin B12", "Iron", "Folic Acid", "Calcium", "Zinc", "Probiotics 25 bilion D_H", "Complex B-100 vitamins", "Extra strength Ginko", "Vitamin K", "Colecalciferol", "Cholecalciferol 200IU", "Licorice supplement"]
+    },
+
+    "5_groups": {
+        "Neurological/Psychiatric": ["Donepezil", "Memox", "Gabapentin", "Brintellix", "Rivastigmine", "Lamictal", "Memantine", "Cipralex", "Fluoxetine", "Sertraline", "Escitalopram", "Keppra", "Levetiracetam", "Ritalin", "Bupropion Hydrochloride", "Zolpidem Tartrate", "Cymbalta", "Paroxitine", "Duloxetine"],
+        "Cardiovascular": ["Simvastatin", "Cardiloc", "Crestor", "Plavix", "Atorvastatin", "valsartan", "Losartan", "Ramipril", "Candesartan", "Vasodip", "Carvedilol", "Bisoprolol", "Aspirin", "Rosuvastatin"],
+        "Metabolic/Diabetes": ["Metformin", "Insulin", "Januvia", "Ozempic", "Forxiga", "Jardiance", "Trulicity", "Repaglinidine", "Januet", "Insulin Basaglar", "Insulin Glargine", "Insulin Tregludec", "Rybelsus"],
+        "Supplements/Vitamins": ["Vitamin D", "Magnesium supplement", "Vitamin B12", "Omega 3", "Calcium Carbonate Vitamin D3", "Calcium", "Zinc", "Complex B-100 vitamins", "Extra strength Ginko", "Vitamin K", "Colecalciferol", "Lion's Mane Mashroom"],
+        "Respiratory/Gastrointestinal/Others": ["Nexium", "Controloc", "Duoreso spiromax", "Ventolin", "Trelegy", "Seretide Diskus", "Montelukast", "Solifenacin", "Lansoprazole", "Dexilant", "Esomeprazole", "Duodart", "Butrans", "Creon", "Lercapress", "Tamsulin"]
+    },
+
+    "10_groups": {
+        "Antidepressants/Anxiolytics": ["Cipralex", "Fluoxetine", "Paroxitine", "Escitalopram", "Wellbutrin", "Brintellix", "Duloxetine", "Viepax", "Sertraline"],
+        "Antipsychotics/Neurological": ["Rivastigmine", "Donepezil", "Memantine", "Leponex", "Depalept", "Keppra", "Levetiracetam", "Lamictal", "Lamotrigine"],
+        "Cardiovascular – Statins": ["Simvastatin", "Atorvastatin", "Rosuvastatin", "Crestor", "Lipitor", "Pravastatin"],
+        "Cardiovascular – Blood Pressure": ["Cardiloc", "valsartan", "Losartan", "Ramipril", "Candesartan", "Bisoprolol", "Carvedilol", "Vasodip", "Norvasc"],
+        "Cardiovascular – Blood Thinners": ["Aspirin", "Micropirin", "Plavix", "prasugrel"],
+        "Diabetes/Metabolic": ["Metformin", "Insulin", "Januvia", "Ozempic", "Forxiga", "Jardiance", "Trulicity", "Rybelsus", "Repaglinidine"],
+        "Vitamins and Supplements": ["Vitamin D", "Magnesium supplement", "Vitamin B12", "Calcium Carbonate Vitamin D3", "Omega 3", "Zinc", "Complex B-100 vitamins", "Lion's Mane Mashroom", "Licorice supplement"],
+        "Gastrointestinal": ["Nexium", "Controloc", "Dexilant", "Esomeprazole", "Lansoprazole", "Creon", "Omeprazole"],
+        "Respiratory": ["Ventolin", "Trelegy", "Duoreso spiromax", "Montelukast", "Seretide Diskus"],
+        "Hormones/Others": ["Thyroxine", "Evorel 50", "Tadalafil", "Vagifem", "Aclasta", "Cannabis oil (specialty indica, sweet gandhi)"]
+    }
+}

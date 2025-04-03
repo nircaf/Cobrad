@@ -14,6 +14,9 @@ import seaborn as sns
 import os
 from sklearn.impute import SimpleImputer
 from xgboost import XGBClassifier
+import json
+from sklearn.cluster import KMeans
+from sklearn.decomposition import PCA
 
 def plot_model_performance(y_true, y_pred, y_prob, model_name, dataset_name,output_folder):
     """
@@ -75,10 +78,36 @@ def prepare_data_vs_controls(cases_df, controls_df = None, target_col='target'):
     y = data[target_col]
     return X, y
 
+def medications_analysis(df_cases, database_name):
+    df_cases_copy = df_cases.copy()
+    # Identify the separation point between clinical and EEG features
+    separator_index = next((i for i, col in enumerate(df_cases.columns) if 'overall_' in col), None)
+    if separator_index is None:
+        st.error("No column with 'overall_' found to separate clinical and EEG features.")
+        return
+    
+    # Split columns into clinical and EEG features
+    clinical_features = [col for col in df_cases.columns[:separator_index] if col != 'Group']
+    eeg_features = [col for col in df_cases.columns[separator_index:] if col != 'Group']
+    medication_cols = [col for col in df_cases.columns if col.startswith('medications_')]
+    # remove 'medications_' from the column names
+    df_cases.columns = [col.replace('medications_', '').strip() for col in df_cases.columns]
+    clinical_features = [col.replace('medications_', '').strip() for col in clinical_features if col != 'sum']
+    output_folder = 'medications'
+    # read utils/drug_groups.json
+    with open('utils/drug_groups.json', 'r') as f:
+        drug_groups = json.load(f)
+    
+    classify_drug_groups(df_cases, drug_groups, eeg_features, output_folder=output_folder, filename='eeg', database_name=database_name)
+    classify_drug_groups(df_cases, drug_groups, clinical_features, output_folder=output_folder, filename='clinical', database_name=database_name)
+
+        
+
 def run_data_intra(df_cases,database_name):
     clinical_columns, boxplot_columns = get_clinical_and_boxplot_cols(df_cases)
     # Visualization
     numeric_cols = df_cases.select_dtypes(include=[np.number]).columns
+
     # Iterate over clinical columns
     for col in clinical_columns:
         df_wnv3 = df_cases[df_cases[col].notna()].copy()
@@ -157,7 +186,7 @@ def train_classical_ml(X_train, y_train, X_test, y_test, dataset_name,output_fol
     plt.xlim([-1, top_n])
     plt.tight_layout()  # Adjust layout to ensure everything fits without overlap
     os.makedirs(f'{dataset_name}_figures/ml_plots/{output_folder}', exist_ok=True)
-    plt.savefig(f'{dataset_name}_figures/ml_plots/{output_folder}/{dataset_name}_XGBoost_top_{top_n}_feature_importance.png')
+    plt.savefig(f'{dataset_name}_figures/ml_plots/{output_folder}/{dataset_name}_XGB_{top_n}_feat_imp_{acc_xgb:.2f}.png')
     plt.close()
 
     return {
@@ -264,6 +293,39 @@ def train_nn_classifier(X_train_encoded, y_train, X_test_encoded, y_test, epochs
 
     return acc, auc_score, y_pred_class.numpy(), y_pred.numpy()
 
+def classify_drug_groups(df_cases, drug_groups, eeg_features, output_folder, filename, database_name):
+    """
+    Classify drug groups based on EEG features.
+
+    Parameters:
+    - df_cases: DataFrame containing EEG features and drug columns.
+    - drug_groups: Dictionary mapping drug groups to drug names.
+    - eeg_features: List of EEG feature columns.
+    - output_folder: Folder to save the classification results.
+    - filename: Name of the file to save the classification results.
+    - database_name: Name of the database for organizing output.
+
+    Returns:
+    - classification_results: Dictionary containing classification metrics for each drug group.
+    """
+    classification_results = {}
+
+    # Iterate over drug groups
+    for group_name, drugs in drug_groups.items():
+        # Find columns corresponding to the drugs in this group
+        drug_columns = [drug for drug in drugs if drug in df_cases.columns]
+        if not drug_columns:
+            continue
+
+        # Create a binary target variable for the drug group
+        df_cases[group_name] = df_cases[drug_columns].sum(axis=1) > 0
+
+        # Extract EEG features and target variable
+        X = df_cases[eeg_features].fillna(0)
+        y = df_cases[group_name].astype(int)
+        train_w_x_y(X, y, database_name, group_name)
+
+
 def process_dataset(dataset_name):
     """
     Process the specified dataset ('COBRAD' or 'WNV') including data loading,
@@ -280,9 +342,10 @@ def process_dataset(dataset_name):
     else:
         raise ValueError("Invalid dataset name. Choose 'COBRAD' or 'WNV'.")
     # Data Preparation
+    medications_analysis(df_cases, dataset_name)
     run_data_intra(df_cases,database_name=dataset_name)
-    # X, y = prepare_data_vs_controls(df_cases, controls)
-    # train_w_x_y(X, y, dataset_name)
+    X, y = prepare_data_vs_controls(df_cases, controls)
+    train_w_x_y(X, y, dataset_name)
     
 def train_w_x_y(X, y, dataset_name,output_folder):
     # Split data

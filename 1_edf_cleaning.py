@@ -35,7 +35,7 @@ def suppress_stdout():
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(os.getcwd())
 
-is_prod = False
+is_prod = not any('vscode' in arg.lower() for arg in sys.argv)
 use_multiprocessing = False
 # Suppress specific RuntimeWarnings
 warnings.filterwarnings("ignore", message="Channels contain different highpass filters. Highest filter setting will be stored.")
@@ -45,7 +45,7 @@ getcwd = os.getcwd()
 
 #%% INITIALIZATION
 directory = os.path.join(getcwd, 'EDF')
-directory = os.path.join(getcwd, 'Controls')
+# directory = os.path.join(getcwd, 'Controls')
 os_splittor = '\\' if 'nt' in os.name else '/'
 cases_project_name = 'west_nile_virus'
 cases_project_name = 'EDF'
@@ -287,18 +287,27 @@ def analyze_eeg_data(raw,is_prod,filename):
     # Step 1: Preprocessing with PyPrep
     channels = raw.ch_names
     try:
-        # remove channels that don't have EEG in their name from raw
-        raw.drop_channels([channel for channel in raw.ch_names if 'EEG' not in channel])
+        # remove channels that don't have EEG, ECG, or EOG in their name from raw
+        # raw.drop_channels([channel for channel in raw.ch_names if 'EEG' not in channel])
         # remove EEG from channel name
         raw.rename_channels({channel: channel.replace('EEG', '').strip() for channel in raw.ch_names})
+        # all channels that have EEG, their split(' ')[-1] needs to be uppercase first letter, all rest lower case
+        raw.rename_channels({channel: ' '.join([part.capitalize() if i == len(channel.split(' ')) - 1 else part for i, part in enumerate(channel.split(' '))]) if 'EEG' in channel else channel for channel in raw.ch_names})
         # rename channels based on eeg_utils.eeg_dict_convertion
-        raw.rename_channels(eeg_utils.eeg_dict_convertion)
+        valid_channels = set(raw.info['ch_names'])
+        valid_rename_dict = {k: v for k, v in eeg_utils.eeg_dict_convertion.items() if k in valid_channels}
+        raw.rename_channels(valid_rename_dict)
     except:
         pass
-    # all channels that have EEG, their split(' ')[-1] needs to be uppercase first letter, all rest lower case
-    raw.rename_channels({channel: ' '.join([part.capitalize() if i == len(channel.split(' ')) - 1 else part for i, part in enumerate(channel.split(' '))]) if 'EEG' in channel else channel for channel in raw.ch_names})
-    # drop channels that are not in eeg_utils.eeg_channels
-    raw.drop_channels([channel for channel in raw.ch_names if channel not in eeg_utils.eeg_channels])
+    for channel in raw.ch_names:
+        if channel in eeg_utils.eeg_channels:
+            raw.set_channel_types({channel: 'eeg'})
+        elif channel == 'eog':
+            raw.set_channel_types({channel: 'eog'})
+        elif channel == 'ecg':
+            raw.set_channel_types({channel: 'ecg'})
+        else:
+            raw.set_channel_types({channel: 'misc'})
     plot_not_prod(raw,is_prod,'pre_clean1')
     # Clean data
     # Filter the data
@@ -345,12 +354,16 @@ def analyze_eeg_data(raw,is_prod,filename):
     info = epochs_clean.info  # Use the info from the epochs
     raw = mne.io.RawArray(reshaped_data, info)
     plot_not_prod(raw,is_prod,'AutoReject5')
-    eeg_data = raw.get_data()
+    # save spec_data to pickle in pickles/project_name/filename
+    with open(f'pickles/{project_name}/{filename}.pkl', 'wb') as f:
+        pickle.dump(raw, f)
+    raw_eeg = raw.copy().pick_types(eeg=True)
+    eeg_data = raw_eeg.get_data()
     # eeg_data sklearn.preprocessing.MinMaxScaler minmax norm
     # eeg_data = MinMaxScaler().fit_transform(eeg_data)
     # Define window parameters
     window_size_sec = 1  # 1-second windows for sliding
-    sf = raw.info['sfreq']
+    sf = raw_eeg.info['sfreq']
     window_size = int(window_size_sec * sf)
     min_duration_sec = 5  # Minimum duration for PSWE
     
@@ -446,7 +459,6 @@ def analyze_eeg_data(raw,is_prod,filename):
             bp /= np.trapz(psd, freqs, axis=1)
 
         return bp
-    sf = raw.info['sfreq']
     delta_power = bandpower(eeg_data, sf, [1, 4])
     theta_power = bandpower(eeg_data, sf, [4, 8])
     alpha_power = bandpower(eeg_data, sf, [8, 12])
@@ -460,9 +472,7 @@ def analyze_eeg_data(raw,is_prod,filename):
     # Compute FFT
     fft_data = np.fft.fft(eeg_data, axis=1)
     fft_freqs = np.fft.fftfreq(eeg_data.shape[1], 1/sf)
-    # save spec_data to pickle in pickles/project_name/filename
-    with open(f'pickles/{project_name}/{filename}.pkl', 'wb') as f:
-        pickle.dump(raw, f)
+
     metadata = {}
     metadata['overall_pswe_median_percentage'] = overall_pswe_median_percentage
     metadata['overall_pswe_events_per_minute'] = overall_pswe_events_per_minute
@@ -487,7 +497,7 @@ def analyze_eeg_data(raw,is_prod,filename):
     metadata['overall_mpf_median'] = np.median(mpf_array)  
     metadata['overall_df_mean'] = df_array.mean()
     metadata['overall_dfv_std'] = dfv_array.mean()  
-    for i, channel in enumerate(raw.ch_names):
+    for i, channel in enumerate(raw_eeg.ch_names):
         metadata[f'min_EEG {channel}'] = eeg_data.min(axis=1)[i]
         metadata[f'max_EEG {channel}'] = eeg_data.max(axis=1)[i]
         metadata[f'mean_EEG {channel}'] = eeg_data.mean(axis=1)[i]
@@ -522,14 +532,6 @@ def process_file(row,filename,is_prod):
     # if file temps/{row['file_name']}.csv exists
     if f'{row["file_name"]}.csv' in os.listdir(temp_dir):
         return 
-    # load file name csv
-    try:
-        df_csv = pd.read_csv(filename)
-        # if file name in csv
-        if row['file_name'] in df_csv['file_name'].values:
-            return 
-    except:
-        pass
     if metadata:
         channels = raw.ch_names
         # Check the duration of the recording
@@ -577,6 +579,14 @@ def process_file(row,filename,is_prod):
                     df_segment = pd.DataFrame([segment_metadata])
                     df_segment.to_csv(f'{temp_dir}/{segment_filename}', index=False)
         else:
+            # load file name csv
+            try:
+                df_csv = pd.read_csv(filename)
+                # if file name in csv
+                if row['file_name'] in df_csv['file_name'].values:
+                    return 
+            except:
+                pass
             eeg_metadata = analyze_eeg_data(raw,is_prod,row["file_name"])
             if eeg_metadata is None:
                 # save empty csv file
@@ -602,7 +612,7 @@ if __name__ == "__main__":
     # remove duplicates subset file_name
     df.drop_duplicates(subset='file_name', inplace=True)
     # leave only the files that contains 
-    # df = df[df['file_name'].str.contains('028')]
+    df = df[df['file_name'].str.contains('010')]
     # Set multiprocessing flag
     filename = f'{project_name}.csv'
     if use_multiprocessing:
