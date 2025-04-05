@@ -21,6 +21,7 @@ import yasa
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.decomposition import PCA
 from contextlib import contextmanager
+from utils.eeg_utils import *
 
 @contextmanager
 def suppress_stdout():
@@ -256,22 +257,6 @@ def read_edf_mne(file_path):
     }
     return metadata, raw
 
-def find_consecutive_sequences(events, min_length=5):
-    sequences = []
-    temp_seq = [events[0]]
-
-    for i in range(1, len(events)):
-        if events[i] == events[i - 1] + 1:
-            temp_seq.append(events[i])
-        else:
-            if len(temp_seq) >= min_length:
-                sequences.append(temp_seq)
-            temp_seq = [events[i]]
-
-    if len(temp_seq) >= min_length:  # Check the last sequence
-        sequences.append(temp_seq)
-
-    return sequences
 
 def plot_not_prod(raw,is_prod,filename):
     if not is_prod:
@@ -357,172 +342,9 @@ def analyze_eeg_data(raw,is_prod,filename):
     # save spec_data to pickle in pickles/project_name/filename
     with open(f'pickles/{project_name}/{filename}.pkl', 'wb') as f:
         pickle.dump(raw, f)
-    raw_eeg = raw.copy().pick_types(eeg=True)
-    eeg_data = raw_eeg.get_data()
-    # eeg_data sklearn.preprocessing.MinMaxScaler minmax norm
-    # eeg_data = MinMaxScaler().fit_transform(eeg_data)
-    # Define window parameters
-    window_size_sec = 1  # 1-second windows for sliding
-    sf = raw_eeg.info['sfreq']
-    window_size = int(window_size_sec * sf)
-    min_duration_sec = 5  # Minimum duration for PSWE
-    
-    # Initialize lists to store results
-    psd_list = []
-    mpf_list = []
-    pswe_events_per_channel = []
-    df_list = []
-    dfv_list = []
-    
-    # Compute power spectral density (PSD) and MPF for each window and each channel
-    for channel_data in eeg_data:
-        channel_psd_list = []
-        channel_mpf_list = []
-        channel_pswe_events = []
-        channel_df_list = []
-        
-        for start in range(0, channel_data.shape[0] - window_size + 1, window_size):
-            window_data = channel_data[start:start + window_size]
-            window_psd, window_freqs = mne.time_frequency.psd_array_welch(window_data, sf, fmin=1, fmax=40, n_fft=int(sf))
-            window_psd = window_psd.squeeze()
-            window_mpf = np.sum(window_psd * window_freqs) / np.sum(window_psd)
-            dominant_freq = window_freqs[np.argmax(window_psd)]
-    
-            channel_psd_list.append(window_psd)
-            channel_mpf_list.append(window_mpf)
-            channel_df_list.append(dominant_freq)
-            
-            # Detect Paroxysmal Slow Wave Events (PSWE)
-            if window_mpf < 6.0:
-                channel_pswe_events.append(start / sf)
-        
-        psd_list.append(channel_psd_list)
-        mpf_list.append(channel_mpf_list)
-        pswe_events_per_channel.append(channel_pswe_events)
-        df_list.append(channel_df_list)
-        dfv_list.append(np.std(channel_df_list))
-    
-    # Convert lists to arrays
-    psd_array = np.array(psd_list)
-    mpf_array = np.array(mpf_list)
-    df_array = np.array(df_list)
-    dfv_array = np.array(dfv_list)
-    
-    # Aggregate PSWE events per channel
-    pswe_stats = []
-    overall_pswe_durations = []
+    eeg_data_to_features(raw)
 
-    for channel_pswe_events in pswe_events_per_channel:
-        channel_pswe_events = np.array(channel_pswe_events)
-        if len(channel_pswe_events) > 0:
-            pswe_sequences = find_consecutive_sequences(channel_pswe_events, min_duration_sec)
-            pswe_durations = [len(seq) for seq in pswe_sequences]
-        else:
-            pswe_durations = np.array([])
 
-        # Calculate PSWE statistics per channel
-        total_duration = eeg_data.shape[1] / sf
-        pswe_total_duration = np.sum(pswe_durations)
-        pswe_percentage = (pswe_total_duration / total_duration) * 100
-        pswe_events_per_minute = len(pswe_durations) / (total_duration / 60)
-        pswe_avg_length = np.mean(pswe_durations) if len(pswe_durations) > 0 else 0
-        pswe_stats.append({
-            'pswe_percentage': pswe_percentage,
-            'pswe_events_per_minute': pswe_events_per_minute,
-            'pswe_avg_length': pswe_avg_length
-        })
-        # Collect overall PSWE durations
-        overall_pswe_durations.extend(pswe_durations)
-
-    # Calculate overall PSWE statistics
-    overall_pswe_total_duration = np.median(overall_pswe_durations)
-    overall_pswe_median_percentage = (overall_pswe_total_duration / total_duration) * 100
-    overall_pswe_events_per_minute = len(overall_pswe_durations) / ((total_duration*len(pswe_events_per_channel)) / 60)
-    overall_pswe_avg_length = np.mean(overall_pswe_durations) if len(overall_pswe_durations) > 0 else 0
-    
-    # Compute band power
-    def bandpower(data, sf, band, window_sec=None, relative=False):
-        from scipy.signal import welch
-        band = np.asarray(band)
-        low, high = band
-
-        if window_sec is not None:
-            nperseg = window_sec * sf
-        else:
-            nperseg = (2 / low) * sf
-
-        freqs, psd = welch(data, sf, nperseg=nperseg)
-        idx_band = np.logical_and(freqs >= low, freqs <= high)
-        bp = np.trapz(psd[:, idx_band], freqs[idx_band], axis=1)
-
-        if relative:
-            bp /= np.trapz(psd, freqs, axis=1)
-
-        return bp
-    delta_power = bandpower(eeg_data, sf, [1, 4])
-    theta_power = bandpower(eeg_data, sf, [4, 8])
-    alpha_power = bandpower(eeg_data, sf, [8, 12])
-    beta_power = bandpower(eeg_data, sf, [12, 30])
-    gamma_power = bandpower(eeg_data, sf, [30, 100])
-    
-    # Compute additional statistics
-    skewness = np.apply_along_axis(lambda x: pd.Series(x).skew(), 1, eeg_data)
-    kurtosis = np.apply_along_axis(lambda x: pd.Series(x).kurt(), 1, eeg_data)
-    
-    # Compute FFT
-    fft_data = np.fft.fft(eeg_data, axis=1)
-    fft_freqs = np.fft.fftfreq(eeg_data.shape[1], 1/sf)
-
-    metadata = {}
-    metadata['overall_pswe_median_percentage'] = overall_pswe_median_percentage
-    metadata['overall_pswe_events_per_minute'] = overall_pswe_events_per_minute
-    metadata['overall_pswe_avg_length'] = overall_pswe_avg_length
-    metadata['overall_min'] = eeg_data.min()
-    metadata['overall_max'] = eeg_data.max()
-    metadata['overall_mean'] = eeg_data.mean()
-    metadata['overall_median'] = np.median(eeg_data)
-    metadata['overall_std'] = eeg_data.std()
-    metadata['overall_psd_mean'] = psd_array.mean()
-    metadata['overall_psd_std'] = psd_array.std()
-    metadata['overall_fft_mean'] = np.abs(fft_data).mean()
-    metadata['overall_fft_std'] = np.abs(fft_data).std()
-    metadata['overall_delta_power'] = delta_power.mean()
-    metadata['overall_theta_power'] = theta_power.mean()
-    metadata['overall_alpha_power'] = alpha_power.mean()
-    metadata['overall_beta_power'] = beta_power.mean()
-    metadata['overall_gamma_power'] = gamma_power.mean()
-    metadata['overall_skewness'] = skewness.mean()
-    metadata['overall_kurtosis'] = kurtosis.mean()
-    metadata['overall_mpf_mean'] = mpf_array.mean()
-    metadata['overall_mpf_median'] = np.median(mpf_array)  
-    metadata['overall_df_mean'] = df_array.mean()
-    metadata['overall_dfv_std'] = dfv_array.mean()  
-    for i, channel in enumerate(raw_eeg.ch_names):
-        metadata[f'min_EEG {channel}'] = eeg_data.min(axis=1)[i]
-        metadata[f'max_EEG {channel}'] = eeg_data.max(axis=1)[i]
-        metadata[f'mean_EEG {channel}'] = eeg_data.mean(axis=1)[i]
-        metadata[f'median_EEG {channel}'] = np.median(eeg_data, axis=1)[i]
-        metadata[f'std_EEG {channel}'] = eeg_data.std(axis=1)[i]
-        metadata[f'psd_mean_EEG {channel}'] = psd_array.mean(axis=2).mean(axis=1)[i]
-        metadata[f'psd_std_EEG {channel}'] = psd_array.std(axis=2).mean(axis=1)[i]
-        metadata[f'fft_mean_EEG {channel}'] = np.abs(fft_data).mean(axis=1)[i]
-        metadata[f'fft_std_EEG {channel}'] = np.abs(fft_data).std(axis=1)[i]
-        metadata[f'delta_power_EEG {channel}'] = delta_power[i]
-        metadata[f'theta_power_EEG {channel}'] = theta_power[i]
-        metadata[f'alpha_power_EEG {channel}'] = alpha_power[i]
-        metadata[f'beta_power_EEG {channel}'] = beta_power[i]
-        metadata[f'gamma_power_EEG {channel}'] = gamma_power[i]
-        metadata[f'skewness_EEG {channel}'] = skewness[i]
-        metadata[f'kurtosis_EEG {channel}'] = kurtosis[i]
-        metadata[f'mean_mpf_EEG {channel}'] = mpf_array.mean(axis=1)[i]
-        metadata[f'median_mpf_EEG {channel}'] = np.median(mpf_array, axis=1)[i]
-        metadata[f'pswe_percentage_EEG {channel}'] = pswe_stats[i]['pswe_percentage']
-        metadata[f'pswe_events_per_minute_EEG {channel}'] = pswe_stats[i]['pswe_events_per_minute']
-        metadata[f'pswe_avg_length_EEG {channel}'] = pswe_stats[i]['pswe_avg_length']
-        metadata[f'dfv_mean_EEG {channel}'] = df_array.mean(axis=1)[i]
-        metadata[f'dfv_std_EEG {channel}'] = dfv_array[i]
-        
-    return metadata
 
 def process_file(row,filename,is_prod):
     metadata, raw = read_edf_mne(row['file_path'])

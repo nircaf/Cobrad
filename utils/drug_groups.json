@@ -24,5 +24,19 @@
         "Gastrointestinal": ["Nexium", "Controloc", "Dexilant", "Esomeprazole", "Lansoprazole", "Creon", "Omeprazole"],
         "Respiratory": ["Ventolin", "Trelegy", "Duoreso spiromax", "Montelukast", "Seretide Diskus"],
         "Hormones/Others": ["Thyroxine", "Evorel 50", "Tadalafil", "Vagifem", "Aclasta", "Cannabis oil (specialty indica, sweet gandhi)"]
+    },
+    "Custom_groups": {
+        "ASM": ["Gabapentin", "Kepra", "Lamictal", "Lamotrigine", "Depalept", "Lyrica", "Levetiracetam"],
+    
+        "Anti-depression/Anxiety": ["Donepezil", "Brintellix", "Wellbutrin", "Cipralex", "Paroxitine", "Fluoxetine", "Sertraline", "Escitalopram", "Cymbalta", "Duloxetine", "Viepax", "Lustral", "Recital", "Isopram", "Bupropion Hydrochloride", "Trazodil"],
+    
+        "Antipsychotic": ["Memantine", "Rivastigmine", "Exelon", "Memox", "Leponex"],
+    
+        "Sleep": ["Circadin", "Zolpidem Tartrate", "Bondormin", "Zodorm", "Ambien"],
+    
+        "Pain": ["Cannabis oil (specialty indica, sweet gandhi)", "Butrans", "Targin", "Lyrica"],
+    
+        "Others": ["Simvastatin", "Crestor", "Atorvastatin", "Metformin", "Insulin", "Januvia", "Ozempic", "Forxiga", "Jardiance", "Trulicity", "Vitamin D", "Magnesium supplement", "Potassium supplement", "Omega 3", "Calcium Carbonate Vitamin D3", "Ventolin", "Seretide Diskus", "Nexium", "Controloc", "Aspirin", "Plavix", "Micropirin", "valsartan", "Cardiloc", "Bisoprolol", "Carvedilol", "Candesartan", "Norvasc", "Thyroxine", "Aclasta", "Evorel 50", "Vagifem", "Tadalafil", "Licorice supplement", "Lion's Mane Mashroom", "Probiotics 25 bilion D_H", "Zinc", "Complex B-100 vitamins", "Extra strength Ginko"]
     }
+    
 }

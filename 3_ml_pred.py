@@ -62,6 +62,8 @@ def plot_model_performance(y_true, y_pred, y_prob, model_name, dataset_name,outp
 def prepare_data_vs_controls(cases_df, controls_df = None, target_col='target'):
     """Prepare data by combining cases and controls with common features."""
     common_cols = list(set(cases_df.columns) & set(controls_df.columns))
+    # remove columns duration_min and number_of_signals
+    common_cols = [col for col in common_cols if col not in ['duration_min', 'number_of_signals']]
     cases = cases_df[common_cols].copy()
     controls = controls_df[common_cols].copy()
 
@@ -110,6 +112,8 @@ def run_data_intra(df_cases,database_name):
 
     # Iterate over clinical columns
     for col in clinical_columns:
+        # Ensure column labels are unique
+        df_cases = df_cases.loc[:, ~df_cases.columns.duplicated()].copy()
         df_wnv3 = df_cases[df_cases[col].notna()].copy()
         unique_values = df_wnv3[col].unique()
         print(f'Analyzing {col} with {len(unique_values)} unique values')
@@ -149,14 +153,6 @@ def train_classical_ml(X_train, y_train, X_test, y_test, dataset_name,output_fol
     X_train_scaled = scaler.fit_transform(X_train)
     X_test_scaled = scaler.transform(X_test)
 
-    # Logistic Regression
-    lr = LogisticRegression(max_iter=1000)
-    lr.fit(X_train_scaled, y_train)
-    y_pred_lr = lr.predict(X_test_scaled)
-    y_prob_lr = lr.predict_proba(X_test_scaled)[:, 1]
-    acc_lr = accuracy_score(y_test, y_pred_lr)
-    auc_lr = roc_auc_score(y_test, y_prob_lr)
-
     # XGBoost
     xgb = XGBClassifier(use_label_encoder=False, eval_metric='logloss', random_state=42)
     xgb.fit(X_train_scaled, y_train)
@@ -190,7 +186,6 @@ def train_classical_ml(X_train, y_train, X_test, y_test, dataset_name,output_fol
     plt.close()
 
     return {
-        'Logistic_Regression': (acc_lr, auc_lr, y_pred_lr, y_prob_lr),
         'XGBoost': (acc_xgb, auc_xgb, y_pred_xgb, y_prob_xgb)
     }
 
@@ -345,11 +340,11 @@ def process_dataset(dataset_name):
     medications_analysis(df_cases, dataset_name)
     run_data_intra(df_cases,database_name=dataset_name)
     X, y = prepare_data_vs_controls(df_cases, controls)
-    train_w_x_y(X, y, dataset_name)
+    train_w_x_y(X, y, dataset_name,'vs_controls')
     
 def train_w_x_y(X, y, dataset_name,output_folder):
     # Split data
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
     # Classical ML Models
     results_classical = train_classical_ml(X_train, y_train, X_test, y_test, dataset_name,output_folder)
     for model_name, (acc, auc_score, y_pred, y_prob) in results_classical.items():

@@ -16,6 +16,8 @@ from scipy.signal import spectrogram
 import statsmodels.api as sm
 import streamlit as st
 import json
+import pickle
+
 eeg_channels = ['Fp1', 'Fp2', 'F3', 'F4', 'C3', 'C4', 'P3', 'P4', 'O1', 'O2', 'F7',
        'F8', 'T3', 'T4', 'T5', 'T6', 'Fz', 'Cz', 'Pz', 'A1','A2', 'Fpz', 'Oz']
 
@@ -403,8 +405,196 @@ def wnv_get_files():
     cases_group_name = 'WNV'
     return df_wnv,patients_folder,control_folder,controls,df_wnv2,cases_group_name
 
+
+def find_consecutive_sequences(events, min_length=5):
+    sequences = []
+    temp_seq = [events[0]]
+
+    for i in range(1, len(events)):
+        if events[i] == events[i - 1] + 1:
+            temp_seq.append(events[i])
+        else:
+            if len(temp_seq) >= min_length:
+                sequences.append(temp_seq)
+            temp_seq = [events[i]]
+
+    if len(temp_seq) >= min_length:  # Check the last sequence
+        sequences.append(temp_seq)
+
+    return sequences
+
+def eeg_data_to_features(raw):
+    raw_eeg = raw.copy().pick_types(eeg=True)
+    eeg_data = raw_eeg.get_data()
+    # eeg_data sklearn.preprocessing.MinMaxScaler minmax norm
+    # eeg_data = MinMaxScaler().fit_transform(eeg_data)
+    # Define window parameters
+    window_size_sec = 1  # 1-second windows for sliding
+    sf = raw_eeg.info['sfreq']
+    window_size = int(window_size_sec * sf)
+    min_duration_sec = 5  # Minimum duration for PSWE
+    
+    # Initialize lists to store results
+    psd_list = []
+    mpf_list = []
+    pswe_events_per_channel = []
+    df_list = []
+    dfv_list = []
+    
+    # Compute power spectral density (PSD), MPF, and other features for each window and each channel
+    for channel_data in eeg_data:
+        channel_psd_list = []
+        channel_mpf_list = []
+        channel_pswe_events = []
+        channel_df_list = []
+
+        for start in range(0, channel_data.shape[0] - window_size + 1, window_size):
+            window_data = channel_data[start:start + window_size]
+            window_psd, window_freqs = mne.time_frequency.psd_array_welch(window_data, sf, fmin=1, fmax=40, n_fft=int(sf))
+            window_psd = window_psd.squeeze()
+            
+            # Compute MPF and dominant frequency in the same loop
+            window_mpf = np.sum(window_psd * window_freqs) / np.sum(window_psd)
+            dominant_freq = window_freqs[np.argmax(window_psd)]
+
+            channel_psd_list.append(window_psd)
+            channel_mpf_list.append(window_mpf)
+            channel_df_list.append(dominant_freq)
+
+            # Detect Paroxysmal Slow Wave Events (PSWE)
+            if window_mpf < 6.0:
+                channel_pswe_events.append(start / sf)
+
+        psd_list.append(channel_psd_list)
+        mpf_list.append(channel_mpf_list)
+        pswe_events_per_channel.append(channel_pswe_events)
+        df_list.append(channel_df_list)
+        dfv_list.append(np.std(channel_df_list))
+    
+    # Convert lists to arrays
+    psd_array = np.array(psd_list)
+    mpf_array = np.array(mpf_list)
+    df_array = np.array(df_list)
+    dfv_array = np.array(dfv_list)
+    
+    # Aggregate PSWE events per channel
+    pswe_stats = []
+    overall_pswe_durations = []
+
+    for channel_pswe_events in pswe_events_per_channel:
+        channel_pswe_events = np.array(channel_pswe_events)
+        if len(channel_pswe_events) > 0:
+            pswe_sequences = find_consecutive_sequences(channel_pswe_events, min_duration_sec)
+            pswe_durations = [len(seq) for seq in pswe_sequences]
+        else:
+            pswe_durations = np.array([])
+
+        # Calculate PSWE statistics per channel
+        total_duration = eeg_data.shape[1] / sf
+        pswe_total_duration = np.sum(pswe_durations)
+        pswe_percentage = (pswe_total_duration / total_duration) * 100
+        pswe_events_per_minute = len(pswe_durations) / (total_duration / 60)
+        pswe_avg_length = np.mean(pswe_durations) if len(pswe_durations) > 0 else 0
+        pswe_stats.append({
+            'pswe_percentage': pswe_percentage,
+            'pswe_events_per_minute': pswe_events_per_minute,
+            'pswe_avg_length': pswe_avg_length
+        })
+        # Collect overall PSWE durations
+        overall_pswe_durations.extend(pswe_durations)
+
+    # Calculate overall PSWE statistics
+    overall_pswe_total_duration = np.median(overall_pswe_durations)
+    overall_pswe_median_percentage = (overall_pswe_total_duration / total_duration) * 100
+    overall_pswe_events_per_minute = len(overall_pswe_durations) / ((total_duration*len(pswe_events_per_channel)) / 60)
+    overall_pswe_avg_length = np.mean(overall_pswe_durations) if len(overall_pswe_durations) > 0 else 0
+    
+    # Compute band power
+    def bandpower(data, sf, band, window_sec=None, relative=False):
+        from scipy.signal import welch
+        band = np.asarray(band)
+        low, high = band
+
+        if window_sec is not None:
+            nperseg = window_sec * sf
+        else:
+            nperseg = (2 / low) * sf
+
+        freqs, psd = welch(data, sf, nperseg=nperseg)
+        idx_band = np.logical_and(freqs >= low, freqs <= high)
+        bp = np.trapz(psd[:, idx_band], freqs[idx_band], axis=1)
+
+        if relative:
+            bp /= np.trapz(psd, freqs, axis=1)
+
+        return bp
+    delta_power = bandpower(eeg_data, sf, [1, 4])
+    theta_power = bandpower(eeg_data, sf, [4, 8])
+    alpha_power = bandpower(eeg_data, sf, [8, 12])
+    beta_power = bandpower(eeg_data, sf, [12, 30])
+    gamma_power = bandpower(eeg_data, sf, [30, 100])
+    
+    # Compute additional statistics
+    skewness = np.apply_along_axis(lambda x: pd.Series(x).skew(), 1, eeg_data)
+    kurtosis = np.apply_along_axis(lambda x: pd.Series(x).kurt(), 1, eeg_data)
+    
+    # Compute FFT
+    fft_data = np.fft.fft(eeg_data, axis=1)
+    fft_freqs = np.fft.fftfreq(eeg_data.shape[1], 1/sf)
+
+    metadata = {}
+    metadata['overall_pswe_median_percentage'] = overall_pswe_median_percentage
+    metadata['overall_pswe_events_per_minute'] = overall_pswe_events_per_minute
+    metadata['overall_pswe_avg_length'] = overall_pswe_avg_length
+    metadata['overall_min'] = eeg_data.min()
+    metadata['overall_max'] = eeg_data.max()
+    metadata['overall_mean'] = eeg_data.mean()
+    metadata['overall_median'] = np.median(eeg_data)
+    metadata['overall_std'] = eeg_data.std()
+    metadata['overall_psd_mean'] = psd_array.mean()
+    metadata['overall_psd_std'] = psd_array.std()
+    metadata['overall_fft_mean'] = np.abs(fft_data).mean()
+    metadata['overall_fft_std'] = np.abs(fft_data).std()
+    metadata['overall_delta_power'] = delta_power.mean()
+    metadata['overall_theta_power'] = theta_power.mean()
+    metadata['overall_alpha_power'] = alpha_power.mean()
+    metadata['overall_beta_power'] = beta_power.mean()
+    metadata['overall_gamma_power'] = gamma_power.mean()
+    metadata['overall_skewness'] = skewness.mean()
+    metadata['overall_kurtosis'] = kurtosis.mean()
+    metadata['overall_mpf_mean'] = mpf_array.mean()
+    metadata['overall_mpf_median'] = np.median(mpf_array)  
+    metadata['overall_df_mean'] = df_array.mean()
+    metadata['overall_dfv_std'] = dfv_array.mean()  
+    for i, channel in enumerate(raw_eeg.ch_names):
+        metadata[f'min_EEG {channel}'] = eeg_data.min(axis=1)[i]
+        metadata[f'max_EEG {channel}'] = eeg_data.max(axis=1)[i]
+        metadata[f'mean_EEG {channel}'] = eeg_data.mean(axis=1)[i]
+        metadata[f'median_EEG {channel}'] = np.median(eeg_data, axis=1)[i]
+        metadata[f'std_EEG {channel}'] = eeg_data.std(axis=1)[i]
+        metadata[f'psd_mean_EEG {channel}'] = psd_array.mean(axis=2).mean(axis=1)[i]
+        metadata[f'psd_std_EEG {channel}'] = psd_array.std(axis=2).mean(axis=1)[i]
+        metadata[f'fft_mean_EEG {channel}'] = np.abs(fft_data).mean(axis=1)[i]
+        metadata[f'fft_std_EEG {channel}'] = np.abs(fft_data).std(axis=1)[i]
+        metadata[f'delta_power_EEG {channel}'] = delta_power[i]
+        metadata[f'theta_power_EEG {channel}'] = theta_power[i]
+        metadata[f'alpha_power_EEG {channel}'] = alpha_power[i]
+        metadata[f'beta_power_EEG {channel}'] = beta_power[i]
+        metadata[f'gamma_power_EEG {channel}'] = gamma_power[i]
+        metadata[f'skewness_EEG {channel}'] = skewness[i]
+        metadata[f'kurtosis_EEG {channel}'] = kurtosis[i]
+        metadata[f'mean_mpf_EEG {channel}'] = mpf_array.mean(axis=1)[i]
+        metadata[f'median_mpf_EEG {channel}'] = np.median(mpf_array, axis=1)[i]
+        metadata[f'pswe_percentage_EEG {channel}'] = pswe_stats[i]['pswe_percentage']
+        metadata[f'pswe_events_per_minute_EEG {channel}'] = pswe_stats[i]['pswe_events_per_minute']
+        metadata[f'pswe_avg_length_EEG {channel}'] = pswe_stats[i]['pswe_avg_length']
+        metadata[f'dfv_mean_EEG {channel}'] = df_array.mean(axis=1)[i]
+        metadata[f'dfv_std_EEG {channel}'] = dfv_array[i]       
+     
+    return metadata
+
 #%% COBRAD
-def cobrad_get_files(num_samples_per_patient=0):
+def cobrad_get_files(num_samples_per_patient=0,only_awake=False):
     # read sheets clinical, medications, npi-q, epworth,isi, ecpg_12 from COBRAD_clinical_24022025.xlsx
     sheets_to_read = ['clinical', 'medications', 'npi-q', 'epworth', 'isi', 'ecog_12','Sheet4','seizures']
     sheets_to_sum_vals = ['epworth', 'isi', 'ecog_12','Sheet4','npi-q','seizures', 'medications']
@@ -461,7 +651,10 @@ def cobrad_get_files(num_samples_per_patient=0):
     df_wnv.columns = df_wnv.columns.str.replace('.', '_').str.replace('<', '').str.replace('>', '')
     patients_folder = "EDF"
     control_folder = f"{patients_folder}_controls"
-    case_file = f"{patients_folder}.csv"
+    if only_awake:
+        case_file = f"{patients_folder}_awake.csv"
+    else:
+        case_file = f"{patients_folder}.csv"
     controls = pd.read_csv(f'{control_folder}.csv')
     controls['ID'] = controls['file_name'].apply(lambda x: x.split('_')[0]).astype(str)
     numeric_cols = controls.select_dtypes(include=[np.number]).columns
@@ -585,8 +778,236 @@ def custom_describe(df):
     # round 2
     return df_ret.round(2)
 
+import mne
+import yasa
+import matplotlib.pyplot as plt
+import numpy as np
+
+def detect_sleep_stages(raw, plot=True):
+    """
+    Detect sleep stages using YASA on a selected EEG channel.
+
+    Parameters:
+    -----------
+    raw : mne.io.Raw
+        MNE Raw object containing the EEG data.
+    channel : str, optional
+        The channel name to use for sleep staging (default is 'Fpz').
+    epoch_sec : int, optional
+        The length (in seconds) of each epoch (default is 30).
+    plot : bool, optional
+        If True, plots the hypnogram of the sleep stages.
+
+    Returns:
+    --------
+    predicted_stages : numpy.ndarray
+        Array of predicted sleep stage labels for each epoch.
+    """
+    # Check if the chosen channel is available in the raw data
+    channels = raw.info['ch_names']
+    # Fz if exists if not C4 if not C3
+    eeg_name = 'Fz' if 'Fz' in channels else 'C4' if 'C4' in channels else 'C3'
+    # Initialize and run YASA's sleep staging
+    ss = yasa.SleepStaging(raw,eeg_name=eeg_name)
+    predicted_stages = ss.predict()
+
+    # Plot hypnogram if requested
+    if plot:
+        plt.figure(figsize=(10, 4))
+        plt.plot(predicted_stages, drawstyle='steps-post')
+        plt.xlabel('Epochs (sec segments)')
+        plt.ylabel('Sleep Stage')
+        plt.title(f'Sleep Staging Hypnogram from {eeg_name}')
+        # Map stages to labels (0 = Wake, 1 = N1, 2 = N2, 3 = N3, 5 = REM)
+        plt.yticks([0, 1, 2, 3, 5], ['W', 'N1', 'N2', 'N3', 'REM'])
+        plt.grid(True)
+        plt.show(block=False)
+    return predicted_stages
+
+def fix_predicted_stages(predicted_stages, min_non_w=10):
+    """
+    Fix the predicted_stages array by turning sequences of fewer than `min_non_w` 'W' values
+    into the nearest neighboring stage.
+
+    Parameters:
+    -----------
+    predicted_stages : np.ndarray
+        Array of predicted sleep stage labels.
+    min_non_w : int
+        Minimum number of consecutive 'W' values to keep as 'W'.
+
+    Returns:
+    --------
+    np.ndarray
+        Fixed predicted_stages array.
+    """
+    fixed_stages = predicted_stages.copy()
+    w_indices = np.where(predicted_stages == 'W')[0]  # Indices of 'W' values
+
+    # Group consecutive indices of 'W' values
+    groups = np.split(w_indices, np.where(np.diff(w_indices) != 1)[0] + 1)
+
+    for group in groups:
+        if len(group) < min_non_w and len(group) > 0:
+            # Replace with the nearest neighboring stage
+            start_idx = group[0]
+            end_idx = group[-1]
+
+            # Get the value before the group (if it exists)
+            before_value = fixed_stages[start_idx - 1] if start_idx > 0 else None
+            # Get the value after the group (if it exists)
+            after_value = fixed_stages[end_idx + 1] if end_idx + 1 < len(fixed_stages) else None
+
+            # Decide the replacement value
+            if before_value == after_value:
+                replacement_value = before_value  # Use the same value if both neighbors are the same
+            elif before_value is not None:
+                replacement_value = before_value  # Prefer the value before the group
+            elif after_value is not None:
+                replacement_value = after_value  # Otherwise, use the value after the group
+            else:
+                replacement_value = 'W'  # Default to 'W' if no neighbors exist
+
+            # Replace the group with the determined value
+            fixed_stages[group] = replacement_value
+
+    return fixed_stages
+
+def detect_sleep(cases_group_name):
+    # Get pickle files from pickles/{cases_group_name}/*.pkl
+    case_files = []
+    for root, dirs, files in os.walk(f'pickles/{cases_group_name}'):
+        for file in files:
+            if file.endswith('.pkl'):
+                case_files.append(os.path.join(root, file))
+
+    # Create output directory for wake data
+    wake_dir = f'pickles/wake_{cases_group_name}'
+    os.makedirs(wake_dir, exist_ok=True)
+
+    for case_file in case_files:
+        # Load the file
+        with open(case_file, 'rb') as f:
+            raw = pickle.load(f)
+
+        # Get the ID from the file name
+        ID = os.path.basename(case_file).split('.')[0].split(' ')[0]
+
+        # Detect sleep stages
+        predicted_stages = detect_sleep_stages(raw, plot=False)
+        duration_sec = raw.times[-1] - raw.times[0]
+        epoch_length_sec = int(duration_sec / len(predicted_stages))
+        # min_non_w to be 10 minutes. based on epoch_length_sec
+        min_non_w = int(10 * 60 / epoch_length_sec)
+        # Fix the predicted_stages array
+        predicted_stages = fix_predicted_stages(predicted_stages, min_non_w=min_non_w)
+
+        # If there are no awake ('W') segments, skip this file
+        if not any(predicted_stages == 'W'):
+            print(f"No awake segments found for ID {ID}. Skipping...")
+            continue
+
+        # Get the indices of the awake ('W') segments
+        awake_indices = np.where(predicted_stages == 'W')[0]
+        # Group consecutive awake indices
+        awake_groups = np.split(awake_indices, np.where(np.diff(awake_indices) != 1)[0] + 1)
+        # Initialize an empty list to store the awake segments
+        awake_segments = []
+        # Convert awake groups to time in seconds and crop the raw data
+        for group in awake_groups:
+            start_time = group[0] * epoch_length_sec
+            end_time = (group[-1] + 1) * epoch_length_sec
+            awake_segments.append(raw.copy().crop(tmin=start_time, tmax=end_time, include_tmax=False))
+
+        # Concatenate all awake segments into a single raw object
+        awake_raw = mne.concatenate_raws(awake_segments)
+
+        # Save the clipped raw data to a new pickle file
+        wake_file_path = os.path.join(f'{case_file}')
+        # remove .edf and .csv
+        wake_file_path = wake_file_path.replace('.edf', '').replace('.csv', '')
+        # replace 'EDF' with 'wake_EDF'
+        wake_file_path = wake_file_path.replace('EDF', f'wake_{cases_group_name}')
+        with open(wake_file_path, 'wb') as f:
+            pickle.dump(awake_raw, f)
+
+        print(f"Saved awake data for ID {ID} to {wake_file_path}")
+    return
+
+def read_pkl_files(path):
+    """
+    Read all pickle files from a given path, process them per ID, and save individual metadata as CSV files.
+    Merge all individual CSV files into one consolidated CSV file.
+
+    Parameters:
+    -----------
+    path : str
+        Path to the directory containing the pickle files.
+
+    Returns:
+    --------
+    pd.DataFrame
+        DataFrame containing merged metadata for all file IDs.
+    """
+    pkl_files = [os.path.join(path, f) for f in os.listdir(path) if f.endswith('.pkl')]
+    metadata_list = []
+    temp_dir = 'temps_awake_EDF'
+    os.makedirs(temp_dir, exist_ok=True)
+
+    for file in pkl_files:
+        with open(file, 'rb') as f:
+            raw = pickle.load(f)
+            # Extract ID from the filename (assuming ID is part of the filename)
+            file_id = os.path.basename(file).split(' ')[0]
+            metadata = eeg_data_to_features(raw)
+            metadata['ID'] = file_id  # Add ID to metadata
+            metadata['duration_sec'] = raw.times[-1] - raw.times[0]
+            metadata['duration_min'] = metadata['duration_sec'] / 60
+            metadata_list.append(metadata)
+            # replace .pkl with .csv
+            file_name = os.path.basename(file).replace('.pkl', '')
+            # Save individual metadata to a CSV file
+            individual_csv_path = os.path.join(temp_dir, f'{file_name}.csv')
+            pd.DataFrame([metadata]).to_csv(individual_csv_path, index=False)
+    # Merge all individual CSV files into one consolidated CSV file
+    merge_csv_files(temp_dir)
+    
+    
+def merge_csv_files(temp_dir):
+    # Merge all individual CSV files into one consolidated CSV file
+    all_metadata_df = pd.DataFrame()
+    for f in os.listdir(temp_dir):
+        if f.endswith('.csv'):
+            temp_df = pd.read_csv(os.path.join(temp_dir, f))
+
+            temp_df['file_name'] = f.split(' ')[0]  # Extract file name from filename
+            temp_df['csv_file_name'] = f  # Extract file name from filename
+            # with regex find 0345-%d
+            temp_df['ID'] = temp_df['csv_file_name'].apply(lambda x: x.split('.')[0]).astype(str)
+            # remove first letter of ID
+            temp_df['ID'] = temp_df['ID'].apply(lambda x: x[1:])
+            # split ' ' and get first element
+            temp_df['ID'] = temp_df['ID'].apply(lambda x: x.split('_')[0].split(' ')[0])
+            all_metadata_df = pd.concat([all_metadata_df, temp_df], ignore_index=True)
+    consolidated_csv_path = os.path.join('EDF_awake.csv')
+    # move ID to the first column
+    cols = all_metadata_df.columns.tolist()
+    cols.insert(0, cols.pop(cols.index('ID')))
+    all_metadata_df = all_metadata_df[cols]
+    # Save the consolidated DataFrame to a CSV file
+    all_metadata_df.to_csv(consolidated_csv_path, index=False)
+    return
+    # print how many unique ID
+    f"Total unique IDs in the consolidated CSV: {all_metadata_df['ID'].nunique()}"
+    all_metadata_df['ID'].unique()
+
+
 # if name == main
 if __name__ == '__main__':
     # Example usage
-    df_wnv,patients_folder,control_folder,controls,df_wnv2,cases_group_name = cobrad_get_files(num_samples_per_patient=0)
-    print(df_wnv2.head())
+    # detect_sleep('EDF') 
+    # read_pkl_files('pickles/wake_EDF')
+
+    merge_csv_files('temps_awake_EDF')
+
+    df_wnv,patients_folder,control_folder,controls,df_wnv2,cases_group_name = cobrad_get_files(num_samples_per_patient=0,only_awake=True)

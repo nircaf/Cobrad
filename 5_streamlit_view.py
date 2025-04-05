@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import statsmodels.api as sm
 import os
+import re
 from utils.eeg_utils import *
 import mne
 import pandas as pd
@@ -147,15 +148,45 @@ def ml_plots_get_images(project_name, selected_feature):
     else:
         st.write(f"No ML plots found in {ml_plots_dir}")
 
+def find_and_sort_ml_plots(ml_plots_dir):
+    """
+    Find all files in subfolders of ml_plots that match the pattern
+    COBRAD_XGB_10_feat_imp_%d and sort them by %d.
+
+    Parameters:
+        ml_plots_dir (str): Path to the ml_plots directory.
+
+    Returns:
+        list: Sorted list of file paths.
+    """
+    pattern = r"COBRAD_XGB_10_feat_imp_(\d+)"  # Regex to extract the number %d
+    matched_files = []
+
+    # Walk through all subfolders and files in ml_plots_dir
+    for root, _, files in os.walk(ml_plots_dir):
+        for file in files:
+            match = re.search(pattern, file)
+            if match:
+                # Extract the number %d and store it with the file path
+                matched_files.append((int(match.group(1)), os.path.join(root, file)))
+
+    # Sort the files by the extracted number %d
+    matched_files.sort(key=lambda x: x[0], reverse=True)
+
+    # Return only the sorted file paths
+    return [file_path for _, file_path in matched_files]
+
 # Streamlit App
 def main():
     # have user choose COBRAD or WNV
     project_name = st.sidebar.selectbox("Select Project", ["COBRAD", "WNV"])
     if project_name == "COBRAD":
+        # sidebar checkbox - awake only
+        awake_only = st.sidebar.checkbox("Awake Only", value=True)
         # slider from 1 to 12
         num_samples_per_patient = st.sidebar.slider("Select number of samples per patient", 0, 12, 0)
         # Load COBRAD data
-        df_wnv, patients_folder, control_folder, controls, df_wnv2, cases_group_name = cobrad_get_files(num_samples_per_patient)
+        df_wnv, patients_folder, control_folder, controls, df_wnv2, cases_group_name = cobrad_get_files(num_samples_per_patient, awake_only)
     else:
         # Load WNV data
         df_wnv, patients_folder, control_folder, controls, df_wnv2, cases_group_name = wnv_get_files()
@@ -209,7 +240,6 @@ def main():
     if not clinical_features or not eeg_features:
         st.error("Could not identify clinical or EEG features based on the 'overall_' separator.")
         return
-    
 
     if feature_type == "vs_Controls":
         vs_controls_run(project_name)
@@ -219,7 +249,9 @@ def main():
         return
     elif feature_type == "ml_plots":
         # get the names of folders that are in {figures_dir}/ml_plots
-        ml_plots_features = [f for f in os.listdir(f"{project_name}_figures/ml_plots") if os.path.isdir(os.path.join(f"{project_name}_figures/ml_plots", f))]
+        # ml_plots_features = [f for f in os.listdir(f"{project_name}_figures/ml_plots") if os.path.isdir(os.path.join(f"{project_name}_figures/ml_plots", f))]
+        sorted_files = find_and_sort_ml_plots(f"{project_name}_figures/ml_plots")
+        ml_plots_features = [f.split('/')[2] for f in sorted_files]
         selected_feature = st.sidebar.radio("Select a feature for ML plots:", ml_plots_features)
         if selected_feature:
             ml_plots_get_images(project_name, selected_feature)
