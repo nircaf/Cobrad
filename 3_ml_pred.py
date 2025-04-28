@@ -40,7 +40,7 @@ def plot_model_performance(y_true, y_pred, y_prob, model_name, dataset_name,outp
     if accuracy_score(y_true, y_pred) > .8:
         os.makedirs(f'{dataset_name}_figures/ml_plots/{output_folder}', exist_ok=True)
         plt.savefig(f'{dataset_name}_figures/ml_plots/{output_folder}/{dataset_name}_{model_name}_confusion_matrix.png')
-    plt.close()
+        plt.close()
 
     # ROC Curve
     fpr, tpr, _ = roc_curve(y_true, y_prob)
@@ -57,7 +57,7 @@ def plot_model_performance(y_true, y_pred, y_prob, model_name, dataset_name,outp
     if roc_auc > .8:
         os.makedirs(f'{dataset_name}_figures/ml_plots/{output_folder}', exist_ok=True)
         plt.savefig(f'{dataset_name}_figures/ml_plots/{output_folder}/{dataset_name}_{model_name}_roc_curve.png')
-    plt.close()
+        plt.close()
 
 def prepare_data_vs_controls(cases_df, controls_df = None, target_col='target'):
     """Prepare data by combining cases and controls with common features."""
@@ -147,14 +147,21 @@ def run_data_intra(df_cases,database_name):
             pass
 
 
-def train_classical_ml(X_train, y_train, X_test, y_test, dataset_name,output_folder):
-    """Train classical ML models and return metrics and predictions."""
+from sklearn.model_selection import cross_val_score
+
+def train_classical_ml(X_train, y_train, X_test, y_test, dataset_name, output_folder):
+    """Train classical ML models with cross-validation and return metrics and predictions."""
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train)
     X_test_scaled = scaler.transform(X_test)
 
-    # XGBoost
+    # XGBoost with Cross-Validation
     xgb = XGBClassifier(use_label_encoder=False, eval_metric='logloss', random_state=42)
+    cv_scores = cross_val_score(xgb, X_train_scaled, y_train, cv=5, scoring='roc_auc')  # 5-fold CV
+    print(f"XGBoost Cross-Validation AUC Scores: {cv_scores}")
+    print(f"XGBoost Mean CV AUC: {cv_scores.mean():.4f}")
+
+    # Fit the model on the training set
     xgb.fit(X_train_scaled, y_train)
     y_pred_xgb = xgb.predict(X_test_scaled)
     y_prob_xgb = xgb.predict_proba(X_test_scaled)[:, 1]
@@ -176,13 +183,13 @@ def train_classical_ml(X_train, y_train, X_test, y_test, dataset_name,output_fol
     n_train = len(y_train)
     n_test = len(y_test)
     plt.figure(figsize=(12, 8))  # Increase figure size for better visibility
-    plt.title(f"Top 10 Feature Importances (Train N={n_train}, Test N={n_test}, Accuracy={acc_xgb:.2f})")
+    plt.title(f"Top 10 Feature Importances (Train N={n_train}, Test N={n_test}, cv_scores={cv_scores.mean():.3f})")
     plt.bar(range(top_n), top_importances, align="center")
     plt.xticks(range(top_n), top_features, rotation=90)
     plt.xlim([-1, top_n])
     plt.tight_layout()  # Adjust layout to ensure everything fits without overlap
     os.makedirs(f'{dataset_name}_figures/ml_plots/{output_folder}', exist_ok=True)
-    plt.savefig(f'{dataset_name}_figures/ml_plots/{output_folder}/{dataset_name}_XGB_{top_n}_feat_imp_{acc_xgb:.2f}.png')
+    plt.savefig(f'{dataset_name}_figures/ml_plots/{output_folder}/{dataset_name}_XGB_{top_n}_feat_imp_{cv_scores.mean():.3f}.png')
     plt.close()
 
     return {

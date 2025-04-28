@@ -45,11 +45,12 @@ warnings.filterwarnings("ignore", message="Effective window size : 1.000 (s)")
 getcwd = os.getcwd()
 
 #%% INITIALIZATION
-directory = os.path.join(getcwd, 'EDF')
+cases_project_name = 'west_nile_virus'
+# cases_project_name = 'EDF'
+directory = os.path.join(getcwd, cases_project_name)
 # directory = os.path.join(getcwd, 'Controls')
 os_splittor = '\\' if 'nt' in os.name else '/'
-cases_project_name = 'west_nile_virus'
-cases_project_name = 'EDF'
+
 
 #%% Load the data
 # df_wnv = pd.read_excel(f'WNV_merged_291224_KP.xlsx')
@@ -239,25 +240,6 @@ def get_edf_files(directory):
     return df
 
 
-def read_edf_mne(file_path):
-    raw = mne.io.read_raw_edf(file_path, preload=True, encoding='latin1')
-    metadata = {
-        'file_name': os.path.basename(file_path),
-        'start_date': raw.info['meas_date'],
-        'duration_sec': raw.times[-1],
-        'duration_min': raw.times[-1] / 60,
-        'number_of_signals': len(raw.ch_names),
-        'signal_labels': raw.ch_names,
-        'sampling_frequency': raw.info['sfreq'],
-        'highpass': raw.info['highpass'],
-        'lowpass': raw.info['lowpass'],
-        'annotations': raw.annotations if raw.annotations else None,
-        'n_samples': raw.n_times,
-        'bad_channels': raw.info['bads']
-    }
-    return metadata, raw
-
-
 def plot_not_prod(raw,is_prod,filename):
     if not is_prod:
         fig = raw.plot(show=False)
@@ -342,7 +324,8 @@ def analyze_eeg_data(raw,is_prod,filename):
     # save spec_data to pickle in pickles/project_name/filename
     with open(f'pickles/{project_name}/{filename}.pkl', 'wb') as f:
         pickle.dump(raw, f)
-    eeg_data_to_features(raw)
+    metadata = eeg_data_to_features(raw)
+    return metadata
 
 
 
@@ -412,7 +395,7 @@ def process_file(row,filename,is_prod):
             eeg_metadata = analyze_eeg_data(raw,is_prod,row["file_name"])
             if eeg_metadata is None:
                 # save empty csv file
-                pd.DataFrame().to_csv(f'{temp_dir}/{row["file_name"]}', index=False)
+                # pd.DataFrame().to_csv(f'{temp_dir}/{row["file_name"]}.csv', index=False)
                 print(f'Error processing {row["file_name"]}')
             else:
                 metadata.update(eeg_metadata)
@@ -434,7 +417,7 @@ if __name__ == "__main__":
     # remove duplicates subset file_name
     df.drop_duplicates(subset='file_name', inplace=True)
     # leave only the files that contains 
-    df = df[df['file_name'].str.contains('010')]
+    # df = df[df['file_name'].str.contains('010')]
     # Set multiprocessing flag
     filename = f'{project_name}.csv'
     if use_multiprocessing:

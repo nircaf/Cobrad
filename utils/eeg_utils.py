@@ -16,7 +16,10 @@ from scipy.signal import spectrogram
 import statsmodels.api as sm
 import streamlit as st
 import json
-import pickle
+import pickle, uuid
+import re, io
+import h5py
+from tqdm import tqdm
 
 eeg_channels = ['Fp1', 'Fp2', 'F3', 'F4', 'C3', 'C4', 'P3', 'P4', 'O1', 'O2', 'F7',
        'F8', 'T3', 'T4', 'T5', 'T6', 'Fz', 'Cz', 'Pz', 'A1','A2', 'Fpz', 'Oz']
@@ -46,28 +49,59 @@ eeg_dict_convertion = {
         'ECG2+': 'ecg',
 }
 
+# Define power bands as a dictionary
+power_bands = {
+    "delta": [1, 4],
+    "theta": [4, 8],
+    "alpha": [8, 12],
+    "beta": [12, 30],
+    "gamma": [30, 100]
+}
+
+def mean_of_resized_arrays(arrays):
+    # Get the shapes of all arrays
+    shapes = np.array([arr.shape for arr in arrays])
+    
+    # Compute median dimensions
+    median_shape = tuple(np.median(shapes, axis=0).astype(int))
+    
+    # Resize all arrays to the median shape
+    resized_arrays = np.array([np.resize(arr, median_shape) for arr in arrays])
+    
+    # Compute the mean
+    return np.mean(resized_arrays, axis=0)
+
 def stat_text_get(group_data, col=None):
     lower_bound = -1e-20
     upper_bound = 1e20
     if col is None:
-        stats_text = (
-            f"N = {len(group_data)}, "
-            f"Mean = {np.clip(group_data.mean(), lower_bound, upper_bound):.2e}, "
-            f"Median = {np.clip(group_data.median(), lower_bound, upper_bound):.2e}, "
-            f"Max = {np.clip(group_data.max(), lower_bound, upper_bound):.2e}, "
-            f"Min = {np.clip(group_data.min(), lower_bound, upper_bound):.2e}, "
-            f"Std = {np.clip(group_data.std(), lower_bound, upper_bound):.2e}"
-        )
+        stats_dict = {
+            "N": len(group_data),
+            "Mean": np.clip(group_data.mean(), lower_bound, upper_bound),
+            "Median": np.clip(group_data.median(), lower_bound, upper_bound),
+            "Max": np.clip(group_data.max(), lower_bound, upper_bound),
+            "Min": np.clip(group_data.min(), lower_bound, upper_bound),
+            "Std": np.clip(group_data.std(), lower_bound, upper_bound),
+        }
     else:
-        stats_text = (
-            f"N = {len(group_data)}, "
-            f"Mean = {np.clip(group_data[col].mean(), lower_bound, upper_bound):.2e}, "
-            f"Median = {np.clip(group_data[col].median(), lower_bound, upper_bound):.2e}, "
-            f"Max = {np.clip(group_data[col].max(), lower_bound, upper_bound):.2e}, "
-            f"Min = {np.clip(group_data[col].min(), lower_bound, upper_bound):.2e}, "
-            f"Std = {np.clip(group_data[col].std(), lower_bound, upper_bound):.2e}"
-        )
-    return stats_text
+        stats_dict = {
+            "N": len(group_data),
+            "Mean": np.clip(group_data[col].mean(), lower_bound, upper_bound),
+            "Median": np.clip(group_data[col].median(), lower_bound, upper_bound),
+            "Max": np.clip(group_data[col].max(), lower_bound, upper_bound),
+            "Min": np.clip(group_data[col].min(), lower_bound, upper_bound),
+            "Std": np.clip(group_data[col].std(), lower_bound, upper_bound),
+        }
+
+    stats_text = (
+        f"N = {stats_dict['N']}, "
+        f"Mean = {stats_dict['Mean']:.2e}, "
+        f"Median = {stats_dict['Median']:.2e}, "
+        f"Max = {stats_dict['Max']:.2e}, "
+        f"Min = {stats_dict['Min']:.2e}, "
+        f"Std = {stats_dict['Std']:.2e}"
+    )
+    return stats_text, stats_dict
 
 def boxplot_plot(results_df, combined_df, col, output_dir,figures_dir=None,is_streamlit=False,analysis_type=None, show_histograms=False):
     # Function to remove outliers based on 5 standard deviations
@@ -116,42 +150,67 @@ def boxplot_plot(results_df, combined_df, col, output_dir,figures_dir=None,is_st
         plt.tight_layout()
         if is_streamlit:
             st.write(f"Boxplot of {col} by Group")
-            st.pyplot(plt)
+            for group_val in cleaned_df['Group'].unique():
+                group_data = cleaned_df[cleaned_df['Group'] == group_val][col]
+                stats_text, stat_dict = stat_text_get(group_data)
+                st.write(f"{group_val} mean {stat_dict['Mean']:.2f} ± {stat_dict['Std']:.2f}")
+            st.write(f"P-value: {row['adj_p_value']:.3e}, Effect size: d {row['Cohen_d']:.2f}")
+            st_pyplot_func(plt,filename=f"{col}_comparison")
         else:
             os.makedirs(f'{figures_dir}/boxplots/{output_dir}', exist_ok=True)
             plt.savefig(f"{figures_dir}/boxplots/{output_dir}/{col}_comparison.png")
-        plt.close()
+            plt.close()
         if show_histograms:
             # Plot histograms for each group and both groups together
             plt.figure(figsize=(10, 6))
             sns.histplot(data=cleaned_df, x=col, hue='Group', element='step', stat='density', common_norm=False)
             for i, group in enumerate(cleaned_df['Group'].unique()):
                 group_data = cleaned_df[cleaned_df['Group'] == group][col]
-                stats_text = stat_text_get(group_data)
+                stats_text, _ = stat_text_get(group_data)
                 plt.annotate(stats_text, xy=(0.25, 0.95 - i * 0.1), xycoords='axes fraction', fontsize=10,
                         verticalalignment='top', bbox=dict(boxstyle='round,pad=0.3', edgecolor='black', facecolor='white'))
             plt.title(f"{col} Histogram by Group")
             if is_streamlit:
                 st.write(f"Histogram of {col} by Group")
-                st.pyplot(plt)
+                st_pyplot_func(plt)
             else:
                 os.makedirs(f'{figures_dir}/hist/{output_dir}', exist_ok=True)
                 plt.savefig(f"{figures_dir}/hist/{output_dir}/{col}_hist_by_group.png")
-            plt.close()
+                plt.close()
             plt.figure(figsize=(10, 6))
             sns.histplot(data=cleaned_df, x=col, element='step', stat='density')
             combined_data = cleaned_df[col]
-            stats_text = stat_text_get(combined_data)
+            stats_text, _ = stat_text_get(combined_data)
             plt.annotate(stats_text, xy=(0.25, 0.95), xycoords='axes fraction', fontsize=10,
                         verticalalignment='top', bbox=dict(boxstyle='round,pad=0.3', edgecolor='black', facecolor='white'))
             plt.title(f"{col} Histogram Combined")
             if is_streamlit:
                 st.write(f"Histogram of {col}")
-                st.pyplot(plt)
+                st_pyplot_func(plt)
             else:
                 plt.savefig(f"{figures_dir}/hist/{output_dir}/{col}_hist_combined.png")
-            plt.close()
+                plt.close()
     return results_df
+
+def st_pyplot_func(plt,filename='plot'):
+    """Function to display matplotlib figures in Streamlit."""
+    # bbox_inches="tight":
+    plt.tight_layout()
+    st.pyplot(plt)
+    # Save the plot as an SVG file in memory
+    svg_buffer = io.BytesIO()
+    plt.savefig(svg_buffer, format="svg")
+    svg_buffer.seek(0)
+    uuid4 = str(uuid.uuid4())
+    # Add a download button for the SVG file
+    st.download_button(
+        label="Download plot as SVG",
+        data=svg_buffer,
+        file_name=f"{filename}.svg",
+        mime="image/svg+xml",
+        key=uuid4,
+    )
+    # plt.close()
     
 def scatter_plot_with_regression(results_df, combined_df, x_col, y_col, output_dir,figures_dir= None,is_streamlit=False,analysis_type=None, show_histograms=False):
     plt.figure(figsize=(10, 6))
@@ -185,44 +244,14 @@ def scatter_plot_with_regression(results_df, combined_df, x_col, y_col, output_d
         # Make folder {figures_dir}
         if is_streamlit:
             st.write(f"Scatterplot of {x_col} vs {y_col}")
-            st.pyplot(plt)
+            # write {x_col} mean ± std
+            st.write(f"{x_col} mean {combined_df[x_col].mean():.2f} ± {combined_df[x_col].std():.2f}")
+            st.write(f"{y_col} mean {combined_df[y_col].mean():.2f} ± {combined_df[y_col].std():.2f}")
+            st.write(f"P-value {p_value:.3e}, R^2 {r_squared:.2f}")
+            st_pyplot_func(plt,filename=f"{x_col}_vs_{y_col}_regression")
         else:
             os.makedirs(f'{figures_dir}/scatterplots/{output_dir}', exist_ok=True)
             plt.savefig(f"{figures_dir}/scatterplots/{output_dir}/{y_col}_regression.png")
-        plt.close()
-        if show_histograms:
-            # Plot histogram of X
-            plt.figure(figsize=(10, 6))
-            sns.histplot(combined_df[x_col], color='blue', kde=True, stat='density', element='step')
-            x_stats = stat_text_get(combined_df, x_col)
-            plt.annotate(x_stats, xy=(0.05, 0.95), xycoords='axes fraction', fontsize=10,
-                        verticalalignment='top', bbox=dict(boxstyle='round,pad=0.3', edgecolor='black', facecolor='white'))
-            plt.title(f"Histogram of {x_col}")
-            plt.xlabel("Value")
-            plt.ylabel("Density")
-            plt.tight_layout()
-            if is_streamlit:
-                st.write(f"Histogram of {x_col}")
-                st.pyplot(plt)
-            else:
-                plt.savefig(f"{figures_dir}/scatterplots/{output_dir}/{x_col}_histogram.png")
-            plt.close()
-
-            # Plot histogram of Y
-            plt.figure(figsize=(10, 6))
-            sns.histplot(combined_df[y_col], color='red', kde=True, stat='density', element='step')
-            y_stats = stat_text_get(combined_df, y_col)
-            plt.annotate(y_stats, xy=(0.05, 0.95), xycoords='axes fraction', fontsize=10,
-                        verticalalignment='top', bbox=dict(boxstyle='round,pad=0.3', edgecolor='black', facecolor='white'))
-            plt.title(f"Histogram of {y_col}")
-            plt.xlabel("Value")
-            plt.ylabel("Density")
-            plt.tight_layout()
-            if is_streamlit:
-                st.write(f"Histogram of {y_col}")
-                st.pyplot(plt)
-            else:
-                plt.savefig(f"{figures_dir}/scatterplots/{output_dir}/{y_col}_histogram.png")
             plt.close()
     
 def analyze_and_correct(combined_df, columns_to_analyze, groups=['Control', 'WNV']):
@@ -255,7 +284,15 @@ def analyze_and_correct(combined_df, columns_to_analyze, groups=['Control', 'WNV
                     'Test': test_used,
                     'Statistic': stat,
                     'p_value': p,
-                    'Cohen_d': cohen_d
+                    'Cohen_d': cohen_d,
+                    'Mean_Group1': control_data.mean(),
+                    'Mean_Group2': case_data.mean(),
+                    'Std_Group1': control_data.std(),
+                    'Std_Group2': case_data.std(),
+                    'median_Group1': control_data.median(),
+                    'median_Group2': case_data.median(),
+                    'MAD_Group1': stats.median_abs_deviation(control_data),
+                    'MAD_Group2': stats.median_abs_deviation(case_data),
                 })
         return results
 
@@ -309,11 +346,11 @@ def topomap_group_data( band, montage,control_data,wnv_data,output_dir,figures_d
         # Save the figure
         if is_streamlit:
             st.write(f"Topomap for {band} {output_dir} P-Value")
-            st.pyplot(plt)
+            st_pyplot_func(plt)
         else:
             os.makedirs(f'{figures_dir}/topomaps_p_values/{output_dir}', exist_ok=True)
             plt.savefig(f"{figures_dir}/topomaps_p_values/{output_dir}/p_values_{band}_topomap.png")
-        plt.close()
+            plt.close()
 
 def process_group_data(group, run_df, frequency_bands, eeg_dict_convertion, eeg_channels, montage,group_data):
     # get only columns that say EEG
@@ -371,19 +408,21 @@ def wnv_get_files():
     df_wnv = pd.read_excel('WNV_merged_291224_KP.xlsx')
     # df_wnv replace '.' in column names with '_'
     df_wnv.columns = df_wnv.columns.str.replace('.', '_')
+    # df_wnv replace 'NA' with np.nan
+    df_wnv = df_wnv.replace('NA', np.nan)
     # Configuration
     patients_folder = "west_nile_virus"
-    control_folder = f"{patients_folder}_controls"
     case_file = f"{patients_folder}.csv"
     # Read and prepare data
-    controls = pd.read_csv(f'{control_folder}.csv')
+    controls = pd.read_csv(f'{patients_folder}_controls.csv')
     cases = pd.read_csv(case_file)
     wnv_ids = [file.split('/')[-2] for file in cases['file_path']]
     # to int
     wnv_ids = [int(id) for id in wnv_ids]
     cases['ID'] = wnv_ids
     # merge the dataframes
-    df_merged = pd.merge(df_wnv, cases, on='ID', how='inner')
+    df_merged_outer = pd.merge(df_wnv, cases, on='ID', how='outer',indicator=True)
+    df_merged = df_merged_outer[df_merged_outer['_merge'] == 'both']
     wnv_files = os.listdir(f'west_nile_virus')
     # remove .DS_Store
     wnv_files = [file for file in wnv_files if 'DS_Store' not in file]
@@ -402,9 +441,22 @@ def wnv_get_files():
     numeric_cols = df_merged.select_dtypes(include=[np.number]).columns
     # Group by ID and calculate the mean of each numeric column
     df_wnv2 = df_merged.groupby('ID').apply(weighted_avg, weight_col='duration_min', numeric_cols=numeric_cols).reset_index(drop=True)
+    # delta = MRS_FOLLOW_UP - MRS_prior
+    df_wnv2['MRS_delta_follow_up'] = df_wnv2['MRS_FOLLOW_UP'] - df_wnv2['MRS_prior']
+    df_wnv2['MRS_delta_at_peak_illness'] = df_wnv2['MRS_at_peak_illness'] - df_wnv2['MRS_prior']
+    df_wnv2['MRS_delta_peak_minus_follow_up'] = df_wnv2['MRS_at_peak_illness'] - df_wnv2['MRS_FOLLOW_UP']
     cases_group_name = 'WNV'
-    return df_wnv,patients_folder,control_folder,controls,df_wnv2,cases_group_name
-
+    return df_wnv,patients_folder,controls,df_wnv2,cases_group_name 
+    # df_wnv2 to csv 'wnv_grouped.csv'
+    df_wnv2.to_csv('wnv_grouped.csv', index=False)
+    # sum ENCEPHALITIS
+    df_wnv2['ENCEPHALITIS'].sum()
+    # sum MENINGITIS
+    df_wnv2['MENINGITIS'].sum()
+    # df_wnv2.columns where MRS
+    [col for col in df_wnv2.columns if 'MRS' in col]
+    df_wnv2.columns.tolist()
+    df_merged['ID'].to_list()
 
 def find_consecutive_sequences(events, min_length=5):
     sequences = []
@@ -422,6 +474,24 @@ def find_consecutive_sequences(events, min_length=5):
         sequences.append(temp_seq)
 
     return sequences
+
+def read_edf_mne(file_path):
+    raw = mne.io.read_raw_edf(file_path, preload=True, encoding='latin1')
+    metadata = {
+        'file_name': os.path.basename(file_path),
+        'start_date': raw.info['meas_date'],
+        'duration_sec': raw.times[-1],
+        'duration_min': raw.times[-1] / 60,
+        'number_of_signals': len(raw.ch_names),
+        'signal_labels': raw.ch_names,
+        'sampling_frequency': raw.info['sfreq'],
+        'highpass': raw.info['highpass'],
+        'lowpass': raw.info['lowpass'],
+        'annotations': raw.annotations if raw.annotations else None,
+        'n_samples': raw.n_times,
+        'bad_channels': raw.info['bads']
+    }
+    return metadata, raw
 
 def eeg_data_to_features(raw):
     raw_eeg = raw.copy().pick_types(eeg=True)
@@ -528,12 +598,18 @@ def eeg_data_to_features(raw):
             bp /= np.trapz(psd, freqs, axis=1)
 
         return bp
-    delta_power = bandpower(eeg_data, sf, [1, 4])
-    theta_power = bandpower(eeg_data, sf, [4, 8])
-    alpha_power = bandpower(eeg_data, sf, [8, 12])
-    beta_power = bandpower(eeg_data, sf, [12, 30])
-    gamma_power = bandpower(eeg_data, sf, [30, 100])
-    
+    # Compute band powers using the dictionary
+    band_powers = {}
+    for band_name, freq_range in power_bands.items():
+        band_powers[band_name] = bandpower(eeg_data, sf, freq_range)
+
+    # Access individual band powers from the dictionary
+    delta_power = band_powers["delta"]
+    theta_power = band_powers["theta"]
+    alpha_power = band_powers["alpha"]
+    beta_power = band_powers["beta"]
+    gamma_power = band_powers["gamma"]
+
     # Compute additional statistics
     skewness = np.apply_along_axis(lambda x: pd.Series(x).skew(), 1, eeg_data)
     kurtosis = np.apply_along_axis(lambda x: pd.Series(x).kurt(), 1, eeg_data)
@@ -594,83 +670,105 @@ def eeg_data_to_features(raw):
     return metadata
 
 #%% COBRAD
-def cobrad_get_files(num_samples_per_patient=0,only_awake=False):
-    # read sheets clinical, medications, npi-q, epworth,isi, ecpg_12 from COBRAD_clinical_24022025.xlsx
-    sheets_to_read = ['clinical', 'medications', 'npi-q', 'epworth', 'isi', 'ecog_12','Sheet4','seizures']
-    sheets_to_sum_vals = ['epworth', 'isi', 'ecog_12','Sheet4','npi-q','seizures', 'medications']
-    dfs = pd.read_excel('COBRAD_clinical_24022025.xlsx', sheet_name=sheets_to_read)
-    # Rename 'record_id' to 'ID' in each DataFrame and convert to string
-    for sheet in sheets_to_read:
-        dfs[sheet] = dfs[sheet].rename(columns={'record_id': 'ID'}).astype(str)
-        # drop col contain has_eeg or has eeg . ignore case
-        dfs[sheet] = dfs[sheet].drop(columns=[col for col in dfs[sheet].columns if 'has eeg' in col.lower() or 'has_eeg' in col.lower()])
-        # One-hot encode drugs in the medications sheet
-        if sheet == 'medications':
-            # Extract the drug names no 'nan'
-            drug_names = dfs[sheet]['name_drug_1'].dropna().unique()
-            # remove 'nan'
-            drug_names = [drug for drug in drug_names if 'nan' not in drug]
-            # Create one-hot encoded columns for each drug
-            for drug in drug_names:
-                dfs[sheet][f'{drug}'] = dfs[sheet]['name_drug_1'].apply(lambda x: 1 if x == drug else 0)
-            # Keep only the ID and one-hot encoded drug columns
-            drug_columns = [f'{drug}' for drug in drug_names]
-            dfs[sheet] = dfs[sheet][['ID'] + drug_columns]  
-            # merge columns per ID
-            dfs[sheet] = dfs[sheet].groupby('ID').sum().reset_index()   
-            # dict how many ID take a drug
-            drug_counts = dfs[sheet].drop(columns='ID').sum().to_dict() 
-            # only above 3
-            drug_counts = {k: v for k, v in drug_counts.items() if v > 3}  
-            # read utils/drug_groups.json
-            with open('utils/drug_groups.json', 'r') as f:
-                drug_groups = json.load(f)
-            for key_number_groups in drug_groups:
-                for key_group, value_group in drug_groups[key_number_groups].items():
-                    # value_group remove /n and stip
-                    value_group = [group.strip() for group in value_group]
-                    # get the columns that contain the key_group
-                    columns = [col for col in dfs[sheet].columns if any(group in col for group in value_group)]
-                    # sum the columns and create a new column with the name of the group
-                    dfs[sheet][f'{key_number_groups}_groups_{key_group}'] = dfs[sheet][columns].sum(axis=1)
-        if sheet in sheets_to_sum_vals:
-            # to numeric all columns but ID
-            dfs[sheet] = pd.concat([dfs[sheet]['ID'], dfs[sheet].drop(columns='ID').apply(pd.to_numeric, errors='coerce')], axis=1)
-            dfs[sheet][f'{sheet}_sum'] = dfs[sheet].drop(columns='ID').sum(axis=1)
-            if sheet =='seizures':
-                # replace -9 with np.nan
-                dfs[sheet] = dfs[sheet].replace(-9, np.nan)
-        # add the name of sheet at beggining of column all cols but ID
-        dfs[sheet].columns = [f'{sheet}_{col}' if col != 'ID' else col for col in dfs[sheet].columns]
-
-    # Merge all DataFrames on 'ID'
-    df_wnv = dfs[sheets_to_read[0]]
-    for sheet in sheets_to_read[1:]:
-        df_wnv = pd.merge(df_wnv, dfs[sheet], on='ID', how='outer')
-    # df_wnv replace '.' in column names with '_' and replace '<' and '>' with ''
-    df_wnv.columns = df_wnv.columns.str.replace('.', '_').str.replace('<', '').str.replace('>', '')
+def cobrad_get_files(sample_window_size=0,only_awake=False):
     patients_folder = "EDF"
-    control_folder = f"{patients_folder}_controls"
-    if only_awake:
-        case_file = f"{patients_folder}_awake.csv"
-    else:
-        case_file = f"{patients_folder}.csv"
-    controls = pd.read_csv(f'{control_folder}.csv')
-    controls['ID'] = controls['file_name'].apply(lambda x: x.split('_')[0]).astype(str)
-    numeric_cols = controls.select_dtypes(include=[np.number]).columns
-    controls = controls.groupby('ID').apply(
-        lambda x: (x[numeric_cols].multiply(x['duration_min'], axis=0)).sum(skipna=False) / x['duration_min'].sum(skipna=False)
-    ).reset_index()
-    cases = pd.read_csv(case_file)
-    cases['ID'] = cases['csv_file_name'].apply(lambda x: x.split('.')[0]).astype(str)
-    # remove first letter of ID
-    cases['ID'] = cases['ID'].apply(lambda x: x[1:])
-    # split ' ' and get first element
-    cases['ID'] = cases['ID'].apply(lambda x: x.split(' ')[0])
-    # sort id ID
-    cases = cases.sort_values(by='ID')
+    sheets_to_read = ['clinical', 'medications', 'npi-q', 'epworth', 'isi', 'ecog_12','Sheet4','seizures']
+    dfs = pd.read_excel('COBRAD_clinical_24022025.xlsx', sheet_name=sheets_to_read)
+    def get_df_wnv():
+        # read sheets clinical, medications, npi-q, epworth,isi, ecpg_12 from COBRAD_clinical_24022025.xlsx
+        sheets_to_sum_vals = ['epworth', 'isi', 'ecog_12','Sheet4','npi-q','seizures', 'medications']
+        # Rename 'record_id' to 'ID' in each DataFrame and convert to string
+        for sheet in sheets_to_read:
+            dfs[sheet] = dfs[sheet].rename(columns={'record_id': 'ID'}).astype(str)
+            # drop col contain has_eeg or has eeg . ignore case
+            dfs[sheet] = dfs[sheet].drop(columns=[col for col in dfs[sheet].columns if 'has eeg' in col.lower() or 'has_eeg' in col.lower()])
+            # One-hot encode drugs in the medications sheet
+            if sheet == 'medications':
+                # Extract the drug names no 'nan'
+                drug_names = dfs[sheet]['name_drug_1'].dropna().unique()
+                # remove 'nan'
+                drug_names = [drug for drug in drug_names if 'nan' not in drug]
+                # Create one-hot encoded columns for each drug
+                for drug in drug_names:
+                    dfs[sheet][f'{drug}'] = dfs[sheet]['name_drug_1'].apply(lambda x: 1 if x == drug else 0)
+                # Keep only the ID and one-hot encoded drug columns
+                drug_columns = [f'{drug}' for drug in drug_names]
+                dfs[sheet] = dfs[sheet][['ID'] + drug_columns]  
+                # merge columns per ID
+                dfs[sheet] = dfs[sheet].groupby('ID').sum().reset_index()   
+                # dict how many ID take a drug
+                drug_counts = dfs[sheet].drop(columns='ID').sum().to_dict() 
+                # only above 3
+                drug_counts = {k: v for k, v in drug_counts.items() if v > 3}  
+                # read utils/drug_groups.json
+                with open('utils/drug_groups.json', 'r') as f:
+                    drug_groups = json.load(f)
+                for key_number_groups in drug_groups:
+                    for key_group, value_group in drug_groups[key_number_groups].items():
+                        # value_group remove /n and stip
+                        value_group = [group.strip() for group in value_group]
+                        # get the columns that contain the key_group
+                        columns = [col for col in dfs[sheet].columns if any(group in col for group in value_group)]
+                        # sum the columns and create a new column with the name of the group
+                        dfs[sheet][f'{key_number_groups}_groups_{key_group}'] = dfs[sheet][columns].sum(axis=1)
+            if sheet in sheets_to_sum_vals:
+                # to numeric all columns but ID
+                dfs[sheet] = pd.concat([dfs[sheet]['ID'], dfs[sheet].drop(columns='ID').apply(pd.to_numeric, errors='coerce')], axis=1)
+                dfs[sheet][f'{sheet}_sum'] = dfs[sheet].drop(columns='ID').sum(axis=1)
+                if sheet =='seizures':
+                    # replace -9 with np.nan
+                    dfs[sheet] = dfs[sheet].replace(-9, np.nan)
+            # add the name of sheet at beggining of column all cols but ID
+            dfs[sheet].columns = [f'{sheet}_{col}' if col != 'ID' else col for col in dfs[sheet].columns]
+
+        # Merge all DataFrames on 'ID'
+        df_wnv = dfs[sheets_to_read[0]]
+        for sheet in sheets_to_read[1:]:
+            df_wnv = pd.merge(df_wnv, dfs[sheet], on='ID', how='outer')
+        return df_wnv
+    def get_cobrad_controls():
+        controls = pd.read_csv(f'{patients_folder}_controls.csv')
+        controls['ID'] = controls['file_name'].apply(lambda x: x.split('_')[0]).astype(str)
+        numeric_cols = controls.select_dtypes(include=[np.number]).columns
+        controls = controls.groupby('ID').apply(
+            lambda x: (x[numeric_cols].multiply(x['duration_min'], axis=0)).sum(skipna=False) / x['duration_min'].sum(skipna=False)
+        ).reset_index()
+        return controls
+    controls = get_cobrad_controls()
+    def get_cases_cobrad():
+        if sample_window_size == 0:
+            if only_awake:
+                case_file = f"{patients_folder}_awake.csv"
+            else:
+                case_file = f"{patients_folder}.csv"
+            cases = pd.read_csv(case_file)
+            cases['ID'] = cases['csv_file_name'].apply(id_from_csv_filename).astype(str)
+            # sort id ID
+            cases = cases.sort_values(by='ID')
+        else:
+            save_to_folder = f'pickles/windows_HDF5_{patients_folder}'
+            os.makedirs(save_to_folder, exist_ok=True)
+            pickles_location = 'pickles/wake_EDF' if only_awake else 'pickles/EDF'
+            files = [file for file in os.listdir(pickles_location) if file.endswith('.pkl')]
+            for file in tqdm(files, desc="Processing files"):
+                raw = pickle.load(open(os.path.join(pickles_location, file), 'rb'))
+                time_sec = raw.times[-1]  # Total duration in seconds
+                n_windows = int(time_sec / sample_window_size)
+                patient_file_name = file.split('.')[0]
+                patient_hdf5_path = os.path.join(save_to_folder, f"{patient_file_name}_{sample_window_size}.h5")
+                with h5py.File(patient_hdf5_path, "w") as hdf5_file:
+                    patient_group = hdf5_file.create_group(patient_file_name)
+                    for i in range(n_windows):
+                        raw_window = raw.copy().crop(tmin=i * sample_window_size, tmax=(i + 1) * sample_window_size)
+                        metadata_window = eeg_data_to_features(raw_window)
+                        for key, value in metadata_window.items():
+                            patient_group.create_dataset(f"{key}_window_{i}", data=value)
+        return cases
+    cases = get_cases_cobrad()
+    df_wnv = get_df_wnv()
+    df_wnv.columns = df_wnv.columns.str.replace('.', '_').str.replace('<', '').str.replace('>', '')
+
     df_merged = pd.merge(df_wnv, cases, on='ID', how='outer',indicator=True)
-    
     # Get all files that end with .edf from EDF folder and subfolders
     eeg_files = []
     for root, dirs, files in os.walk('EDF'):
@@ -678,7 +776,6 @@ def cobrad_get_files(num_samples_per_patient=0,only_awake=False):
             if file.endswith('.edf'):
                 eeg_files.append(os.path.join(root, file))
     # print outer
-    print('Only clinical data - eeg data currupted')
     failed_ids = df_merged[df_merged['_merge'] == 'left_only']['ID'].unique()
     # check if they exist in eeg_files
     for id_to_check in failed_ids:
@@ -688,9 +785,6 @@ def cobrad_get_files(num_samples_per_patient=0,only_awake=False):
             pass
     df_merged = df_merged[df_merged['_merge'] == 'both'].drop(columns='_merge')
     numeric_cols = df_merged.select_dtypes(include=[np.number]).columns
-    if num_samples_per_patient:
-        # Get per ID randomly number of rows equal to num_samples_per_patient
-        df_merged = df_merged.groupby('ID').apply(lambda x: x.sample(n=num_samples_per_patient, random_state=1)).reset_index(drop=True)
     # Group by ID and apply the weighted average function
     df_wnv2 = df_merged.groupby('ID').apply(weighted_avg, weight_col='duration_min', numeric_cols=numeric_cols).reset_index(drop=True)
     # remove highpass, lowpass, n_samples, size, patient_number
@@ -721,7 +815,7 @@ def cobrad_get_files(num_samples_per_patient=0,only_awake=False):
             for sheet_name, df_desc in desc_stats.items():
                 df_desc.to_excel(writer, sheet_name=sheet_name)
     # df_wnv save to csv
-    return df_wnv,patients_folder,control_folder,controls,df_wnv2,cases_group_name
+    return df_wnv,patients_folder,controls,df_wnv2,cases_group_name
     df_merged['ID'].unique()
     df_merged['_merge'].unique()
     df_merged[df_merged['_merge'] == 'right_only']['ID'].unique()
@@ -971,7 +1065,16 @@ def read_pkl_files(path):
             pd.DataFrame([metadata]).to_csv(individual_csv_path, index=False)
     # Merge all individual CSV files into one consolidated CSV file
     merge_csv_files(temp_dir)
+
     
+def id_from_csv_filename(filename):
+    # re get '0345-{3%d}' from filename
+    match = re.search(r'0345-\d{3}', filename)
+    if match:
+        return match.group(0)[1:]
+    else:
+        print(f"ID not found in filename: {filename}")
+        return None
     
 def merge_csv_files(temp_dir):
     # Merge all individual CSV files into one consolidated CSV file
@@ -983,11 +1086,8 @@ def merge_csv_files(temp_dir):
             temp_df['file_name'] = f.split(' ')[0]  # Extract file name from filename
             temp_df['csv_file_name'] = f  # Extract file name from filename
             # with regex find 0345-%d
-            temp_df['ID'] = temp_df['csv_file_name'].apply(lambda x: x.split('.')[0]).astype(str)
-            # remove first letter of ID
-            temp_df['ID'] = temp_df['ID'].apply(lambda x: x[1:])
-            # split ' ' and get first element
-            temp_df['ID'] = temp_df['ID'].apply(lambda x: x.split('_')[0].split(' ')[0])
+            temp_df['ID'] = temp_df['csv_file_name'].apply(id_from_csv_filename)
+            # remove ID from file name
             all_metadata_df = pd.concat([all_metadata_df, temp_df], ignore_index=True)
     consolidated_csv_path = os.path.join('EDF_awake.csv')
     # move ID to the first column
@@ -1001,13 +1101,124 @@ def merge_csv_files(temp_dir):
     f"Total unique IDs in the consolidated CSV: {all_metadata_df['ID'].nunique()}"
     all_metadata_df['ID'].unique()
 
+def raw_run(cases_group_name='EDF'):
+    group = 'west_nile_virus' if cases_group_name == 'WNV' else 'EDF'
+    pickle_files = [f for f in os.listdir(f'pickles/{group}') if f.endswith('.pkl')]
+    pickle_file = st.selectbox('Select a file', pickle_files)
+    
+    with open(f'pickles/{group}/{pickle_file}', 'rb') as f:
+        raw = pickle.load(f)
+    
+    total_duration = raw.times[-1]
+    st.write(f"Total duration: {total_duration:.2f} seconds ({total_duration / 60:.2f} minutes)")
 
+    start_time = st.number_input("Select start time (seconds)", min_value=0.0, max_value=max(0.0, total_duration), value=0.0, step=10.0, format="%.1f")
+    end_time = min(start_time + 10, total_duration)
+    cropped_raw = raw.copy().crop(tmin=start_time, tmax=end_time, include_tmax=False)
+
+    st.write(f"Displaying data from {start_time:.2f} to {end_time:.2f} seconds")
+    fig = cropped_raw.plot(show=False, block=False)
+    st_pyplot_func(fig)
+    
+    # Compute power spectral density (PSD) for delta band (0.5-4 Hz)
+    psd, freqs = raw.compute_psd(fmin=0.5, fmax=4.0).get_data(return_freqs=True)
+    delta_power = psd.mean(axis=1)  # Average across frequencies for each channel
+
+    # Find the channel with the highest delta power
+    max_channel_idx = delta_power.argmax()
+    max_channel_name = raw.info['ch_names'][max_channel_idx]
+    st.write(f"Channel with most delta power: {max_channel_name}")
+
+    window_size = st.sidebar.slider("Select window size in seconds", 10, int(total_duration//2), 5)
+    # Plot the channel with the highest delta power
+    fig_max_channel = raw.plot(start=start_time, duration=window_size, picks=[max_channel_idx], show=False, block=False)
+    st.write(f"Plot of {max_channel_name} with most delta power")
+    st_pyplot_func(fig_max_channel)
+
+    # Find the channel with the lowest delta power
+    min_channel_idx = delta_power.argmin()
+    min_channel_name = raw.info['ch_names'][min_channel_idx]
+    st.write(f"Channel with least delta power: {min_channel_name}")
+
+    # Plot the channel with the lowest delta power
+    fig_min_channel = raw.plot(start=start_time, duration=window_size, picks=[min_channel_idx], show=False, block=False)
+    st.write(f"Plot of {min_channel_name} with least delta power")
+    st_pyplot_func(fig_min_channel)
+
+    # Find region with the highest delta power across all channels
+    max_power_idx = delta_power.argmax()
+    start_slow = max_power_idx * window_size
+    end_slow = min(start_slow + window_size, total_duration)
+    slowing_raw = raw.copy().crop(tmin=start_slow, tmax=end_slow, include_tmax=False)
+    st.write(f"Most delta power: {start_slow:.2f} to {end_slow:.2f} seconds")
+    fig_slow = slowing_raw.plot(show=False, block=False)
+    st_pyplot_func(fig_slow)
+
+    # Find region with the lowest delta power across all channels
+    min_power_idx = delta_power.argmin()
+    start_fast = min_power_idx * window_size
+    end_fast = min(start_fast + window_size, total_duration)
+    speeding_raw = raw.copy().crop(tmin=start_fast, tmax=end_fast, include_tmax=False)
+    st.write(f"Least delta power: {start_fast:.2f} to {end_fast:.2f} seconds")
+    fig_fast = speeding_raw.plot(show=False, block=False)
+    st_pyplot_func(fig_fast)
+
+def spectogram_run(group,figures_dir=None,win_sec=5):
+    if figures_dir is None:
+        # read f'pickles/group_mean/{group}_mean.pkl'
+        with open(f'pickles/group_mean/{group}_mean.pkl', 'rb') as f:
+            di = pickle.load(f)
+        raw = di['raw']
+        arr_mean = di['arr_mean']
+    else:
+        # Ensure the directory exists
+        os.makedirs(f'{figures_dir}/spectograms', exist_ok=True)
+        # Read all pickle files from pickles/{group}
+        pickle_files = [f for f in os.listdir(f'pickles/{group}') if f.endswith('.pkl')] 
+        arr = []
+        for i, pickle_file in enumerate(pickle_files):
+            # Load the data
+            raw = pd.read_pickle(f'pickles/{group}/{pickle_file}')
+            data = raw.get_data()
+            arr.append(data)
+        arr_mean = mean_of_resized_arrays(arr)
+        # save arr_mean to pkl
+        os.makedirs(f'pickles/group_mean', exist_ok=True)
+        with open(f'pickles/group_mean/{figures_dir.split('_')[0]}_mean.pkl', 'wb') as f:
+            pickle.dump({'raw': raw, 'arr_mean': arr_mean}, f)
+    #%%  spectrogram
+    # get eeg channels that are in raw.info['ch_names'] and in eeg_channels
+    channels = [ch for ch in eeg_channels if ch in raw.info['ch_names']]
+    sf = raw.info['sfreq']
+    show_per_channel = True
+    if figures_dir is None:
+        show_per_channel = st.button("Show spectrogram per channel")
+    if show_per_channel:
+        for i, ch in enumerate(channels):
+            # plot spectrogram
+            fig = yasa.plot_spectrogram(arr_mean[i, :], sf, win_sec=win_sec, ch_names=[ch], cmap='jet')
+            if figures_dir is None:
+                    st.subheader(f'{ch}')
+                    st_pyplot_func(fig)
+            else:
+                fig.savefig(f'{figures_dir}/spectograms/{group}_{ch}_spectrogram.png')
+            plt.close(fig)
+    # mean over all channels
+    fig = yasa.plot_spectrogram(arr_mean.mean(axis=0), sf,win_sec=win_sec, ch_names=['mean'],cmap='jet')
+    if figures_dir is None:
+        st.title(f'Spectrogram mean')
+        st_pyplot_func(fig)
+    else:
+        fig.savefig(f'{figures_dir}/spectograms/{group}_mean_spectrogram.png')
+        
 # if name == main
 if __name__ == '__main__':
     # Example usage
     # detect_sleep('EDF') 
     # read_pkl_files('pickles/wake_EDF')
 
-    merge_csv_files('temps_awake_EDF')
+    # merge_csv_files('temps_awake_EDF')
 
-    df_wnv,patients_folder,control_folder,controls,df_wnv2,cases_group_name = cobrad_get_files(num_samples_per_patient=0,only_awake=True)
+    df_wnv,patients_folder,controls,df_wnv2,cases_group_name = cobrad_get_files(sample_window_size=600,only_awake=True)
+    
+    # df_wnv,patients_folder,controls,df_wnv2,cases_group_name = wnv_get_files()

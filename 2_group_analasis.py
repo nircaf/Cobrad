@@ -37,8 +37,8 @@ plt.rc('axes',  titlesize=12)  # Set title size to be the same as x and y labels
   
 
 #%% Choose project
-df_wnv,patients_folder,control_folder,controls,df_wnv2,cases_group_name = wnv_get_files()
-# df_wnv,patients_folder,control_folder,controls,df_wnv2,cases_group_name = cobrad_get_files()
+df_wnv,patients_folder,controls,df_wnv2,cases_group_name = wnv_get_files()
+# df_wnv,patients_folder,controls,df_wnv2,cases_group_name = cobrad_get_files(sample_window_size=600,only_awake=True)
 #%% Initialize variables
 figures_dir = f'{cases_group_name}_figures'
 # Add group labels
@@ -62,6 +62,21 @@ eeg_channels = eeg_channels
 eeg_dict_convertion = eeg_dict_convertion
 # Iterate over each frequency band and plot the topomap
 frequency_bands = ['delta_power', 'theta_power', 'alpha_power', 'beta_power', 'gamma_power','pswe_events_per_minute','pswe_avg_length','mean_mpf','dfv_std','dfv_mean']
+#%% Vs Controls CSV
+df_wnv2.columns.tolist()
+# print df_wnv2 ['age'] mean  ± std
+age_columns = 'age' if 'age' in df_wnv2.columns else 'clinical_age_at_visit'
+print(f'{cases_group_name} mean age: {df_wnv2[age_columns].mean():.2f} ± {df_wnv2[age_columns].std():.2f}')
+# print df_wnv2 ['sex'] mean  ± std
+sex_column = 'sex' if 'sex' in df_wnv2.columns else 'clinical_sex, 1=male'
+print(f'{cases_group_name} mean sex: {df_wnv2[sex_column].mean():.2f} ± {df_wnv2[sex_column].std():.2f}')
+results_df = analyze_and_correct(combined_df, columns_to_analyze,groups=['Control', cases_group_name])
+# Save statistical results
+results_df.to_csv(f"{patients_folder}_analysis_results.csv", index=False)
+#%% Spectrogram
+spec_group_name = 'west_nile_virus' if cases_group_name == 'WNV' else 'edf'
+spectogram_run(spec_group_name,figures_dir)
+spectogram_run(f'Controls',figures_dir)
 
 #%% clinical data analysis
 clinical_columns, boxplot_columns = get_clinical_and_boxplot_cols(df_wnv2=df_wnv2)
@@ -145,10 +160,6 @@ for band in frequency_bands:
     wnv_data = group_data[cases_group_name][band]
     topomap_group_data(band, montage,control_data,wnv_data,'vs_controls',figures_dir=figures_dir)
 
-results_df = analyze_and_correct(combined_df, columns_to_analyze,groups=['Control', cases_group_name])
-# Save statistical results
-results_df.to_csv(f"{patients_folder}_analysis_results.csv", index=False)
-
 ### Boxplot Group Comparison
 # columns to analyze which contains overall
 # Visualization
@@ -159,43 +170,4 @@ for col in boxplot_columns:
         continue
     boxplot_plot(results_df,curr_data, col, 'vs_controls', figures_dir)
 
-def mean_of_resized_arrays(arrays):
-    # Get the shapes of all arrays
-    shapes = np.array([arr.shape for arr in arrays])
-    
-    # Compute median dimensions
-    median_shape = tuple(np.median(shapes, axis=0).astype(int))
-    
-    # Resize all arrays to the median shape
-    resized_arrays = np.array([np.resize(arr, median_shape) for arr in arrays])
-    
-    # Compute the mean
-    return np.mean(resized_arrays, axis=0)
-#%% Spectrogram
-def spectogram_run():
-    # Ensure the directory exists
-    os.makedirs(f'{figures_dir}/spectograms', exist_ok=True)
-    for group in [patients_folder, control_folder]:
-        # Read all pickle files from pickles/{group}
-        pickle_files = [f for f in os.listdir(f'pickles/{group}') if f.endswith('.pkl')] 
-        arr = []
-        for i, pickle_file in enumerate(pickle_files):
-            # Load the data
-            raw = pd.read_pickle(f'pickles/{group}/{pickle_file}')
-            data = raw.get_data()
-            arr.append(data)
-            if i ==0:
-                sf = raw.info['sfreq']
-        arr_mean = mean_of_resized_arrays(arr)
-        #%%  spectrogram
-        # pca of eeg_data
-        pca = PCA(n_components=0.95)
-        pca.fit(arr_mean.T)
-        eeg_data_pca = pca.transform(arr_mean.T)
-        print(pca.explained_variance_ratio_)
-        # plot spectrogram
-        fig = yasa.plot_spectrogram(eeg_data_pca.T[0,:], sf,win_sec=1)
-        fig.savefig(f'{figures_dir}/spectograms/{group}_spectrogram.png')
-        plt.close(fig)
-    
-# spectogram_run()
+

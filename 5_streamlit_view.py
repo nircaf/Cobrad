@@ -17,6 +17,8 @@ import statsmodels.stats.multitest as smm
 from scipy.signal import spectrogram
 import statsmodels.api as sm
 from collections import Counter
+import io
+import zipfile
 
 # Set plotting styles as specified
 sns.set_context('talk')
@@ -70,7 +72,7 @@ def multiselect_pairplot(all_features):
 
 def pairplot_columns(df, clinical_features, eeg_features, hue=None, output_dir=None):
     """
-    Creates a pairplot for the specified columns in the DataFrame.
+    Creates a pairplot and scatterplots for the specified columns in the DataFrame.
 
     Parameters:
         df (pd.DataFrame): The DataFrame containing the data.
@@ -109,26 +111,86 @@ def pairplot_columns(df, clinical_features, eeg_features, hue=None, output_dir=N
                 
                 # Add regression line to the lower triangle
                 sns.regplot(x=x, y=y, ax=pairplot.axes[i, j], scatter=False, color='red', line_kws={'alpha': 0.5})
+                
+                # Calculate R^2 and p-value
+                X = sm.add_constant(x)
+                model = sm.OLS(y, X).fit()
+                r_squared = model.rsquared
+                p_value = model.pvalues[1]  # p-value for the slope
+                
+                # Annotate the plot with R^2 and p-value
+                pairplot.axes[i, j].annotate(
+                    f"$R^2$={r_squared:.2f}\n$p$={p_value:.2e}",
+                    xy=(0.05, 0.95),
+                    xycoords='axes fraction',
+                    ha='left',
+                    va='top',
+                    fontsize=10,
+                    bbox=dict(boxstyle='round,pad=0.3', edgecolor='black', facecolor='white')
+                )
         
         # Add a title and adjust layout to prevent text cutoff
         pairplot.fig.suptitle("Pairplot of Selected Columns", y=1.02)
         pairplot.fig.tight_layout()  # Automatically adjust subplots to fit within the figure area
         pairplot.fig.subplots_adjust(top=0.95)  # Add extra space at the top for the title
         
-        # Display the plot in Streamlit
-        st.pyplot(pairplot)
+        # Display the pairplot in Streamlit
+        st_pyplot_func(pairplot.fig,filename=f'pairplot_{"_".join(columns)}.png')
 
-def vs_controls_run(project_name):
+        # Display scatterplots for each x column with all y columns on one plot
+        st.header("Scatterplots with R^2 and p-value (All Columns on One Plot)")
+        for j in range(len(columns)):
+            x = df_cleaned[columns[j]]
+            plt.figure(figsize=(10, 8))
+            
+            for i in range(len(columns)):
+                if i == j:
+                    continue
+                y = df_cleaned[columns[i]]
+                
+                # Apply Z-score normalization to y
+                y_zscore = (y - y.mean()) / y.std()
+                
+                sns.scatterplot(x=x, y=y_zscore, alpha=0.5, label=columns[i])
+                sns.regplot(x=x, y=y_zscore, scatter=False, line_kws={'alpha': 0.5}, label=None)
+                
+                # Calculate R^2 and p-value
+                X = sm.add_constant(x)
+                model = sm.OLS(y_zscore, X).fit()
+                r_squared = model.rsquared
+                p_value = model.pvalues[1]
+                
+                # Annotate the plot with R^2 and p-value for each y column
+                plt.annotate(
+                    f"{columns[i]}: $R^2$={r_squared:.2f}, $p$={p_value:.2e}",
+                    xy=(0.05, 0.95 - i * 0.05),
+                    xycoords='axes fraction',
+                    fontsize=10,
+                    ha='left',
+                    bbox=dict(boxstyle='round,pad=0.3', edgecolor='black', facecolor='white')
+                )
+            
+            # Add title and labels
+            plt.title(f"{columns[j]} vs MRS")
+            plt.xlabel(columns[j])
+            plt.ylabel("Z-Score")
+            plt.legend(title="", loc="upper right")
+            st_pyplot_func(plt.gcf(), filename=f'scatterplot_{columns[j]}_vs_all_y_zscore.png')
+            plt.close()
+
+def vs_controls_run(project_name,df_wnv2,controls,boxplot_columns,analysis_type):
+    df_wnv2['Group'] = project_name
+    controls['Group'] = 'Controls'
+    combined_df = pd.concat([df_wnv2, controls], ignore_index=True,axis=0)
     scatterplots_dir = f"{project_name}_figures/topomaps_p_values/vs_controls"
     boxplots_dir = f"{project_name}_figures/boxplots/vs_controls"
-    # Display boxplots
-    st.header("Boxplots vs Controls")
-    if os.path.exists(boxplots_dir):
-        boxplot_files = [f for f in os.listdir(boxplots_dir) if f.endswith('.png')]
-        for file in boxplot_files:
-            st.image(os.path.join(boxplots_dir, file), caption=file)
-    else:
-        st.write(f"No boxplots found in {boxplots_dir}")
+    for col in boxplot_columns:
+        curr_data = combined_df[[col, 'Group']].dropna()
+        num_groups = curr_data['Group'].nunique()
+        if num_groups < 2:
+            continue
+        results_df = analyze_and_correct(curr_data, [col], groups=curr_data['Group'].unique())
+        boxplot_plot(results_df,curr_data, col, 'vs_controls',is_streamlit=True,analysis_type=analysis_type)
     # Display scatterplots
     st.header("Scatterplots vs Controls")
     if os.path.exists(scatterplots_dir):
@@ -184,16 +246,15 @@ def main():
         # sidebar checkbox - awake only
         awake_only = st.sidebar.checkbox("Awake Only", value=True)
         # slider from 1 to 12
-        num_samples_per_patient = st.sidebar.slider("Select number of samples per patient", 0, 12, 0)
+        sample_window_size = st.sidebar.slider("Select the sample window size", 0, 12, 0)
         # Load COBRAD data
-        df_wnv, patients_folder, control_folder, controls, df_wnv2, cases_group_name = cobrad_get_files(num_samples_per_patient, awake_only)
+        df_wnv, patients_folder, controls, df_wnv2, cases_group_name = cobrad_get_files(sample_window_size, awake_only)
     else:
         # Load WNV data
-        df_wnv, patients_folder, control_folder, controls, df_wnv2, cases_group_name = wnv_get_files()
+        df_wnv, patients_folder, controls, df_wnv2, cases_group_name = wnv_get_files()
 
     st.title("EEG vs Clinical Features")
     # Iterate over each frequency band and plot the topomap
-    frequency_bands = ['delta_power', 'theta_power', 'alpha_power', 'beta_power', 'gamma_power','pswe_events_per_minute','pswe_avg_length','mean_mpf','dfv_std','dfv_mean']
     cols_to_drop = ['annotations', 'bad_channels', 'patient_number', 'csv_file_name', 'file_name', 'file_path', 'signal_labels', 'number_of_signals', 'sampling_frequency', 'sampling_rate', 'duration_min']
     # Remove specified columns and those containing dates from df_wnv2
     df_wnv2 = df_wnv2.drop(columns=[col for col in df_wnv2.columns if col in cols_to_drop or 'date' in col.lower()])
@@ -214,8 +275,9 @@ def main():
     
     # Sidebar for feature selection
     st.sidebar.header("Feature Selection")
-    feature_type = st.sidebar.selectbox("Select feature type to plot against the other type:", ("Clinical Feature", "EEG Feature","ml_plots", "vs_Controls","Pair Plot"))
-    if feature_type == "Clinical Feature" or feature_type == "EEG Feature":
+    feature_types = ("Clinical Feature", "EEG Feature", "ml_plots", "vs_Controls", "Pair Plot",'Spectogram','Raw')
+    feature_type = st.sidebar.selectbox("Select feature type to plot against the other type:", feature_types)
+    if feature_type == "Clinical Feature" or feature_type == "EEG Feature" or feature_type == "vs_Controls":
         # ask user if they want only significant, or full.
         st.sidebar.header("Select Analysis Type")
         analysis_type = st.sidebar.selectbox("Select Analysis Type", ["Significant", "Full"])
@@ -240,9 +302,8 @@ def main():
     if not clinical_features or not eeg_features:
         st.error("Could not identify clinical or EEG features based on the 'overall_' separator.")
         return
-
     if feature_type == "vs_Controls":
-        vs_controls_run(project_name)
+        vs_controls_run(project_name,df_wnv2,controls,boxplot_columns,analysis_type)
         return
     elif feature_type == "Pair Plot":
         pairplot_columns(df_wnv2, clinical_features, eeg_features)
@@ -255,6 +316,19 @@ def main():
         selected_feature = st.sidebar.radio("Select a feature for ML plots:", ml_plots_features)
         if selected_feature:
             ml_plots_get_images(project_name, selected_feature)
+        return
+    elif feature_type == "Spectogram":
+        st.title("Spectrogram")
+        # ask user for win_sec
+        win_sec = st.sidebar.slider("Select window size in seconds", 1, 30, 5)
+        spectogram_run(cases_group_name,win_sec=win_sec)
+        st.subheader("Spectrogram Controls")
+        spectogram_run(f'Controls',win_sec=win_sec)
+
+        return
+    elif feature_type == "Raw":
+        st.title("Raw Data")
+        raw_run(cases_group_name)
         return
     elif feature_type == "EEG Feature":
         selected_feature = st.sidebar.radio("Select an EEG feature:", eeg_features)
@@ -277,6 +351,8 @@ def main():
     col5.metric("Maximum", f"{feature_data.max():.2f}")
     # col 6 is N with dropna
     col6.metric("N", f"{feature_data.dropna().count()}")
+    # write text for {selected feature}, N= {}, mean ± std
+    st.write(f'{selected_feature} N= {feature_data.dropna().count()}, mean {feature_data.mean():.2f} ± {feature_data.std():.2f}')
     numeric_colunms = df_wnv2.select_dtypes(include=[np.number]).columns
     # sidebar checkbox - Clinical Features Correlation
     # if EEG Fearture
