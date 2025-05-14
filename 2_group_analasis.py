@@ -37,8 +37,9 @@ plt.rc('axes',  titlesize=12)  # Set title size to be the same as x and y labels
   
 
 #%% Choose project
-df_wnv,patients_folder,controls,df_wnv2,cases_group_name = wnv_get_files()
-# df_wnv,patients_folder,controls,df_wnv2,cases_group_name = cobrad_get_files(sample_window_size=600,only_awake=True)
+# df_wnv,patients_folder,controls,df_wnv2,cases_group_name = wnv_get_files()
+only_awake=False
+df_wnv,patients_folder,controls,df_wnv2,cases_group_name = cobrad_get_files(only_awake=only_awake)
 #%% Initialize variables
 figures_dir = f'{cases_group_name}_figures'
 # Add group labels
@@ -72,7 +73,10 @@ sex_column = 'sex' if 'sex' in df_wnv2.columns else 'clinical_sex, 1=male'
 print(f'{cases_group_name} mean sex: {df_wnv2[sex_column].mean():.2f} ± {df_wnv2[sex_column].std():.2f}')
 results_df = analyze_and_correct(combined_df, columns_to_analyze,groups=['Control', cases_group_name])
 # Save statistical results
-results_df.to_csv(f"{patients_folder}_analysis_results.csv", index=False)
+if only_awake:
+    results_df.to_csv(f"{patients_folder}_analysis_results_awake.csv", index=False)
+else:
+    results_df.to_csv(f"{patients_folder}_analysis_results.csv", index=False)
 #%% Spectrogram
 spec_group_name = 'west_nile_virus' if cases_group_name == 'WNV' else 'edf'
 spectogram_run(spec_group_name,figures_dir)

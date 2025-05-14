@@ -673,7 +673,7 @@ def process_file(file, pickles_location, sample_window_size):
     metadata_window = eeg_data_to_features(raw, window_size_sec=sample_window_size)
     return patient_id, metadata_window
 #%% COBRAD
-def cobrad_get_files(sample_window_size=0,only_awake=False):
+def cobrad_get_files(sample_window_size=0,only_awake=False,sleep_only=False):
     patients_folder = "EDF"
     sheets_to_read = ['clinical', 'medications', 'npi-q', 'epworth', 'isi', 'ecog_12','Sheet4','seizures']
     dfs = pd.read_excel('COBRAD_clinical_24022025.xlsx', sheet_name=sheets_to_read)
@@ -985,7 +985,7 @@ def fix_predicted_stages(predicted_stages, min_non_w=10):
 
     return fixed_stages
 
-def detect_sleep(cases_group_name):
+def detect_sleep(cases_group_name, save_sleep_only=False):
     # Get pickle files from pickles/{cases_group_name}/*.pkl
     case_files = []
     for root, dirs, files in os.walk(f'pickles/{cases_group_name}'):
@@ -996,11 +996,18 @@ def detect_sleep(cases_group_name):
     # Create output directory for wake data
     wake_dir = f'pickles/wake_{cases_group_name}'
     os.makedirs(wake_dir, exist_ok=True)
+    if save_sleep_only:
+        sleep_dir = f'pickles/sleep_{cases_group_name}'
+        os.makedirs(sleep_dir, exist_ok=True)
 
     for case_file in case_files:
         # Load the file
-        with open(case_file, 'rb') as f:
-            raw = pickle.load(f)
+        try:
+            with open(case_file, 'rb') as f:
+                raw = pickle.load(f)
+        except Exception as e:
+            print(f"Failed to load {case_file}: {e}")
+            continue
 
         # Get the ID from the file name
         ID = os.path.basename(case_file).split('.')[0].split(' ')[0]
@@ -1044,6 +1051,27 @@ def detect_sleep(cases_group_name):
             pickle.dump(awake_raw, f)
 
         print(f"Saved awake data for ID {ID} to {wake_file_path}")
+
+        # Save sleep segments if requested
+        if save_sleep_only:
+            # Find indices where predicted_stages != 'W'
+            sleep_indices = np.where(predicted_stages != 'W')[0]
+            if len(sleep_indices) == 0:
+                print(f"No sleep segments found for ID {ID}.")
+                continue
+            sleep_groups = np.split(sleep_indices, np.where(np.diff(sleep_indices) != 1)[0] + 1)
+            sleep_segments = []
+            for group in sleep_groups:
+                start_time = group[0] * epoch_length_sec
+                end_time = (group[-1] + 1) * epoch_length_sec
+                sleep_segments.append(raw.copy().crop(tmin=start_time, tmax=end_time, include_tmax=False))
+            if sleep_segments:
+                sleep_raw = mne.concatenate_raws(sleep_segments)
+                sleep_file_path = case_file.replace('.edf', '').replace('.csv', '')
+                sleep_file_path = sleep_file_path.replace('EDF', f'sleep_{cases_group_name}')
+                with open(sleep_file_path, 'wb') as f:
+                    pickle.dump(sleep_raw, f)
+                print(f"Saved sleep data for ID {ID} to {sleep_file_path}")
     return
 
 def read_pkl_files(path):
@@ -1232,11 +1260,11 @@ def spectogram_run(group,figures_dir=None,win_sec=5):
 # if name == main
 if __name__ == '__main__':
     # Example usage
-    # detect_sleep('EDF') 
+    detect_sleep('EDF', save_sleep_only=True)
     # read_pkl_files('pickles/wake_EDF')
 
     # merge_csv_files('temps_awake_EDF')
 
-    df_wnv,patients_folder,controls,df_wnv2,cases_group_name = cobrad_get_files(sample_window_size=600,only_awake=True)
+    # df_wnv,patients_folder,controls,df_wnv2,cases_group_name = cobrad_get_files(sample_window_size=600,only_awake=True)
     
     # df_wnv,patients_folder,controls,df_wnv2,cases_group_name = wnv_get_files()
