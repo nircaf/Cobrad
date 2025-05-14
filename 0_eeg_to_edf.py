@@ -1,60 +1,30 @@
-import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
-from scipy import stats
-from statsmodels.stats.multitest import multipletests
-import numpy as np
 import os
 import mne
-from scipy.stats import ttest_ind
-import statsmodels.stats.multitest as smm
-from scipy.signal import spectrogram
-import yasa
-from sklearn.decomposition import PCA
-import statsmodels.api as sm
-from collections import Counter
-from collections import defaultdict
 
-directory = '/Users/nircafri/Desktop/Scripts/Nir/cobrad/west_nile_virus'
-prject_name = directory.split('/')[-1]
-file_size_map = defaultdict(list)
+directory = os.getcwd()
+prject_name = os.path.basename(directory)
 
-for root, _, files in os.walk(directory):
-    for file in files:
-        file_path = os.path.join(root, file)
-        file_size = os.path.getsize(file_path)
-        file_size_map[file_size].append(file_path)
-data = []
-for size, files in file_size_map.items():
-    for file in files:
-        data.append({"file_path": file, "size": size})
-df = pd.DataFrame(data)
+def find_eeg_files(directory):
+    eeg_files = []
+    for root, _, files in os.walk(directory):
+        for file in files:
+            if file.endswith('.EEG'):
+                eeg_files.append(os.path.join(root, file))
+    return eeg_files
 
-#%% 
-# file name to path split [-1]
-df['file_name'] = df['file_path'].str.split('/').str[-1]
-# .EEG files
-df_eegs_format = df[df['file_path'].str.contains('.EEG')]
-df_eegs_format['patient_id'] = df_eegs_format['file_path'].str.split('/').str[-2].astype(int)
-df_eegs_format['patient_id'].tolist()
+def convert_and_remove_eeg(eeg_files):
+    for eeg_file_path in eeg_files:
+        base, _ = os.path.splitext(eeg_file_path)
+        edf_file_path = base + '.edf'
+        try:
+            raw = mne.io.read_raw_nihon(eeg_file_path, preload=True)
+            raw.export(edf_file_path, fmt='edf', overwrite=True)
+            print(f"Converted {eeg_file_path} to {edf_file_path}")
+            os.remove(eeg_file_path)
+            print(f"Deleted original EEG file: {eeg_file_path}")
+        except Exception as e:
+            print(f"Failed to convert {eeg_file_path}: {e}")
 
-def convert_eeg_to_edf(df_eegs_format):
-    for index, row in df_eegs_format.iterrows():
-        eeg_file_path = row['file_path']
-        patient_id = eeg_file_path.split('/')[-2]
-        edf_file_path = f'{'/'.join(eeg_file_path.split("/")[:-1])}/{patient_id}.edf'
-        edf_file_path_to_remove = eeg_file_path.replace('.EEG', '.edf')
-        # remove edf_file_path_to_remove
-        os.system(f'rm -rf {edf_file_path_to_remove}')
-        # os system run EEG2EDF_Matlab/EEG_to_edf('/EEG_data/', 'edf_data/')  
-        os.system(f'EEG2EDF_Matlab/EEG_to_edf("{eeg_file_path}", "{edf_file_path}")')
-        # use mne.io.read_raw_nihon
-        raw = mne.io.read_raw_nihon(eeg_file_path, preload=True)
-        # Save the data as .edf
-        raw.export(edf_file_path, fmt='edf',overwrite=True)
-        print(f"Converted {eeg_file_path} to {edf_file_path}")
-        continue
-        raw.plot()
-
-# Call the function
-convert_eeg_to_edf(df_eegs_format)
+if __name__ == "__main__":
+    eeg_files = find_eeg_files(directory)
+    convert_and_remove_eeg(eeg_files)

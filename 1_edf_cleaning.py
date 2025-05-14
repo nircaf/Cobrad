@@ -47,6 +47,7 @@ getcwd = os.getcwd()
 #%% INITIALIZATION
 cases_project_name = 'west_nile_virus'
 # cases_project_name = 'EDF'
+cases_project_name = 'HANDL'
 directory = os.path.join(getcwd, cases_project_name)
 # directory = os.path.join(getcwd, 'Controls')
 os_splittor = '\\' if 'nt' in os.name else '/'

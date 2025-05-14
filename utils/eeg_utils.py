@@ -1202,7 +1202,7 @@ def spectogram_run(group,figures_dir=None,win_sec=5):
         arr_mean = mean_of_resized_arrays(arr)
         # save arr_mean to pkl
         os.makedirs(f'pickles/group_mean', exist_ok=True)
-        with open(f'pickles/group_mean/{figures_dir.split('_')[0]}_mean.pkl', 'wb') as f:
+        with open(f"pickles/group_mean/{figures_dir.split('_')[0]}_mean.pkl", 'wb') as f:
             pickle.dump({'raw': raw, 'arr_mean': arr_mean}, f)
     #%%  spectrogram
     # get eeg channels that are in raw.info['ch_names'] and in eeg_channels

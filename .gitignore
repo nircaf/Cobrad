@@ -10,3 +10,4 @@ venv/
 # xlsx that start with ~
 ~$*.xlsx
 *.h5
+*.log
