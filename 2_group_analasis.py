@@ -78,7 +78,7 @@ if only_awake:
 else:
     results_df.to_csv(f"{patients_folder}_analysis_results.csv", index=False)
 #%% Spectrogram
-spec_group_name = 'west_nile_virus' if cases_group_name == 'WNV' else 'edf'
+spec_group_name = 'west_nile_virus' if cases_group_name == 'WNV' else 'EDF'
 spectogram_run(spec_group_name,figures_dir)
 spectogram_run(f'Controls',figures_dir)
 

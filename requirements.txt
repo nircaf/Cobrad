@@ -10,3 +10,11 @@ scikit-learn
 openpyxl
 pyarrow
 EDFlib-Python
+pyedflib
+tqdm
+yasa
+autoreject
+pyprep
+h5py
+pickle-mixin
+ray

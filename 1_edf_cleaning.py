@@ -22,6 +22,7 @@ from sklearn.preprocessing import MinMaxScaler
 from sklearn.decomposition import PCA
 from contextlib import contextmanager
 from utils.eeg_utils import *
+import ray
 
 @contextmanager
 def suppress_stdout():
@@ -48,6 +49,7 @@ getcwd = os.getcwd()
 cases_project_name = 'west_nile_virus'
 # cases_project_name = 'EDF'
 cases_project_name = 'HANDL'
+cases_project_name = 'EDF'
 directory = os.path.join(getcwd, cases_project_name)
 # directory = os.path.join(getcwd, 'Controls')
 os_splittor = '\\' if 'nt' in os.name else '/'
@@ -280,7 +282,7 @@ def analyze_eeg_data(raw,is_prod,filename):
     # Clean data
     # Filter the data
     nyquist_freq = raw.info['sfreq'] / 2
-    raw.filter(l_freq=1.0, h_freq=nyquist_freq - 0.1)
+    raw.filter(l_freq=.5, h_freq=nyquist_freq - 0.1)
     raw.notch_filter(np.arange(50, nyquist_freq, 50), filter_length='auto', phase='zero')
     plot_not_prod(raw,is_prod,'filter2')
     # picks = mne.pick_types(raw.info, meg=False, eeg=True, stim=False, eog=False)
@@ -331,6 +333,8 @@ def analyze_eeg_data(raw,is_prod,filename):
 
 
 def process_file(row,filename,is_prod):
+    print(f'Processing {row["file_name"]}')
+    # read file
     metadata, raw = read_edf_mne(row['file_path'])
     metadata.update(row)
     # make folder if not exist
@@ -342,48 +346,49 @@ def process_file(row,filename,is_prod):
         channels = raw.ch_names
         # Check the duration of the recording
         duration_s = raw.times[-1]  # Convert duration to milliseconds
-        duration_skip = 10 * 60  # Skip recordings less than 10 minutes
+        duration_skip = 9 * 60  # Skip recordings less than 10 minutes
         if duration_s < duration_skip:
             return
         # Split the data into segments
-        max_duration_s = 60 * 60  # 60 minutes in seconds
+        max_duration_s = 60 * 10  # 60 minutes in seconds
         
         if duration_s > max_duration_s:
             eeg_metadata = None
             start_i = 0
-            while eeg_metadata is None:
-                if max_duration_s == 0:
-                    pd.DataFrame().to_csv(f'{temp_dir}/{row["file_name"]}_{max_duration_s}_{start_i}.csv', index=False)
-                    start_i += 1
-                    max_duration_s = 60 * 60
-                    print(f'Error processing {row["file_name"]}_{max_duration_s}_{start_i}, skipping...')
+            # while eeg_metadata is None:
+                # if max_duration_s == 0:
+                #     pd.DataFrame().to_csv(f'{temp_dir}/{row["file_name"]}_{max_duration_s}_{start_i}.csv', index=False)
+                #     start_i += 1
+                #     max_duration_s = 60 * 60
+                #     print(f'Error processing {row["file_name"]}_{max_duration_s}_{start_i}, skipping...')
                 # Split the data into 60-minute segments
-                n_segments = int(np.ceil(duration_s / max_duration_s))
-                for i in range(start_i, n_segments):
-                    segment_filename = f'{row["file_name"]}_{max_duration_s}_{i + 1}.csv'
-                    if os.path.exists(f'{temp_dir}/{segment_filename}'):
-                        continue
-                    start = i * max_duration_s  # Start time in seconds
-                    stop = min((i + 1) * max_duration_s, raw.times[-1])  # Stop time in seconds
-                    raw_segment = raw.copy().crop(tmin=start, tmax=stop)
-                    eeg_metadata = analyze_eeg_data(raw_segment, is_prod, segment_filename)
-                    if eeg_metadata is None:
-                        # Reduce max_duration_s by 10 minutes but not below 0
-                        print(f'Error processing {row["file_name"]}_{max_duration_s}_{start_i}, retrying with max_duration_s={max_duration_s-600}...')
-                        max_duration_s = max(max_duration_s - 5 * 60, 0)
-                        break  # Exit the for loop to recalculate segments with new max_duration_s
-                    # Update and write segment metadata
-                    metadata.update(eeg_metadata)
-                    segment_metadata = metadata.copy()
-                    segment_metadata['segment'] = i + 1
-                    segment_metadata['start_time'] = start
-                    segment_metadata['end_time'] = stop
-                    segment_metadata['duration_sec'] = stop - start
-                    segment_metadata['duration_min'] = (stop - start) / 60
-        
-                    # Write segment metadata to CSV
-                    df_segment = pd.DataFrame([segment_metadata])
-                    df_segment.to_csv(f'{temp_dir}/{segment_filename}', index=False)
+            n_segments = int(np.ceil(duration_s / max_duration_s))
+            for i in range(start_i, n_segments):
+                segment_filename = f'{row["file_name"]}_{max_duration_s}_{i + 1}.csv'
+                if os.path.exists(f'{temp_dir}/{segment_filename}'):
+                    continue
+                start = i * max_duration_s  # Start time in seconds
+                stop = min((i + 1) * max_duration_s, raw.times[-1])  # Stop time in seconds
+                raw_segment = raw.copy().crop(tmin=start, tmax=stop)
+                eeg_metadata = analyze_eeg_data(raw_segment, is_prod, segment_filename.replace(".csv", ""))
+                if eeg_metadata is None:
+                    # Reduce max_duration_s by 10 minutes but not below 0
+                    continue
+                    # print(f'Error processing {row["file_name"]}_{max_duration_s}_{start_i}, retrying with max_duration_s={max_duration_s-600}...')
+                    # max_duration_s = max(max_duration_s - 5 * 60, 0)
+                    # break  # Exit the for loop to recalculate segments with new max_duration_s
+                # Update and write segment metadata
+                metadata.update(eeg_metadata)
+                segment_metadata = metadata.copy()
+                segment_metadata['segment'] = i + 1
+                segment_metadata['start_time'] = start
+                segment_metadata['end_time'] = stop
+                segment_metadata['duration_sec'] = stop - start
+                segment_metadata['duration_min'] = (stop - start) / 60
+    
+                # Write segment metadata to CSV
+                df_segment = pd.DataFrame([segment_metadata])
+                df_segment.to_csv(f'{temp_dir}/{segment_filename}', index=False)
         else:
             # load file name csv
             try:
@@ -419,19 +424,26 @@ if __name__ == "__main__":
     df.drop_duplicates(subset='file_name', inplace=True)
     # leave only the files that contains 
     # df = df[df['file_name'].str.contains('010')]
+    # inverse df
+    # df = df[::-1]
     # Set multiprocessing flag
     filename = f'{project_name}.csv'
     if use_multiprocessing:
-        print(f'Processing {len(df)} files in parallel...')
-        # Process files in parallel
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor: # max_workers=10
-            futures = [executor.submit(process_file, row, filename, is_prod) for _, row in df.iterrows()]
-            for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures)):
-                future.result()
+        print(f'Processing {len(df)} files in parallel with Ray...')
+        ray.init(ignore_reinit_error=True, num_cpus=15)
+        # Process files in parallel using Ray
+        @ray.remote
+        def process_file_ray(row):
+            return process_file(row, filename, is_prod)
+        
+        futures = [process_file_ray.remote(row) for _, row in df.iterrows()]
+        for _ in tqdm(ray.get(futures), total=len(futures)):
+            pass
+        ray.shutdown()
     else:
         print(f'Processing {len(df)} files sequentially...')
         # Process files sequentially
-        metadata_list = [process_file(row, filename,is_prod) for _, row in tqdm(df.iterrows(), total=len(df))]
+        metadata_list = [process_file(row, filename, is_prod) for _, row in tqdm(df.iterrows(), total=len(df))]
     if project_name == 'Controls':
         # Combine all the temporary CSV files into a single CSV file
         filename = f'{cases_project_name}_controls.csv'
