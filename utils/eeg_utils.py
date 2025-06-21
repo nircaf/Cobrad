@@ -1008,7 +1008,10 @@ def detect_sleep(cases_group_name, save_sleep_only=False):
         except Exception as e:
             print(f"Failed to load {case_file}: {e}")
             continue
-
+        # if raw time less than 5 minutes continue
+        if raw.times[-1] - raw.times[0] < 5 * 60:
+            print(f"File {case_file} has less than 5 minutes of data. Skipping...")
+            continue
         # Get the ID from the file name
         ID = os.path.basename(case_file).split('.')[0].split(' ')[0]
 

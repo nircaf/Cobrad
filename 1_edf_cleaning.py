@@ -38,7 +38,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(os.getcwd())
 
 is_prod = not any('vscode' in arg.lower() for arg in sys.argv)
-use_multiprocessing = False
+use_multiprocessing = True
 # Suppress specific RuntimeWarnings
 warnings.filterwarnings("ignore", message="Channels contain different highpass filters. Highest filter setting will be stored.")
 warnings.filterwarnings("ignore", message="Channels contain different lowpass filters. Lowest filter setting will be stored.")
@@ -46,9 +46,8 @@ warnings.filterwarnings("ignore", message="Effective window size : 1.000 (s)")
 getcwd = os.getcwd()
 
 #%% INITIALIZATION
-cases_project_name = 'west_nile_virus'
-# cases_project_name = 'EDF'
-cases_project_name = 'HANDL'
+# cases_project_name = 'west_nile_virus'
+# cases_project_name = 'HANDL'
 cases_project_name = 'EDF'
 directory = os.path.join(getcwd, cases_project_name)
 # directory = os.path.join(getcwd, 'Controls')

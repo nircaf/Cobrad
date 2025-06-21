@@ -18,3 +18,9 @@ pyprep
 h5py
 pickle-mixin
 ray
+
+neurokit2
+mne_connectivity
+bctpy
+PyWavelets
+networkx
