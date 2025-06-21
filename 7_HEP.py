@@ -21,7 +21,7 @@ try:
 except ImportError:
     is_streamlit = False
 
-def compute_brain_heart_coupling(edf_results, key, motor_symptoms=None, bool_plots=False):
+def compute_brain_heart_coupling(edf_results, key, motor_symptoms=None, bool_plots=False, save_plot=False, edf_pickle_name=""):
     """
     Compute time-varying EEG network metrics and HRV indices, then their mutual-information coupling.
 
@@ -35,6 +35,10 @@ def compute_brain_heart_coupling(edf_results, key, motor_symptoms=None, bool_plo
         Δ motor symptom values for correlation plots.
     bool_plots : bool
         If True, display plots (supports Streamlit).
+    save_plot : bool
+        If True, save the plot to a file.
+    edf_pickle_name : str
+        Base name for the EDF pickle file, used for saving plot filenames.
 
     Returns
     -------
@@ -156,8 +160,16 @@ def compute_brain_heart_coupling(edf_results, key, motor_symptoms=None, bool_plo
             z = (stat - n*(n+1)/4) / np.sqrt(n*(n+1)*(2*n+1)/24)
             ax.set_title(f'p={p:.3f}, Z={z:.2f}')
             plt.tight_layout()
-            if is_streamlit: st.pyplot(fig)
-            else: plt.show()
+            if save_plot:
+                save_dir = 'figures_HEP/compute_brain_heart_coupling'
+                os.makedirs(save_dir, exist_ok=True)
+                # Use a significant name, e.g., based on the EDF pickle filename or subject identifier
+                plot_filename = f"{save_dir}/{edf_pickle_name}_scatter_mi_motor_symptoms.png"
+                plt.savefig(plot_filename, dpi=300, bbox_inches='tight')
+                plt.close()
+            else:
+                if is_streamlit: st.pyplot(fig)
+                else: plt.show()
 
         # Example time series HRV vs network metric
         fig, ax = plt.subplots(figsize=(6, 4))
@@ -168,8 +180,16 @@ def compute_brain_heart_coupling(edf_results, key, motor_symptoms=None, bool_plo
         ax.set_xlabel('Time (s)')
         ax.set_title('Dynamic Efficiency vs Sympathetic')
         plt.tight_layout()
-        if is_streamlit: st.pyplot(fig)
-        else: plt.show()
+        if save_plot:
+            save_dir = 'figures_HEP/compute_brain_heart_coupling'
+            os.makedirs(save_dir, exist_ok=True)
+            # Use a significant name, e.g., based on the EDF pickle filename or subject identifier
+            plot_filename = f"{save_dir}/{edf_pickle_name}_time_series_efficiency_sympathetic.png"
+            plt.savefig(plot_filename, dpi=300, bbox_inches='tight')
+            plt.close()
+        else:
+            if is_streamlit: st.pyplot(fig)
+            else: plt.show()
 
     return results_df
 
@@ -208,7 +228,7 @@ edf_results = load_edf_pickles_with_ecg()
 # remove keys with None values
 edf_results = {k: v for k, v in edf_results.items() if v is not None}
 edf_results['0345-010.edf_600_1.pkl'].ch_names
-compute_brain_heart_coupling(edf_results, '0345-010.edf_600_1.pkl', bool_plots=True)
+compute_brain_heart_coupling(edf_results, '0345-010.edf_600_1.pkl', bool_plots=True, save_plot=True, edf_pickle_name="0345-010")
 pass
 # for fname, raw in edf_results.items():
 #     print(fname, 'Has ECG' if raw is not None else 'No ECG')
