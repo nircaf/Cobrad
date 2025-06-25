@@ -4,7 +4,7 @@ numpy
 matplotlib
 seaborn
 statsmodels
-scipy
+scipy==1.15.2
 mne
 scikit-learn
 openpyxl
@@ -24,3 +24,4 @@ mne_connectivity
 bctpy
 PyWavelets
 networkx
+dabest

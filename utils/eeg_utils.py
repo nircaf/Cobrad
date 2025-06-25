@@ -158,7 +158,7 @@ def plot_tsne_by_group(
 
     plt.figure(figsize=(16, 9))
     unique_groups = np.unique(groups)
-    colors = plt.cm.get_cmap('Accent', len(unique_groups))
+    colors = plt.cm.get_cmap('Set1', len(unique_groups))
     ax = plt.gca()
 
     for i, group in enumerate(unique_groups):
