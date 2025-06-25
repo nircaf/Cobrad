@@ -238,6 +238,12 @@ def find_and_sort_ml_plots(ml_plots_dir):
     # Return only the sorted file paths
     return [file_path for _, file_path in matched_files]
 
+def org_selected_feature(selected_feature):
+    # if clinical_LBD_Cognitive_fluctuation change to LBD
+    if selected_feature == 'clinical_LBD_Cognitive_fluctuation':
+        return 'CF'
+    
+
 # Streamlit App
 def main():
     # have user choose COBRAD or WNV
@@ -381,9 +387,11 @@ def main():
                     df_wnv3['Group'] = df_wnv3[selected_feature].apply(lambda x: 'm' if x == 1 else 'f')
                 else:
                     # group values based on band if =1, else f'not {band}'
-                    df_wnv3['Group'] = df_wnv3[selected_feature].apply(lambda x: selected_feature if x == 1 else f'not {selected_feature}')
+                    org_selected_feature_for_plot = org_selected_feature(selected_feature)
+                    df_wnv3['Group'] = df_wnv3[selected_feature].apply(lambda x: f'{org_selected_feature_for_plot}+' if x == 1 else f'{org_selected_feature_for_plot}-')
                 results_df = analyze_and_correct(df_wnv3, [band], groups=df_wnv3['Group'].unique())
                 boxplot_plot(results_df, df_wnv3, band, f'{selected_feature}',is_streamlit=True,analysis_type=analysis_type)
+                boxplot_plot_sns(results_df, df_wnv3, band, f'{selected_feature}',is_streamlit=True,analysis_type=analysis_type)
             # if frequency band is contained in the column name
             # group_data = {}
             # for value in unique_values:

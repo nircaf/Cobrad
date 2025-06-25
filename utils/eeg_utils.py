@@ -22,7 +22,7 @@ import h5py
 from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor
 from scipy.signal import welch
-
+import dabest
 eeg_channels = ['Fp1', 'Fp2', 'F3', 'F4', 'C3', 'C4', 'P3', 'P4', 'O1', 'O2', 'F7',
        'F8', 'T3', 'T4', 'T5', 'T6', 'Fz', 'Cz', 'Pz', 'A1','A2', 'Fpz', 'Oz']
 
@@ -112,12 +112,43 @@ def boxplot_plot(results_df, combined_df, col, output_dir,figures_dir=None,is_st
             mean = group[col].mean()
             std = group[col].std()
             return group[np.abs(group[col] - mean) <= threshold * std]
+        return df.groupby(group_col).apply(filter_group).reset_index(drop=True)
+
+    # Remove outliers from each group
+    cleaned_df = remove_outliers(combined_df, col, 'Group')
+    unique_groups = cleaned_df['Group'].unique()
+    # DABEST estimation plot only if exactly 2 groups
+    if len(unique_groups) == 2 and cleaned_df.groupby('Group')[col].count().min() > 0:
+        # Ensure 'Group' is categorical and idx matches
+        cleaned_df['Group'] = pd.Categorical(cleaned_df['Group'], categories=unique_groups.tolist(), ordered=True)
+        dabest_obj = dabest.load(cleaned_df, x='Group', y=col, idx=unique_groups.tolist())
+        # dabest_obj = dabest.load(cleaned_df, x='Group', y=col)
+        plt.figure(figsize=(16, 9))
+        # est = dabest_obj.mean_diff.plot(raw_marker_size=6, raw_label=col, contrast_label=f"Mean difference in {col}")
+        est = dabest_obj.mean_diff.plot(raw_marker_size=6, raw_label=col)
+        plt.title(f"{col} by Group")
+        if figures_dir:
+            os.makedirs(f'{figures_dir}/dabest_plots/{output_dir}', exist_ok=True)
+            plt.savefig(f"{figures_dir}/dabest_plots/{output_dir}/{col}_dabest_plot.png")
+            plt.close()
+        if is_streamlit:
+            st.divider()
+            st.subheader(f"DABEST Estimation Plot of {col} by Group")
+            st_pyplot_func(plt, filename=f"{col}_dabest_plot")
+    return results_df
+
+def boxplot_plot_sns(results_df, combined_df, col, output_dir,figures_dir=None,is_streamlit=False,analysis_type=None, show_histograms=False):
+    # Function to remove outliers based on 5 standard deviations
+    def remove_outliers(df, col, group_col, threshold=5):
+        def filter_group(group):
+            mean = group[col].mean()
+            std = group[col].std()
+            return group[np.abs(group[col] - mean) <= threshold * std]
         
         return df.groupby(group_col).apply(filter_group).reset_index(drop=True)
 
     # Remove outliers from each group
     cleaned_df = remove_outliers(combined_df, col, 'Group')
-
     # Plot the cleaned data
     plt.figure(figsize=(10, 6))
     sns.boxplot(x='Group', y=col, data=cleaned_df, showfliers=False)
