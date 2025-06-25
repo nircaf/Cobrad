@@ -379,19 +379,21 @@ def main():
             # check that there are at least 3 in each group (0,1)
             if len(df_wnv3[df_wnv3[selected_feature] == 1]) < 3 or len(df_wnv3[df_wnv3[selected_feature] == 0]) < 3:
                 return
+            if selected_feature == 'sex':
+                # if 1 'f' else 'm'
+                df_wnv3['Group'] = df_wnv3[selected_feature].apply(lambda x: 'f' if x == 1 else 'm')
+            elif selected_feature == 'sex, 1=male':
+                df_wnv3['Group'] = df_wnv3[selected_feature].apply(lambda x: 'm' if x == 1 else 'f')
+            else:
+                # group values based on band if =1, else f'not {band}'
+                org_selected_feature_for_plot = org_selected_feature(selected_feature)
+                df_wnv3['Group'] = df_wnv3[selected_feature].apply(lambda x: f'{org_selected_feature_for_plot}+' if x == 1 else f'{org_selected_feature_for_plot}-')
+            plot_tsne_by_group(df_wnv3)
+            st.divider()
             for band in boxplot_columns:
-                if selected_feature == 'sex':
-                    # if 1 'f' else 'm'
-                    df_wnv3['Group'] = df_wnv3[selected_feature].apply(lambda x: 'f' if x == 1 else 'm')
-                elif selected_feature == 'sex, 1=male':
-                    df_wnv3['Group'] = df_wnv3[selected_feature].apply(lambda x: 'm' if x == 1 else 'f')
-                else:
-                    # group values based on band if =1, else f'not {band}'
-                    org_selected_feature_for_plot = org_selected_feature(selected_feature)
-                    df_wnv3['Group'] = df_wnv3[selected_feature].apply(lambda x: f'{org_selected_feature_for_plot}+' if x == 1 else f'{org_selected_feature_for_plot}-')
                 results_df = analyze_and_correct(df_wnv3, [band], groups=df_wnv3['Group'].unique())
                 boxplot_plot(results_df, df_wnv3, band, f'{selected_feature}',is_streamlit=True,analysis_type=analysis_type)
-                boxplot_plot_sns(results_df, df_wnv3, band, f'{selected_feature}',is_streamlit=True,analysis_type=analysis_type)
+                # boxplot_plot_sns(results_df, df_wnv3, band, f'{selected_feature}',is_streamlit=True,analysis_type=analysis_type)
             # if frequency band is contained in the column name
             # group_data = {}
             # for value in unique_values:

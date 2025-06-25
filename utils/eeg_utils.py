@@ -105,6 +105,93 @@ def stat_text_get(group_data, col=None):
     )
     return stats_text, stats_dict
 
+
+def plot_tsne_by_group(
+    df,
+    features=None,
+    group_col="Group",
+    perplexity=30,
+    random_state=42,
+    is_streamlit=True,
+    dbscan_eps=3,
+    dbscan_min_samples=5
+):
+    """
+    Plot a t-SNE of the DataFrame, coloring by group and drawing a convex hull polygon around clusters of points
+    within each group if the cluster has more than dbscan_min_samples points.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame containing features and group column.
+    features : list of str, optional
+        List of columns to use as features. If None, use all numeric columns except group_col.
+    group_col : str
+        Name of the column to use for coloring.
+    perplexity : int
+        t-SNE perplexity parameter.
+    random_state : int
+        t-SNE random state.
+    is_streamlit : bool
+        Whether to use Streamlit plotting.
+    dbscan_eps : float
+        The maximum distance between two samples for one to be considered as in the neighborhood of the other (DBSCAN).
+    dbscan_min_samples : int
+        The number of samples in a neighborhood for a point to be considered as a core point (DBSCAN).
+    """
+    from sklearn.manifold import TSNE
+    from scipy.spatial import ConvexHull
+    from matplotlib.patches import Polygon
+    from sklearn.cluster import DBSCAN
+
+    if features is None:
+        features = [col for col in df.select_dtypes(include=[np.number]).columns if col != group_col]
+    X = df[features].values
+    # Impute missing values with the mean of each column
+    from sklearn.impute import SimpleImputer
+    imputer = SimpleImputer(strategy="mean")
+    X = imputer.fit_transform(X)
+    groups = df[group_col].values
+
+    tsne = TSNE(n_components=2, perplexity=perplexity, random_state=random_state)
+    X_embedded = tsne.fit_transform(X)
+
+    plt.figure(figsize=(16, 9))
+    unique_groups = np.unique(groups)
+    colors = plt.cm.get_cmap('Accent', len(unique_groups))
+    ax = plt.gca()
+
+    for i, group in enumerate(unique_groups):
+        idx = groups == group
+        points = X_embedded[idx]
+        # Cluster points to find dense regions
+        if points.shape[0] >= dbscan_min_samples:
+            db = DBSCAN(eps=dbscan_eps, min_samples=dbscan_min_samples).fit(points)
+            labels = db.labels_
+            unique_labels = set(labels)
+            for cluster_label in unique_labels:
+                if cluster_label == -1:
+                    continue  # Skip noise
+                cluster_points = points[labels == cluster_label]
+                if cluster_points.shape[0] >= dbscan_min_samples:
+                    try:
+                        hull = ConvexHull(cluster_points)
+                        polygon = Polygon(cluster_points[hull.vertices], closed=True, facecolor=colors(i), alpha=0.2, edgecolor=colors(i), linewidth=2)
+                        ax.add_patch(polygon)
+                    except Exception:
+                        pass  # Skip degenerate clusters
+        plt.scatter(points[:, 0], points[:, 1], label=str(group), alpha=0.8, s=60, color=colors(i))
+    plt.xlabel("t-SNE 1")
+    plt.ylabel("t-SNE 2")
+    plt.title("t-SNE by Group")
+    plt.legend()
+    plt.tight_layout()
+
+    if is_streamlit:
+        st_pyplot_func(plt, filename="tsne_by_group")
+    else:
+        plt.show()
+
 def boxplot_plot(results_df, combined_df, col, output_dir,figures_dir=None,is_streamlit=False,analysis_type=None, show_histograms=False):
     # Function to remove outliers based on 5 standard deviations
     def remove_outliers(df, col, group_col, threshold=5):
@@ -126,7 +213,22 @@ def boxplot_plot(results_df, combined_df, col, output_dir,figures_dir=None,is_st
         plt.figure(figsize=(16, 9))
         # est = dabest_obj.mean_diff.plot(raw_marker_size=6, raw_label=col, contrast_label=f"Mean difference in {col}")
         est = dabest_obj.mean_diff.plot(raw_marker_size=6, raw_label=col)
-        plt.title(f"{col} by Group")
+
+        # Extract p-value and Cohen's d from dabest results
+        dabest_results = dabest_obj.mean_diff.results
+        dabest_results.columns
+        p_value = dabest_results['pvalue_mann_whitney'].values[0] if 'pvalue_mann_whitney' in dabest_results else np.nan
+
+        # Compute r^2 (eta squared for ANOVA)
+        group_means = cleaned_df.groupby('Group')[col].mean()
+        grand_mean = cleaned_df[col].mean()
+        ss_between = sum(cleaned_df.groupby('Group').size() * (group_means - grand_mean) ** 2)
+        ss_total = sum((cleaned_df[col] - grand_mean) ** 2)
+        r_squared = ss_between / ss_total if ss_total > 0 else np.nan
+
+        # Format title
+        plt.title(f"{col} by Group\np = {p_value:.3e}, r² = {r_squared:.2f}")
+
         if figures_dir:
             os.makedirs(f'{figures_dir}/dabest_plots/{output_dir}', exist_ok=True)
             plt.savefig(f"{figures_dir}/dabest_plots/{output_dir}/{col}_dabest_plot.png")
@@ -150,7 +252,7 @@ def boxplot_plot_sns(results_df, combined_df, col, output_dir,figures_dir=None,i
     # Remove outliers from each group
     cleaned_df = remove_outliers(combined_df, col, 'Group')
     # Plot the cleaned data
-    plt.figure(figsize=(10, 6))
+    plt.figure(figsize=(16, 9))
     sns.boxplot(x='Group', y=col, data=cleaned_df, showfliers=False)
     # Add stripplot
     sns.stripplot(x='Group', y=col, data=cleaned_df, alpha=0.5, jitter=True, color='black')

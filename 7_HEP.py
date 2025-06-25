@@ -38,6 +38,7 @@ try:
 except ImportError:
     is_streamlit = False
 from scipy.stats import zscore
+save_dir = "figures_HEP/compute_brain_heart_coupling"
 
 def clean_ecg_signal(ecg_signal, sfreq, lowcut=0.5, highcut=40, order=4):
     """
@@ -81,16 +82,28 @@ def plot_ecg_signal(ecg_signal, sfreq, edf_pickle_name, save_plot, save_dir, lab
 
 def filter_by_ecg_quality(ecg_clean, data_all, ecg_quality, threshold=0.5):
     """
-    Remove timepoints from ecg_clean and data_all where ecg_quality <= threshold.
-    Returns filtered ecg_clean and filtered data_all.
+    Interpolate (not remove) timepoints in ecg_clean and data_all where ecg_quality <= threshold.
+    Returns interpolated ecg_clean and data_all.
     """
     mask = ecg_quality > threshold
-    ecg_clean_filt = ecg_clean[mask]
-    if data_all.ndim == 2:
-        data_all_filt = data_all[:, mask]
-    else:
-        data_all_filt = data_all[mask]
-    return ecg_clean_filt, data_all_filt
+    # Interpolate ecg_clean
+    ecg_clean_interp = np.copy(ecg_clean)
+    if not np.all(mask):
+        x = np.arange(len(ecg_quality))
+        good = mask
+        bad = ~mask
+        ecg_clean_interp[bad] = np.interp(x[bad], x[good], ecg_clean[good])
+    # Interpolate data_all
+    # if data_all.ndim == 2:
+    #     data_all_interp = np.copy(data_all)
+    #     for i in range(data_all.shape[0]):
+    #         if not np.all(mask):
+    #             data_all_interp[i, bad] = np.interp(x[bad], x[good], data_all[i, good])
+    # else:
+    #     data_all_interp = np.copy(data_all)
+    #     if not np.all(mask):
+    #         data_all_interp[bad] = np.interp(x[bad], x[good], data_all[good])
+    return ecg_clean_interp, data_all
 
 def joint_entropy(x, y, bins=50):
     """Compute joint entropy of two arrays."""
@@ -270,8 +283,9 @@ def _plot_metric_vs_hrv(t, arrs, labels, save_plot, edf_name, save_dir):
         # Also plot all arrays as pairwise scatterplots with regression (PairGrid)
         df_pair = pd.DataFrame({label: arr for label, arr in zip(labels, arrs)})
         g = sns.PairGrid(df_pair, diag_sharey=False)
+
         def scatter_with_stats(x, y, **kwargs):
-            ax = plt.gca()
+            ax = kwargs.get('ax', plt.gca())
             ax.scatter(x, y, alpha=0.7)
             # Regression line
             if len(x) > 1 and len(y) > 1:
@@ -280,14 +294,12 @@ def _plot_metric_vs_hrv(t, arrs, labels, save_plot, edf_name, save_dir):
                 ax.annotate(f"$R^2$={r**2:.2f}\np={p:.3g}",
                             xy=(0.05, 0.85), xycoords='axes fraction', fontsize=9,
                             bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="gray", alpha=0.7))
-        g.map_upper(scatter_with_stats)
-        # Lower: plot x and y as functions of t
-        def lineplot_with_time(x, y, t, **kwargs):
-            ax = plt.gca()
+
+        def lineplot_with_time(x, y, **kwargs):
+            ax = kwargs.get('ax', plt.gca())
+            # t is available from the closure
             ax.plot(t, x, label='x', alpha=0.7)
             ax.plot(t, y, label='y', alpha=0.7)
-            # Compute and annotate R^2 and p-value
-            from scipy.stats import pearsonr
             if len(x) > 1 and len(y) > 1:
                 r, p = pearsonr(x, y)
                 ax.annotate(f"$R^2$={r**2:.2f}\np={p:.3g}",
@@ -296,8 +308,11 @@ def _plot_metric_vs_hrv(t, arrs, labels, save_plot, edf_name, save_dir):
             ax.legend(fontsize=8)
             ax.set_xlabel('t')
             ax.set_ylabel('Value')
-        g.map_lower(partial(lineplot_with_time, t=t))
-        g.map_diag(sns.histplot, kde=True)
+
+        g.map_diag(sns.histplot)
+        g.map_upper(scatter_with_stats)
+        g.map_lower(lineplot_with_time)
+
         plt.suptitle("Pairwise relationships of all metrics and HRV indices", y=1.02)
         plt.tight_layout()
         if save_plot:
@@ -369,12 +384,7 @@ def compute_network_features(eeg_data, sfreq, freq_band, threshold_density=0.2):
     modularity = nx.algorithms.community.modularity(G, nx.community.label_propagation_communities(G))
 
     return efficiency, clustering, assortativity, modularity
-    {
-        'efficiency': efficiency,
-        'clustering': clustering,
-        'assortativity': assortativity,
-        'modularity': modularity
-    }
+
 
 def compute_brain_heart_coupling(edf_results, key, motor_symptoms=None, bool_plots=False, save_plot=False, edf_pickle_name="",step_sec=5):
     """
@@ -409,17 +419,20 @@ def compute_brain_heart_coupling(edf_results, key, motor_symptoms=None, bool_plo
     eeg_channels = ['Fpz', 'F7', 'T3', 'T5', 'Fp1', 'F3', 'C3', 'P3', 'Oz', 'F8', 'T4', 'T6', 'Fp2', 'F4', 'C4', 'P4', 'Fz', 'Cz']
     sfreq = int(raw.info['sfreq'])
     print(f"Sampling frequency: {sfreq}")
+    save_dir = "figures_HEP/compute_brain_heart_coupling"
 
     # Extract ECG and detect R-peaks
     if 'ecg' not in ch_names:
         raise ValueError("No 'ecg' channel found")
     print("Extracting ECG signal and detecting R-peaks...")
     ecg_signal = data_all[ch_names.index('ecg')]
-    save_dir = "figures_HEP/compute_brain_heart_coupling"
     # Plot raw ECG
     plot_ecg_signal(ecg_signal, sfreq, edf_pickle_name, save_plot, save_dir, label="raw", bool_plots=bool_plots)
+    # Bandpass filter ECG before processing
+    ecg_signal_filt = clean_ecg_signal(ecg_signal, sfreq, lowcut=0.5, highcut=40, order=4)
+    plot_ecg_signal(ecg_signal_filt, sfreq, edf_pickle_name, save_plot, save_dir, label="bandpass_filtered", bool_plots=bool_plots)
     # Process ECG signal
-    signals, info = nk.ecg_process(ecg_signal, sampling_rate=sfreq)
+    signals, info = nk.ecg_process(ecg_signal_filt, sampling_rate=sfreq)
     ecg_clean = signals['ECG_Clean'].values
     # Plot cleaned ECG
     plot_ecg_signal(ecg_clean, sfreq, edf_pickle_name, save_plot, save_dir, label="cleaned", bool_plots=bool_plots)
@@ -436,20 +449,31 @@ def compute_brain_heart_coupling(edf_results, key, motor_symptoms=None, bool_plo
     r_times = rpeaks / sfreq
     # --- Print average HR per minute ---
     if len(r_times) > 1:
+        from scipy.signal import medfilt
         total_duration = r_times[-1]
         num_minutes = int(np.ceil(total_duration / 60))
-        print("Average HR per minute:")
+        hr_per_minute = []
         for minute in range(num_minutes):
             start_t = minute * 60
             end_t = (minute + 1) * 60
-            # R-peaks in this minute
             idx = np.where((r_times >= start_t) & (r_times < end_t))[0]
             if len(idx) > 1:
                 rr_intervals = np.diff(r_times[idx])
                 avg_hr = 60.0 / np.mean(rr_intervals)
-                print(f"  Minute {minute+1}: {avg_hr:.2f} bpm")
+                hr_per_minute.append(avg_hr)
             else:
-                print(f"  Minute {minute+1}: insufficient data")
+                hr_per_minute.append(np.nan)
+        # Remove implausible HR values
+        hr_per_minute = np.array(hr_per_minute)
+        hr_per_minute[(hr_per_minute < 40) | (hr_per_minute > 180)] = np.nan
+        # Median filter (window size 3)
+        hr_smooth = medfilt(hr_per_minute, kernel_size=3)
+        print("Average HR per minute (raw):")
+        for i, hr in enumerate(hr_per_minute):
+            print(f"  Minute {i+1}: {hr:.2f} bpm" if not np.isnan(hr) else f"  Minute {i+1}: insufficient/invalid data")
+        print("Average HR per minute (smoothed):")
+        for i, hr in enumerate(hr_smooth):
+            print(f"  Minute {i+1}: {hr:.2f} bpm" if not np.isnan(hr) else f"  Minute {i+1}: insufficient/invalid data")
     else:
         print("Not enough R-peaks to compute HR per minute.")
 
@@ -555,9 +579,6 @@ def compute_brain_heart_coupling(edf_results, key, motor_symptoms=None, bool_plo
         t = np.arange(len(eff_arr)) * step_sec
         arrs = [cvi_arr_band, csi_arr_band, eff_arr, clu_arr, mod_arr, ass_arr]
         labels = ['Vagal_SD1', 'Sympathetic_SD2', 'Efficiency', 'Clustering', 'Modularity', 'Assortativity']
-        _plot_metric_vs_hrv(
-            t, arrs, labels, save_plot, f"{edf_pickle_name}_{band}", save_dir
-        )
         # Also plot z-scored arrays
         arrs_zscore = [zscore(arr) if np.std(arr) > 0 else arr for arr in arrs]
         _plot_metric_vs_hrv(
@@ -567,23 +588,11 @@ def compute_brain_heart_coupling(edf_results, key, motor_symptoms=None, bool_plo
     # Return the results for the alpha band for compatibility
     return results_df_dict
 
-def only_plots(results_df,save_plot,save_dir, step_sec=5):
+def only_plots(results_df,save_plot,save_dir):
     
-    # Now loop over the DataFrame to plot
-    for idx, row in results_df.iterrows():
-        t = np.arange(len(row['Efficiency'])) * step_sec
-        edf_pickle_name = row['edf_pickle_name']  # or the relevant identifier
+    pass
     
-        # Plot Vagal vs Sympathetic
-        _plot_metric_vs_hrv(t, row['Vagal_SD1'], row['Sympathetic_SD2'],
-                            'Vagal_SD1', 'Sympathetic_SD2', save_plot, edf_pickle_name, save_dir)
-    
-        # Plot each metric vs Sympathetic and Vagal
-        for m_name in ['Efficiency', 'Clustering', 'Modularity', 'Assortativity']:
-            _plot_metric_vs_hrv(t, row[m_name], row['Sympathetic_SD2'],
-                                m_name, 'Sympathetic_SD2', save_plot, edf_pickle_name, save_dir)
-            _plot_metric_vs_hrv(t, row[m_name], row['Vagal_SD1'],
-                                m_name, 'Vagal_SD1', save_plot, edf_pickle_name, save_dir)
+
             
 def load_edf_pickles_with_ecg(pickle_dir='pickles/EDF'):
     """
@@ -650,7 +659,7 @@ def process_all_patients(edf_results, step_sec=5):
         avg_df = pd.concat(dfs).groupby(level=0).mean(numeric_only=True)
         # Use the first edf_pickle_name for naming
         edf_pickle_name = patient_id
-        only_plots(avg_df, edf_pickle_name=edf_pickle_name, save_plot=True)
+        only_plots(results_df,save_plot=True,save_dir=save_dir)
     # 3. Average across all patients and plot
     if patient_results:
         print("Averaging and plotting across all patients")
@@ -663,7 +672,7 @@ def process_all_patients(edf_results, step_sec=5):
         # Now average across all patients
         grand_avg_df = pd.concat(all_avg_dfs).groupby(level=0).mean(numeric_only=True)
         # Use a generic name for the group plot
-        only_plots(grand_avg_df, edf_pickle_name='ALL_PATIENTS', save_plot=True)
+        # only_plots(grand_avg_df, save_plot='ALL_PATIENTS', save_plot=True)
     print("All processing and plotting complete.")
 
 # Example usage:
