@@ -3,7 +3,7 @@ pandas
 numpy
 matplotlib
 seaborn
-statsmodels
+statsmodels==0.14.4
 scipy==1.15.2
 mne
 scikit-learn

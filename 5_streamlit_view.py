@@ -16,8 +16,7 @@ import statsmodels.stats.multitest as smm
 from scipy.signal import spectrogram
 import statsmodels.api as sm
 from collections import Counter
-import io
-import zipfile
+
 
 # Set plotting styles as specified
 sns.set_context('talk')
