@@ -3,7 +3,6 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-import statsmodels.api as sm
 import os
 import re
 from utils.eeg_utils import *
@@ -17,8 +16,6 @@ import statsmodels.stats.multitest as smm
 from scipy.signal import spectrogram
 import statsmodels.api as sm
 from collections import Counter
-import io
-import zipfile
 
 # Set plotting styles as specified
 sns.set_context('talk')
@@ -238,6 +235,12 @@ def find_and_sort_ml_plots(ml_plots_dir):
     # Return only the sorted file paths
     return [file_path for _, file_path in matched_files]
 
+def org_selected_feature(selected_feature):
+    # if clinical_LBD_Cognitive_fluctuation change to LBD
+    if selected_feature == 'clinical_LBD_Cognitive_fluctuation':
+        return 'CF'
+    
+
 # Streamlit App
 def main():
     # have user choose COBRAD or WNV
@@ -373,17 +376,21 @@ def main():
             # check that there are at least 3 in each group (0,1)
             if len(df_wnv3[df_wnv3[selected_feature] == 1]) < 3 or len(df_wnv3[df_wnv3[selected_feature] == 0]) < 3:
                 return
+            if selected_feature == 'sex':
+                # if 1 'f' else 'm'
+                df_wnv3['Group'] = df_wnv3[selected_feature].apply(lambda x: 'f' if x == 1 else 'm')
+            elif selected_feature == 'sex, 1=male':
+                df_wnv3['Group'] = df_wnv3[selected_feature].apply(lambda x: 'm' if x == 1 else 'f')
+            else:
+                # group values based on band if =1, else f'not {band}'
+                org_selected_feature_for_plot = org_selected_feature(selected_feature)
+                df_wnv3['Group'] = df_wnv3[selected_feature].apply(lambda x: f'{org_selected_feature_for_plot}+' if x == 1 else f'{org_selected_feature_for_plot}-')
+            plot_tsne_by_group(df_wnv3)
+            st.divider()
             for band in boxplot_columns:
-                if selected_feature == 'sex':
-                    # if 1 'f' else 'm'
-                    df_wnv3['Group'] = df_wnv3[selected_feature].apply(lambda x: 'f' if x == 1 else 'm')
-                elif selected_feature == 'sex, 1=male':
-                    df_wnv3['Group'] = df_wnv3[selected_feature].apply(lambda x: 'm' if x == 1 else 'f')
-                else:
-                    # group values based on band if =1, else f'not {band}'
-                    df_wnv3['Group'] = df_wnv3[selected_feature].apply(lambda x: selected_feature if x == 1 else f'not {selected_feature}')
                 results_df = analyze_and_correct(df_wnv3, [band], groups=df_wnv3['Group'].unique())
                 boxplot_plot(results_df, df_wnv3, band, f'{selected_feature}',is_streamlit=True,analysis_type=analysis_type)
+                # boxplot_plot_sns(results_df, df_wnv3, band, f'{selected_feature}',is_streamlit=True,analysis_type=analysis_type)
             # if frequency band is contained in the column name
             # group_data = {}
             # for value in unique_values:

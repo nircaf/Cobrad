@@ -11,3 +11,4 @@ venv/
 ~$*.xlsx
 *.h5
 *.log
+EDF.csv
