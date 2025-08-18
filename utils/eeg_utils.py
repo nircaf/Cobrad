@@ -23,6 +23,8 @@ from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor
 from scipy.signal import welch
 import dabest
+from statsmodels.stats.power import TTestIndPower
+
 eeg_channels = ['Fp1', 'Fp2', 'F3', 'F4', 'C3', 'C4', 'P3', 'P4', 'O1', 'O2', 'F7',
        'F8', 'T3', 'T4', 'T5', 'T6', 'Fz', 'Cz', 'Pz', 'A1','A2', 'Fpz', 'Oz']
 
@@ -216,19 +218,49 @@ def boxplot_plot(results_df, combined_df, col, output_dir,figures_dir=None,is_st
 
         # Extract p-value and Cohen's d from dabest results
         dabest_results = dabest_obj.mean_diff.results
-        dabest_results.columns
         p_value = dabest_results['pvalue_mann_whitney'].values[0] if 'pvalue_mann_whitney' in dabest_results else np.nan
-
+        dabest_results.columns
+        
         # Compute r^2 (eta squared for ANOVA)
         group_means = cleaned_df.groupby('Group')[col].mean()
         grand_mean = cleaned_df[col].mean()
         ss_between = sum(cleaned_df.groupby('Group').size() * (group_means - grand_mean) ** 2)
         ss_total = sum((cleaned_df[col] - grand_mean) ** 2)
         r_squared = ss_between / ss_total if ss_total > 0 else np.nan
+        # Format Cohen's d
+        cd = dabest_obj.cohens_d.results
+        cohen_d = cd['difference'].values[0] if 'difference' in cd.columns else np.nan
+        analysis = TTestIndPower()
+        alpha = 0.05
+        alternative = 'two-sided'  # or 'larger'/'smaller' if you had a directional hypothesis
 
+        # Compute observed power per contrast
+        cd = cd.copy()
+        observed_power = [
+            analysis.power(effect_size=abs(d),          # power depends on |d|
+                        nobs1=int(n1),
+                        ratio=float(n2)/float(n1),
+                        alpha=alpha,
+                        alternative=alternative)
+            for d, n1, n2 in zip(cd["difference"], cd["control_N"], cd["test_N"])
+        ]
+        # If observed_power is nan, set to 1.0 if p < 0.05, else 0.0
+        pval_col = "pvalue_mann_whitney" if "pvalue_mann_whitney" in dabest_results else "pvalue_permutation"
+        pvals = dabest_results[pval_col].values if pval_col in dabest_results else [np.nan] * len(observed_power)
+        for i, (power, pval) in enumerate(zip(observed_power, pvals)):
+            if not np.isfinite(power):
+                if pval < 0.05:
+                    observed_power[i] = 1.0
+                else:
+                    observed_power[i] = 0.0
+            else:
+                observed_power[i] = min(max(power, 0.0), 1.0)
         # Format title
-        plt.title(f"{col} by Group\np = {p_value:.3e}, r² = {r_squared:.2f}")
-
+        plt_title = f"""{col} by Group\n
+    p = {p_value:.3e}, r² = {r_squared:.2f}
+    95% CI [{dabest_results['bca_low'].values[0]:.2f}, {dabest_results['bca_high'].values[0]:.2f}]
+    Cohen's d = {cohen_d:.2f}. Observed power = {100*observed_power[0]:.2f}%"""
+        plt.title(plt_title)
         if figures_dir:
             os.makedirs(f'{figures_dir}/dabest_plots/{output_dir}', exist_ok=True)
             plt.savefig(f"{figures_dir}/dabest_plots/{output_dir}/{col}_dabest_plot.png")
@@ -236,6 +268,7 @@ def boxplot_plot(results_df, combined_df, col, output_dir,figures_dir=None,is_st
         if is_streamlit:
             st.divider()
             st.subheader(f"DABEST Estimation Plot of {col} by Group")
+            st.write(plt_title)
             st_pyplot_func(plt, filename=f"{col}_dabest_plot")
     return results_df
 
@@ -584,16 +617,13 @@ def wnv_get_files():
     df_wnv2['MRS_delta_peak_minus_follow_up'] = df_wnv2['MRS_at_peak_illness'] - df_wnv2['MRS_FOLLOW_UP']
     cases_group_name = 'WNV'
     return df_wnv,patients_folder,controls,df_wnv2,cases_group_name 
-    # df_wnv2 to csv 'wnv_grouped.csv'
-    df_wnv2.to_csv('wnv_grouped.csv', index=False)
-    # sum ENCEPHALITIS
-    df_wnv2['ENCEPHALITIS'].sum()
-    # sum MENINGITIS
-    df_wnv2['MENINGITIS'].sum()
-    # df_wnv2.columns where MRS
-    [col for col in df_wnv2.columns if 'MRS' in col]
-    df_wnv2.columns.tolist()
-    df_merged['ID'].to_list()
+    # The following lines were unreachable after return and have been removed:
+    # df_wnv2.to_csv('wnv_grouped.csv', index=False)
+    # df_wnv2['ENCEPHALITIS'].sum()
+    # df_wnv2['MENINGITIS'].sum()
+    # [col for col in df_wnv2.columns if 'MRS' in col]
+    # df_wnv2.columns.tolist()
+    # df_merged['ID'].to_list()
 
 def find_consecutive_sequences(events, min_length=5):
     sequences = []
