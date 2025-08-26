@@ -176,12 +176,33 @@ def pairplot_columns(df, clinical_features, eeg_features, hue=None, output_dir=N
             st_pyplot_func(plt.gcf(), filename=f'scatterplot_{columns[j]}_vs_all_y_zscore.png')
             plt.close()
 
+from scipy.stats import mannwhitneyu
 def vs_controls_run(project_name,df_wnv2,controls,boxplot_columns,analysis_type):
     df_wnv2['Group'] = project_name
     controls['Group'] = 'Controls'
     combined_df = pd.concat([df_wnv2, controls], ignore_index=True,axis=0)
     scatterplots_dir = f"{project_name}_figures/topomaps_p_values/vs_controls"
     boxplots_dir = f"{project_name}_figures/boxplots/vs_controls"
+    controls_dir = f'temps_Controls_EDF' if project_name == 'COBRAD' else ''
+    try:
+        st.header('COBRAD Controls Demographics')
+        # get controls demographic from get_controls_ages_genders(controls_dir)
+        controls_demographics_df = get_controls_ages_genders(controls_dir)
+        cobrad_ages = df_wnv2['clinical_age_at_visit']
+        cobrad_sexes = df_wnv2['clinical_sex, 1=male']
+        cobrad_sexes -= 1
+        st.write(f"Controls Demographics: N= {controls_demographics_df.shape[0]}, mean age {controls_demographics_df['Age'].mean():.2f} ± {controls_demographics_df['Age'].std():.2f}")
+        # Display mean gender (assuming 1=male, 0=female or similar coding)
+        st.write(f"Mean gender (1=female): {controls_demographics_df['Gender'].mean():.2f} ± {controls_demographics_df['Gender'].std():.2f}")
+        # Mann-Whitney U test for age
+        age_stat, age_p = mannwhitneyu(cobrad_ages.dropna(), controls_demographics_df['Age'].dropna(), alternative='two-sided')
+        st.write(f"Mann-Whitney U test for age: p={age_p:.3g}")
+        # Mann-Whitney U test for gender
+        if 'Gender' in controls_demographics_df.columns:
+            gender_stat, gender_p = mannwhitneyu(cobrad_sexes.dropna(), controls_demographics_df['Gender'].dropna(), alternative='two-sided')
+            st.write(f"Mann-Whitney U test for gender: p={gender_p:.3g}")
+    except Exception as e:
+        st.error(f"Error occurred while processing controls demographics: {e}")
     for col in boxplot_columns:
         curr_data = combined_df[[col, 'Group']].dropna()
         num_groups = curr_data['Group'].nunique()
@@ -245,19 +266,21 @@ def org_selected_feature(selected_feature):
 # Streamlit App
 def main():
     # have user choose COBRAD or WNV
-    project_name = st.sidebar.selectbox("Select Project", ["COBRAD", "WNV"])
+    project_name = st.sidebar.selectbox("Select Project", ["COBRAD", "WNV","TGA"])
     if project_name == "COBRAD":
         # sidebar checkbox - awake only
-        awake_only = st.sidebar.checkbox("Awake Only", value=True)
+        awake_only = st.sidebar.checkbox("Awake Only", value=False)
         # slider from 1 to 12
         sample_window_size = st.sidebar.slider("Select the sample window size", 0, 12, 0)
         # Load COBRAD data
         df_wnv, patients_folder, controls, df_wnv2, cases_group_name = cobrad_get_files(sample_window_size, awake_only)
-    else:
+    elif project_name == "WNV":
         # Load WNV data
         df_wnv, patients_folder, controls, df_wnv2, cases_group_name = wnv_get_files()
+    elif project_name == "TGA":
+        df_wnv, patients_folder, controls, df_wnv2, cases_group_name = tga_get_files()
 
-    st.title("EEG vs Clinical Features")
+    st.title("EEG Analysis")
     # Iterate over each frequency band and plot the topomap
     cols_to_drop = ['annotations', 'bad_channels', 'patient_number', 'csv_file_name', 'file_name', 'file_path', 'signal_labels', 'number_of_signals', 'sampling_frequency', 'sampling_rate', 'duration_min']
     # Remove specified columns and those containing dates from df_wnv2
@@ -284,7 +307,7 @@ def main():
     if feature_type == "Clinical Feature" or feature_type == "EEG Feature" or feature_type == "vs_Controls":
         # ask user if they want only significant, or full.
         st.sidebar.header("Select Analysis Type")
-        analysis_type = st.sidebar.selectbox("Select Analysis Type", ["Significant", "Full"])
+        analysis_type = st.sidebar.selectbox("Select Analysis Type", [ "Full","Significant"])
     else:
         analysis_type = "Full"
         

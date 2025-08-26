@@ -38,7 +38,11 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(os.getcwd())
 
 is_prod = not any('vscode' in arg.lower() for arg in sys.argv)
-use_multiprocessing = True
+# Detect if running inside tmux
+def is_tmux():
+    return 'TMUX' in os.environ
+
+use_multiprocessing = is_tmux()
 # Suppress specific RuntimeWarnings
 warnings.filterwarnings("ignore", message="Channels contain different highpass filters. Highest filter setting will be stored.")
 warnings.filterwarnings("ignore", message="Channels contain different lowpass filters. Lowest filter setting will be stored.")
@@ -48,7 +52,8 @@ getcwd = os.getcwd()
 #%% INITIALIZATION
 # cases_project_name = 'west_nile_virus'
 # cases_project_name = 'HANDL'
-cases_project_name = 'EDF'
+# cases_project_name = 'EDF'
+cases_project_name = 'TGA'
 directory = os.path.join(getcwd, cases_project_name)
 # directory = os.path.join(getcwd, 'Controls')
 os_splittor = '\\' if 'nt' in os.name else '/'
@@ -62,23 +67,7 @@ os.makedirs(temp_dir, exist_ok=True)
 # make folder
 os.makedirs(f'pickles/{project_name}', exist_ok=True)
 
-def clean_df_demographics(df_demographics,patient_names):
-    # strip all values
-    df_demographics = df_demographics.map(lambda x: x.strip() if isinstance(x, str) else x)
-    # find what column has values 'נקבה'
-    sex_col_num = df_demographics.columns[df_demographics.isin(['נקבה']).any()][0]
-    # move to be first col
-    df_demographics = pd.concat([df_demographics.loc[:, [sex_col_num]], df_demographics.drop(columns=[sex_col_num])], axis=1)
-    # rename to gender
-    df_demographics.rename(columns={sex_col_num: 'Gender'}, inplace=True)
-    # what column contains patient_names at least 1
-    id_col_num = df_demographics.columns[df_demographics.isin(patient_names).any()][0]
-    # move to be first col
-    df_demographics = pd.concat([df_demographics.loc[:, [id_col_num]], df_demographics.drop(columns=[id_col_num])], axis=1)
-    # rename to ID
-    df_demographics.rename(columns={id_col_num: 'ID'}, inplace=True)
-    return df_demographics
-    df_demographics.iloc[:,0]
+
 
 
 def controls_match(sexes,ages,controls_ratio=4):
@@ -349,7 +338,7 @@ def process_file(row,filename,is_prod):
         if duration_s < duration_skip:
             return
         # Split the data into segments
-        max_duration_s = 60 * 10  # 60 minutes in seconds
+        max_duration_s = 60 * 60  # 60 minutes in seconds
         
         if duration_s > max_duration_s:
             eeg_metadata = None

@@ -25,3 +25,4 @@ bctpy
 PyWavelets
 networkx
 dabest
+edfio
