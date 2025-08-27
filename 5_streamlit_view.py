@@ -187,7 +187,7 @@ def vs_controls_run(project_name,df_wnv2,controls,boxplot_columns,analysis_type)
         if num_groups < 2:
             continue
         results_df = analyze_and_correct(curr_data, [col], groups=curr_data['Group'].unique())
-        boxplot_plot(results_df,curr_data, col, 'vs_controls',is_streamlit=True,analysis_type=analysis_type)
+        boxplot_plot_sns(results_df,curr_data, col, 'vs_controls',is_streamlit=True,analysis_type=analysis_type)
     # Display scatterplots
     st.header("Scatterplots vs Controls")
     if os.path.exists(scatterplots_dir):
@@ -389,7 +389,7 @@ def main():
             st.divider()
             for band in boxplot_columns:
                 results_df = analyze_and_correct(df_wnv3, [band], groups=df_wnv3['Group'].unique())
-                boxplot_plot(results_df, df_wnv3, band, f'{selected_feature}',is_streamlit=True,analysis_type=analysis_type)
+                boxplot_plot_sns(results_df, df_wnv3, band, f'{selected_feature}',is_streamlit=True,analysis_type=analysis_type)
                 # boxplot_plot_sns(results_df, df_wnv3, band, f'{selected_feature}',is_streamlit=True,analysis_type=analysis_type)
             # if frequency band is contained in the column name
             # group_data = {}
@@ -405,7 +405,7 @@ def main():
                 df_wnv3[selected_feature] = df_wnv3[selected_feature].astype(float)
                 # do boxplot for each band
                 results_df = analyze_and_correct(df_wnv3, [band], groups=df_wnv3['Group'].unique())
-                boxplot_plot(results_df, df_wnv3, band, f'{selected_feature}',is_streamlit=True,analysis_type=analysis_type)
+                boxplot_plot_sns(results_df, df_wnv3, band, f'{selected_feature}',is_streamlit=True,analysis_type=analysis_type)
         elif selected_feature in numeric_colunms:
             for band in boxplot_columns:
                 scatter_plot_with_regression({}, df_wnv3, selected_feature, band, f'{selected_feature}',is_streamlit=True,analysis_type=analysis_type)

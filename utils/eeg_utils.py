@@ -22,11 +22,7 @@ import h5py
 from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor
 from scipy.signal import welch
-<<<<<<< HEAD
 
-=======
-import dabest
->>>>>>> 291d4348e1182c43c96ec693072b0cc310e6538c
 eeg_channels = ['Fp1', 'Fp2', 'F3', 'F4', 'C3', 'C4', 'P3', 'P4', 'O1', 'O2', 'F7',
        'F8', 'T3', 'T4', 'T5', 'T6', 'Fz', 'Cz', 'Pz', 'A1','A2', 'Fpz', 'Oz']
 
@@ -109,8 +105,6 @@ def stat_text_get(group_data, col=None):
     )
     return stats_text, stats_dict
 
-<<<<<<< HEAD
-=======
 
 def plot_tsne_by_group(
     df,
@@ -198,16 +192,14 @@ def plot_tsne_by_group(
     else:
         plt.show()
 
->>>>>>> 291d4348e1182c43c96ec693072b0cc310e6538c
-def boxplot_plot(results_df, combined_df, col, output_dir,figures_dir=None,is_streamlit=False,analysis_type=None, show_histograms=False):
+def boxplot_plot_dabest(results_df, combined_df, col, output_dir,figures_dir=None,is_streamlit=False,analysis_type=None, show_histograms=False):
+    import dabest
     # Function to remove outliers based on 5 standard deviations
     def remove_outliers(df, col, group_col, threshold=5):
         def filter_group(group):
             mean = group[col].mean()
             std = group[col].std()
             return group[np.abs(group[col] - mean) <= threshold * std]
-<<<<<<< HEAD
-=======
         return df.groupby(group_col).apply(filter_group).reset_index(drop=True)
 
     # Remove outliers from each group
@@ -255,20 +247,13 @@ def boxplot_plot_sns(results_df, combined_df, col, output_dir,figures_dir=None,i
             mean = group[col].mean()
             std = group[col].std()
             return group[np.abs(group[col] - mean) <= threshold * std]
->>>>>>> 291d4348e1182c43c96ec693072b0cc310e6538c
         
         return df.groupby(group_col).apply(filter_group).reset_index(drop=True)
 
     # Remove outliers from each group
     cleaned_df = remove_outliers(combined_df, col, 'Group')
-<<<<<<< HEAD
-
-    # Plot the cleaned data
-    plt.figure(figsize=(10, 6))
-=======
     # Plot the cleaned data
     plt.figure(figsize=(16, 9))
->>>>>>> 291d4348e1182c43c96ec693072b0cc310e6538c
     sns.boxplot(x='Group', y=col, data=cleaned_df, showfliers=False)
     # Add stripplot
     sns.stripplot(x='Group', y=col, data=cleaned_df, alpha=0.5, jitter=True, color='black')
@@ -822,11 +807,7 @@ def process_file(file, pickles_location, sample_window_size):
     metadata_window = eeg_data_to_features(raw, window_size_sec=sample_window_size)
     return patient_id, metadata_window
 #%% COBRAD
-<<<<<<< HEAD
-def cobrad_get_files(sample_window_size=0,only_awake=False):
-=======
 def cobrad_get_files(sample_window_size=0,only_awake=False,sleep_only=False):
->>>>>>> 291d4348e1182c43c96ec693072b0cc310e6538c
     patients_folder = "EDF"
     sheets_to_read = ['clinical', 'medications', 'npi-q', 'epworth', 'isi', 'ecog_12','Sheet4','seizures']
     dfs = pd.read_excel('COBRAD_clinical_24022025.xlsx', sheet_name=sheets_to_read)
@@ -1044,7 +1025,6 @@ def custom_describe(df):
     return df_ret.round(2)
 
 import mne
-import yasa
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -1068,6 +1048,8 @@ def detect_sleep_stages(raw, plot=True):
     predicted_stages : numpy.ndarray
         Array of predicted sleep stage labels for each epoch.
     """
+    import yasa
+
     # Check if the chosen channel is available in the raw data
     channels = raw.info['ch_names']
     # Fz if exists if not C4 if not C3
@@ -1138,11 +1120,7 @@ def fix_predicted_stages(predicted_stages, min_non_w=10):
 
     return fixed_stages
 
-<<<<<<< HEAD
-def detect_sleep(cases_group_name):
-=======
 def detect_sleep(cases_group_name, save_sleep_only=False):
->>>>>>> 291d4348e1182c43c96ec693072b0cc310e6538c
     # Get pickle files from pickles/{cases_group_name}/*.pkl
     case_files = []
     for root, dirs, files in os.walk(f'pickles/{cases_group_name}'):
@@ -1153,14 +1131,6 @@ def detect_sleep(cases_group_name, save_sleep_only=False):
     # Create output directory for wake data
     wake_dir = f'pickles/wake_{cases_group_name}'
     os.makedirs(wake_dir, exist_ok=True)
-<<<<<<< HEAD
-
-    for case_file in case_files:
-        # Load the file
-        with open(case_file, 'rb') as f:
-            raw = pickle.load(f)
-
-=======
     if save_sleep_only:
         sleep_dir = f'pickles/sleep_{cases_group_name}'
         os.makedirs(sleep_dir, exist_ok=True)
@@ -1177,7 +1147,6 @@ def detect_sleep(cases_group_name, save_sleep_only=False):
         if raw.times[-1] - raw.times[0] < 5 * 60:
             print(f"File {case_file} has less than 5 minutes of data. Skipping...")
             continue
->>>>>>> 291d4348e1182c43c96ec693072b0cc310e6538c
         # Get the ID from the file name
         ID = os.path.basename(case_file).split('.')[0].split(' ')[0]
 
@@ -1220,8 +1189,6 @@ def detect_sleep(cases_group_name, save_sleep_only=False):
             pickle.dump(awake_raw, f)
 
         print(f"Saved awake data for ID {ID} to {wake_file_path}")
-<<<<<<< HEAD
-=======
 
         # Save sleep segments if requested
         if save_sleep_only:
@@ -1243,7 +1210,6 @@ def detect_sleep(cases_group_name, save_sleep_only=False):
                 with open(sleep_file_path, 'wb') as f:
                     pickle.dump(sleep_raw, f)
                 print(f"Saved sleep data for ID {ID} to {sleep_file_path}")
->>>>>>> 291d4348e1182c43c96ec693072b0cc310e6538c
     return
 
 def read_pkl_files(path):
@@ -1382,6 +1348,7 @@ def raw_run(cases_group_name='EDF'):
     st_pyplot_func(fig_fast)
 
 def spectogram_run(group,figures_dir=None,win_sec=5):
+    import yasa
     if figures_dir is None:
         # read f'pickles/group_mean/{group}_mean.pkl'
         with open(f'pickles/group_mean/{group}_mean.pkl', 'rb') as f:
@@ -1402,11 +1369,7 @@ def spectogram_run(group,figures_dir=None,win_sec=5):
         arr_mean = mean_of_resized_arrays(arr)
         # save arr_mean to pkl
         os.makedirs(f'pickles/group_mean', exist_ok=True)
-<<<<<<< HEAD
-        with open(f"pickles/group_mean/{figures_dir.split('_')[0]}_mean.pkl", 'wb') as f:
-=======
         with open(f'pickles/group_mean/{figures_dir.split("_")[0]}_mean.pkl', 'wb') as f:
->>>>>>> 291d4348e1182c43c96ec693072b0cc310e6538c
             pickle.dump({'raw': raw, 'arr_mean': arr_mean}, f)
     #%%  spectrogram
     # get eeg channels that are in raw.info['ch_names'] and in eeg_channels
@@ -1436,19 +1399,11 @@ def spectogram_run(group,figures_dir=None,win_sec=5):
 # if name == main
 if __name__ == '__main__':
     # Example usage
-<<<<<<< HEAD
-    # detect_sleep('EDF') 
-=======
     detect_sleep('EDF', save_sleep_only=True)
->>>>>>> 291d4348e1182c43c96ec693072b0cc310e6538c
     # read_pkl_files('pickles/wake_EDF')
 
     # merge_csv_files('temps_awake_EDF')
 
-<<<<<<< HEAD
-    df_wnv,patients_folder,controls,df_wnv2,cases_group_name = cobrad_get_files(sample_window_size=600,only_awake=True)
-=======
     # df_wnv,patients_folder,controls,df_wnv2,cases_group_name = cobrad_get_files(sample_window_size=600,only_awake=True)
->>>>>>> 291d4348e1182c43c96ec693072b0cc310e6538c
     
     # df_wnv,patients_folder,controls,df_wnv2,cases_group_name = wnv_get_files()
