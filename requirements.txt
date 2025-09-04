@@ -25,3 +25,7 @@ bctpy
 PyWavelets
 networkx
 dabest
+<<<<<<< HEAD
+=======
+edfio
+>>>>>>> 88614153a2850c0412be7a3a871778d47ccad786

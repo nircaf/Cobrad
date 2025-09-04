@@ -31,7 +31,8 @@ from scipy.signal import coherence, windows
 from itertools import combinations
 from scipy.stats import linregress
 import seaborn as sns
-
+from statsmodels.stats.multitest import fdrcorrection
+import glob
 try:
     import streamlit as st
     is_streamlit = True
@@ -39,7 +40,13 @@ except ImportError:
     is_streamlit = False
 from scipy.stats import zscore
 save_dir = "figures_HEP/compute_brain_heart_coupling"
-
+# Initialize time series dicts for each band
+bands = {
+    "delta": (1, 4),
+    "alpha": (8, 12),
+    "beta": (12, 30),
+    "gamma": (30, 45)
+}
 def clean_ecg_signal(ecg_signal, sfreq, lowcut=0.5, highcut=40, order=4):
     """
     Bandpass filter the ECG signal to remove noise and baseline wander.
@@ -181,8 +188,8 @@ def generate_control_table(group1_data, group2_data,
     return table
 
 from functools import partial
-
-def _plot_metric_vs_hrv(t, arrs, labels, save_plot, edf_name, save_dir):
+from scipy.stats import linregress
+def _plot_metric_vs_hrv(t, arrs, labels, save_plot, edf_name, save_dir,is_streamlit=False):
     """
     Plot multiple arrays (metrics/HRV indices) over time, with optional saving.
     Also saves normalized (min joint entropy) plot and Wilcoxon signed-rank test values for the first two arrays.
@@ -234,7 +241,7 @@ def _plot_metric_vs_hrv(t, arrs, labels, save_plot, edf_name, save_dir):
             fig.savefig(fname, dpi=300, bbox_inches='tight')
             plt.close(fig)
         else:
-            if 'is_streamlit' in globals() and is_streamlit:
+            if is_streamlit:
                 st.pyplot(fig)
             else:
                 plt.show()
@@ -258,7 +265,7 @@ def _plot_metric_vs_hrv(t, arrs, labels, save_plot, edf_name, save_dir):
             fig.savefig(fname, dpi=300, bbox_inches='tight')
             plt.close(fig)
         else:
-            if 'is_streamlit' in globals() and is_streamlit:
+            if is_streamlit:
                 st.pyplot(fig)
             else:
                 plt.show()
@@ -276,52 +283,109 @@ def _plot_metric_vs_hrv(t, arrs, labels, save_plot, edf_name, save_dir):
             fig2.savefig(fname2, dpi=300, bbox_inches='tight')
             plt.close(fig2)
         else:
-            if 'is_streamlit' in globals() and is_streamlit:
+            if is_streamlit:
                 st.pyplot(fig2)
             else:
                 plt.show()
-        # Also plot all arrays as pairwise scatterplots with regression (PairGrid)
+
+        # ------------------ PairGrid with scatter and line plots ------------------
         df_pair = pd.DataFrame({label: arr for label, arr in zip(labels, arrs)})
         g = sns.PairGrid(df_pair, diag_sharey=False)
+        # Compute all unique pairwise p-values for FDR correction
+        n_vars = len(df_pair.columns)
+        var_names = list(df_pair.columns)
+        pair_indices = []
+        r_vals = []
+        p_vals = []
+        for i in range(n_vars):
+            for j in range(i+1, n_vars):
+                x = df_pair.iloc[:, i]
+                y = df_pair.iloc[:, j]
+                mask = ~np.isnan(x) & ~np.isnan(y)
+                x_clean = np.array(x)[mask]
+                y_clean = np.array(y)[mask]
+                if len(x_clean) > 1 and len(y_clean) > 1:
+                    r, p = pearsonr(x_clean, y_clean)
+                else:
+                    r, p = np.nan, np.nan
+                pair_indices.append((i, j))
+                r_vals.append(r)
+                p_vals.append(p)
+        # FDR correction
+        p_vals_array = np.array([p if not np.isnan(p) else 1.0 for p in p_vals])
+        reject, pvals_fdr = fdrcorrection(p_vals_array, alpha=0.05, method='indep')
+        # Map (i, j) -> (r, p_fdr)
+        pair_to_stats = {}
+        for idx, (i, j) in enumerate(pair_indices):
+            pair_to_stats[(i, j)] = (r_vals[idx], pvals_fdr[idx])
 
         def scatter_with_stats(x, y, **kwargs):
             ax = kwargs.get('ax', plt.gca())
-            ax.scatter(x, y, alpha=0.7)
-            # Regression line
-            if len(x) > 1 and len(y) > 1:
-                sns.regplot(x=x, y=y, scatter=False, ax=ax, color='red', truncate=False)
-                r, p = pearsonr(x, y)
-                ax.annotate(f"$R^2$={r**2:.2f}\np={p:.3g}",
+            # Find which pair this is
+            i, j = None, None
+            for idx, col in enumerate(var_names):
+                if np.all(x == df_pair[col]):
+                    i = idx
+                if np.all(y == df_pair[col]):
+                    j = idx
+            if i is not None and j is not None and i != j:
+                key = (min(i, j), max(i, j))
+                r, p_fdr = pair_to_stats.get(key, (np.nan, np.nan))
+            else:
+                r, p_fdr = np.nan, np.nan
+            # Scatter plot for the joint distribution
+            mask = ~np.isnan(x) & ~np.isnan(y)
+            x_clean = np.array(x)[mask]
+            y_clean = np.array(y)[mask]
+            sns.scatterplot(x=x_clean, y=y_clean, ax=ax, alpha=0.7, s=20)
+            # Optionally add regression line
+            if len(x_clean) > 1 and len(y_clean) > 1:
+                sns.regplot(x=x_clean, y=y_clean, ax=ax, scatter=False, color='gray', line_kws={'alpha':0.5})
+            # Annotate with r^2 and FDR-corrected p-value only if significant
+            if not np.isnan(r) and not np.isnan(p_fdr) and p_fdr < 0.05:
+                ax.annotate(f"$R^2$={r**2:.2f}\np={p_fdr:.3g}",
                             xy=(0.05, 0.85), xycoords='axes fraction', fontsize=9,
                             bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="gray", alpha=0.7))
 
         def lineplot_with_time(x, y, **kwargs):
             ax = kwargs.get('ax', plt.gca())
-            # t is available from the closure
-            ax.plot(t, x, label='x', alpha=0.7)
-            ax.plot(t, y, label='y', alpha=0.7)
-            if len(x) > 1 and len(y) > 1:
-                r, p = pearsonr(x, y)
-                ax.annotate(f"$R^2$={r**2:.2f}\np={p:.3g}",
+            # t_temp = linspace between min and max of x and y
+            t_temp = np.linspace(min(min(x), min(y)), max(max(x), max(y)), num=len(x))
+            # For time plots, use the same FDR-corrected p-value as for the pair
+            i, j = None, None
+            for idx, col in enumerate(var_names):
+                if np.all(x == df_pair[col]):
+                    i = idx
+                if np.all(y == df_pair[col]):
+                    j = idx
+            if i is not None and j is not None and i != j:
+                key = (min(i, j), max(i, j))
+                r, p_fdr = pair_to_stats.get(key, (np.nan, np.nan))
+            else:
+                r, p_fdr = np.nan, np.nan
+            ax.plot(t_temp, x, label='x', alpha=0.7)
+            ax.plot(t_temp, y, label='y', alpha=0.7)
+            if not np.isnan(r) and not np.isnan(p_fdr) and p_fdr < 0.05:
+                ax.annotate(f"$R^2$={r**2:.2f}\np={p_fdr:.3g}",
                             xy=(0.05, 0.85), xycoords='axes fraction', fontsize=9,
                             bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="gray", alpha=0.7))
             ax.legend(fontsize=8)
             ax.set_xlabel('t')
             ax.set_ylabel('Value')
 
-        g.map_diag(sns.histplot)
+        g.map_diag(sns.histplot, kde=True, bins=10)
         g.map_upper(scatter_with_stats)
         g.map_lower(lineplot_with_time)
-
-        plt.suptitle("Pairwise relationships of all metrics and HRV indices", y=1.02)
+        g.fig.suptitle("Pairwise relationships", y=1.02)
         plt.tight_layout()
         if save_plot:
+            os.makedirs(save_dir, exist_ok=True)
             fname2 = f"{save_dir}/pairgrid_all_{edf_name}.png"
-            plt.savefig(fname2, dpi=300, bbox_inches='tight')
-            plt.close()
+            g.savefig(fname2, dpi=300, bbox_inches='tight')
+            plt.close(g.fig)
         else:
-            if 'is_streamlit' in globals() and is_streamlit:
-                st.pyplot(plt.gcf())
+            if is_streamlit:
+                st.pyplot(g.fig)
             else:
                 plt.show()
     else:
@@ -338,7 +402,7 @@ def _plot_metric_vs_hrv(t, arrs, labels, save_plot, edf_name, save_dir):
             fig.savefig(fname, dpi=300, bbox_inches='tight')
             plt.close(fig)
         else:
-            if 'is_streamlit' in globals() and is_streamlit:
+            if is_streamlit:
                 st.pyplot(fig)
             else:
                 plt.show()
@@ -467,12 +531,8 @@ def compute_brain_heart_coupling(edf_results, key, motor_symptoms=None, bool_plo
         hr_per_minute = np.array(hr_per_minute)
         hr_per_minute[(hr_per_minute < 40) | (hr_per_minute > 180)] = np.nan
         # Median filter (window size 3)
-        hr_smooth = medfilt(hr_per_minute, kernel_size=3)
         print("Average HR per minute (raw):")
         for i, hr in enumerate(hr_per_minute):
-            print(f"  Minute {i+1}: {hr:.2f} bpm" if not np.isnan(hr) else f"  Minute {i+1}: insufficient/invalid data")
-        print("Average HR per minute (smoothed):")
-        for i, hr in enumerate(hr_smooth):
             print(f"  Minute {i+1}: {hr:.2f} bpm" if not np.isnan(hr) else f"  Minute {i+1}: insufficient/invalid data")
     else:
         print("Not enough R-peaks to compute HR per minute.")
@@ -489,13 +549,7 @@ def compute_brain_heart_coupling(edf_results, key, motor_symptoms=None, bool_plo
     n_windows = int((n_samples - w_eeg) / step) + 1
     print(f"Number of windows: {n_windows}, Window size: {w_eeg}, Step: {step}")
 
-    # Initialize time series dicts for each band
-    bands = {
-        "delta": (1, 4),
-        "alpha": (8, 12),
-        "beta": (12, 30),
-        "gamma": (30, 45)
-    }
+
     eff_ts = {band: [] for band in bands}
     clu_ts = {band: [] for band in bands}
     mod_ts = {band: [] for band in bands}
@@ -572,6 +626,14 @@ def compute_brain_heart_coupling(edf_results, key, motor_symptoms=None, bool_plo
             'Vagal_SD1': cvi_arr_band,
             'Sympathetic_SD2': csi_arr_band
         })
+        # Add z-scored columns
+        results_df['Vagal_SD1_zscore'] = zscore(cvi_arr_band) if np.std(cvi_arr_band) > 0 else cvi_arr_band
+        results_df['Sympathetic_SD2_zscore'] = zscore(csi_arr_band) if np.std(csi_arr_band) > 0 else csi_arr_band
+        results_df['Efficiency_zscore'] = zscore(eff_arr) if np.std(eff_arr) > 0 else eff_arr
+        results_df['Clustering_zscore'] = zscore(clu_arr) if np.std(clu_arr) > 0 else clu_arr
+        results_df['Modularity_zscore'] = zscore(mod_arr) if np.std(mod_arr) > 0 else mod_arr
+        results_df['Assortativity_zscore'] = zscore(ass_arr) if np.std(ass_arr) > 0 else ass_arr
+
         results_df.attrs['mutual_info'] = mi_results
         results_df_dict[band] = results_df
 
@@ -581,17 +643,95 @@ def compute_brain_heart_coupling(edf_results, key, motor_symptoms=None, bool_plo
         labels = ['Vagal_SD1', 'Sympathetic_SD2', 'Efficiency', 'Clustering', 'Modularity', 'Assortativity']
         # Also plot z-scored arrays
         arrs_zscore = [zscore(arr) if np.std(arr) > 0 else arr for arr in arrs]
-        _plot_metric_vs_hrv(
-            t, arrs_zscore, labels, save_plot, f"{edf_pickle_name}_{band}_zscore", save_dir
-        )
+        if bool_plots:
+            _plot_metric_vs_hrv(
+                t, arrs_zscore, labels, save_plot, f"{edf_pickle_name}_{band}_zscore", save_dir
+            )
 
     # Return the results for the alpha band for compatibility
     return results_df_dict
 
-def only_plots(results_df,save_plot,save_dir):
-    
-    pass
-    
+def only_plots(results_df, save_plot, save_dir, edf_pickle_name="plot", band="band", step_sec=5):
+    """
+    Utility to plot all z-scored metrics and HRV indices from a results_df.
+    """
+    # Define the order and labels
+    zscore_cols = [
+        'Vagal_SD1_zscore',
+        'Sympathetic_SD2_zscore',
+        'Efficiency_zscore',
+        'Clustering_zscore',
+        'Modularity_zscore',
+        'Assortativity_zscore'
+    ]
+    labels = [
+        'Vagal_SD1',
+        'Sympathetic_SD2',
+        'Efficiency',
+        'Clustering',
+        'Modularity',
+        'Assortativity'
+    ]
+    arrs_zscore = [results_df[col].values for col in zscore_cols if col in results_df]
+    t = np.arange(len(results_df)) * step_sec
+    _plot_metric_vs_hrv(
+        t, arrs_zscore, labels, save_plot, f"{edf_pickle_name}_{band}_zscore", save_dir
+    )
+
+def plot_patient_band_means(patient_id, bands=None, step_sec=5, temps_dir="temps_EDF_HEP", save_dir="figures_HEP/compute_brain_heart_coupling"):
+    """
+    For a given patient_id, for each band, read all the patient's .csv files, average them, then run only_plots with the mean DataFrame.
+    """
+    for band in bands:
+        # Find all files for this patient and band
+        pattern = os.path.join(temps_dir, f"*{patient_id}*_results_{band}.csv")
+        file_list = glob.glob(pattern)
+        if not file_list:
+            print(f"No files found for patient {patient_id}, band {band}")
+            continue
+        dfs = []
+        for f in file_list:
+            try:
+                df = pd.read_csv(f)
+                dfs.append(df)
+            except Exception as e:
+                print(f"Error reading {f}: {e}")
+        if not dfs:
+            print(f"No valid DataFrames for patient {patient_id}, band {band}")
+            continue
+        # Align columns and average row-wise using nanmean logic
+        # 1. Get union of all columns
+        all_columns = set()
+        for df in dfs:
+            all_columns.update(df.columns)
+        all_columns = list(all_columns)
+        # 2. Reindex columns and rows for all dfs
+        max_len = max(len(df) for df in dfs)
+        dfs_aligned = []
+        for df in dfs:
+            df_aligned = df.reindex(columns=all_columns)
+            df_aligned = df_aligned.reindex(range(max_len)).reset_index(drop=True)
+            dfs_aligned.append(df_aligned)
+        # 3. Stack into 3D array (n_files, n_rows, n_cols)
+        arrs = np.stack([d.values for d in dfs_aligned], axis=0)
+        # 4. For each cell, count non-NaN, if >= half, nanmean, else NaN
+        n_files = len(dfs)
+        n_rows, n_cols = arrs.shape[1], arrs.shape[2]
+        mean_arr = np.full((n_rows, n_cols), np.nan)
+        for i in range(n_rows):
+            for j in range(n_cols):
+                vals = arrs[:, i, j]
+                n_not_nan = np.sum(~np.isnan(vals))
+                if n_not_nan >= n_files / 2:
+                    mean_arr[i, j] = np.nanmean(vals)
+                else:
+                    mean_arr[i, j] = np.nan
+        mean_df = pd.DataFrame(mean_arr, columns=all_columns)
+        # Drop rows where all columns are NaN (or, optionally, where most columns are NaN)
+        mean_df = mean_df.dropna(how="all")
+        edf_pickle_name = patient_id
+        only_plots(mean_df, save_plot=True, save_dir=save_dir, edf_pickle_name=edf_pickle_name, band=band, step_sec=step_sec)
+        print(f"Plotted mean for patient {patient_id}, band {band}")
 
             
 def load_edf_pickles_with_ecg(pickle_dir='pickles/EDF'):
@@ -620,6 +760,7 @@ def load_edf_pickles_with_ecg(pickle_dir='pickles/EDF'):
                     results[fname] = None
                 else:
                     results[fname] = raw
+                    print(f"Loaded {fname} with ECG channel.")
                     if not is_tmux:
                         ### DEV RUN
                         break
@@ -640,7 +781,7 @@ def process_all_patients(edf_results, step_sec=5):
         patient_id = edf_key.split('-')[1].split('.')[0]
         edf_pickle_name = patient_id
         results_df_dict = compute_brain_heart_coupling(
-            edf_results, edf_key, bool_plots=True, save_plot=True,
+            edf_results, edf_key, bool_plots=False, save_plot=True,
             edf_pickle_name=edf_pickle_name, step_sec=step_sec
         )
         # Save per scan, per band
@@ -655,24 +796,63 @@ def process_all_patients(edf_results, step_sec=5):
     # 2. Average all results_df for each patient, then plot
     for patient_id, dfs in patient_results.items():
         print(f"Averaging and plotting for patient: {patient_id}")
-        # Align columns and average
-        avg_df = pd.concat(dfs).groupby(level=0).mean(numeric_only=True)
-        # Use the first edf_pickle_name for naming
-        edf_pickle_name = patient_id
-        only_plots(results_df,save_plot=True,save_dir=save_dir)
+        plot_patient_band_means(            patient_id, bands=bands.keys(),
+            step_sec=step_sec, temps_dir="temps_EDF_HEP", save_dir="figures_HEP/compute_brain_heart_coupling"
+        )
+        
     # 3. Average across all patients and plot
-    if patient_results:
-        print("Averaging and plotting across all patients")
-        # Concatenate all patient average DataFrames
-        all_avg_dfs = []
-        for dfs in patient_results.values():
-            # Each dfs is a list of per-scan DataFrames for a patient
-            avg_df = pd.concat(dfs).groupby(level=0).mean(numeric_only=True)
-            all_avg_dfs.append(avg_df)
-        # Now average across all patients
-        grand_avg_df = pd.concat(all_avg_dfs).groupby(level=0).mean(numeric_only=True)
-        # Use a generic name for the group plot
-        # only_plots(grand_avg_df, save_plot='ALL_PATIENTS', save_plot=True)
+    def plot_all_patients_band_means(bands=None, step_sec=5, temps_dir="temps_EDF_HEP", save_dir="figures_HEP/compute_brain_heart_coupling"):
+        """
+        For each band, average all *_results_{band}.csv files across all patients, then plot.
+        """
+        if bands is None:
+            bands = ["delta", "alpha", "beta", "gamma"]
+        for band in bands:
+            pattern = os.path.join(temps_dir, f"*results_{band}.csv")
+            file_list = glob.glob(pattern)
+            if not file_list:
+                print(f"No files found for band {band} (all patients)")
+                continue
+            dfs = []
+            for f in file_list:
+                try:
+                    df = pd.read_csv(f)
+                    dfs.append(df)
+                except Exception as e:
+                    print(f"Error reading {f}: {e}")
+            if not dfs:
+                print(f"No valid DataFrames for band {band} (all patients)")
+                continue
+            # Align columns and average row-wise using nanmean logic
+            all_columns = set()
+            for df in dfs:
+                all_columns.update(df.columns)
+            all_columns = list(all_columns)
+            max_len = max(len(df) for df in dfs)
+            dfs_aligned = []
+            for df in dfs:
+                df_aligned = df.reindex(columns=all_columns)
+                df_aligned = df_aligned.reindex(range(max_len)).reset_index(drop=True)
+                dfs_aligned.append(df_aligned)
+            arrs = np.stack([d.values for d in dfs_aligned], axis=0)
+            n_files = len(dfs)
+            n_rows, n_cols = arrs.shape[1], arrs.shape[2]
+            mean_arr = np.full((n_rows, n_cols), np.nan)
+            for i in range(n_rows):
+                for j in range(n_cols):
+                    vals = arrs[:, i, j]
+                    n_not_nan = np.sum(~np.isnan(vals))
+                    if n_not_nan >= n_files / 2:
+                        mean_arr[i, j] = np.nanmean(vals)
+                    else:
+                        mean_arr[i, j] = np.nan
+            mean_df = pd.DataFrame(mean_arr, columns=all_columns)
+            mean_df = mean_df.dropna(how="all")
+            only_plots(mean_df, save_plot=True, save_dir=save_dir, edf_pickle_name="ALL_PATIENTS", band=band, step_sec=step_sec)
+            print(f"Plotted mean for ALL_PATIENTS, band {band}")
+
+    plot_all_patients_band_means(bands=bands.keys(), step_sec=step_sec, temps_dir="temps_EDF_HEP", save_dir="figures_HEP/compute_brain_heart_coupling")
+
     print("All processing and plotting complete.")
 
 # Example usage:
@@ -681,3 +861,6 @@ edf_results = {k: v for k, v in edf_results.items() if v is not None}
 process_all_patients(edf_results, step_sec=5)
 
 print("Processing and plotting complete for all patients.")
+
+# Example: plot mean band results for a specific patient (replace "010" with desired patient_id)
+# plot_patient_band_means("010")

@@ -1,8 +1,7 @@
 import os
 import mne
 
-directory = os.getcwd()
-prject_name = os.path.basename(directory)
+# directory = os.getcwd()
 
 def find_eeg_files(directory):
     eeg_files = []
@@ -26,5 +25,6 @@ def convert_and_remove_eeg(eeg_files):
             print(f"Failed to convert {eeg_file_path}: {e}")
 
 if __name__ == "__main__":
+    directory = 'TGA_SN_25'
     eeg_files = find_eeg_files(directory)
     convert_and_remove_eeg(eeg_files)

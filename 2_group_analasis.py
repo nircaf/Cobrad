@@ -40,6 +40,10 @@ plt.rc('axes',  titlesize=12)  # Set title size to be the same as x and y labels
 df_wnv,patients_folder,controls,df_wnv2,cases_group_name = wnv_get_files()
 only_awake=False
 # df_wnv,patients_folder,controls,df_wnv2,cases_group_name = cobrad_get_files(only_awake=only_awake)
+<<<<<<< HEAD
+=======
+df_wnv,patients_folder,controls,df_wnv2,cases_group_name = tga_get_files()
+>>>>>>> 88614153a2850c0412be7a3a871778d47ccad786
 #%% Initialize variables
 figures_dir = f'{cases_group_name}_figures'
 # Add group labels

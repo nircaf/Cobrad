@@ -22,6 +22,11 @@ import h5py
 from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor
 from scipy.signal import welch
+<<<<<<< HEAD
+=======
+import dabest
+from statsmodels.stats.power import TTestIndPower
+>>>>>>> 88614153a2850c0412be7a3a871778d47ccad786
 
 eeg_channels = ['Fp1', 'Fp2', 'F3', 'F4', 'C3', 'C4', 'P3', 'P4', 'O1', 'O2', 'F7',
        'F8', 'T3', 'T4', 'T5', 'T6', 'Fz', 'Cz', 'Pz', 'A1','A2', 'Fpz', 'Oz']
@@ -217,26 +222,65 @@ def boxplot_plot_dabest(results_df, combined_df, col, output_dir,figures_dir=Non
 
         # Extract p-value and Cohen's d from dabest results
         dabest_results = dabest_obj.mean_diff.results
-        dabest_results.columns
         p_value = dabest_results['pvalue_mann_whitney'].values[0] if 'pvalue_mann_whitney' in dabest_results else np.nan
-
+        dabest_results.columns
+        
         # Compute r^2 (eta squared for ANOVA)
         group_means = cleaned_df.groupby('Group')[col].mean()
         grand_mean = cleaned_df[col].mean()
         ss_between = sum(cleaned_df.groupby('Group').size() * (group_means - grand_mean) ** 2)
         ss_total = sum((cleaned_df[col] - grand_mean) ** 2)
         r_squared = ss_between / ss_total if ss_total > 0 else np.nan
+        # Format Cohen's d
+        cd = dabest_obj.cohens_d.results
+        cohen_d = cd['difference'].values[0] if 'difference' in cd.columns else np.nan
+        analysis = TTestIndPower()
+        alpha = 0.05
+        alternative = 'two-sided'  # or 'larger'/'smaller' if you had a directional hypothesis
 
+        # Compute observed power per contrast
+        cd = cd.copy()
+        observed_power = [
+            analysis.power(effect_size=abs(d),          # power depends on |d|
+                        nobs1=int(n1),
+                        ratio=float(n2)/float(n1),
+                        alpha=alpha,
+                        alternative=alternative)
+            for d, n1, n2 in zip(cd["difference"], cd["control_N"], cd["test_N"])
+        ]
+        # If observed_power is nan, set to 1.0 if p < 0.05, else 0.0
+        pval_col = "pvalue_mann_whitney" if "pvalue_mann_whitney" in dabest_results else "pvalue_permutation"
+        pvals = dabest_results[pval_col].values if pval_col in dabest_results else [np.nan] * len(observed_power)
+        for i, (power, pval) in enumerate(zip(observed_power, pvals)):
+            if not np.isfinite(power):
+                if pval < 0.05:
+                    observed_power[i] = 1.0
+                else:
+                    observed_power[i] = 0.0
+            else:
+                observed_power[i] = min(max(power, 0.0), 1.0)
         # Format title
-        plt.title(f"{col} by Group\np = {p_value:.3e}, r² = {r_squared:.2f}")
-
+        plt_title = f"""{col} by Group\n
+    p = {p_value:.3e}, r² = {r_squared:.2f}
+    Cohen's d = {cohen_d:.2f} with 95% CI [{cd['bca_low'].values[0]:.2f}, {cd['bca_high'].values[0]:.2f}]
+    Observed power = {100*observed_power[0]:.2f}%"""
+        plt.title(plt_title)
         if figures_dir:
             os.makedirs(f'{figures_dir}/dabest_plots/{output_dir}', exist_ok=True)
             plt.savefig(f"{figures_dir}/dabest_plots/{output_dir}/{col}_dabest_plot.png")
             plt.close()
         if is_streamlit:
+            # if not significt, return
+            if p_value > 0.05:
+                return
             st.divider()
             st.subheader(f"DABEST Estimation Plot of {col} by Group")
+            st.write(plt_title)
+            # st write mean +- std for each group
+            for group in combined_df['Group'].unique():
+                group_data = combined_df[combined_df['Group'] == group][col]
+                stats_text, stat_dict = stat_text_get(group_data)
+                st.write(f"{group} mean {stat_dict['Mean']:.2e} ± {stat_dict['Std']:.2e}")
             st_pyplot_func(plt, filename=f"{col}_dabest_plot")
     return results_df
 
@@ -585,30 +629,32 @@ def wnv_get_files():
     df_wnv2['MRS_delta_peak_minus_follow_up'] = df_wnv2['MRS_at_peak_illness'] - df_wnv2['MRS_FOLLOW_UP']
     cases_group_name = 'WNV'
     return df_wnv,patients_folder,controls,df_wnv2,cases_group_name 
-    # df_wnv2 to csv 'wnv_grouped.csv'
-    df_wnv2.to_csv('wnv_grouped.csv', index=False)
-    # sum ENCEPHALITIS
-    df_wnv2['ENCEPHALITIS'].sum()
-    # sum MENINGITIS
-    df_wnv2['MENINGITIS'].sum()
-    # df_wnv2.columns where MRS
-    [col for col in df_wnv2.columns if 'MRS' in col]
-    df_wnv2.columns.tolist()
-    df_merged['ID'].to_list()
+    # The following lines were unreachable after return and have been removed:
+    # df_wnv2.to_csv('wnv_grouped.csv', index=False)
+    # df_wnv2['ENCEPHALITIS'].sum()
+    # df_wnv2['MENINGITIS'].sum()
+    # [col for col in df_wnv2.columns if 'MRS' in col]
+    # df_wnv2.columns.tolist()
+    # df_merged['ID'].to_list()
 
-def find_consecutive_sequences(events, min_length=5):
+def find_consecutive_sequences(events, min_duration_sec=5):
     sequences = []
     temp_seq = [events[0]]
 
     for i in range(1, len(events)):
-        if events[i] == events[i - 1] + 1:
+        if events[i] == events[i - 1] + min_duration_sec:
             temp_seq.append(events[i])
         else:
-            if len(temp_seq) >= min_length:
+            # get sum diff
+            temp_seq_sum_diff = sum(np.diff(temp_seq))
+            if min_duration_sec < 5:
+                if temp_seq_sum_diff >= 5:
+                    sequences.append(temp_seq)
+            else:
                 sequences.append(temp_seq)
             temp_seq = [events[i]]
 
-    if len(temp_seq) >= min_length:  # Check the last sequence
+    if len(temp_seq) >= 5:  # Check the last sequence
         sequences.append(temp_seq)
 
     return sequences
@@ -643,11 +689,12 @@ def eeg_data_to_features(raw, window_size_sec=5, min_duration_sec=5):
     mpf_list = []
     df_list = []
     dfv_list = []
+    pswe_mpf_avg = []
     pswe_events_per_channel = []
 
     # Loop channels
     for channel_data in eeg_data:
-        ch_psd, ch_fft, ch_mpf, ch_df, ch_pswe = [], [], [], [], []
+        ch_psd, ch_fft, ch_mpf, ch_df, ch_pswe,pswe_mpf_list_temp = [], [], [], [], [],[]
 
         # Slide windows
         for start in range(0, len(channel_data) - window_size + 1, window_size):
@@ -674,8 +721,10 @@ def eeg_data_to_features(raw, window_size_sec=5, min_duration_sec=5):
             # PSWE detection
             if mpf < 6.0:
                 ch_pswe.append(start / sf)
+                pswe_mpf_list_temp.append(mpf)
 
         # Store per-channel
+        pswe_mpf_avg.append(np.mean(pswe_mpf_list_temp) if pswe_mpf_list_temp else np.nan)
         psd_list.append(ch_psd)
         fft_list.append(ch_fft)
         mpf_list.append(ch_mpf)
@@ -695,23 +744,32 @@ def eeg_data_to_features(raw, window_size_sec=5, min_duration_sec=5):
     overall_pswe_durations = []
     pswe_stats = []
 
-    for events in pswe_events_per_channel:
-        if events:
-            # find_consecutive_sequences should return lists of indices or times
-            sequences = find_consecutive_sequences(np.array(events), min_duration_sec)
-            durations = [len(seq) for seq in sequences]
+    for channel in pswe_events_per_channel:
+        if channel:
+            sequences = find_consecutive_sequences(np.array(channel), min_duration_sec)
+            durations = [len(seq)*min_duration_sec for seq in sequences]
+            # Bin edges: 0, 60, 120, ..., up to total_duration
+            n_bins = int(np.ceil(total_duration / 60))
+            bin_edges = np.arange(0, n_bins + 1) * 60
+            # Count events in each bin
+            event_times = np.array(channel)
+            event_counts, _ = np.histogram(event_times, bins=bin_edges)
+            # Bin index is minute number
+            events_per_minute = {minute: int(event_counts[minute]) for minute in range(n_bins)}
         else:
             durations = []
+            events_per_minute = {}
 
         pswe_total = sum(durations)
         pct = (pswe_total / total_duration) * 100
-        per_min = len(durations) / (total_duration / 60)
-        avg_len = np.mean(durations) if durations else 0
-
+        avg_len = float(np.mean(durations) if durations else 0)
+        # mean events_per_minute
+        events_p_minute = float(np.mean(list(events_per_minute.values())) if events_per_minute else 0)
         pswe_stats.append({
             'pswe_percentage': pct,
-            'pswe_events_per_minute': per_min,
-            'pswe_avg_length': avg_len
+            'pswe_events_per_minute': events_p_minute,
+            'pswe_avg_length': avg_len,
+            'pswe_mpf_avg': pswe_mpf_avg
         })
         overall_pswe_durations.extend(durations)
 
@@ -794,7 +852,7 @@ def eeg_data_to_features(raw, window_size_sec=5, min_duration_sec=5):
         })
     return meta
 
-def process_file(file, pickles_location, sample_window_size):
+def process_file_2(file, pickles_location, sample_window_size):
     """
     Process a single file to extract metadata.
     """
@@ -806,7 +864,149 @@ def process_file(file, pickles_location, sample_window_size):
     raw = pickle.load(open(os.path.join(pickles_location, file), 'rb'))
     metadata_window = eeg_data_to_features(raw, window_size_sec=sample_window_size)
     return patient_id, metadata_window
+
+#%% TGA
+def _parse_series_mixed(s: pd.Series, *, primary_dayfirst: bool) -> pd.Series:
+    """Try parsing with primary_dayfirst, then flip for any NaT."""
+    p1 = pd.to_datetime(s, errors="coerce", dayfirst=primary_dayfirst, infer_datetime_format=True)
+    missing = p1.isna()
+    if missing.any():
+        p2 = pd.to_datetime(s[missing], errors="coerce", dayfirst=not primary_dayfirst, infer_datetime_format=True)
+        p1.loc[missing] = p2
+    return p1
+
+def _standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    mapper = {
+        "tga time onset": "onset_raw",
+        "tga_time_onset": "onset_raw",
+        "tga onset": "onset_raw",
+        "tga time final": "final_raw",
+        "tga_time_final": "final_raw",
+        "tga final": "final_raw",
+        "final diagnosis? 0=no tga; 1=yes; 2=maybe2": "diagnosis",
+        "final diagnosis": "diagnosis",
+        "eeg_date": "eeg_raw",
+        "eeg time": "eeg_raw",
+        "eeg": "eeg_raw",
+    }
+    cols_norm = {c: c.strip().lower().replace("\u200f", "").replace("\u202c", "") for c in df.columns}
+    df2 = df.copy()
+    df2.columns = [cols_norm[c] for c in df.columns]
+    for k, v in mapper.items():
+        if k in df2.columns and v not in df2.columns:
+            df2.rename(columns={k: v}, inplace=True)
+    # Keep original names alongside standardized ones when possible
+    return df2
+
+def _derive_phase(eeg, onset, final):
+    if pd.isna(eeg) or pd.isna(onset) or pd.isna(final):
+        return "unknown"
+    if eeg < onset:
+        return "pre-onset"
+    if onset <= eeg <= final:
+        return "during"
+    return "post-final"
+
+def enrich_tga_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    df0 = _standardize_columns(df)
+
+    # Parse datetimes with sensible defaults:
+    # TGA times are often logged day-first (e.g., 20/9/2014),
+    # EEG entries are often month-first (e.g., 9/8/14).
+    onset_dt = _parse_series_mixed(df0.get("onset_raw", pd.Series([], dtype=object)), primary_dayfirst=True)
+    final_dt = _parse_series_mixed(df0.get("final_raw", pd.Series([], dtype=object)), primary_dayfirst=True)
+    eeg_dt   = _parse_series_mixed(df0.get("eeg_raw", pd.Series([], dtype=object)), primary_dayfirst=False)
+
+    out = df.copy()  # preserve original columns/ordering
+    out["onset_dt"] = onset_dt
+    out["final_dt"] = final_dt
+    out["eeg_dt"]   = eeg_dt
+
+    # Core durations (hours, float with 3 decimals)
+    tga_total = (final_dt - onset_dt).dt.total_seconds() / 3600.0
+    eeg_minus_onset = (eeg_dt - onset_dt).dt.total_seconds() / 3600.0
+    eeg_minus_final = (eeg_dt - final_dt).dt.total_seconds() / 3600.0
+
+    out["tga_total_hours"] = np.round(tga_total, 3)
+    out["eeg_minus_onset_hours"] = np.round(eeg_minus_onset, 3)
+    out["eeg_minus_final_hours"] = np.round(eeg_minus_final, 3)
+
+    # Valid if duration between 0 and 48 hours
+    out["duration_valid"] = (tga_total >= 0) & (tga_total <= 48)
+
+    # Days between EEG and onset date (absolute) to catch suspicious spans
+    # Use .normalize() to compare by date only
+    onset_date = onset_dt.dt.normalize()
+    eeg_date   = eeg_dt.dt.normalize()
+    span_days = (eeg_date - onset_date).dt.days.abs()
+    out["suspect_span_days"] = span_days
+    out["suspect_span_gt30d"] = span_days > 30
+
+    # Missingness
+    out["missing_any"] = out[["onset_dt", "final_dt", "eeg_dt"]].isna().any(axis=1)
+
+    # Notes column for quick QA
+    notes = []
+    for i, row in out.iterrows():
+        msgs = []
+        if row.get("missing_any", False):
+            msgs.append("missing datetimes")
+        if not pd.isna(row.get("tga_total_hours")):
+            if row["tga_total_hours"] < 0:
+                msgs.append("final < onset")
+            elif row["tga_total_hours"] > 48:
+                msgs.append("duration > 48h (check dates)")
+        if bool(row.get("suspect_span_gt30d", False)):
+            msgs.append("EEG far from onset (>30d)")
+        notes.append("; ".join(msgs) if msgs else "")
+    out["notes"] = notes
+
+    # Optional: normalize/clean diagnosis to int category if present
+    diag_col = None
+    for c in out.columns:
+        if c.strip().lower().startswith("final diagnosis"):
+            diag_col = c
+            break
+    if diag_col is not None:
+        out["diagnosis_int"] = pd.to_numeric(out[diag_col], errors="coerce").astype("Int64")
+
+    return out
+
+def tga_get_files():
+    def get_df_clinical(filepath="TGAEEG_ANONYM.xlsx"):
+        """Reads the anonymized clinical Excel file into a pandas DataFrame."""
+        try:
+            df = pd.read_excel(filepath)
+            return df
+        except Exception as e:
+            print(f"Error reading clinical file: {e}")
+            return None
+
+
+    # Example usage inside tga_get_files
+    clinical_df = get_df_clinical()
+    clinical_df = convert_sex_column(clinical_df,'sex')
+    # read TGA.csv
+    df_wnv = pd.read_csv('TGA.csv')
+    # get clinical features
+    clinical_df = enrich_tga_dataframe(clinical_df)
+    # remove from file_name .edf
+    df_wnv['file_name'] = df_wnv['file_name'].str.replace('.edf', '', regex=False)
+    patients_folder = "TGA"
+    controls = get_cobrad_controls("EDF")
+    # df_wnv2 is merged df_wnv and clinical_df right on EEG FILE NAME, left on PATIENT_ID
+    df_wnv2 = df_wnv.merge(clinical_df, left_on='file_name', right_on='EEG FILE NAME', how='inner')
+    cases_group_name = "TGA"
+    return df_wnv, patients_folder, controls, df_wnv2, cases_group_name
 #%% COBRAD
+def get_cobrad_controls(patients_folder):
+    controls = pd.read_csv(f'{patients_folder}_controls.csv')
+    controls['ID'] = controls['file_name'].apply(lambda x: x.split('_')[0]).astype(str)
+    numeric_cols = controls.select_dtypes(include=[np.number]).columns
+    controls = controls.groupby('ID').apply(
+        lambda x: (x[numeric_cols].multiply(x['duration_min'], axis=0)).sum(skipna=False) / x['duration_min'].sum(skipna=False)
+    ).reset_index()
+    return controls
 def cobrad_get_files(sample_window_size=0,only_awake=False,sleep_only=False):
     patients_folder = "EDF"
     sheets_to_read = ['clinical', 'medications', 'npi-q', 'epworth', 'isi', 'ecog_12','Sheet4','seizures']
@@ -863,15 +1063,8 @@ def cobrad_get_files(sample_window_size=0,only_awake=False,sleep_only=False):
         for sheet in sheets_to_read[1:]:
             df_wnv = pd.merge(df_wnv, dfs[sheet], on='ID', how='outer')
         return df_wnv
-    def get_cobrad_controls():
-        controls = pd.read_csv(f'{patients_folder}_controls.csv')
-        controls['ID'] = controls['file_name'].apply(lambda x: x.split('_')[0]).astype(str)
-        numeric_cols = controls.select_dtypes(include=[np.number]).columns
-        controls = controls.groupby('ID').apply(
-            lambda x: (x[numeric_cols].multiply(x['duration_min'], axis=0)).sum(skipna=False) / x['duration_min'].sum(skipna=False)
-        ).reset_index()
-        return controls
-    controls = get_cobrad_controls()
+
+    controls = get_cobrad_controls(patients_folder)
 
     def get_cases_cobrad():
         if sample_window_size == 0:
@@ -1395,11 +1588,108 @@ def spectogram_run(group,figures_dir=None,win_sec=5):
         st_pyplot_func(fig)
     else:
         fig.savefig(f'{figures_dir}/spectograms/{group}_mean_spectrogram.png')
+
+# Utility function to convert sex column
+def convert_sex_column(clinical_df, sex_column):
+    """
+    Converts 'M'/'m'/'male' to 0 and 'F'/'f'/'female' to 1 in the specified sex column of clinical_df.
+    Returns the modified DataFrame.
+    """
+    mapping = {
+        'm': 0, 'male': 0,
+        'f': 1, 'female': 1
+    }
+    clinical_df[sex_column] = clinical_df[sex_column].astype(str).str.strip().str.lower().map(lambda x: mapping.get(x, np.nan))
+    return clinical_df
         
+def clean_df_demographics(df_demographics,patient_names):
+    # strip all values
+    df_demographics = df_demographics.map(lambda x: x.strip() if isinstance(x, str) else x)
+    # find what column has values 'נקבה'
+    sex_col_num = df_demographics.columns[df_demographics.isin(['נקבה']).any()][0]
+    # move to be first col
+    df_demographics = pd.concat([df_demographics.loc[:, [sex_col_num]], df_demographics.drop(columns=[sex_col_num])], axis=1)
+    # rename to gender
+    df_demographics.rename(columns={sex_col_num: 'Gender'}, inplace=True)
+    # what column contains patient_names at least 1
+    id_col_num = df_demographics.columns[df_demographics.isin(patient_names).any()][0]
+    # move to be first col
+    df_demographics = pd.concat([df_demographics.loc[:, [id_col_num]], df_demographics.drop(columns=[id_col_num])], axis=1)
+    # rename to ID
+    df_demographics.rename(columns={id_col_num: 'ID'}, inplace=True)
+    return df_demographics
+    df_demographics.iloc[:,0]
+
+
+def get_controls_ages_genders(selected_folder, controls_dir='Controls'):
+    # Define age groups and their ranges
+    age_groups = [
+        '18-30 data', '31-40 data', '41-50 data', '51-60 data',
+        '61-70 data', '71-80 data', '81-90 data', '90+ data'
+    ]
+    age_groups_int = [
+        (18, 30), (31, 40), (41, 50), (51, 60),
+        (61, 70), (71, 80), (81, 90), (90, 120)
+    ]
+
+    # Get control IDs from the selected folder (.csv files)
+    control_ids = [f.split('_')[0] for f in os.listdir(selected_folder) if f.endswith('.csv')]
+    results = []
+
+    for group, (start, end) in zip(age_groups, age_groups_int):
+        group_name = group.split(' ')[0]
+        group_path = os.path.join(controls_dir, group)
+
+        # Read demographics
+        demo_path = os.path.join(group_path, f'{group_name}.xlsx')
+        df_demo = pd.read_excel(demo_path, header=None)
+        # Find which column contains any of the control_ids
+        col_with_ids = None
+        for col in df_demo.columns:
+            if df_demo[col].isin(control_ids).any():
+                col_with_ids = col
+                break
+        if col_with_ids is not None:
+            # Filter rows where the column matches control_ids
+            df_demo2 = df_demo[df_demo[col_with_ids].isin(control_ids)].copy()
+            df_demo2 = clean_df_demographics(df_demo2, control_ids)
+        else:
+            continue
+
+        # For age groups 61-90, also read "final data"
+        if start >= 61 and end <= 90:
+            demo_path2 = os.path.join(group_path, f'{group_name} final data.xlsx')
+            # rename column 5 to 'Age'
+            
+            df_demo2 = pd.read_excel(demo_path2, header=None)
+            df_demo2.rename(columns={5: 'Age'}, inplace=True)
+            df_demo2 = clean_df_demographics(df_demo2, control_ids)
+        else:
+            # rename column 7 to Age
+            df_demo2.rename(columns={7: 'Age'}, inplace=True)
+
+        # Remove duplicate columns and NaN IDs
+        sex_col_num = 1
+        df_demo2.iloc[:, sex_col_num] = df_demo2.iloc[:, sex_col_num].apply(lambda x: 'f' if x == 'נקבה' else 'm')
+
+        # Filter for selected controls
+        df_selected = df_demo2[df_demo2['ID'].isin(control_ids)]
+        results.append(df_selected[['ID', df_selected.columns[sex_col_num], 'Age']])  # Assuming age is col 2
+
+    # Concatenate all results
+    final_df = pd.concat(results, ignore_index=True)
+    final_df.columns = ['ID', 'Gender', 'Age']
+    # final_df remove ID coplicates
+    final_df = final_df.loc[:, ~final_df.columns.duplicated()].dropna(subset=['ID'])
+    # convert_sex_column
+    final_df = convert_sex_column(final_df,'Gender')
+    return final_df      
 # if name == main
 if __name__ == '__main__':
     # Example usage
-    detect_sleep('EDF', save_sleep_only=True)
+    # tga_get_files()
+    get_controls_ages_genders('temps_Controls_EDF')
+    # detect_sleep('EDF', save_sleep_only=True)
     # read_pkl_files('pickles/wake_EDF')
 
     # merge_csv_files('temps_awake_EDF')
@@ -1407,3 +1697,5 @@ if __name__ == '__main__':
     # df_wnv,patients_folder,controls,df_wnv2,cases_group_name = cobrad_get_files(sample_window_size=600,only_awake=True)
     
     # df_wnv,patients_folder,controls,df_wnv2,cases_group_name = wnv_get_files()
+
+
