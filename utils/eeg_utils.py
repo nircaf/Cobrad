@@ -13,6 +13,8 @@ from scipy import stats
 from statsmodels.stats.multitest import multipletests
 import statsmodels.stats.multitest as smm
 from scipy.signal import spectrogram
+import mne_connectivity
+from mne_connectivity import SpectralConnectivity as spectral_connectivity
 import statsmodels.api as sm
 import streamlit as st
 import json
@@ -61,6 +63,217 @@ power_bands = {
     "beta": [12, 30],
     "gamma": [30, 100]
 }
+
+import numpy as np
+import mne
+
+def slice_stratified_windows(
+    raw: mne.io.BaseRaw,
+    n_bins: int = 6,
+    window_s: float = 600.0,
+    windows_per_bin: int = 3,
+    min_gap_s: float | None = None,
+    grid_s: float = 1.0,
+    seed: int = 0,
+    exclude_desc: tuple[str, ...] = ("BAD", "ARTIFACT", "EDGE", "REJECT")
+):
+    """
+    Split the recording duration into N equal bins, and from EACH bin select
+    random short windows totaling approximately M minutes (minutes_per_bin).
+    Selection is random within each bin, respects excluded annotations, and
+    enforces a minimum gap between chosen windows. If not enough candidates
+    exist, a relaxed fallback sampling is applied to reach the target count.
+
+    Parameters
+    ----------
+    raw : mne.io.Raw
+        Continuous EEG data (preloaded).
+    n_bins : int
+        Number of equal bins for the recording duration.
+    window_s : float
+        Window length in seconds (e.g., 600 for 10 minutes).
+    windows_per_bin : int
+        Number of non-overlapping windows to sample from each bin.
+    min_gap_s : float | None
+        Minimum time between window starts. Defaults to window_s.
+    grid_s : float
+        Candidate start grid resolution (seconds).
+    seed : int
+        RNG seed for reproducibility.
+    exclude_desc : tuple[str, ...]
+        Annotation descriptions to exclude (case-insensitive substring match).
+
+    Returns
+    -------
+    X : np.ndarray, shape (n_windows, n_channels, n_times)
+        Stacked windows from all bins.
+    meta : dict
+        Metadata including per-window bin index and counts per bin:
+          - starts_s, stops_s
+          - bin_index (per window)
+          - per_bin_counts (length n_bins)
+          - bin_ranges_s: list[(start, stop)] for each bin
+          - sfreq, ch_names, window_s, etc.
+    """
+    sfreq = float(raw.info["sfreq"])
+    n_ch = len(raw.ch_names)
+    # Duration in seconds (raw.times starts at 0.0)
+    dur_s = float(raw.times[-1])
+    if dur_s <= 0:
+        raise RuntimeError("Recording duration is non-positive.")
+    bin_len = dur_s / float(n_bins)
+    rng = np.random.default_rng(seed)
+    gap = window_s if min_gap_s is None else float(min_gap_s)
+
+    # ------------------ helpers ------------------ #
+    def clean_intervals():
+        # Start with the full interval, subtract excluded annotations.
+        clean = [(0.0, dur_s)]
+        ex = []
+        # mne.Annotations elements have attributes .description, .onset, .duration
+        for ann in getattr(raw, "annotations", []):
+            desc = str(getattr(ann, "description", ""))
+            if any(tag.lower() in desc.lower() for tag in exclude_desc):
+                onset = float(getattr(ann, "onset", 0.0))
+                duration = float(getattr(ann, "duration", 0.0))
+                ex.append((onset, onset + duration))
+
+        def subtract(intervals, rm):
+            out = []
+            s, e = rm
+            for a, b in intervals:
+                if e <= a or s >= b:
+                    out.append((a, b))
+                else:
+                    if a < s:
+                        out.append((a, s))
+                    if e < b:
+                        out.append((e, b))
+            return out
+
+        for rm in ex:
+            clean = subtract(clean, rm)
+        # Keep only intervals that can hold at least one window
+        return [(a, b) for a, b in clean if (b - a) >= window_s]
+
+    def candidate_starts(intervals, start, stop):
+        # Generate candidate starts on a grid, clipped to [start, stop - window_s]
+        cands = []
+        for a, b in intervals:
+            a_clip, b_clip = max(a, start), min(b, stop)
+            end = b_clip - window_s
+            if end <= a_clip:
+                continue
+            # inclusive start, exclusive end
+            starts = np.arange(a_clip, end + 1e-9, grid_s, dtype=float)
+            if starts.size:
+                cands.append(starts)
+        if not cands:
+            return np.array([], dtype=float)
+        return np.unique(np.concatenate(cands))
+
+    def choose_with_gap(cands, n_target, gap_s):
+        # Shuffle candidates and pick greedily with min gap constraint
+        c = np.array(cands, dtype=float)
+        rng.shuffle(c)
+        chosen = []
+        for t in c:
+            if all(abs(t - u) >= gap_s for u in chosen):
+                chosen.append(float(t))
+                if len(chosen) >= n_target:
+                    break
+        return np.array(sorted(chosen), dtype=float)
+
+    # --------------------------------------------- #
+
+    clean_ints = clean_intervals()
+    if not clean_ints:
+        raise RuntimeError("No clean intervals of at least window_s were found after excluding annotations.")
+
+    # Target windows per bin
+    n_per_bin = int(windows_per_bin)
+    n_times = int(round(window_s * sfreq))
+
+    # Collect per-bin selections
+    starts_all = []
+    stops_all = []
+    bin_index_all = []
+    per_bin_counts = []
+    bin_ranges = []
+
+    for i in range(n_bins):
+        b0, b1 = i * bin_len, (i + 1) * bin_len
+        bin_ranges.append((b0, b1))
+        cands = candidate_starts(clean_ints, b0, b1)
+
+        selected = np.array([], dtype=float)
+        if cands.size > 0 and n_per_bin > 0:
+            # First pass: enforce gap
+            selected = choose_with_gap(cands, n_per_bin, gap)
+            # If not enough, relax gap (half gap)
+            if selected.size < n_per_bin and cands.size > 0:
+                need = n_per_bin - selected.size
+                # Prefer starts far from already chosen to reduce heavy overlap
+                remaining = np.setdiff1d(cands, selected)
+                if remaining.size == 0:
+                    remaining = cands
+                # Fallback: random choice from remaining (may violate gap if necessary)
+                extra = rng.choice(remaining, size=need, replace=(remaining.size < need))
+                selected = np.sort(np.concatenate([selected, extra]))
+
+        per_bin_counts.append(int(selected.size))
+        if selected.size:
+            starts_all.extend(selected.tolist())
+            stops_all.extend((selected + window_s).tolist())
+            bin_index_all.extend([i] * selected.size)
+
+    # Convert to arrays
+    starts = np.array(starts_all, dtype=float)
+    stops = np.array(stops_all, dtype=float)
+    bin_index = np.array(bin_index_all, dtype=int)
+
+    # Extract data safely (skip any window that would exceed data length)
+    X_list = []
+    valid_starts = []
+    valid_stops = []
+    valid_bins = []
+    n_samples_total = raw.n_times
+    for t0, t1, bidx in zip(starts, stops, bin_index):
+        s0 = int(round(t0 * sfreq))
+        s1 = s0 + n_times
+        if s0 < 0 or s1 > n_samples_total:
+            continue
+        X_list.append(raw.get_data(start=s0, stop=s1))
+        valid_starts.append(t0)
+        valid_stops.append(t1)
+        valid_bins.append(bidx)
+
+    if len(X_list) == 0:
+        raise RuntimeError("No windows could be extracted. Consider reducing minutes_per_bin or constraints.")
+
+    X = np.stack(X_list, axis=0)  # (n_windows, n_channels, n_times)
+    meta = dict(
+        starts_s=np.array(valid_starts, dtype=float),
+        stops_s=np.array(valid_stops, dtype=float),
+        bin_index=np.array(valid_bins, dtype=int),
+        per_bin_counts=np.array(per_bin_counts, dtype=int),
+        bin_ranges_s=bin_ranges,
+        sfreq=sfreq,
+        ch_names=list(raw.ch_names),
+        window_s=window_s,
+        n_windows=X.shape[0],
+        n_channels=n_ch,
+        n_times=n_times,
+        n_bins=n_bins,
+        windows_per_bin=windows_per_bin,
+        grid_s=grid_s,
+        gap_s=gap,
+    )
+    return X, meta
+
+# ---------------- Example usage ----------------
+# X, meta = slice_stratified_windows(raw, n_bins=6, window_s=4.0, minutes_per_bin=10, seed=42)
+# -> About 6 * (10 min / 4 s) ≈ 900 windows total
 
 def mean_of_resized_arrays(arrays):
     # Get the shapes of all arrays
@@ -194,33 +407,102 @@ def plot_tsne_by_group(
     else:
         plt.show()
 
-def boxplot_plot(results_df, combined_df, col, output_dir,figures_dir=None,is_streamlit=False,analysis_type=None, show_histograms=False):
-    # Function to remove outliers based on 5 standard deviations
-    def remove_outliers(df, col, group_col, threshold=5):
+def remove_outliers(df, col, group_col=None, threshold=5, by_group=True):
+    if by_group and group_col is not None:
+        # process each group separately, preserve original order
         def filter_group(group):
             mean = group[col].mean()
             std = group[col].std()
             return group[np.abs(group[col] - mean) <= threshold * std]
-        return df.groupby(group_col).apply(filter_group).reset_index(drop=True)
+        
+        # use groupby with group_keys=False to preserve order
+        return (
+            df.groupby(group_col, group_keys=False, sort=False)
+              .apply(filter_group)
+              .reset_index(drop=True)
+        )
+    else:
+        # global filtering
+        mean = df[col].mean()
+        std = df[col].std()
+        return df[np.abs(df[col] - mean) <= threshold * std].reset_index(drop=True)
+    
+def boxplot_plot(results_df, combined_df, col, output_dir,figures_dir=None,is_streamlit=False,analysis_type=None, show_histograms=False):
 
     # Remove outliers from each group
     cleaned_df = remove_outliers(combined_df, col, 'Group')
     unique_groups = cleaned_df['Group'].unique()
     # DABEST estimation plot only if exactly 2 groups
-    if len(unique_groups) == 2 and cleaned_df.groupby('Group')[col].count().min() > 0:
+    if cleaned_df.groupby('Group')[col].count().min() > 0:
         # Ensure 'Group' is categorical and idx matches
         cleaned_df['Group'] = pd.Categorical(cleaned_df['Group'], categories=unique_groups.tolist(), ordered=True)
         dabest_obj = dabest.load(cleaned_df, x='Group', y=col, idx=unique_groups.tolist())
-        # dabest_obj = dabest.load(cleaned_df, x='Group', y=col)
-        plt.figure(figsize=(16, 9))
-        # est = dabest_obj.mean_diff.plot(raw_marker_size=6, raw_label=col, contrast_label=f"Mean difference in {col}")
-        est = dabest_obj.mean_diff.plot(raw_marker_size=6, raw_label=col)
 
         # Extract p-value and Cohen's d from dabest results
         dabest_results = dabest_obj.mean_diff.results
         p_value = dabest_results['pvalue_mann_whitney'].values[0] if 'pvalue_mann_whitney' in dabest_results else np.nan
         dabest_results.columns
-        
+
+        def add_sig_lines(is_streamlit=False):
+            # --- Add significance lines and asterisks (including '****') for ALL pairwise comparisons ---
+            from scipy.stats import mannwhitneyu
+            ax = plt.gca()
+            y_min, y_max = ax.get_ylim()
+            xticks = ax.get_xticks()
+            xticklabels = [tick.get_text() for tick in ax.get_xticklabels()]
+            if not any(xticklabels):
+                xticklabels = [str(g) for g in unique_groups]
+            group_to_x = {str(g): i for i, g in enumerate(unique_groups)}
+            group_y_max = {}
+            for i, group in enumerate(unique_groups):
+                ys = cleaned_df[cleaned_df['Group'] == group][col].values
+                if len(ys) > 0:
+                    group_y_max[group] = np.max(ys)
+                else:
+                    group_y_max[group] = y_max * 0.95
+            base_height = max(group_y_max.values()) if group_y_max else y_max * 0.95
+            y_stack = base_height + 0.05 * (y_max - y_min)
+            y_increment = 0.05 * (y_max - y_min)
+            # For all unique pairs of groups, compute p-value and annotate
+            from itertools import combinations
+            pval_lines = []
+            for group1, group2 in combinations(unique_groups, 2):
+                data1 = cleaned_df[cleaned_df['Group'] == group1][col].dropna()
+                data2 = cleaned_df[cleaned_df['Group'] == group2][col].dropna()
+                if len(data1) < 2 or len(data2) < 2:
+                    continue
+                try:
+                    stat, pval = mannwhitneyu(data1, data2, alternative='two-sided')
+                except Exception:
+                    continue
+                # Collect tuple for Streamlit display and logic
+                if is_streamlit and len(unique_groups) > 1:
+                    pval_lines.append((group1, group2, pval))
+                # Determine significance symbol
+                if pval < 0.0001:
+                    stars = '****'
+                elif pval < 0.001:
+                    stars = '***'
+                elif pval < 0.01:
+                    stars = '**'
+                elif pval < 0.05:
+                    stars = '*'
+                else:
+                    continue  # Not significant, skip
+                x1 = group_to_x.get(str(group1), None)
+                x2 = group_to_x.get(str(group2), None)
+                if x1 is None or x2 is None:
+                    continue
+                # Draw the line
+                x_coords = [x1, x1, x2, x2]
+                y_coords = [y_stack, y_stack + y_increment, y_stack + y_increment, y_stack]
+                ax.plot(x_coords, y_coords, lw=1, c='k')
+                ax.text((x1 + x2) / 2, y_stack + y_increment + 0.01 * (y_max - y_min), stars,
+                        ha='center', va='bottom', color='k', fontsize=12, fontweight='bold')
+                y_stack += y_increment * 1.2
+            return pval_lines
+        pval_lines = add_sig_lines(is_streamlit=is_streamlit)
+
         # Compute r^2 (eta squared for ANOVA)
         group_means = cleaned_df.groupby('Group')[col].mean()
         grand_mean = cleaned_df[col].mean()
@@ -228,8 +510,12 @@ def boxplot_plot(results_df, combined_df, col, output_dir,figures_dir=None,is_st
         ss_total = sum((cleaned_df[col] - grand_mean) ** 2)
         r_squared = ss_between / ss_total if ss_total > 0 else np.nan
         # Format Cohen's d
-        cd = dabest_obj.cohens_d.results
-        cohen_d = cd['difference'].values[0] if 'difference' in cd.columns else np.nan
+        try:
+            cd = dabest_obj.cohens_d.results
+            cohen_d = cd['difference'].values[0] if 'difference' in cd.columns else np.nan
+        except Exception as e:
+            st.write(f"Could not compute Cohen's d: {e}")
+            return 
         analysis = TTestIndPower()
         alpha = 0.05
         alternative = 'two-sided'  # or 'larger'/'smaller' if you had a directional hypothesis
@@ -260,25 +546,37 @@ def boxplot_plot(results_df, combined_df, col, output_dir,figures_dir=None,is_st
     p = {p_value:.3e}, r² = {r_squared:.2f}
     Cohen's d = {cohen_d:.2f} with 95% CI [{cd['bca_low'].values[0]:.2f}, {cd['bca_high'].values[0]:.2f}]
     Observed power = {100*observed_power[0]:.2f}%"""
-        plt.title(plt_title)
+        # plt.title(plt_title)
+        plt.figure(figsize=(16, 9))
+        est = dabest_obj.mean_diff.plot(raw_marker_size=6, raw_label=col,float_contrast=True)
+
         if figures_dir:
             os.makedirs(f'{figures_dir}/dabest_plots/{output_dir}', exist_ok=True)
             plt.savefig(f"{figures_dir}/dabest_plots/{output_dir}/{col}_dabest_plot.png")
             plt.close()
         if is_streamlit:
-            # if not significt, return
-            if p_value > 0.05:
+            # Only show if at least one p-value is significant
+            if pval_lines and all(pval > 0.05 for _, _, pval in pval_lines):
                 return
             st.divider()
-            st.subheader(f"DABEST Estimation Plot of {col} by Group")
-            st.write(plt_title)
-            # st write mean +- std for each group
-            for group in combined_df['Group'].unique():
-                group_data = combined_df[combined_df['Group'] == group][col]
-                stats_text, stat_dict = stat_text_get(group_data)
-                st.write(f"{group} mean {stat_dict['Mean']:.2e} ± {stat_dict['Std']:.2e}")
+            st.subheader(f"Estimation Plot of {col} by Group")
+
+            # Show p-value lines in Streamlit: first line, rest in expander
+            if is_streamlit and len(pval_lines) > 0:
+                formatted_lines = [f"{g1} vs {g2} P-value: {pval:.3e}" for g1, g2, pval in pval_lines]
+                st.write(formatted_lines[0])
+                if len(formatted_lines) > 1:
+                    with st.expander("Show numeric results"):
+                        st.write(plt_title)
+                        # st write mean +- std for each group
+                        for group in combined_df['Group'].unique():
+                            group_data = combined_df[combined_df['Group'] == group][col]
+                            stats_text, stat_dict = stat_text_get(group_data)
+                            st.write(f"{group} mean {stat_dict['Mean']:.2e} ± {stat_dict['Std']:.2e}")
+                        for line in formatted_lines[1:]:
+                            st.write(line)
             st_pyplot_func(plt, filename=f"{col}_dabest_plot")
-    return results_df
+    return # results_df
 
 def boxplot_plot_sns(results_df, combined_df, col, output_dir,figures_dir=None,is_streamlit=False,analysis_type=None, show_histograms=False):
     # Function to remove outliers based on 5 standard deviations
@@ -408,7 +706,7 @@ def scatter_plot_with_regression(results_df, combined_df, x_col, y_col, output_d
         sig_symbol = '*'
     else:
         sig_symbol = 'ns'
-    if sig_symbol != 'ns' or analysis_type == 'Full':
+    if sig_symbol != 'ns':
         # Add stats results to the title
         plt.title(
             f"{x_col} vs {y_col} Regression\n"
@@ -688,14 +986,17 @@ def eeg_data_to_features(raw, window_size_sec=5, min_duration_sec=5):
     pswe_mpf_avg = []
     pswe_events_per_channel = []
 
-    # Loop channels
-    for channel_data in eeg_data:
-        ch_psd, ch_fft, ch_mpf, ch_df, ch_pswe,pswe_mpf_list_temp = [], [], [], [], [],[]
+    # --- NEW: Initialize network feature arrays per band ---
+    band_feature_arrays = {band: {'efficiency': [], 'clustering': [], 'assortativity': [], 'modularity': []}
+                          for band in power_bands}
 
+    # Loop channels
+    for i, channel_data in enumerate(eeg_data):
+        ch_psd, ch_fft, ch_mpf, ch_df, ch_pswe,pswe_mpf_list_temp = [], [], [], [], [],[]
         # Slide windows
         for start in range(0, len(channel_data) - window_size + 1, window_size):
+            segment = eeg_data[:,start:start + window_size]
             win = channel_data[start:start + window_size]
-
             # PSD
             psd_vals, freqs = mne.time_frequency.psd_array_welch(
                 win, sf, fmin=1, fmax=40, n_fft=int(sf)
@@ -718,7 +1019,14 @@ def eeg_data_to_features(raw, window_size_sec=5, min_duration_sec=5):
             if mpf < 6.0:
                 ch_pswe.append(start / sf)
                 pswe_mpf_list_temp.append(mpf)
-
+            # --- MODIFIED: Compute network features for each window and band ---
+            if i == 0:
+                for band_name, (fmin, fmax) in power_bands.items():
+                    efficiency, clustering, assortativity, modularity = compute_network_features(segment, sf, [fmin, fmax])
+                    band_feature_arrays[band_name]['efficiency'].append(efficiency)
+                    band_feature_arrays[band_name]['clustering'].append(clustering)
+                    band_feature_arrays[band_name]['assortativity'].append(assortativity)
+                    band_feature_arrays[band_name]['modularity'].append(modularity)
         # Store per-channel
         pswe_mpf_avg.append(np.mean(pswe_mpf_list_temp) if pswe_mpf_list_temp else np.nan)
         psd_list.append(ch_psd)
@@ -792,6 +1100,39 @@ def eeg_data_to_features(raw, window_size_sec=5, min_duration_sec=5):
     skew = np.apply_along_axis(lambda x: pd.Series(x).skew(), 1, eeg_data)
     kurt = np.apply_along_axis(lambda x: pd.Series(x).kurt(), 1, eeg_data)
 
+    # Compute connectivity matrix (coherence) using MNE spectral_connectivity
+    try:
+        # spectral_connectivity expects shape (n_epochs, n_signals, n_times) -> wrap our data as a single epoch
+        data_for_conn = eeg_data[np.newaxis, :, :]  # shape (1, n_channels, n_times)
+        conn_res = spectral_connectivity(
+            data_for_conn,
+            method='coh',
+            sfreq=sf,
+            fmin=1.0,
+            fmax=40.0,
+            faverage=True,
+            verbose=False,
+        )
+        conn = conn_res[0]  # connectivity array
+        # conn can be (n_channels, n_channels, n_freqs) or (n_connections, n_freqs)
+        if conn.ndim == 3:
+            conn_mat = np.mean(conn, axis=2)
+        elif conn.ndim == 2:
+            # convert upper-tri vector to symmetric matrix
+            n_ch = eeg_data.shape[0]
+            conn_mean = np.mean(conn, axis=1)
+            conn_mat = np.zeros((n_ch, n_ch))
+            triu_idx = np.triu_indices(n_ch, k=1)
+            conn_mat[triu_idx] = conn_mean
+            conn_mat[(triu_idx[1], triu_idx[0])] = conn_mean
+        else:
+            conn_mat = np.full((eeg_data.shape[0], eeg_data.shape[0]), np.nan)
+        conn_df = pd.DataFrame(conn_mat, index=raw_eeg.ch_names, columns=raw_eeg.ch_names)
+    except Exception as e:
+        # If connectivity fails, return an empty dict and continue
+        conn_df = pd.DataFrame()
+        print(f"Connectivity computation failed: {e}")
+
     # Compile metadata
     meta = {
         'overall_pswe_median_percentage': overall_pct,
@@ -816,8 +1157,9 @@ def eeg_data_to_features(raw, window_size_sec=5, min_duration_sec=5):
         'overall_mpf_mean': mpf_arr.mean(),
         'overall_mpf_median': np.median(mpf_arr),
         'overall_df_mean': df_arr.mean(),
-        'overall_dfv_std': dfv_arr.mean()
+        'overall_dfv_std': dfv_arr.mean(),
     }
+
 
     # Channel-specific metadata
     for i, ch in enumerate(raw_eeg.ch_names):
@@ -846,7 +1188,13 @@ def eeg_data_to_features(raw, window_size_sec=5, min_duration_sec=5):
             f'dfv_mean_EEG {ch}': df_arr[i].mean(),
             f'dfv_std_EEG {ch}': dfv_arr[i]
         })
-    return meta
+    # --- Compute mean and std of network features per band and add to meta ---
+    for band_name in power_bands:
+        for feat in ['efficiency', 'clustering', 'assortativity', 'modularity']:
+            arr = np.array(band_feature_arrays[band_name][feat])
+            meta[f'network_{band_name}_{feat}_mean'] = np.nanmean(arr) if arr.size > 0 else np.nan
+            meta[f'network_{band_name}_{feat}_std'] = np.nanstd(arr) if arr.size > 0 else np.nan
+    return meta, conn_df
 
 def process_file_2(file, pickles_location, sample_window_size):
     """
@@ -1053,11 +1401,20 @@ def cobrad_get_files(sample_window_size=0,only_awake=False,sleep_only=False):
                     dfs[sheet] = dfs[sheet].replace(-9, np.nan)
             # add the name of sheet at beggining of column all cols but ID
             dfs[sheet].columns = [f'{sheet}_{col}' if col != 'ID' else col for col in dfs[sheet].columns]
-
         # Merge all DataFrames on 'ID'
         df_wnv = dfs[sheets_to_read[0]]
         for sheet in sheets_to_read[1:]:
             df_wnv = pd.merge(df_wnv, dfs[sheet], on='ID', how='outer')
+        # Rename any column that contains 'clinical_sex' (case-insensitive) to 'sex'
+        for col in df_wnv.columns:
+            if isinstance(col, str) and 'clinical_sex' in col.lower():
+                # If 'sex' already exists, prefer the existing 'sex' column; otherwise rename
+                if 'sex' not in df_wnv.columns:
+                    df_wnv = df_wnv.rename(columns={col: 'sex'})
+                else:
+                    # If both exist, keep both but standardize name by creating 'sex_orig' for clarity
+                    df_wnv = df_wnv.rename(columns={col: f"{col}_orig"})
+                break
         return df_wnv
 
     controls = get_cobrad_controls(patients_folder)
@@ -1086,13 +1443,6 @@ def cobrad_get_files(sample_window_size=0,only_awake=False,sleep_only=False):
                                     total=len(files), desc="Processing files"))
 
             # Aggregate metadata for each patient
-            for patient_id, metadata_window in results:
-                if patient_id not in patient_metadata:
-                    patient_metadata[patient_id] = []
-                patient_metadata[patient_id].append(metadata_window)
-
-            # Calculate average values for each patient
-            cases = []
             for patient_id, metadata_list in patient_metadata.items():
                 # Convert list of metadata dictionaries to a DataFrame
                 patient_df = pd.DataFrame(metadata_list)
@@ -1324,7 +1674,7 @@ def detect_sleep(cases_group_name, save_sleep_only=False):
         os.makedirs(sleep_dir, exist_ok=True)
 
     for case_file in case_files:
-        # Load the file
+               # Load the file
         try:
             with open(case_file, 'rb') as f:
                 raw = pickle.load(f)
@@ -1677,7 +2027,54 @@ def get_controls_ages_genders(selected_folder, controls_dir='Controls'):
     final_df = final_df.loc[:, ~final_df.columns.duplicated()].dropna(subset=['ID'])
     # convert_sex_column
     final_df = convert_sex_column(final_df,'Gender')
-    return final_df      
+    return final_df
+
+from itertools import combinations
+from scipy.signal import coherence, windows
+import networkx as nx
+def compute_network_features(eeg_data, sfreq, freq_band, threshold_density=0.2):
+    """
+    Compute network features from EEG data using coherence in a given frequency band.
+
+    Parameters:
+        eeg_data (ndarray): EEG data (channels x samples)
+        sfreq (float): Sampling frequency
+        freq_band (tuple): Frequency band (low, high) in Hz
+        threshold_density (float): Proportion of top connections to retain in binarized graph
+
+    Returns:
+        dict: Network metrics (clustering, efficiency, assortativity, modularity)
+    """
+    n_channels = eeg_data.shape[0]
+    coh_matrix = np.zeros((n_channels, n_channels))
+    # sfreq to int
+    sfreq = int(sfreq)
+    # Compute coherence between all pairs
+    for i, j in combinations(range(n_channels), 2):
+        f, Cxy = coherence(eeg_data[i], eeg_data[j], fs=sfreq, window=windows.hann(sfreq),
+                           nperseg=sfreq, noverlap=sfreq//2)
+        freq_mask = (f >= freq_band[0]) & (f <= freq_band[1])
+        mean_coh = np.mean(Cxy[freq_mask])
+        coh_matrix[i, j] = coh_matrix[j, i] = mean_coh
+
+    # Binarize: keep top X% of connections (thresholding by density)
+    n_possible = n_channels * (n_channels - 1) / 2
+    n_edges = int(threshold_density * n_possible)
+    triu_vals = coh_matrix[np.triu_indices(n_channels, k=1)]
+    thresh_val = np.sort(triu_vals)[-n_edges] if n_edges > 0 else 0
+    binarized = (coh_matrix >= thresh_val).astype(int)
+    np.fill_diagonal(binarized, 0)
+
+    # Build graph and compute features
+    G = nx.from_numpy_array(binarized)
+
+    clustering = nx.transitivity(G)
+    efficiency = nx.global_efficiency(G)
+    assortativity = nx.degree_pearson_correlation_coefficient(G)
+    modularity = nx.algorithms.community.modularity(G, nx.community.label_propagation_communities(G))
+
+    return efficiency, clustering, assortativity, modularity
+      
 # if name == main
 if __name__ == '__main__':
     # Example usage
@@ -1691,5 +2088,3 @@ if __name__ == '__main__':
     # df_wnv,patients_folder,controls,df_wnv2,cases_group_name = cobrad_get_files(sample_window_size=600,only_awake=True)
     
     # df_wnv,patients_folder,controls,df_wnv2,cases_group_name = wnv_get_files()
-
-

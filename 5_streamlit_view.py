@@ -149,7 +149,8 @@ def pairplot_columns(df, clinical_features, eeg_features, hue=None, output_dir=N
                 # Apply Z-score normalization to y
                 y_zscore = (y - y.mean()) / y.std()
                 
-                sns.scatterplot(x=x, y=y_zscore, alpha=0.5, label=columns[i])
+                sns.scatterplot(x=x, y=y_zscore, alpha=0.5, label=columns[i]
+                )
                 sns.regplot(x=x, y=y_zscore, scatter=False, line_kws={'alpha': 0.5}, label=None)
                 
                 # Calculate R^2 and p-value
@@ -261,24 +262,42 @@ def org_selected_feature(selected_feature):
     # if clinical_LBD_Cognitive_fluctuation change to LBD
     if selected_feature == 'clinical_LBD_Cognitive_fluctuation':
         return 'CF'
+    return selected_feature
     
 
 # Streamlit App
 def main():
     # have user choose COBRAD or WNV
-    project_name = st.sidebar.selectbox("Select Project", ["COBRAD", "WNV","TGA"])
-    if project_name == "COBRAD":
-        # sidebar checkbox - awake only
-        awake_only = st.sidebar.checkbox("Awake Only", value=False)
-        # slider from 1 to 12
-        sample_window_size = st.sidebar.slider("Select the sample window size", 0, 12, 0)
-        # Load COBRAD data
-        df_wnv, patients_folder, controls, df_wnv2, cases_group_name = cobrad_get_files(sample_window_size, awake_only)
-    elif project_name == "WNV":
-        # Load WNV data
-        df_wnv, patients_folder, controls, df_wnv2, cases_group_name = wnv_get_files()
-    elif project_name == "TGA":
-        df_wnv, patients_folder, controls, df_wnv2, cases_group_name = tga_get_files()
+    # allow multiple selection for project
+    selected_projects = st.sidebar.multiselect("Select Project(s)", ["COBRAD", "WNV", "TGA"], default=["COBRAD","TGA"])
+    if not selected_projects:
+        st.error("Please select at least one project.")
+        return
+    df_wnv2 = None
+    df_wnv2_others = []
+    controls = None
+    controls_others = []
+    cases_group_name = None
+    cases_group_name_others = []
+    for idx, project_name in enumerate(selected_projects):
+        if project_name == "COBRAD":
+            awake_only = st.sidebar.checkbox("Awake Only", value=False)
+            sample_window_size = st.sidebar.slider("Select the sample window size", 0, 12, 0)
+            df_wnv, patients_folder, temp_controls, temp_df_wnv2, temp_cases_group_name = cobrad_get_files(sample_window_size, awake_only)
+        elif project_name == "WNV":
+            df_wnv, patients_folder, temp_controls, temp_df_wnv2, temp_cases_group_name = wnv_get_files()
+        elif project_name == "TGA":
+            df_wnv, patients_folder, temp_controls, temp_df_wnv2, temp_cases_group_name = tga_get_files()
+        if idx == 0:
+            df_wnv2 = temp_df_wnv2
+            controls = temp_controls
+            controls['Group'] = 'Control'
+            cases_group_name = temp_cases_group_name
+        else:
+            df_wnv2_others.append((project_name, temp_df_wnv2))
+            controls_others.append((project_name, temp_controls))
+            cases_group_name_others.append((project_name, temp_cases_group_name))
+    project_name = selected_projects[0]  # Use the first selected project for downstream logic
 
     st.title("EEG Analysis")
     # Iterate over each frequency band and plot the topomap
@@ -313,7 +332,8 @@ def main():
         
     marked_clinical_features = []
     dict_features = {}
-    cols_to_skip = ['ID','annotations','bad_channels','Group','patient_number']
+    bool_all_features = False
+    cols_to_skip = ['ID','annotations','bad_channels','Group','patient_number','size','n_samples']
     clinical_features = [feature for feature in clinical_features if feature not in cols_to_skip]
     for feature in clinical_features:
         if os.path.exists(os.path.join(boxplots_folder, feature)) or os.path.exists(os.path.join(scatterplots_folder, feature)):
@@ -358,15 +378,26 @@ def main():
         raw_run(cases_group_name)
         return
     elif feature_type == "EEG Feature":
-        selected_feature = st.sidebar.radio("Select an EEG feature:", eeg_features)
+        eeg_feature_options =  eeg_features+ ["All Features"] 
+        selected_feature = st.sidebar.radio("Select an EEG feature:", eeg_feature_options)
+        if selected_feature == "All Features":
+            all_feat_list = eeg_features
+            selected_feature = eeg_features[0]
+            bool_all_features = True
         plot_title = f"Plots of {selected_feature} vs All Clinical Features"
         boxplot_columns = clinical_features_numeric
     else:
         clinical_features_correlation = st.sidebar.checkbox("Show Clinical Features Correlation", value=False)
-        selected_feature = st.sidebar.radio("Select a Clinical feature:", marked_clinical_features)
+        marked_clinical_features_w_all = marked_clinical_features + ["All Features"]
+        selected_feature = st.sidebar.radio("Select a Clinical feature:", marked_clinical_features_w_all)
+        if selected_feature == "All Features":
+            all_feat_list = marked_clinical_features
+            selected_feature = marked_clinical_features[0]
+            bool_all_features = True
         # map back to key of dict_features
         selected_feature = [key for key, value in dict_features.items() if value == selected_feature][0]
         plot_title = f"Plots of {selected_feature} vs All EEG Features"
+    st.header(plot_title)
     # remove ID from selected_feature
     feature_data = df_wnv2[selected_feature].dropna().astype(float)
     col1, col2, col3 = st.columns(3)
@@ -387,52 +418,99 @@ def main():
         if clinical_features_correlation:
             # from clinical columns get
             boxplot_columns = boxplot_columns + clinical_features - selected_feature
-    # Display selected feature and plots
-    if selected_feature:
-        st.header(plot_title)
-        df_wnv3 = df_wnv2[df_wnv2[selected_feature].notna()].copy()
-        unique_values = df_wnv3[selected_feature].unique()
-        # Save the raw data
-        print(f'Analyzing {selected_feature} with {len(unique_values)} unique values')
-        if df_wnv3.shape[0] < 3 or unique_values.shape[0] < 2:
-            return
-        if len(unique_values) == 2:  # Check if binary
-            # check that there are at least 3 in each group (0,1)
-            if len(df_wnv3[df_wnv3[selected_feature] == 1]) < 3 or len(df_wnv3[df_wnv3[selected_feature] == 0]) < 3:
+    def run_selected_feature():
+            # Display selected feature and plots
+            df_wnv3 = df_wnv2[df_wnv2[selected_feature].notna()].copy()
+            unique_values = df_wnv3[selected_feature].unique()
+            # Save the raw data
+            print(f'Analyzing {selected_feature} with {len(unique_values)} unique values')
+            if df_wnv3.shape[0] < 3 or unique_values.shape[0] < 2:
                 return
-            if selected_feature == 'sex':
-                # if 1 'f' else 'm'
-                df_wnv3['Group'] = df_wnv3[selected_feature].apply(lambda x: 'f' if x == 1 else 'm')
-            elif selected_feature == 'sex, 1=male':
-                df_wnv3['Group'] = df_wnv3[selected_feature].apply(lambda x: 'm' if x == 1 else 'f')
-            else:
-                # group values based on band if =1, else f'not {band}'
-                org_selected_feature_for_plot = org_selected_feature(selected_feature)
-                df_wnv3['Group'] = df_wnv3[selected_feature].apply(lambda x: f'{org_selected_feature_for_plot}+' if x == 1 else f'{org_selected_feature_for_plot}-')
-            plot_tsne_by_group(df_wnv3)
+            if len(unique_values) == 2:  # Check if binary
+                # check that there are at least 3 in each group (0,1)
+                if len(df_wnv3[df_wnv3[selected_feature] == 1]) < 3 or len(df_wnv3[df_wnv3[selected_feature] == 0]) < 3:
+                    return
+                if selected_feature == 'sex':
+                    # if max is 2, decrease 1
+                    if int(df_wnv3[selected_feature].max()) ==2:
+                        df_wnv3[selected_feature] -= 1
+                    # if 1 'f' else 'm'
+                    df_wnv3['Group'] = df_wnv3[selected_feature].apply(lambda x: 'f' if x == 1 else 'm')
+                else:
+                    # group values based on band if =1, else f'not {band}'
+                    org_selected_feature_for_plot = org_selected_feature(selected_feature)
+                    df_wnv3['Group'] = df_wnv3[selected_feature].apply(lambda x: f'{org_selected_feature_for_plot}+' if x == 1 else f'{org_selected_feature_for_plot}-')
+                plot_tsne_by_group(df_wnv3)
+                st.divider()
+                # run over df_wnv2_others
+                for idx, (project_name_other, df_wnv2_other) in enumerate(df_wnv2_others):
+                    if idx ==0:
+                        # concat with controls, df_wnv3
+                        df_wnv3 = pd.concat([controls, df_wnv3], ignore_index=True)
+                    if selected_feature == 'sex':
+                        # Build a safe string representation of sex (map numeric codes to 'f'/'m' if possible)
+                        if 'sex' in df_wnv2_other.columns:
+                            s = df_wnv2_other['sex']
+                            if pd.api.types.is_numeric_dtype(s):
+                                s_num = s.fillna(-1).astype(float)
+                                # Some datasets use {1,2} where 2 represents female -> normalize to 0/1
+                                if np.nanmax(s_num) >= 2:
+                                    s_num = s_num - 1
+                                s_str = s_num.fillna(-1).astype(int).map({1: 'f', 0: 'm'}).astype(str)
+                            else:
+                                s_str = s.astype(str).str.strip()
+                        else:
+                            s_str = pd.Series([project_name_other] * len(df_wnv2_other), index=df_wnv2_other.index)
+                        df_wnv2_other['Group'] = s_str + '_' + project_name_other
+                        # df_wnv2_other['Group'] remove rows where df_wnv2_other['Group'] is NaN
+                        df_wnv2_other = df_wnv2_other.dropna(subset=['sex'])
+                    else:
+                        df_wnv2_other['Group'] = project_name_other
+                    # concat to df_wnv3
+                    df_wnv3 = pd.concat([df_wnv3, df_wnv2_other], ignore_index=True)
+                for band in boxplot_columns:
+                    results_df = analyze_and_correct(df_wnv3, [band], groups=df_wnv3['Group'].unique())
+                    boxplot_plot(results_df, df_wnv3, band, f'{selected_feature}',is_streamlit=True,analysis_type=analysis_type)
+                    # boxplot_plot_sns(results_df, df_wnv3, band, f'{selected_feature}',is_streamlit=True,analysis_type=analysis_type)
+                # if frequency band is contained in the column name
+                # group_data = {}
+                # for value in unique_values:
+                #     group = selected_feature if value == 1 else f'not {selected_feature}'
+                #     run_df = df_wnv3[df_wnv3[selected_feature] == value]
+                #     group_data = process_group_data(group, run_df, frequency_bands, eeg_dict_convertion, eeg_channels, montage, group_data)
+            # If numeric non-binary
+                # if col name has ( and )
+            elif '(' in selected_feature and ')' in selected_feature:
+                for band in boxplot_columns:
+                    df_wnv3['Group'] = df_wnv3[selected_feature].astype(str)
+                    df_wnv3[selected_feature] = df_wnv3[selected_feature].astype(float)
+                    # do boxplot for each band
+                    results_df = analyze_and_correct(df_wnv3, [band], groups=df_wnv3['Group'].unique())
+                    boxplot_plot(results_df, df_wnv3, band, f'{selected_feature}',is_streamlit=True,analysis_type=analysis_type)
+            elif selected_feature in numeric_colunms:
+                for band in boxplot_columns:
+                    scatter_plot_with_regression({}, df_wnv3, selected_feature, band, f'{selected_feature}',is_streamlit=True,analysis_type=analysis_type)
+    # if selected_feature_w_all is not None
+    if bool_all_features:
+        for feature in all_feat_list:
+            selected_feature = [key for key, value in dict_features.items() if value == feature][0]
+            st.write(f"## Analyzing Feature: {selected_feature}")
+            run_selected_feature()
             st.divider()
-            for band in boxplot_columns:
-                results_df = analyze_and_correct(df_wnv3, [band], groups=df_wnv3['Group'].unique())
-                boxplot_plot(results_df, df_wnv3, band, f'{selected_feature}',is_streamlit=True,analysis_type=analysis_type)
-                # boxplot_plot_sns(results_df, df_wnv3, band, f'{selected_feature}',is_streamlit=True,analysis_type=analysis_type)
-            # if frequency band is contained in the column name
-            # group_data = {}
-            # for value in unique_values:
-            #     group = selected_feature if value == 1 else f'not {selected_feature}'
-            #     run_df = df_wnv3[df_wnv3[selected_feature] == value]
-            #     group_data = process_group_data(group, run_df, frequency_bands, eeg_dict_convertion, eeg_channels, montage, group_data)
-        # If numeric non-binary
-            # if col name has ( and )
-        elif '(' in selected_feature and ')' in selected_feature:
-            for band in boxplot_columns:
-                df_wnv3['Group'] = df_wnv3[selected_feature].astype(str)
-                df_wnv3[selected_feature] = df_wnv3[selected_feature].astype(float)
-                # do boxplot for each band
-                results_df = analyze_and_correct(df_wnv3, [band], groups=df_wnv3['Group'].unique())
-                boxplot_plot(results_df, df_wnv3, band, f'{selected_feature}',is_streamlit=True,analysis_type=analysis_type)
-        elif selected_feature in numeric_colunms:
-            for band in boxplot_columns:
-                scatter_plot_with_regression({}, df_wnv3, selected_feature, band, f'{selected_feature}',is_streamlit=True,analysis_type=analysis_type)
+    else:
+        run_selected_feature()
+
+def nilearn_plotting(df_wnv3):
+    # leave all columns that say 'EEG' and group column
+    df_eeg_group = df_wnv3.filter(like='EEG')
+    df_eeg_group = df_eeg_group.assign(Group=df_wnv3['Group'])
+    # remove columns any NaN
+    df_eeg_group = df_eeg_group.dropna(axis=1)
+    # save eeg_group to csv
+    df_eeg_group.to_csv("eeg_group.csv", index=False)
+    # Now you can use df_eeg_group for your Nilearn plotting
+    # Example: plot brain maps, connectivity matrices, etc.
+    pass
 
 if __name__ == "__main__":
     main()
