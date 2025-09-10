@@ -262,7 +262,67 @@ def org_selected_feature(selected_feature):
     if selected_feature == 'clinical_LBD_Cognitive_fluctuation':
         return 'CF'
     return selected_feature
-    
+
+def HEP_plots(project_name, df_wnv3, controls, boxplot_columns, analysis_type,selected_feature=None):
+    if project_name == 'COBRAD':
+        HEP_dir = 'temps_EDF_HEP'
+    else:
+        return
+    # Run over power bands
+    for band_name, band_range in power_bands.items():
+        st.write(f"Analyzing power band: {band_name}")
+        # glob all files in HEP_dir that match f"*_{band_name}.parquet"
+        band_files = [f for f in os.listdir(HEP_dir) if f.endswith(f"_{band_name}.parquet")]
+        dfs = []
+        hue = None
+        for file in band_files:
+            file_path = os.path.join(HEP_dir, file)
+            if selected_feature:
+                ID = file.split('_')[0][1:]
+                id_group = df_wnv3[df_wnv3['ID'] == ID]['Group'].values
+            try:
+                df = pd.read_parquet(file_path)
+                if selected_feature:
+                    # Attach group info to each df
+                    if len(id_group) > 0:
+                        df['Group'] = id_group[0]
+                dfs.append(df)
+            except Exception as e:
+                st.warning(f"Could not read {file}: {e}")
+        if dfs:
+            if selected_feature:
+                # Group by 'Group' and compute mean for each group
+                group_dfs = []
+                for group in df_wnv3['Group'].unique():
+                    group_patients = [df for df in dfs if 'Group' in df.columns and df['Group'].iloc[0] == group]
+                    # Filter out dfs shorter than 50 rows
+                    group_patients = [df for df in group_patients if df.shape[0] >= 50]
+                    if group_patients:
+                        min_len = min(df.shape[0] for df in group_patients)
+                        if min_len < 50:
+                            continue
+                        # Truncate all dfs to min_len rows
+                        truncated = [df.drop(columns=['Group'], errors='ignore').iloc[:min_len] for df in group_patients]
+                        group_mean = pd.concat(truncated, axis=1).mean(axis=1)
+                        group_mean_df = pd.DataFrame([group_mean.values], columns=truncated[0].columns)
+                        group_mean_df['Group'] = group
+                        group_dfs.append(group_mean_df)
+                results_df = pd.concat(group_dfs, ignore_index=True)
+                hue = results_df['Group']
+                st.write(f"Loaded {len(results_df)} group means for band {band_name}")
+            else:
+                # Compute the mean of all DataFrames (row-wise, column-wise)
+                results_df = pd.concat(dfs, ignore_index=True).groupby(level=0).mean()
+                st.write(f"Loaded {len(results_df)} rows (mean of all files) for band {band_name}")
+        else:
+            st.write(f"No data found for band {band_name}")
+        #  apply zscore each column (only numeric columns)
+        numeric_cols = results_df.select_dtypes(include=[np.number]).columns
+        results_df[numeric_cols] = results_df[numeric_cols].apply(zscore)
+        # if selected_feature not None. 
+        # run only_plots on results_df
+        only_plots(results_df, save_plot='', save_dir='', edf_pickle_name="plot", band=band_name, step_sec=5,is_streamlit=True,hue=hue)
+        st.divider()
 
 # Streamlit App
 def main():
@@ -320,7 +380,7 @@ def main():
     
     # Sidebar for feature selection
     st.sidebar.header("Feature Selection")
-    feature_types = ("Clinical Feature", "EEG Feature", "ml_plots", "vs_Controls", "Pair Plot",'Spectogram','Raw')
+    feature_types = ("Clinical Feature", "EEG Feature", "ml_plots", "vs_Controls", "Pair Plot",'Spectogram','Raw',"HEP")
     feature_type = st.sidebar.selectbox("Select feature type to plot against the other type:", feature_types)
     if feature_type == "Clinical Feature" or feature_type == "EEG Feature" or feature_type == "vs_Controls":
         # ask user if they want only significant, or full.
@@ -350,6 +410,9 @@ def main():
         return
     if feature_type == "vs_Controls":
         vs_controls_run(project_name,df_wnv2,controls,boxplot_columns,analysis_type)
+        return
+    elif feature_type == "HEP":
+        HEP_plots(project_name, df_wnv2, controls, boxplot_columns, analysis_type)
         return
     elif feature_type == "Pair Plot":
         pairplot_columns(df_wnv2, clinical_features, eeg_features)
@@ -385,7 +448,7 @@ def main():
             bool_all_features = True
         plot_title = f"Plots of {selected_feature} vs All Clinical Features"
         boxplot_columns = clinical_features_numeric
-    else:
+    else: # Clinical Feature
         clinical_features_correlation = st.sidebar.checkbox("Show Clinical Features Correlation", value=False)
         marked_clinical_features_w_all = marked_clinical_features + ["All Features"]
         selected_feature = st.sidebar.radio("Select a Clinical feature:", marked_clinical_features_w_all)
@@ -439,6 +502,13 @@ def main():
                     # group values based on band if =1, else f'not {band}'
                     org_selected_feature_for_plot = org_selected_feature(selected_feature)
                     df_wnv3['Group'] = df_wnv3[selected_feature].apply(lambda x: f'{org_selected_feature_for_plot}+' if x == 1 else f'{org_selected_feature_for_plot}-')
+                # st checkbox if HEP
+                hep_checkbox = st.sidebar.checkbox("Show HEP Plots", value=True)
+                if hep_checkbox:
+                    # new container
+                    with st.container():
+                        st.subheader("HEP Plots")
+                        HEP_plots(project_name, df_wnv3, controls, boxplot_columns, analysis_type,selected_feature)
                 plot_tsne_by_group(df_wnv3)
                 st.divider()
                 # run over df_wnv2_others

@@ -25,6 +25,8 @@ from concurrent.futures import ProcessPoolExecutor
 from scipy.signal import welch
 import dabest
 from statsmodels.stats.power import TTestIndPower
+from scipy.stats import wilcoxon, zscore, pearsonr, entropy, ranksums, linregress
+from statsmodels.stats.multitest import fdrcorrection
 
 eeg_channels = ['Fp1', 'Fp2', 'F3', 'F4', 'C3', 'C4', 'P3', 'P4', 'O1', 'O2', 'F7',
        'F8', 'T3', 'T4', 'T5', 'T6', 'Fz', 'Cz', 'Pz', 'A1','A2', 'Fpz', 'Oz']
@@ -2075,7 +2077,324 @@ def compute_network_features(eeg_data, sfreq, freq_band, threshold_density=0.2):
     modularity = nx.algorithms.community.modularity(G, nx.community.label_propagation_communities(G))
 
     return efficiency, clustering, assortativity, modularity
-      
+
+def _plot_metric_vs_hrv(t, arrs, labels, save_plot, name, save_dir, is_streamlit=False, hue=None):
+    if len(arrs) == 2:
+        import dabest
+        df = pd.DataFrame({
+            'value': np.concatenate([arrs[0], arrs[1]]),
+            'group': [labels[0]] * len(arrs[0]) + [labels[1]] * len(arrs[1]),
+            'pair_id': list(range(len(arrs[0]))) + list(range(len(arrs[1])))
+        })
+        dabest_obj = dabest.load(data=df, x='group', y='value', id_col='pair_id', paired=True)
+        fig = dabest_obj.plot(
+            swarm_label="Value",
+            contrast_label="Mean difference",
+            custom_palette=None,
+            show_pairs=True,
+            raw_marker_size=4,
+            halfviolin_width=0.6,
+            fig_size=(6, 4)
+        )
+        if save_plot:
+            os.makedirs(save_dir, exist_ok=True)
+            fname = f"{save_dir}/dabest_{labels[0]}_vs_{labels[1]}_{name}.png"
+            fig.savefig(fname, dpi=300, bbox_inches='tight')
+            plt.close(fig)
+        else:
+            if is_streamlit:
+                st.pyplot(fig)
+            else:
+                plt.show()
+    elif len(arrs) > 2:
+        n = len(arrs[0])
+        df = pd.DataFrame({
+            'value': np.concatenate(arrs),
+            'group': np.concatenate([[label]*n for label in labels]),
+            'pair_id': np.tile(np.arange(n), len(arrs))
+        })
+        fig, ax = plt.subplots(figsize=(10, 6))
+        sns.swarmplot(data=df, x='group', y='value', ax=ax)
+        ax.set_title("Swarm plot of all metrics and HRV indices")
+        ax.set_xlabel('Metric/Index')
+        ax.set_ylabel('Value')
+        plt.tight_layout()
+        if save_plot:
+            os.makedirs(save_dir, exist_ok=True)
+            fname = f"{save_dir}/swarmplot_all_{name}.png"
+            fig.savefig(fname, dpi=300, bbox_inches='tight')
+            plt.close(fig)
+        else:
+            if is_streamlit:
+                st.pyplot(fig)
+            else:
+                plt.show()
+
+        fig2, ax2 = plt.subplots(figsize=(10, 6))
+        for arr, label in zip(arrs, labels):
+            ax2.plot(t, arr, label=label)
+        ax2.set_title("Time series of all metrics and HRV indices")
+        ax2.set_xlabel('Time (s)')
+        ax2.set_ylabel('Value')
+        ax2.legend()
+        plt.tight_layout()
+        if save_plot:
+            fname2 = f"{save_dir}/xyplot_all_{name}.png"
+            fig2.savefig(fname2, dpi=300, bbox_inches='tight')
+            plt.close(fig2)
+        else:
+            if is_streamlit:
+                st.pyplot(fig2)
+            else:
+                plt.show()
+
+        df_pair = pd.DataFrame({label: arr for label, arr in zip(labels, arrs)})
+        if hue is not None:
+            try:
+                if len(hue) == len(df_pair):
+                    df_pair['__hue__'] = hue
+            except Exception:
+                pass
+
+        g = sns.PairGrid(df_pair, diag_sharey=False)
+        var_names = [c for c in df_pair.columns if c != '__hue__']
+        n_vars = len(var_names)
+        pair_indices, r_vals, p_vals = [], [], []
+        for i in range(n_vars):
+            for j in range(i+1, n_vars):
+                x = df_pair[var_names[i]]
+                y = df_pair[var_names[j]]
+                mask = ~np.isnan(x) & ~np.isnan(y)
+                x_clean = np.array(x)[mask]
+                y_clean = np.array(y)[mask]
+                if len(x_clean) > 1 and len(y_clean) > 1:
+                    r, p = pearsonr(x_clean, y_clean)
+                else:
+                    r, p = np.nan, np.nan
+                pair_indices.append((i, j)); r_vals.append(r); p_vals.append(p)
+        p_vals_array = np.array([p if not np.isnan(p) else 1.0 for p in p_vals])
+        reject, pvals_fdr = fdrcorrection(p_vals_array, alpha=0.05, method='indep')
+        pair_to_stats = {(i, j): (r_vals[idx], pvals_fdr[idx]) for idx, (i, j) in enumerate(pair_indices)}
+
+        def scatter_with_stats(x, y, hue=None, **kwargs):
+            ax = kwargs.get('ax', plt.gca())
+            i = j = None
+            for idx, col in enumerate(var_names):
+                if np.all(x == df_pair[col]): i = idx
+                if np.all(y == df_pair[col]): j = idx
+            if i is not None and j is not None and i != j:
+                key = (min(i, j), max(i, j))
+                r, p_fdr = pair_to_stats.get(key, (np.nan, np.nan))
+            else:
+                r, p_fdr = np.nan, np.nan
+
+            mask = ~np.isnan(x) & ~np.isnan(y)
+            x_clean = np.array(x)[mask]
+            y_clean = np.array(y)[mask]
+            hue_clean = None
+            if hue is not None:
+                try:
+                    hue_arr = np.array(hue)
+                    hue_clean = hue_arr[mask]
+                except Exception:
+                    hue_clean = None
+            if hue_clean is not None:
+                sns.scatterplot(x=x_clean, y=y_clean, hue=hue_clean, ax=ax, alpha=0.7, s=20, palette='Set2', legend=False)
+            else:
+                sns.scatterplot(x=x_clean, y=y_clean, ax=ax, alpha=0.7, s=20)
+
+            if len(x_clean) > 1 and len(y_clean) > 1:
+                sns.regplot(x=x_clean, y=y_clean, ax=ax, scatter=False, color='gray', line_kws={'alpha':0.5})
+            if not np.isnan(r) and not np.isnan(p_fdr) and p_fdr < 0.05:
+                ax.annotate(f"$R^2$={r**2:.2f}\np={p_fdr:.3g}",
+                            xy=(0.05, 0.85), xycoords='axes fraction', fontsize=9,
+                            bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="gray", alpha=0.7))
+
+        def lineplot_with_time(x, y, **kwargs):
+            ax = kwargs.get('ax', plt.gca())
+            t_temp = np.linspace(min(min(x), min(y)), max(max(x), max(y)), num=len(x))
+            i = j = None
+            for idx, col in enumerate(var_names):
+                if np.all(x == df_pair[col]): i = idx
+                if np.all(y == df_pair[col]): j = idx
+            if i is not None and j is not None and i != j:
+                key = (min(i, j), max(i, j))
+                r, p_fdr = pair_to_stats.get(key, (np.nan, np.nan))
+            else:
+                r, p_fdr = np.nan, np.nan
+            ax.plot(t_temp, x, label='x', alpha=0.7)
+            ax.plot(t_temp, y, label='y', alpha=0.7)
+            if not np.isnan(r) and not np.isnan(p_fdr) and p_fdr < 0.05:
+                ax.annotate(f"$R^2$={r**2:.2f}\np={p_fdr:.3g}",
+                            xy=(0.05, 0.85), xycoords='axes fraction', fontsize=9,
+                            bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="gray", alpha=0.7))
+            ax.legend(fontsize=8)
+            ax.set_xlabel('t')
+            ax.set_ylabel('Value')
+
+        g.map_diag(sns.histplot, kde=True, bins=10)
+        if '__hue__' in df_pair.columns:
+            g.map_upper(scatter_with_stats, hue=df_pair['__hue__'])
+        else:
+            g.map_upper(scatter_with_stats)
+        g.map_lower(lineplot_with_time)
+        g.fig.suptitle("Pairwise relationships", y=1.02)
+        plt.tight_layout()
+        if save_plot:
+            os.makedirs(save_dir, exist_ok=True)
+            fname2 = f"{save_dir}/pairgrid_all_{name}.png"
+            g.savefig(fname2, dpi=300, bbox_inches='tight')
+            plt.close(g.fig)
+        else:
+            if is_streamlit:
+                st.pyplot(g.fig)
+            else:
+                plt.show()
+    else:
+        fig, ax = plt.subplots(figsize=(6, 4))
+        ax.plot(t, arrs[0], label=labels[0])
+        ax.set_title(labels[0])
+        ax.set_xlabel('Time (s)')
+        ax.legend()
+        plt.tight_layout()
+        if save_plot:
+            os.makedirs(save_dir, exist_ok=True)
+            fname = f"{save_dir}/{labels[0]}_{name}.png"
+            fig.savefig(fname, dpi=300, bbox_inches='tight')
+            plt.close(fig)
+        else:
+            if is_streamlit:
+                st.pyplot(fig)
+            else:
+                plt.show()
+
+def only_plots(results_df, save_plot, save_dir, edf_pickle_name="plot", band="band", step_sec=5,is_streamlit=False,hue=None):
+    zscore_cols = [
+        'Vagal_SD1_zscore',
+        'Sympathetic_SD2_zscore',
+        'Efficiency_zscore',
+        'Clustering_zscore',
+        'Modularity_zscore',
+        'Assortativity_zscore'
+    ]
+    labels = [
+        'Vagal_SD1',
+        'Sympathetic_SD2',
+        'Efficiency',
+        'Clustering',
+        'Modularity',
+        'Assortativity'
+    ]
+    arrs_zscore = [results_df[col].values for col in zscore_cols if col in results_df]
+    t = np.arange(len(results_df)) * step_sec
+    _plot_metric_vs_hrv(t, arrs_zscore, labels, save_plot, f"{edf_pickle_name}_{band}_zscore", save_dir, is_streamlit=is_streamlit,hue=hue)
+
+def detect_hep_bands(temp_dir='temps_EDF_HEP', candidates=('delta','theta','alpha','beta','gamma')):
+    """
+    Detect available HEP bands from filenames in temp_dir by searching for candidate tokens.
+    Falls back to the provided candidates if none detected or dir missing.
+    """
+    if not os.path.isdir(temp_dir):
+        return list(candidates)
+    files = [f.lower() for f in os.listdir(temp_dir)]
+    detected = [b for b in candidates if any(b in f for f in files)]
+    return detected or list(candidates)
+
+def hep_run(temp_dir='temps_EDF_HEP', bands=None, step_sec=5, save_plot=False, save_dir='figures_HEP', is_streamlit=False):
+    """
+    Iterate over bands, read .parquet files from temp_dir whose filename contains the band,
+    z-score key columns, and plot using only_plots.
+
+    Parameters
+    ----------
+    temp_dir : str
+        Directory with parquet files (default 'temps_EDF_HEP').
+    bands : list[str] | None
+        Bands to process. If None, will attempt to auto-detect from filenames
+        among ['delta','theta','alpha','beta','gamma'].
+    step_sec : int
+        Step size (seconds) for the time axis used by only_plots.
+    save_plot : bool
+        If True, save plots to save_dir.
+    save_dir : str
+        Directory to save plots (default 'figures_HEP').
+    is_streamlit : bool
+        If True, emit Streamlit UI messages and use Streamlit plotting.
+
+    Behavior
+    --------
+    For each band:
+      - Collect parquet files whose name contains the band token (case-insensitive)
+      - Concatenate to a single DataFrame (row-wise)
+      - Compute z-score per column for:
+          Vagal_SD1, Sympathetic_SD2, Efficiency, Clustering, Modularity, Assortativity
+        storing them in columns with suffix '_zscore'
+      - Call only_plots(results_df, ...) to render/save plots
+    """
+    if not os.path.isdir(temp_dir):
+        if is_streamlit:
+            st.warning(f"Directory not found: {temp_dir}")
+        return
+
+    all_files = [f for f in os.listdir(temp_dir) if f.lower().endswith('.parquet')]
+    if len(all_files) == 0:
+        if is_streamlit:
+            st.info(f"No .parquet files found in {temp_dir}")
+        return
+
+    default_bands = ['delta','theta','alpha','beta','gamma']
+    if bands is None or len(bands) == 0:
+        bands = [b for b in default_bands if any(b in f.lower() for f in all_files)] or default_bands
+
+    for band in bands:
+        band_files = [f for f in all_files if band.lower() in f.lower()]
+        if len(band_files) == 0:
+            if is_streamlit:
+                st.write(f"No files found for band '{band}'.")
+            continue
+
+        dfs = []
+        for fname in band_files:
+            fpath = os.path.join(temp_dir, fname)
+            try:
+                df = pd.read_parquet(fpath)
+            except Exception as e:
+                if is_streamlit:
+                    st.write(f"Failed reading {fpath}: {e}")
+                continue
+            dfs.append(df)
+
+        if not dfs:
+            continue
+
+        results_df = pd.concat(dfs, ignore_index=True)
+
+        # Compute z-scores per column for key metrics
+        base_cols = ['Vagal_SD1','Sympathetic_SD2','Efficiency','Clustering','Modularity','Assortativity']
+        for base in base_cols:
+            # find matching column name ignoring case
+            match = next((c for c in results_df.columns if isinstance(c, str) and c.strip().lower() == base.lower()), None)
+            if match is None:
+                continue
+            results_df[match] = pd.to_numeric(results_df[match], errors='coerce')
+            mu = results_df[match].mean()
+            sigma = results_df[match].std()
+            if sigma is not None and np.isfinite(sigma) and sigma > 0:
+                results_df[f"{base}_zscore"] = (results_df[match] - mu) / sigma
+            else:
+                results_df[f"{base}_zscore"] = np.nan
+
+        os.makedirs(save_dir, exist_ok=True)
+        only_plots(
+            results_df=results_df,
+            save_plot=save_plot,
+            save_dir=save_dir,
+            edf_pickle_name=str(band),
+            band=str(band),
+            step_sec=step_sec,
+            is_streamlit=is_streamlit
+        )
+
 # if name == main
 if __name__ == '__main__':
     # Example usage
