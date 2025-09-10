@@ -26,3 +26,5 @@ PyWavelets
 networkx
 dabest
 edfio
+
+plotly

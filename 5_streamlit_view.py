@@ -496,30 +496,6 @@ def main():
             st.write(f"## Analyzing Feature: {selected_feature}")
             run_selected_feature()
             st.divider()
-<<<<<<< HEAD
-            for band in boxplot_columns:
-                results_df = analyze_and_correct(df_wnv3, [band], groups=df_wnv3['Group'].unique())
-                boxplot_plot_sns(results_df, df_wnv3, band, f'{selected_feature}',is_streamlit=True,analysis_type=analysis_type)
-                # boxplot_plot_sns(results_df, df_wnv3, band, f'{selected_feature}',is_streamlit=True,analysis_type=analysis_type)
-            # if frequency band is contained in the column name
-            # group_data = {}
-            # for value in unique_values:
-            #     group = selected_feature if value == 1 else f'not {selected_feature}'
-            #     run_df = df_wnv3[df_wnv3[selected_feature] == value]
-            #     group_data = process_group_data(group, run_df, frequency_bands, eeg_dict_convertion, eeg_channels, montage, group_data)
-        # If numeric non-binary
-            # if col name has ( and )
-        elif '(' in selected_feature and ')' in selected_feature:
-            for band in boxplot_columns:
-                df_wnv3['Group'] = df_wnv3[selected_feature].astype(str)
-                df_wnv3[selected_feature] = df_wnv3[selected_feature].astype(float)
-                # do boxplot for each band
-                results_df = analyze_and_correct(df_wnv3, [band], groups=df_wnv3['Group'].unique())
-                boxplot_plot_sns(results_df, df_wnv3, band, f'{selected_feature}',is_streamlit=True,analysis_type=analysis_type)
-        elif selected_feature in numeric_colunms:
-            for band in boxplot_columns:
-                scatter_plot_with_regression({}, df_wnv3, selected_feature, band, f'{selected_feature}',is_streamlit=True,analysis_type=analysis_type)
-=======
     else:
         run_selected_feature()
 
@@ -534,7 +510,6 @@ def nilearn_plotting(df_wnv3):
     # Now you can use df_eeg_group for your Nilearn plotting
     # Example: plot brain maps, connectivity matrices, etc.
     pass
->>>>>>> 20817eb35bcfa7ea8c72dbc7b1413ec8d63fe59b
 
 if __name__ == "__main__":
     main()

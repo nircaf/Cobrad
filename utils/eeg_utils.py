@@ -406,16 +406,9 @@ def plot_tsne_by_group(
     else:
         plt.show()
 
-<<<<<<< HEAD
-def boxplot_plot_dabest(results_df, combined_df, col, output_dir,figures_dir=None,is_streamlit=False,analysis_type=None, show_histograms=False):
-    import dabest
-    # Function to remove outliers based on 5 standard deviations
-    def remove_outliers(df, col, group_col, threshold=5):
-=======
 def remove_outliers(df, col, group_col=None, threshold=5, by_group=True):
     if by_group and group_col is not None:
         # process each group separately, preserve original order
->>>>>>> 20817eb35bcfa7ea8c72dbc7b1413ec8d63fe59b
         def filter_group(group):
             mean = group[col].mean()
             std = group[col].std()
