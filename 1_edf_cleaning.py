@@ -38,15 +38,11 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(os.getcwd())
 
 is_prod = not any('vscode' in arg.lower() for arg in sys.argv)
-<<<<<<< HEAD
-use_multiprocessing = False
-=======
 # Detect if running inside tmux
 def is_tmux():
     return 'TMUX' in os.environ
 
 use_multiprocessing = is_tmux()
->>>>>>> 88614153a2850c0412be7a3a871778d47ccad786
 # Suppress specific RuntimeWarnings
 warnings.filterwarnings("ignore", message="Channels contain different highpass filters. Highest filter setting will be stored.")
 warnings.filterwarnings("ignore", message="Channels contain different lowpass filters. Lowest filter setting will be stored.")

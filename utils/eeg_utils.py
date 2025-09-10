@@ -18,15 +18,11 @@ import streamlit as st
 import json
 import pickle, uuid
 import re, io
-import h5py
 from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor
 from scipy.signal import welch
-<<<<<<< HEAD
-=======
 import dabest
 from statsmodels.stats.power import TTestIndPower
->>>>>>> 88614153a2850c0412be7a3a871778d47ccad786
 
 eeg_channels = ['Fp1', 'Fp2', 'F3', 'F4', 'C3', 'C4', 'P3', 'P4', 'O1', 'O2', 'F7',
        'F8', 'T3', 'T4', 'T5', 'T6', 'Fz', 'Cz', 'Pz', 'A1','A2', 'Fpz', 'Oz']
