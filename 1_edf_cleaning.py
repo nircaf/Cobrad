@@ -315,8 +315,8 @@ def analyze_eeg_data(raw,is_prod,filename):
     # save spec_data to pickle in pickles/project_name/filename
     with open(f'pickles/{project_name}/{filename}.pkl', 'wb') as f:
         pickle.dump(raw, f)
-    metadata = eeg_data_to_features(raw)
-    return metadata
+    metadata, conn_df = eeg_data_to_features(raw)
+    return metadata, conn_df
 
 
 
@@ -358,13 +358,31 @@ def process_file(row,filename,is_prod):
                 start = i * max_duration_s  # Start time in seconds
                 stop = min((i + 1) * max_duration_s, raw.times[-1])  # Stop time in seconds
                 raw_segment = raw.copy().crop(tmin=start, tmax=stop)
-                eeg_metadata = analyze_eeg_data(raw_segment, is_prod, segment_filename.replace(".csv", ""))
+                eeg_metadata, conn_df = analyze_eeg_data(raw_segment, is_prod, segment_filename.replace(".csv", ""))
                 if eeg_metadata is None:
                     # Reduce max_duration_s by 10 minutes but not below 0
                     continue
                     # print(f'Error processing {row["file_name"]}_{max_duration_s}_{start_i}, retrying with max_duration_s={max_duration_s-600}...')
                     # max_duration_s = max(max_duration_s - 5 * 60, 0)
                     # break  # Exit the for loop to recalculate segments with new max_duration_s
+                # Save connectivity DataFrame (conn_df) to its own CSV folder
+                try:
+                    temp_conn_dir = f"{temp_dir}_conn_df"
+                    os.makedirs(temp_conn_dir, exist_ok=True)
+                    if conn_df is not None:
+                        # If conn_df is a DataFrame, save directly; if it's a dict, convert to DataFrame first
+                        if isinstance(conn_df, pd.DataFrame):
+                            out_df = conn_df
+                        else:
+                            try:
+                                out_df = pd.DataFrame(conn_df)
+                            except Exception:
+                                out_df = None
+                        if out_df is not None and not out_df.empty:
+                            out_path = os.path.join(temp_conn_dir, f"{segment_filename.replace('.csv','')}_conn.csv")
+                            out_df.to_csv(out_path, index=True)
+                except Exception as e:
+                    print(f"Failed to save conn_df for {segment_filename}: {e}")
                 # Update and write segment metadata
                 metadata.update(eeg_metadata)
                 segment_metadata = metadata.copy()
@@ -386,7 +404,7 @@ def process_file(row,filename,is_prod):
                     return 
             except:
                 pass
-            eeg_metadata = analyze_eeg_data(raw,is_prod,row["file_name"])
+            eeg_metadata, conn_df = analyze_eeg_data(raw,is_prod,row["file_name"])
             if eeg_metadata is None:
                 # save empty csv file
                 # pd.DataFrame().to_csv(f'{temp_dir}/{row["file_name"]}.csv', index=False)
@@ -396,6 +414,23 @@ def process_file(row,filename,is_prod):
                 # Write metadata to CSV
                 df = pd.DataFrame([metadata])
                 df.to_csv(f'{temp_dir}/{row["file_name"]}.csv', index=False)
+                # Save connectivity DataFrame (conn_df) to its own CSV folder
+                try:
+                    temp_conn_dir = f"{temp_dir}_conn_df"
+                    os.makedirs(temp_conn_dir, exist_ok=True)
+                    if conn_df is not None:
+                        if isinstance(conn_df, pd.DataFrame):
+                            out_df = conn_df
+                        else:
+                            try:
+                                out_df = pd.DataFrame(conn_df)
+                            except Exception:
+                                out_df = None
+                        if out_df is not None and not out_df.empty:
+                            out_path = os.path.join(temp_conn_dir, f"{row['file_name']}_conn.csv")
+                            out_df.to_csv(out_path, index=True)
+                except Exception as e:
+                    print(f"Failed to save conn_df for {row['file_name']}: {e}")
         # return metadata
     # return metadata
 
