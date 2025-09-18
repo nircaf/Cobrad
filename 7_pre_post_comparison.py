@@ -43,7 +43,7 @@ def load_pre_post_data():
     post_data = []
     file_map = {}
     # EDF directory structure for determining pre/post
-    edf_base_dir = "EDF Format/VNS_PRE_POST_25"
+    edf_base_dir = "EDF_Format/VNS_PRE_POST_25"
     
     for parquet_file in parquet_files:
         try:

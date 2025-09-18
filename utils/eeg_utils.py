@@ -2254,7 +2254,7 @@ def _plot_metric_vs_hrv(t, arrs, labels, save_plot, name, save_dir, is_streamlit
         else:
             g.map_upper(scatter_with_stats)
             g.map_lower(lineplot_with_time)
-        g.fig.suptitle("Pairwise relationships", y=1.02)
+        g.fig.suptitle(f'{name.replace("_"," ")}\nN={len(df_pair)}')
         # 1) Nuke any legends Seaborn created
         if hasattr(g, "_legend") and g._legend is not None:
             g._legend.remove()
@@ -2327,7 +2327,7 @@ def only_plots(results_df, save_plot, save_dir, edf_pickle_name="plot", band="ba
     ]
     arrs_zscore = [results_df[col].values for col in labels if col in results_df]
     t = np.arange(len(results_df)) * step_sec
-    _plot_metric_vs_hrv(t, arrs_zscore, labels, save_plot, f"{edf_pickle_name}_{band}_zscore", save_dir, is_streamlit=is_streamlit,hue=hue)
+    _plot_metric_vs_hrv(t, arrs_zscore, labels, save_plot, f"{edf_pickle_name}_{band}", save_dir, is_streamlit=is_streamlit,hue=hue)
 
 def detect_hep_bands(temp_dir='temps_EDF_HEP', candidates=('delta','theta','alpha','beta','gamma')):
     """
