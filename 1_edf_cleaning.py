@@ -23,6 +23,8 @@ from sklearn.decomposition import PCA
 from contextlib import contextmanager
 from utils.eeg_utils import *
 import ray
+# Import and run the HEP processing
+from utils.HEP_parquet_generation import process_patients_random6
 
 @contextmanager
 def suppress_stdout():
@@ -53,8 +55,11 @@ getcwd = os.getcwd()
 # cases_project_name = 'west_nile_virus'
 # cases_project_name = 'HANDL'
 # cases_project_name = 'EDF'
-cases_project_name = 'TGA'
-directory = os.path.join(getcwd, cases_project_name)
+# cases_project_name = 'TGA'
+edf_dir = 'EDF Format'
+cases_project_name = 'VNS_PRE_POST_25'
+# Where to load the data from 
+directory = os.path.join(getcwd, edf_dir,cases_project_name)
 # directory = os.path.join(getcwd, 'Controls')
 os_splittor = '\\' if 'nt' in os.name else '/'
 
@@ -62,7 +67,8 @@ os_splittor = '\\' if 'nt' in os.name else '/'
 #%% Load the data
 # df_wnv = pd.read_excel(f'WNV_merged_291224_KP.xlsx')
 project_name = directory.split(os_splittor)[-1]
-temp_dir = f'temps_{project_name}' 
+# Where to save the data to
+temp_dir = f'parquet_results/{project_name}' 
 os.makedirs(temp_dir, exist_ok=True)
 # make folder
 os.makedirs(f'pickles/{project_name}', exist_ok=True)
@@ -212,22 +218,13 @@ def list_files_and_find_duplicates(directory):
     df = df[df['size'] > 100000]
     df['file_name'] = df.file_path.apply(lambda x: x.split(os_splittor)[-1])
     # file name: 0345-042 (1).edf  -> patient_number: 042
-    df['patient_number'] = df.file_name.apply(lambda x: re.search(r'\d{3}-(\d{3})', x).group(1) if re.search(r'\d{3}-(\d{3})', x) else None)
+    df['patient_number'] = df.file_name.apply(
+        lambda x: re.search(r'\d{3}-(\d{3})', x).group(1) 
+                if re.search(r'\d{3}-(\d{3})', x) 
+                else x.split('.')[0]
+    )
     # sort by patient number
     df.sort_values(by='patient_number', inplace=True)
-    return df
-
-def get_edf_files(directory):
-    edf_folder = os.path.join(directory, 'EDF')
-    file_list = []
-
-    for root, dirs, files in os.walk(edf_folder):
-        for file in files:
-            if file.endswith('.edf'):
-                file_path = os.path.join(root, file)
-                file_list.append({'file_name': file, 'file_path': file_path})
-
-    df = pd.DataFrame(file_list)
     return df
 
 
@@ -327,8 +324,8 @@ def process_file(row,filename,is_prod):
     metadata.update(row)
     # make folder if not exist
     os.makedirs(temp_dir, exist_ok=True)
-    # if file temps/{row['file_name']}.csv exists
-    if f'{row["file_name"]}.csv' in os.listdir(temp_dir):
+    # if file temps/{row['file_name']}.parquet exists
+    if f'{row["file_name"]}.parquet' in os.listdir(temp_dir):
         return 
     if metadata:
         channels = raw.ch_names
@@ -345,27 +342,27 @@ def process_file(row,filename,is_prod):
             start_i = 0
             # while eeg_metadata is None:
                 # if max_duration_s == 0:
-                #     pd.DataFrame().to_csv(f'{temp_dir}/{row["file_name"]}_{max_duration_s}_{start_i}.csv', index=False)
+                #     pd.DataFrame().to_parquet(f'{temp_dir}/{row["file_name"]}_{max_duration_s}_{start_i}.parquet', index=False)
                 #     start_i += 1
                 #     max_duration_s = 60 * 60
                 #     print(f'Error processing {row["file_name"]}_{max_duration_s}_{start_i}, skipping...')
                 # Split the data into 60-minute segments
             n_segments = int(np.ceil(duration_s / max_duration_s))
             for i in range(start_i, n_segments):
-                segment_filename = f'{row["file_name"]}_{max_duration_s}_{i + 1}.csv'
+                segment_filename = f'{row["file_name"]}_{max_duration_s}_{i + 1}.parquet'
                 if os.path.exists(f'{temp_dir}/{segment_filename}'):
                     continue
                 start = i * max_duration_s  # Start time in seconds
                 stop = min((i + 1) * max_duration_s, raw.times[-1])  # Stop time in seconds
                 raw_segment = raw.copy().crop(tmin=start, tmax=stop)
-                eeg_metadata, conn_df = analyze_eeg_data(raw_segment, is_prod, segment_filename.replace(".csv", ""))
+                eeg_metadata, conn_df = analyze_eeg_data(raw_segment, is_prod, segment_filename.replace(".parquet", ""))
                 if eeg_metadata is None:
                     # Reduce max_duration_s by 10 minutes but not below 0
                     continue
                     # print(f'Error processing {row["file_name"]}_{max_duration_s}_{start_i}, retrying with max_duration_s={max_duration_s-600}...')
                     # max_duration_s = max(max_duration_s - 5 * 60, 0)
                     # break  # Exit the for loop to recalculate segments with new max_duration_s
-                # Save connectivity DataFrame (conn_df) to its own CSV folder
+                # Save connectivity DataFrame (conn_df) to its own Parquet folder
                 try:
                     temp_conn_dir = f"{temp_dir}_conn_df"
                     os.makedirs(temp_conn_dir, exist_ok=True)
@@ -379,12 +376,14 @@ def process_file(row,filename,is_prod):
                             except Exception:
                                 out_df = None
                         if out_df is not None and not out_df.empty:
-                            out_path = os.path.join(temp_conn_dir, f"{segment_filename.replace('.csv','')}_conn.csv")
-                            out_df.to_csv(out_path, index=True)
+                            out_path = os.path.join(temp_conn_dir, f"{segment_filename.replace('.parquet','')}_conn.parquet")
+                            out_df.to_parquet(out_path, index=True)
                 except Exception as e:
                     print(f"Failed to save conn_df for {segment_filename}: {e}")
                 # Update and write segment metadata
                 metadata.update(eeg_metadata)
+                # metadata annotation to str
+                metadata = {k: str(v) if not isinstance(v, (int, float, bool)) else v for k, v in metadata.items()}
                 segment_metadata = metadata.copy()
                 segment_metadata['segment'] = i + 1
                 segment_metadata['start_time'] = start
@@ -392,29 +391,31 @@ def process_file(row,filename,is_prod):
                 segment_metadata['duration_sec'] = stop - start
                 segment_metadata['duration_min'] = (stop - start) / 60
     
-                # Write segment metadata to CSV
+                # Write segment metadata to Parquet
                 df_segment = pd.DataFrame([segment_metadata])
-                df_segment.to_csv(f'{temp_dir}/{segment_filename}', index=False)
+                df_segment.to_parquet(f'{temp_dir}/{segment_filename}', index=False)
         else:
-            # load file name csv
+            # load file name parquet
             try:
-                df_csv = pd.read_csv(filename)
-                # if file name in csv
-                if row['file_name'] in df_csv['file_name'].values:
+                df_parquet = pd.read_parquet(filename)
+                # if file name in parquet
+                if row['file_name'] in df_parquet['file_name'].values:
                     return 
             except:
                 pass
             eeg_metadata, conn_df = analyze_eeg_data(raw,is_prod,row["file_name"])
             if eeg_metadata is None:
-                # save empty csv file
-                # pd.DataFrame().to_csv(f'{temp_dir}/{row["file_name"]}.csv', index=False)
+                # save empty parquet file
+                # pd.DataFrame().to_parquet(f'{temp_dir}/{row["file_name"]}.parquet', index=False)
                 print(f'Error processing {row["file_name"]}')
             else:
                 metadata.update(eeg_metadata)
-                # Write metadata to CSV
+                # metadata annotation to str
+                metadata['annotations'] = str(metadata['annotations'])
+                # Write metadata to Parquet
                 df = pd.DataFrame([metadata])
-                df.to_csv(f'{temp_dir}/{row["file_name"]}.csv', index=False)
-                # Save connectivity DataFrame (conn_df) to its own CSV folder
+                df.to_parquet(f'{temp_dir}/{row["file_name"]}.parquet', index=False)
+                # Save connectivity DataFrame (conn_df) to its own Parquet folder
                 try:
                     temp_conn_dir = f"{temp_dir}_conn_df"
                     os.makedirs(temp_conn_dir, exist_ok=True)
@@ -427,14 +428,54 @@ def process_file(row,filename,is_prod):
                             except Exception:
                                 out_df = None
                         if out_df is not None and not out_df.empty:
-                            out_path = os.path.join(temp_conn_dir, f"{row['file_name']}_conn.csv")
-                            out_df.to_csv(out_path, index=True)
+                            out_path = os.path.join(temp_conn_dir, f"{row['file_name']}_conn.parquet")
+                            out_df.to_parquet(out_path, index=True)
                 except Exception as e:
                     print(f"Failed to save conn_df for {row['file_name']}: {e}")
         # return metadata
     # return metadata
 
+def find_eeg_files(directory):
+    eeg_files = []
+    for root, _, files in os.walk(directory):
+        for file in files:
+            if file.endswith('.EEG'):
+                eeg_files.append(os.path.join(root, file))
+    return eeg_files
+
+def convert_and_remove_eeg(eeg_files):
+    min_size_mb = 5  # Minimum file size in MB
+    min_size_bytes = min_size_mb * 1024 * 1024  # Convert to bytes
+    
+    for eeg_file_path in eeg_files:
+        # Check file size before processing
+        try:
+            file_size = os.path.getsize(eeg_file_path)
+            file_size_mb = file_size / (1024 * 1024)
+            
+            if file_size < min_size_bytes:
+                print(f"⏭️  Skipping {eeg_file_path} - Size: {file_size_mb:.2f}MB (less than {min_size_mb}MB)")
+                continue
+            else:
+                print(f"📁 Processing {eeg_file_path} - Size: {file_size_mb:.2f}MB")
+        except Exception as e:
+            print(f"⚠️  Could not get file size for {eeg_file_path}: {e}")
+            continue
+        
+        base, _ = os.path.splitext(eeg_file_path)
+        edf_file_path = base + '.edf'
+        try:
+            raw = mne.io.read_raw_nihon(eeg_file_path, preload=True)
+            raw.export(edf_file_path, fmt='edf', overwrite=True)
+            print(f"Converted {eeg_file_path} to {edf_file_path}")
+            os.remove(eeg_file_path)
+            print(f"Deleted original EEG file: {eeg_file_path}")
+        except Exception as e:
+            print(f"Failed to convert {eeg_file_path}: {e}")
+
 if __name__ == "__main__":
+    eeg_files = find_eeg_files(directory)
+    convert_and_remove_eeg(eeg_files)
     if project_name == 'Controls':
         temp_dir += f'_{cases_project_name}'
         if cases_project_name == 'west_nile_virus':
@@ -450,7 +491,7 @@ if __name__ == "__main__":
     # inverse df
     # df = df[::-1]
     # Set multiprocessing flag
-    filename = f'{project_name}.csv'
+    filename = f'{project_name}.parquet'
     if use_multiprocessing:
         print(f'Processing {len(df)} files in parallel with Ray...')
         ray.init(ignore_reinit_error=True, num_cpus=15)
@@ -468,8 +509,8 @@ if __name__ == "__main__":
         # Process files sequentially
         metadata_list = [process_file(row, filename, is_prod) for _, row in tqdm(df.iterrows(), total=len(df))]
     if project_name == 'Controls':
-        # Combine all the temporary CSV files into a single CSV file
-        filename = f'{cases_project_name}_controls.csv'
+        # Combine all the temporary Parquet files into a single Parquet file
+        filename = f'{cases_project_name}_controls.parquet'
     # Process temporary files in batches
     batch_size = 100  # Adjust the batch size as needed
     # make folder if not exist
@@ -481,16 +522,25 @@ if __name__ == "__main__":
         df_list = []
         for file in batch_files:
             try:
-                df = pd.read_csv(os.path.join(temp_dir, file))
-                df['csv_file_name'] = file
+                df = pd.read_parquet(os.path.join(temp_dir, file))
+                df['parquet_file_name'] = file
                 df_list.append(df)
-            except pd.errors.EmptyDataError:
-                print(f"Skipping empty file: {file}")
+            except Exception as e:
+                print(f"Skipping file {file}: {e}")
         if df_list:
             df_batch = pd.concat(df_list)
-            # move col csv_file_name to first
-            df_batch = pd.concat([df_batch['csv_file_name'], df_batch.drop(columns=['csv_file_name'])], axis=1)
-            # Determine if the header should be written
-            write_header = not os.path.exists(filename)
-            # Append the DataFrame to the CSV file
-            df_batch.to_csv(filename, mode='a', header=write_header, index=False)
+            # move col parquet_file_name to first
+            df_batch = pd.concat([df_batch['parquet_file_name'], df_batch.drop(columns=['parquet_file_name'])], axis=1)
+            # For Parquet, we need to collect all data and write at once
+            # Append the DataFrame to the list for final write
+            if i == 0:
+                final_df = df_batch.copy()
+            else:
+                final_df = pd.concat([final_df, df_batch], ignore_index=True)
+    
+    # Write the final combined DataFrame to Parquet
+    if 'final_df' in locals():
+        final_df.to_parquet(filename, index=False)
+    
+
+    process_patients_random6(edf_root=f"pickles/{cases_project_name}",)

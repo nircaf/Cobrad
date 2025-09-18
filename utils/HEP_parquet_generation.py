@@ -24,6 +24,9 @@ except ImportError:
     is_streamlit = False
 
 # Project utils: expects power_bands and compute_network_features at least.
+# sys append mother folder
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils.eeg_utils import *
 
 # ------------------------------------------------------------------------------
@@ -37,6 +40,59 @@ os.makedirs(TEMPS_DIR, exist_ok=True)
 # ------------------------------------------------------------------------------
 # Utilities
 # ------------------------------------------------------------------------------
+def is_patient_processed(patient_id, temps_dir=TEMPS_DIR):
+    """
+    Check if a patient was already processed by looking for their parquet files.
+    
+    Args:
+        patient_id (str): Patient ID to check
+        temps_dir (str): Directory containing the parquet files
+        
+    Returns:
+        bool: True if patient was already processed, False otherwise
+    """
+    # Expected bands based on the code
+    expected_bands = ['alpha', 'beta', 'delta', 'gamma', 'theta']
+    
+    for band in expected_bands:
+        parquet_file = os.path.join(temps_dir, f"{patient_id}_results_{band}.parquet")
+        if not os.path.exists(parquet_file):
+            return False
+    
+    return True
+
+def get_processed_patients(temps_dir=TEMPS_DIR):
+    """
+    Get a list of all patients that have been processed (have all parquet files).
+    
+    Args:
+        temps_dir (str): Directory containing the parquet files
+        
+    Returns:
+        list: List of patient IDs that have been processed
+    """
+    if not os.path.exists(temps_dir):
+        return []
+    
+    # Get all parquet files in the directory
+    parquet_files = glob.glob(os.path.join(temps_dir, "*_results_*.parquet"))
+    
+    # Extract patient IDs from filenames
+    patient_ids = set()
+    for file_path in parquet_files:
+        filename = os.path.basename(file_path)
+        # Extract patient ID from filename like "0345-010_results_alpha.parquet"
+        match = re.match(r'^(.+)_results_\w+\.parquet$', filename)
+        if match:
+            patient_ids.add(match.group(1))
+    
+    # Filter to only include patients with all expected bands
+    processed_patients = []
+    for patient_id in patient_ids:
+        if is_patient_processed(patient_id, temps_dir):
+            processed_patients.append(patient_id)
+    
+    return sorted(processed_patients)
 def clean_ecg_signal(ecg_signal, sfreq, lowcut=0.5, highcut=40, order=4):
     nyq = 0.5 * sfreq
     low = lowcut / nyq
@@ -433,14 +489,13 @@ def group_edf_files_by_patient(edf_root="pickles/EDF"):
                 continue
             fpath = os.path.join(root, file)
             m = re.search(r'(\d{4}-\d{3})', fpath)
-            if not m:
+            if m:
+                pid = m.group(1)
+            else:
                 # try parent directory name as fallback
-                base = os.path.basename(root)
-                m = re.search(r'(\d{4}-\d{3})', base)
-            if not m:
-                continue
-            pid = m.group(1)
+                pid = file.split('.')[0]
             patient_to_files.setdefault(pid, []).append(fpath)
+
     return patient_to_files
 
 def edf_has_ecg(edf_path):
@@ -507,9 +562,22 @@ def process_patients_random6(edf_root="EDF", k=6, step_sec=5, seed=42):
     if not patient_to_files:
         print(f"No EDF files found under {edf_root}.")
         return
+    
+    # Check which patients are already processed
+    processed_patients = get_processed_patients()
+    if processed_patients:
+        print(f"Already processed patients: {', '.join(processed_patients)}")
+    else:
+        print("No patients have been processed yet.")
 
     for patient_id, files in sorted(patient_to_files.items()):
         print(f"Patient {patient_id}: {len(files)} PKL files found.")
+        
+        # Check if patient was already processed
+        if is_patient_processed(patient_id):
+            print(f"Patient {patient_id}: already processed (parquet files exist). Skipping.")
+            continue
+        
         selected = select_random_edfs_with_ecg(files, k=k, seed=seed)
         if len(selected) == 0:
             print(f"Patient {patient_id}: no PKLs with ECG channel. Skipping.")

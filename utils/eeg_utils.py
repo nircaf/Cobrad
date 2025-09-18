@@ -27,6 +27,7 @@ import dabest
 from statsmodels.stats.power import TTestIndPower
 from scipy.stats import wilcoxon, zscore, pearsonr, entropy, ranksums, linregress
 from statsmodels.stats.multitest import fdrcorrection
+from scipy.stats import mannwhitneyu
 
 eeg_channels = ['Fp1', 'Fp2', 'F3', 'F4', 'C3', 'C4', 'P3', 'P4', 'O1', 'O2', 'F7',
        'F8', 'T3', 'T4', 'T5', 'T6', 'Fz', 'Cz', 'Pz', 'A1','A2', 'Fpz', 'Oz']
@@ -446,7 +447,6 @@ def boxplot_plot(results_df, combined_df, col, output_dir,figures_dir=None,is_st
 
         def add_sig_lines(is_streamlit=False):
             # --- Add significance lines and asterisks (including '****') for ALL pairwise comparisons ---
-            from scipy.stats import mannwhitneyu
             ax = plt.gca()
             y_min, y_max = ax.get_ylim()
             xticks = ax.get_xticks()
@@ -2108,53 +2108,67 @@ def _plot_metric_vs_hrv(t, arrs, labels, save_plot, name, save_dir, is_streamlit
                 plt.show()
     elif len(arrs) > 2:
         n = len(arrs[0])
+        # assert are all the arrs same length
+        assert all(len(arr) == n for arr in arrs), "All input arrays must"
+        df2 = pd.DataFrame({label: arr for label, arr in zip(labels, arrs)})
         df = pd.DataFrame({
             'value': np.concatenate(arrs),
             'group': np.concatenate([[label]*n for label in labels]),
             'pair_id': np.tile(np.arange(n), len(arrs))
         })
-        fig, ax = plt.subplots(figsize=(10, 6))
-        sns.swarmplot(data=df, x='group', y='value', ax=ax)
-        ax.set_title("Swarm plot of all metrics and HRV indices")
-        ax.set_xlabel('Metric/Index')
-        ax.set_ylabel('Value')
-        plt.tight_layout()
-        if save_plot:
-            os.makedirs(save_dir, exist_ok=True)
-            fname = f"{save_dir}/swarmplot_all_{name}.png"
-            fig.savefig(fname, dpi=300, bbox_inches='tight')
-            plt.close(fig)
-        else:
-            if is_streamlit:
-                st.pyplot(fig)
-            else:
-                plt.show()
+        # fig, ax = plt.subplots(figsize=(10, 6))
+        # sns.swarmplot(data=df, x='group', y='value', ax=ax)
+        # ax.set_title("Swarm plot of all metrics and HRV indices")
+        # ax.set_xlabel('Metric/Index')
+        # ax.set_ylabel('Value')
+        # plt.tight_layout()
+        # if save_plot:
+        #     os.makedirs(save_dir, exist_ok=True)
+        #     fname = f"{save_dir}/swarmplot_all_{name}.png"
+        #     fig.savefig(fname, dpi=300, bbox_inches='tight')
+        #     plt.close(fig)
+        # else:
+        #     if is_streamlit:
+        #         st.pyplot(fig)
+        #     else:
+        #         plt.show()
 
-        fig2, ax2 = plt.subplots(figsize=(10, 6))
-        for arr, label in zip(arrs, labels):
-            ax2.plot(t, arr, label=label)
-        ax2.set_title("Time series of all metrics and HRV indices")
-        ax2.set_xlabel('Time (s)')
-        ax2.set_ylabel('Value')
-        ax2.legend()
-        plt.tight_layout()
-        if save_plot:
-            fname2 = f"{save_dir}/xyplot_all_{name}.png"
-            fig2.savefig(fname2, dpi=300, bbox_inches='tight')
-            plt.close(fig2)
-        else:
-            if is_streamlit:
-                st.pyplot(fig2)
-            else:
-                plt.show()
+        # fig2, ax2 = plt.subplots(figsize=(10, 6))
+        # for arr, label in zip(arrs, labels):
+        #     ax2.plot(t, arr, label=label)
+        # ax2.set_title("Time series of all metrics and HRV indices")
+        # ax2.set_xlabel('Time (s)')
+        # ax2.set_ylabel('Value')
+        # ax2.legend()
+        # plt.tight_layout()
+        # if save_plot:
+        #     fname2 = f"{save_dir}/xyplot_all_{name}.png"
+        #     fig2.savefig(fname2, dpi=300, bbox_inches='tight')
+        #     plt.close(fig2)
+        # else:
+        #     if is_streamlit:
+        #         st.pyplot(fig2)
+        #     else:
+        #         plt.show()
 
         df_pair = pd.DataFrame({label: arr for label, arr in zip(labels, arrs)})
         if hue is not None:
             try:
                 if len(hue) == len(df_pair):
                     df_pair['__hue__'] = hue
-            except Exception:
-                pass
+                    hue_arr = np.array(hue)
+                    # Create a custom palette of distinct RGB colors
+                    import matplotlib.colors as mcolors
+                    unique_groups = np.unique(hue_arr)
+                    n_groups = len(unique_groups)
+                    def distinct_rgb_colors(n_groups):
+                        # colors blue and red
+                        colors = [(0, 0, 1), (1, 0, 0)]
+                        return colors
+                    custom_palette = distinct_rgb_colors(n_groups)
+                    palette_dict = {group: custom_palette[i] for i, group in enumerate(unique_groups)}
+            except Exception as e:
+                print(f"Error processing hue: {e}")
 
         g = sns.PairGrid(df_pair, diag_sharey=False)
         var_names = [c for c in df_pair.columns if c != '__hue__']
@@ -2176,7 +2190,7 @@ def _plot_metric_vs_hrv(t, arrs, labels, save_plot, name, save_dir, is_streamlit
         reject, pvals_fdr = fdrcorrection(p_vals_array, alpha=0.05, method='indep')
         pair_to_stats = {(i, j): (r_vals[idx], pvals_fdr[idx]) for idx, (i, j) in enumerate(pair_indices)}
 
-        def scatter_with_stats(x, y, hue=None, **kwargs):
+        def scatter_with_stats(x, y, hue=None, palette_dict=None, **kwargs):
             ax = kwargs.get('ax', plt.gca())
             i = j = None
             for idx, col in enumerate(var_names):
@@ -2199,7 +2213,7 @@ def _plot_metric_vs_hrv(t, arrs, labels, save_plot, name, save_dir, is_streamlit
                 except Exception:
                     hue_clean = None
             if hue_clean is not None:
-                sns.scatterplot(x=x_clean, y=y_clean, hue=hue_clean, ax=ax, alpha=0.7, s=20, palette='Set2', legend=False)
+                sns.scatterplot(x=x_clean, y=y_clean, hue=hue_clean, ax=ax, alpha=0.7, s=20, palette=palette_dict, legend=False)
             else:
                 sns.scatterplot(x=x_clean, y=y_clean, ax=ax, alpha=0.7, s=20)
 
@@ -2210,7 +2224,7 @@ def _plot_metric_vs_hrv(t, arrs, labels, save_plot, name, save_dir, is_streamlit
                             xy=(0.05, 0.85), xycoords='axes fraction', fontsize=9,
                             bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="gray", alpha=0.7))
 
-        def lineplot_with_time(x, y, **kwargs):
+        def lineplot_with_time(x, y,palette_dict=None, **kwargs):
             ax = kwargs.get('ax', plt.gca())
             t_temp = np.linspace(min(min(x), min(y)), max(max(x), max(y)), num=len(x))
             i = j = None
@@ -2222,8 +2236,9 @@ def _plot_metric_vs_hrv(t, arrs, labels, save_plot, name, save_dir, is_streamlit
                 r, p_fdr = pair_to_stats.get(key, (np.nan, np.nan))
             else:
                 r, p_fdr = np.nan, np.nan
-            ax.plot(t_temp, x, label='x', alpha=0.7)
-            ax.plot(t_temp, y, label='y', alpha=0.7)
+            
+            ax.plot(t_temp, x, label='x', alpha=0.5,color= 'blue')
+            ax.plot(t_temp, y, label='y', alpha=0.5,color='red')
             if not np.isnan(r) and not np.isnan(p_fdr) and p_fdr < 0.05:
                 ax.annotate(f"$R^2$={r**2:.2f}\np={p_fdr:.3g}",
                             xy=(0.05, 0.85), xycoords='axes fraction', fontsize=9,
@@ -2234,11 +2249,43 @@ def _plot_metric_vs_hrv(t, arrs, labels, save_plot, name, save_dir, is_streamlit
 
         g.map_diag(sns.histplot, kde=True, bins=10)
         if '__hue__' in df_pair.columns:
-            g.map_upper(scatter_with_stats, hue=df_pair['__hue__'])
+            g.map_upper(scatter_with_stats, hue=df_pair['__hue__'],palette_dict=palette_dict)
+            g.map_lower(lineplot_with_time, palette_dict=palette_dict)
         else:
             g.map_upper(scatter_with_stats)
-        g.map_lower(lineplot_with_time)
+            g.map_lower(lineplot_with_time)
         g.fig.suptitle("Pairwise relationships", y=1.02)
+        # 1) Nuke any legends Seaborn created
+        if hasattr(g, "_legend") and g._legend is not None:
+            g._legend.remove()
+        for ax in g.axes.flat:
+            leg = ax.get_legend()
+            if leg is not None:
+                leg.remove()
+
+        # 2) Build one legend and put it on the first row, last col
+        first_ax = g.axes[0, -1]  # top-right subplot
+        levels = pd.Index(df_pair['__hue__'].dropna().unique())
+        import matplotlib as mpl
+        handles = []
+        for lvl in levels:
+            color = palette_dict.get(lvl) if palette_dict is not None else None
+            handles.append(
+                mpl.lines.Line2D(
+                    [], [], marker='o', linestyle='',
+                    markerfacecolor=color, markeredgecolor='none',
+                    markersize=6, label=str(lvl)
+                )
+            )
+
+        leg = first_ax.legend(
+            handles=handles,
+            title="Group",          # <- new title
+            loc="best",
+            frameon=True,
+            fontsize=8,             # <- smaller labels
+            title_fontsize=9
+        )
         plt.tight_layout()
         if save_plot:
             os.makedirs(save_dir, exist_ok=True)
@@ -2269,14 +2316,7 @@ def _plot_metric_vs_hrv(t, arrs, labels, save_plot, name, save_dir, is_streamlit
                 plt.show()
 
 def only_plots(results_df, save_plot, save_dir, edf_pickle_name="plot", band="band", step_sec=5,is_streamlit=False,hue=None):
-    zscore_cols = [
-        'Vagal_SD1_zscore',
-        'Sympathetic_SD2_zscore',
-        'Efficiency_zscore',
-        'Clustering_zscore',
-        'Modularity_zscore',
-        'Assortativity_zscore'
-    ]
+
     labels = [
         'Vagal_SD1',
         'Sympathetic_SD2',
@@ -2285,7 +2325,7 @@ def only_plots(results_df, save_plot, save_dir, edf_pickle_name="plot", band="ba
         'Modularity',
         'Assortativity'
     ]
-    arrs_zscore = [results_df[col].values for col in zscore_cols if col in results_df]
+    arrs_zscore = [results_df[col].values for col in labels if col in results_df]
     t = np.arange(len(results_df)) * step_sec
     _plot_metric_vs_hrv(t, arrs_zscore, labels, save_plot, f"{edf_pickle_name}_{band}_zscore", save_dir, is_streamlit=is_streamlit,hue=hue)
 
@@ -2408,3 +2448,5 @@ if __name__ == '__main__':
     # df_wnv,patients_folder,controls,df_wnv2,cases_group_name = cobrad_get_files(sample_window_size=600,only_awake=True)
     
     # df_wnv,patients_folder,controls,df_wnv2,cases_group_name = wnv_get_files()
+
+# %%

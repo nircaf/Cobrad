@@ -284,9 +284,9 @@ def HEP_plots(project_name, df_wnv3, controls, boxplot_columns, analysis_type,se
                 df = pd.read_parquet(file_path)
                 if selected_feature:
                     # Attach group info to each df
-                    if len(id_group) > 0:
+                    if len(id_group) > 0 and not df.empty:
                         df['Group'] = id_group[0]
-                dfs.append(df)
+                        dfs.append(df)
             except Exception as e:
                 st.warning(f"Could not read {file}: {e}")
         if dfs:
@@ -294,20 +294,28 @@ def HEP_plots(project_name, df_wnv3, controls, boxplot_columns, analysis_type,se
                 # Group by 'Group' and compute mean for each group
                 group_dfs = []
                 for group in df_wnv3['Group'].unique():
-                    group_patients = [df for df in dfs if 'Group' in df.columns and df['Group'].iloc[0] == group]
+                    group_patients2 = []
+                    for df in dfs:
+                        if 'Group' in df.columns and df['Group'].iloc[0] == group:
+                            group_patients2.append(df)
+                    # group_patients = pd.concat(group_patients2, ignore_index=False, axis=0)
                     # Filter out dfs shorter than 50 rows
-                    group_patients = [df for df in group_patients if df.shape[0] >= 50]
+                    group_patients = [df for df in group_patients2 if df.shape[0] >= 50]
                     if group_patients:
                         min_len = min(df.shape[0] for df in group_patients)
                         if min_len < 50:
                             continue
                         # Truncate all dfs to min_len rows
                         truncated = [df.drop(columns=['Group'], errors='ignore').iloc[:min_len] for df in group_patients]
-                        group_mean = pd.concat(truncated, axis=1).mean(axis=1)
-                        group_mean_df = pd.DataFrame([group_mean.values], columns=truncated[0].columns)
+                        # Get mean of each df (returns a Series) and concat to DataFrame
+                        group_mean_df = pd.concat([t.mean() for t in truncated], axis=1).T
                         group_mean_df['Group'] = group
                         group_dfs.append(group_mean_df)
                 results_df = pd.concat(group_dfs, ignore_index=True)
+                # remove cols more than 50% NaN
+                results_df = results_df.loc[:, results_df.isnull().mean() < 0.5]
+                # remove rows with any NaN
+                results_df = results_df.dropna()
                 hue = results_df['Group']
                 st.write(f"Loaded {len(results_df)} group means for band {band_name}")
             else:
