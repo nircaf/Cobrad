@@ -12,3 +12,4 @@ venv/
 *.h5
 *.log
 EDF.csv
+EDF_Format/*

@@ -1189,12 +1189,6 @@ def eeg_data_to_features(raw, window_size_sec=5, min_duration_sec=5):
             f'dfv_mean_EEG {ch}': df_arr[i].mean(),
             f'dfv_std_EEG {ch}': dfv_arr[i]
         })
-    # --- Compute mean and std of network features per band and add to meta ---
-    for band_name in power_bands:
-        for feat in ['efficiency', 'clustering', 'assortativity', 'modularity']:
-            arr = np.array(band_feature_arrays[band_name][feat])
-            meta[f'network_{band_name}_{feat}_mean'] = np.nanmean(arr) if arr.size > 0 else np.nan
-            meta[f'network_{band_name}_{feat}_std'] = np.nanstd(arr) if arr.size > 0 else np.nan
     return meta, conn_df
 
 def process_file_2(file, pickles_location, sample_window_size):

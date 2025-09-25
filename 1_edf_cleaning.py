@@ -23,6 +23,7 @@ from sklearn.decomposition import PCA
 from contextlib import contextmanager
 from utils.eeg_utils import *
 import ray
+import argparse
 # Import and run the HEP processing
 from utils.HEP_parquet_generation import process_patients_random6
 
@@ -45,6 +46,7 @@ def is_tmux():
     return 'TMUX' in os.environ
 
 use_multiprocessing = is_tmux()
+use_multiprocessing = False
 # Suppress specific RuntimeWarnings
 warnings.filterwarnings("ignore", message="Channels contain different highpass filters. Highest filter setting will be stored.")
 warnings.filterwarnings("ignore", message="Channels contain different lowpass filters. Lowest filter setting will be stored.")
@@ -52,17 +54,22 @@ warnings.filterwarnings("ignore", message="Effective window size : 1.000 (s)")
 getcwd = os.getcwd()
 
 #%% INITIALIZATION
-# cases_project_name = 'west_nile_virus'
-# cases_project_name = 'HANDL'
-# cases_project_name = 'EDF'
-# cases_project_name = 'TGA'
-edf_dir = 'EDF Format'
-cases_project_name = 'VNS_PRE_POST_25'
+# Parse command line arguments
+parser = argparse.ArgumentParser(description='EDF Cleaning Script')
+parser.add_argument('--cases_project_name', type=str, default=None,
+                    help='Name of the cases project (default: TGA)')
+args = parser.parse_args()
+
+# Get cases_project_name from CLI or use default
+cases_project_name = args.cases_project_name
+if not cases_project_name:
+    cases_project_name = 'CAP_Sleep_Database/1.0.0'
+
+edf_dir = 'EDF_Format'
 # Where to load the data from 
 directory = os.path.join(getcwd, edf_dir,cases_project_name)
 # directory = os.path.join(getcwd, 'Controls')
 os_splittor = '\\' if 'nt' in os.name else '/'
-
 
 #%% Load the data
 # df_wnv = pd.read_excel(f'WNV_merged_291224_KP.xlsx')
@@ -285,7 +292,7 @@ def analyze_eeg_data(raw,is_prod,filename):
             prep.fit()  # Run the pipeline without writing to console
     except Exception as e:
         print(f'Error in PrepPipeline: {e}')
-        return
+        return {},{}
     plot_not_prod(prep.raw,is_prod,'PrepPipeline4')
     raw = prep.raw  # Get cleaned data
     raw.interpolate_bads()
@@ -298,7 +305,7 @@ def analyze_eeg_data(raw,is_prod,filename):
         epochs_clean, reject_log = ar.fit_transform(epochs, return_log=True)
     except Exception as e:
         print(f'Error in AutoReject: {e}')
-        return
+        return {},{}
     # Assuming epochs_clean is an instance of mne.Epochs
     epochs_data = epochs_clean.get_data()  # Shape: (n_epochs, n_channels, n_times)
     
@@ -404,7 +411,7 @@ def process_file(row,filename,is_prod):
             except:
                 pass
             eeg_metadata, conn_df = analyze_eeg_data(raw,is_prod,row["file_name"])
-            if eeg_metadata is None:
+            if eeg_metadata == {}:
                 # save empty parquet file
                 # pd.DataFrame().to_parquet(f'{temp_dir}/{row["file_name"]}.parquet', index=False)
                 print(f'Error processing {row["file_name"]}')
@@ -486,10 +493,6 @@ if __name__ == "__main__":
         df = list_files_and_find_duplicates(directory)
     # remove duplicates subset file_name
     df.drop_duplicates(subset='file_name', inplace=True)
-    # leave only the files that contains 
-    # df = df[df['file_name'].str.contains('010')]
-    # inverse df
-    # df = df[::-1]
     # Set multiprocessing flag
     filename = f'{project_name}.parquet'
     if use_multiprocessing:
