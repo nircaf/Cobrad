@@ -13,3 +13,4 @@ venv/
 *.log
 EDF.csv
 EDF_Format/*
+bin*
