@@ -547,8 +547,8 @@ def boxplot_plot(results_df, combined_df, col, output_dir,figures_dir=None,is_st
     p = {p_value:.3e}, r² = {r_squared:.2f}
     Cohen's d = {cohen_d:.2f} with 95% CI [{cd['bca_low'].values[0]:.2f}, {cd['bca_high'].values[0]:.2f}]
     Observed power = {100*observed_power[0]:.2f}%"""
-        # plt.title(plt_title)
-        plt.figure(figsize=(16, 9))
+        plt.title(plt_title)
+        plt.figure(figsize=(9, 16))
         est = dabest_obj.mean_diff.plot(raw_marker_size=6, raw_label=col,float_contrast=True)
 
         if figures_dir:
@@ -578,6 +578,7 @@ def boxplot_plot(results_df, combined_df, col, output_dir,figures_dir=None,is_st
                             st.write(line)
             st_pyplot_func(plt, filename=f"{col}_dabest_plot")
     return # results_df
+    plt.show(block=True)
 
 def boxplot_plot_sns(results_df, combined_df, col, output_dir,figures_dir=None,is_streamlit=False,analysis_type=None, show_histograms=False):
     # Function to remove outliers based on 5 standard deviations
@@ -592,7 +593,7 @@ def boxplot_plot_sns(results_df, combined_df, col, output_dir,figures_dir=None,i
     # Remove outliers from each group
     cleaned_df = remove_outliers(combined_df, col, 'Group')
     # Plot the cleaned data
-    plt.figure(figsize=(16, 9))
+    plt.figure(figsize=(9, 16))
     sns.boxplot(x='Group', y=col, data=cleaned_df, showfliers=False)
     # Add stripplot
     sns.stripplot(x='Group', y=col, data=cleaned_df, alpha=0.5, jitter=True, color='black')
@@ -671,7 +672,7 @@ def boxplot_plot_sns(results_df, combined_df, col, output_dir,figures_dir=None,i
 def st_pyplot_func(plt,filename='plot'):
     """Function to display matplotlib figures in Streamlit."""
     # bbox_inches="tight":
-    plt.tight_layout()
+    # plt.tight_layout()
     st.pyplot(plt)
     # Save the plot as an SVG file in memory
     svg_buffer = io.BytesIO()
@@ -1325,8 +1326,8 @@ def tga_get_files():
     # Example usage inside tga_get_files
     clinical_df = get_df_clinical()
     clinical_df = convert_sex_column(clinical_df,'sex')
-    # read TGA.csv
-    df_wnv = pd.read_csv('TGA.csv')
+    # read TGA.oarquet
+    df_wnv = pd.read_parquet('TGA.parquet')
     # get clinical features
     clinical_df = enrich_tga_dataframe(clinical_df)
     # remove from file_name .edf

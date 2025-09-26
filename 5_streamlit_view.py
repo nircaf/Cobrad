@@ -393,7 +393,7 @@ def main():
     if feature_type == "Clinical Feature" or feature_type == "EEG Feature" or feature_type == "vs_Controls":
         # ask user if they want only significant, or full.
         st.sidebar.header("Select Analysis Type")
-        analysis_type = st.sidebar.selectbox("Select Analysis Type", [ "Full","Significant"])
+        analysis_type = st.sidebar.selectbox("Select Analysis Type", [ "Significant","Full"])
     else:
         analysis_type = "Full"
         
@@ -511,12 +511,10 @@ def main():
                     org_selected_feature_for_plot = org_selected_feature(selected_feature)
                     df_wnv3['Group'] = df_wnv3[selected_feature].apply(lambda x: f'{org_selected_feature_for_plot}+' if x == 1 else f'{org_selected_feature_for_plot}-')
                 # st checkbox if HEP
-                hep_checkbox = st.sidebar.checkbox("Show HEP Plots", value=True)
+                hep_checkbox = st.checkbox("Show HEP Plots", value=False)
                 if hep_checkbox:
-                    # new container
-                    with st.container():
-                        st.subheader("HEP Plots")
-                        HEP_plots(project_name, df_wnv3, controls, boxplot_columns, analysis_type,selected_feature)
+                    st.subheader("HEP Plots")
+                    HEP_plots(project_name, df_wnv3, controls, boxplot_columns, analysis_type,selected_feature)
                 plot_tsne_by_group(df_wnv3)
                 st.divider()
                 # run over df_wnv2_others
