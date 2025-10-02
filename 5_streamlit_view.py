@@ -181,9 +181,7 @@ def vs_controls_run(project_name,df_wnv2,controls,boxplot_columns,analysis_type)
     df_wnv2['Group'] = project_name
     controls['Group'] = 'Controls'
     combined_df = pd.concat([df_wnv2, controls], ignore_index=True,axis=0)
-    scatterplots_dir = f"{project_name}_figures/topomaps_p_values/vs_controls"
-    boxplots_dir = f"{project_name}_figures/boxplots/vs_controls"
-    controls_dir = f'temps_Controls_EDF' if project_name == 'COBRAD' else ''
+    controls_dir = f'temps_Controls_EDF'
     try:
         st.header('Controls Demographics')
         # get controls demographic from get_controls_ages_genders(controls_dir)
@@ -202,7 +200,7 @@ def vs_controls_run(project_name,df_wnv2,controls,boxplot_columns,analysis_type)
             gender_stat, gender_p = mannwhitneyu(cobrad_sexes.dropna(), controls_demographics_df['Gender'].dropna(), alternative='two-sided')
             st.write(f"Mann-Whitney U test for gender: p={gender_p:.3g}")
     except Exception as e:
-        st.error(f"Error occurred while processing controls demographics: {e}")
+        st.warning(f"Error occurred while processing controls demographics: {e}")
     for col in boxplot_columns:
         curr_data = combined_df[[col, 'Group']].dropna()
         num_groups = curr_data['Group'].nunique()
@@ -211,7 +209,6 @@ def vs_controls_run(project_name,df_wnv2,controls,boxplot_columns,analysis_type)
         results_df = analyze_and_correct(curr_data, [col], groups=curr_data['Group'].unique())
         boxplot_plot_dabest(results_df,curr_data, col, 'vs_controls',is_streamlit=True,analysis_type=analysis_type)
 import upload_project_page as upp
-
 
 def ml_plots_get_images(project_name, selected_feature):
     ml_plots_dir = f"{project_name}_figures/ml_plots"
@@ -325,6 +322,10 @@ def HEP_plots(project_name, df_wnv3, controls, boxplot_columns, analysis_type,se
         # run only_plots on results_df
         only_plots(results_df, save_plot='', save_dir='', edf_pickle_name="plot", band=band_name, step_sec=5,is_streamlit=True,hue=hue)
         st.divider()
+
+
+
+
 # Streamlit App
 def main():
     # options to choose from folders in pickles
@@ -334,7 +335,7 @@ def main():
     # Deduplicate while preserving order
     seen = set()
     opts = [x for x in default_options if not (x in seen or seen.add(x))]
-    selected_projects = st.sidebar.multiselect("Select Project(s)", opts, default=[x for x in ["COBRAD", "CAP_Sleep_Database"] if x in opts])
+    selected_projects = st.sidebar.multiselect("Select Project(s)", opts, default=[x for x in ["Reading_Epilepsy"] if x in opts])
     if not selected_projects:
         st.error("Please select at least one project.")
         return
@@ -368,11 +369,6 @@ def main():
     project_name = selected_projects[0]  # Use the first selected project for downstream logic
 
     st.title("EEG Analysis")
-    # Page selector: Main app or Upload page
-    page = st.sidebar.selectbox('Page', ['Main', 'Upload Project'])
-    if page == 'Upload Project':
-        upp.run_upload_page()
-        return
     # Iterate over each frequency band and plot the topomap
     cols_to_drop = ['annotations', 'bad_channels', 'patient_number', 'csv_file_name', 'file_name', 'file_path', 'signal_labels', 'number_of_signals', 'sampling_frequency', 'sampling_rate', 'duration_min']
     # Remove specified columns and those containing dates from df_wnv2
@@ -390,12 +386,12 @@ def main():
     clinical_features_numeric = [col for col in clinical_features if pd.api.types.is_numeric_dtype(df_wnv2[col])]
     # Sidebar for feature selection
     st.sidebar.header("Feature Selection")
-    feature_types = ("Clinical Feature", "EEG Feature", "ml_plots", "vs_Controls", "Pair Plot",'Raw''Spectogram')
+    feature_types = ('vs_Controls',"Clinical Feature", "EEG Feature", "ml_plots", "vs_Controls", "Pair Plot",'Raw','Spectrogram')
     feature_type = st.sidebar.selectbox("Select feature type to plot against the other type:", feature_types)
     if feature_type == "Clinical Feature" or feature_type == "EEG Feature" or feature_type == "vs_Controls":
         # ask user if they want only significant, or full.
         st.sidebar.header("Select Analysis Type")
-        analysis_type = st.sidebar.selectbox("Select Analysis Type", [ "Significant","Full"])
+        analysis_type = st.sidebar.selectbox("Select Analysis Type", ["Full", "Significant"])
     else:
         analysis_type = "Full"
         
@@ -403,7 +399,6 @@ def main():
     bool_all_features = False
     cols_to_skip = ['ID','annotations','bad_channels','Group','patient_number','size','n_samples']
     clinical_features = [feature for feature in clinical_features if feature not in cols_to_skip]
-    
     if not clinical_features or not eeg_features:
         st.error("Could not identify clinical or EEG features based on the 'overall_' separator.")
         return
@@ -421,14 +416,14 @@ def main():
         if selected_feature:
             ml_plots_get_images(project_name, selected_feature)
         return
-    elif feature_type == "Spectogram":
+    elif feature_type == "Spectrogram":
         st.title("Spectrogram")
         # ask user for win_sec
         win_sec = st.sidebar.slider("Select window size in seconds", 1, 30, 5)
-        spectogram_run(cases_group_name,win_sec=win_sec)
+        spectrogram_run(cases_group_name,win_sec=win_sec)
         st.divider()
         st.subheader("Spectrogram Controls")
-        spectogram_run(f'Controls',win_sec=win_sec)
+        spectrogram_run(f'Controls',win_sec=win_sec)
 
         return
     elif feature_type == "Raw":

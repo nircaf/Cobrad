@@ -604,40 +604,40 @@ def boxplot_plot_dabest(results_df, combined_df, col, output_dir,figures_dir=Non
         ss_between = sum(cleaned_df.groupby('Group').size() * (group_means - grand_mean) ** 2)
         ss_total = sum((cleaned_df[col] - grand_mean) ** 2)
         r_squared = ss_between / ss_total if ss_total > 0 else np.nan
-        # Format Cohen's d
-        try:
-            cd = dabest_obj.cohens_d.results
-            cohen_d = cd['difference'].values[0] if 'difference' in cd.columns else np.nan
-        except Exception as e:
-            st.write(f"Could not compute Cohen's d: {e}")
-            return 
-        analysis = TTestIndPower()
-        alpha = 0.05
-        alternative = 'two-sided'  # or 'larger'/'smaller' if you had a directional hypothesis
+        def cohen_d_power():
+            # Format Cohen's d
+            try:
+                cd = dabest_obj.cohens_d.results
+                cohen_d = cd['difference'].values[0] if 'difference' in cd.columns else np.nan
+            except Exception as e:
+                st.write(f"Could not compute Cohen's d: {e}")
+                return 
+            analysis = TTestIndPower()
+            alpha = 0.05
+            alternative = 'two-sided'  # or 'larger'/'smaller' if you had a directional hypothesis
 
-        # Compute observed power per contrast
-        cd = cd.copy()
-        observed_power = [
-            analysis.power(effect_size=abs(d),          # power depends on |d|
-                        nobs1=int(n1),
-                        ratio=float(n2)/float(n1),
-                        alpha=alpha,
-                        alternative=alternative)
-            for d, n1, n2 in zip(cd["difference"], cd["control_N"], cd["test_N"])
-        ]
-        # If observed_power is nan, set to 1.0 if p < 0.05, else 0.0
-        pval_col = "pvalue_mann_whitney" if "pvalue_mann_whitney" in dabest_results else "pvalue_permutation"
-        pvals = dabest_results[pval_col].values if pval_col in dabest_results else [np.nan] * len(observed_power)
-        for i, (power, pval) in enumerate(zip(observed_power, pvals)):
-            if not np.isfinite(power):
-                if pval < 0.05:
-                    observed_power[i] = 1.0
+            # Compute observed power per contrast
+            cd = cd.copy()
+            observed_power = [
+                analysis.power(effect_size=abs(d),          # power depends on |d|
+                            nobs1=int(n1),
+                            ratio=float(n2)/float(n1),
+                            alpha=alpha,
+                            alternative=alternative)
+                for d, n1, n2 in zip(cd["difference"], cd["control_N"], cd["test_N"])
+            ]
+            # If observed_power is nan, set to 1.0 if p < 0.05, else 0.0
+            pval_col = "pvalue_mann_whitney" if "pvalue_mann_whitney" in dabest_results else "pvalue_permutation"
+            pvals = dabest_results[pval_col].values if pval_col in dabest_results else [np.nan] * len(observed_power)
+            for i, (power, pval) in enumerate(zip(observed_power, pvals)):
+                if not np.isfinite(power):
+                    if pval < 0.05:
+                        observed_power[i] = 1.0
+                    else:
+                        observed_power[i] = 0.0
                 else:
-                    observed_power[i] = 0.0
-            else:
-                observed_power[i] = min(max(power, 0.0), 1.0)
-        # Format title
-         
+                    observed_power[i] = min(max(power, 0.0), 1.0)
+        # cohen_d_power()
         # plt_title = f"""p = {p_value:.3e}, r² = {r_squared:.2f}
         # Cohen's d = {cohen_d:.2f} with 95% CI [{cd['bca_low'].values[0]:.2f}, {cd['bca_high'].values[0]:.2f}]
         # Observed power = {100*observed_power[0]:.2f}%\n\n"""
@@ -1499,6 +1499,14 @@ def generic_get_files(project_name: str):
                 if base.lower().endswith('.edf'):
                     base = base[:-4]
                 df['file_name'] = base
+            filebase = '.'.join(fname.split('.')[:2])
+            # find file path in 'EDF_Format' folder and subfolders with glob
+            import glob
+            pattern = os.path.join('EDF_Format', patients_folder, '**', filebase)
+            matches = glob.glob(pattern, recursive=True)
+            if matches:
+                filepath = matches[0]  # first match
+            df['mother_folder'] = os.path.basename(os.path.dirname(filepath))
             df_list.append(df)
     else:
         print(f"Warning: parquet directory not found: {parquet_dir}")
@@ -1507,6 +1515,7 @@ def generic_get_files(project_name: str):
         df_parquet = pd.DataFrame()
     else:
         df_parquet = pd.concat(df_list, ignore_index=True, sort=False)
+
 
     # Attempt to find a clinical Excel file under EDF_Format/{project_name}
     clinical_df = pd.DataFrame()
@@ -1574,21 +1583,13 @@ def generic_get_files(project_name: str):
                 if matched_rows:
                     df_merged = pd.concat([clinical_df.reset_index(drop=True), df_parquet.loc[matched_rows].reset_index(drop=True)], axis=1, ignore_index=False)
 
+
+    df_merged, df_wnv2 = aggregate_dataframe(df_merged, weighted_avg)
     # Create grouped/aggregated df (df_wnv2) similar to other loaders
     if not df_merged.empty:
         # Drop helper columns if present
         if '_merge' in df_merged.columns:
             df_merged = df_merged.drop(columns=['_merge'], errors='ignore')
-        if 'duration_min' in df_merged.columns:
-            numeric_cols = df_merged.select_dtypes(include=[np.number]).columns
-            try:
-                df_wnv2 = df_merged.groupby('ID').apply(weighted_avg, weight_col='duration_min', numeric_cols=numeric_cols).reset_index(drop=True)
-            except Exception:
-                # fallback to simple mean for numeric columns and preserve first of non-numeric
-                df_wnv2 = df_merged.groupby('ID').mean(numeric_only=True).reset_index()
-        else:
-            df_wnv2 = df_merged.groupby('ID').mean(numeric_only=True).reset_index()
-
         # Clean up common unwanted columns and coerce numeric strings
         cols_to_drop = ['highpass', 'lowpass', 'n_samples', 'size', 'patient_number', 'duration_sec']
         df_wnv2 = df_wnv2.drop(columns=[col for col in df_wnv2.columns if any(drop in col for drop in cols_to_drop)], errors='ignore')
@@ -1598,14 +1599,100 @@ def generic_get_files(project_name: str):
                 df_wnv2[col] = pd.to_numeric(df_wnv2[col])
             except Exception:
                 pass
-
+    
     # Controls: generic loader doesn't have controls; return empty DataFrame
-    controls = pd.DataFrame()
-
+    controls = get_cobrad_controls()
     cases_group_name = project_name
     return df_parquet, patients_folder, controls, df_wnv2, cases_group_name
+
+def aggregate_dataframe(df_merged, weighted_avg):
+    """
+    Aggregate a dataframe by mother_folder (if present) and ID.
+    Uses weighted average if 'duration_min' exists, otherwise falls back to mean.
+    Non-numeric columns preserve the first value.
+
+    Parameters
+    ----------
+    df_merged : pd.DataFrame
+        Input dataframe.
+    weighted_avg : function
+        Function signature must be:
+        weighted_avg(group, weight_col, numeric_cols)
+
+    Returns
+    -------
+    df_merged : pd.DataFrame
+        Aggregated dataframe (mother_folder level if exists).
+    df_wnv2 : pd.DataFrame
+        Aggregated dataframe (ID level).
+    """
+    df_wnv2 = pd.DataFrame()
+
+    # --- Handle mother_folder level aggregation ---
+    if 'mother_folder' in df_merged.columns and df_merged['mother_folder'].nunique() > 1:
+        count_mother = df_merged['mother_folder'].value_counts()
+
+        if 'duration_min' in df_merged.columns:
+            numeric_cols = df_merged.select_dtypes(include=[np.number]).columns
+            try:
+                df_merged = (
+                    df_merged.groupby('mother_folder')
+                    .apply(weighted_avg, weight_col='duration_min', numeric_cols=numeric_cols)
+                    .reset_index(drop=True)
+                )
+            except Exception:
+                print("Warning: weighted average failed, falling back to simple mean")
+                df_merged = (
+                    df_merged.groupby('mother_folder')
+                    .mean(numeric_only=True)
+                    .reset_index()
+                )
+        else:
+            print("Warning: 'duration_min' column not found, falling back to simple mean")
+            df_merged = (
+                df_merged.groupby('mother_folder')
+                .agg(lambda x: x.mean() if pd.api.types.is_numeric_dtype(x) else x.iloc[0])
+                .reset_index()
+            )
+
+        # Add counts
+        df_merged = df_merged.merge(
+            count_mother.rename('num_records'),
+            left_on='mother_folder',
+            right_index=True,
+            how='left'
+        )
+
+    # --- Handle ID level aggregation ---
+    if not df_merged.empty:
+        if '_merge' in df_merged.columns:
+            df_merged = df_merged.drop(columns=['_merge'], errors='ignore')
+
+        if 'duration_min' in df_merged.columns:
+            numeric_cols = df_merged.select_dtypes(include=[np.number]).columns
+            try:
+                df_wnv2 = (
+                    df_merged.groupby('ID')
+                    .apply(weighted_avg, weight_col='duration_min', numeric_cols=numeric_cols)
+                    .reset_index(drop=True)
+                )
+            except Exception:
+                print("Warning: weighted average failed at ID level, falling back to simple mean")
+                df_wnv2 = (
+                    df_merged.groupby('ID')
+                    .mean(numeric_only=True)
+                    .reset_index()
+                )
+        else:
+            df_wnv2 = (
+                df_merged.groupby('ID')
+                .mean(numeric_only=True)
+                .reset_index()
+            )
+
+    return df_merged, df_wnv2
 #%% COBRAD
-def get_cobrad_controls(patients_folder):
+def get_cobrad_controls(patients_folder='EDF'):
     controls = pd.read_csv(f'{patients_folder}_controls.csv')
     controls['ID'] = controls['file_name'].apply(lambda x: x.split('_')[0]).astype(str)
     numeric_cols = controls.select_dtypes(include=[np.number]).columns
@@ -2155,23 +2242,19 @@ import os, pickle, pandas as pd
 import streamlit as st
 from mne.time_frequency import psd_array_welch  # for PSD
 
-def spectogram_run(group, win_sec=5):
-    # Try to read existing group_mean pickle
-    mean_path = f'pickles/group_mean/{group}_mean.pkl'
-    # if os.path.exists(mean_path):
-    #     with open(mean_path, 'rb') as f:
-    #         di = pickle.load(f)
-    #     raw = di['raw']
-    #     arr_mean = di['arr_mean']
-    #     n_samples = di.get('n_samples', None)  # fallback if old file format
-    #     st.write(f"Loaded mean pickle with {n_samples} samples.")
-    #     plot_spectrogram_mean(group, arr_mean,
-    #                           win_sec=win_sec,
-    #                           sf=raw.info['sfreq'])
-    #     return
-    # Load pickle raw files
+def spectrogram_run(group, win_sec=5):
+    # Path for cached spectrogram
+    fig_path = f"figures/spectrogram/{group}.png"
+    os.makedirs(os.path.dirname(fig_path), exist_ok=True)
+
+    # --- If spectrogram image exists, just show it ---
+    if os.path.exists(fig_path):
+        st.image(fig_path, caption=f"Spectrogram (cached) for {group}")
+        return
+
+    # --- Otherwise, generate it from pickles ---
     pickle_files = [f for f in os.listdir(f'pickles/{group}') if f.endswith('.pkl')]
-    default_sample_k = 5
+    default_sample_k = 25
     load_all = st.button(f"Load all pickles ({len(pickle_files)})")
     if not load_all:
         pickle_files = pickle_files[:default_sample_k]
@@ -2185,18 +2268,10 @@ def spectogram_run(group, win_sec=5):
         data = raw.get_data()
         arr.append(data)
         channels = raw.info['ch_names']
-        # update progress bar
         progress.progress(i / total_files)
 
     arr_mean = mean_of_resized_arrays(arr)
     n_samples = len(arr)
-
-    # Save mean pickle with sample count
-    os.makedirs('pickles/group_mean', exist_ok=True)
-    with open(mean_path, 'wb') as f:
-        pickle.dump({'raw': raw,
-                     'arr_mean': arr_mean,
-                     'n_samples': n_samples}, f)
 
     # --- PSD on mean data ---
     sf = raw.info['sfreq']
@@ -2207,28 +2282,28 @@ def spectogram_run(group, win_sec=5):
         fmax=40.0,
         n_fft=int(sf * win_sec)
     )
-    # Create DataFrame with channel names as columns
     ch_names = raw.info['ch_names']
     eeg_channels_lower = [ch.lower() for ch in eeg_channels]
-    # get only the valid eeg channels and sort them else remove them
-    ch_names = sorted(ch_names, key=lambda x: eeg_channels_lower.index(x.lower()) if x.lower() in eeg_channels_lower else len(eeg_channels_lower))
-    # sort psds
+    ch_names = sorted(
+        ch_names,
+        key=lambda x: eeg_channels_lower.index(x.lower())
+        if x.lower() in eeg_channels_lower else len(eeg_channels_lower)
+    )
     psd_df = pd.DataFrame(psds.T, index=freqs, columns=ch_names)
     st.write(f"Mean PSD over {n_samples} samples")
     st.line_chart(psd_df)
-    # Plot spectrogram
-    sf = raw.info['sfreq']
-    # subtitle
-    st.write(f"Mean Spectrogram over {n_samples} samples")
-    plot_spectrogram_mean(group, arr_mean,
-                          win_sec=win_sec,
-                          sf=sf)
 
+    # --- Generate spectrogram figure ---
+    st.write(f"Mean Spectrogram over {n_samples} samples")
+    fig = plot_spectrogram_mean(group, arr_mean, win_sec=win_sec, sf=sf)
+    # Save to PNG
+    fig.savefig(fig_path, dpi=150, bbox_inches="tight")
 
 def plot_spectrogram_mean(group,arr_mean,figures_dir=None,win_sec=5,sf=256):
     # mean over all channels
     fig = yasa.plot_spectrogram(arr_mean.mean(axis=0), sf,win_sec=win_sec, ch_names=['mean'],cmap='jet')
     st_pyplot_func(fig)
+    return fig
 
 # Utility function to convert sex column
 def convert_sex_column(clinical_df, sex_column):
