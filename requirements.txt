@@ -29,3 +29,4 @@ edfio
 
 plotly
 pathlib
+python-pptx 

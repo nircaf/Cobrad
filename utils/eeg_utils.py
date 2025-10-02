@@ -790,28 +790,58 @@ def annotate_pvals_with_jitter(ax, pval_lines, cleaned_df, col, unique_groups):
 
         stack_counter[key] += 1
 
-def st_pyplot_func(plt,filename='plot'):
-    """Function to display matplotlib figures in Streamlit."""
-    bbox_inches="tight"
-    plt.tight_layout()
-    st.pyplot(plt)
-    # Save the plot as an SVG file in memory
+from pptx import Presentation
+from pptx.util import Inches
 
+# initialize session state pptx only once
+if "pptx" not in st.session_state:
+    st.session_state.pptx = Presentation()
+
+def st_pyplot_func(fig, filename="plot"):
+    """Show matplotlib figure in Streamlit, add SVG download,
+       and append to in-memory PPTX stored in session_state."""
+    
+    # show plot
+    st.pyplot(fig)
+
+    # --- Add download for SVG ---
     svg_buffer = io.BytesIO()
-    plt.savefig(svg_buffer, format="svg")
+    fig.savefig(svg_buffer, format="svg", bbox_inches="tight")
     svg_buffer.seek(0)
-    uuid4 = str(uuid.uuid4())
-    # Add a download button for the SVG file
     st.download_button(
-        label="Download plot as SVG",
+        label="Download this plot as SVG",
         data=svg_buffer,
         file_name=f"{filename}.svg",
         mime="image/svg+xml",
-        key=uuid4,
+        key=str(uuid.uuid4())
     )
-    # plt.close()
-    
-def scatter_plot_with_regression(results_df, combined_df, x_col, y_col, output_dir,figures_dir= None,is_streamlit=False,analysis_type=None, show_histograms=False):
+
+    # --- Append PNG to pptx in session_state ---
+    png_buffer = io.BytesIO()
+    fig.savefig(png_buffer, format="png", dpi=300, bbox_inches="tight")
+    png_buffer.seek(0)
+
+    slide = st.session_state.pptx.slides.add_slide(
+        st.session_state.pptx.slide_layouts[6]  # blank layout
+    )
+    slide.shapes.add_picture(png_buffer, Inches(1), Inches(1), height=Inches(5))
+
+
+def download_pptx_button(label="Download all plots as PPTX"):
+    """Provide a Streamlit button to download the aggregated PPTX."""
+    pptx_buffer = io.BytesIO()
+    st.session_state.pptx.save(pptx_buffer)
+    pptx_buffer.seek(0)
+
+    st.download_button(
+        label=label,
+        data=pptx_buffer,
+        file_name="plots.pptx",
+        mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        key="pptx-download"
+    )
+
+def scatter_plot_with_regression(results_df, combined_df, x_col, y_col, output_dir, figures_dir=None, is_streamlit=False, analysis_type=None, show_histograms=False):
     plt.figure(figsize=(10, 6))
     sns.scatterplot(x=x_col, y=y_col, data=combined_df, alpha=0.5, color='black')
     sns.regplot(x=x_col, y=y_col, data=combined_df, scatter=False, color='blue')

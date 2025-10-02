@@ -563,6 +563,8 @@ def main():
             st.divider()
     else:
         run_selected_feature()
+    download_pptx_button()
+
 
 def nilearn_plotting(df_wnv3):
     # leave all columns that say 'EEG' and group column
