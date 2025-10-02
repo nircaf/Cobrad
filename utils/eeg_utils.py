@@ -1462,6 +1462,7 @@ def tga_get_files():
     cases_group_name = "TGA"
     return df_wnv, patients_folder, controls, df_wnv2, cases_group_name
 
+from pathlib import Path
 
 def generic_get_files(project_name: str):
     """
@@ -1506,7 +1507,7 @@ def generic_get_files(project_name: str):
             matches = glob.glob(pattern, recursive=True)
             if matches:
                 filepath = matches[0]  # first match
-            df['mother_folder'] = os.path.basename(os.path.dirname(filepath))
+            df['mother_folder'] = Path(filepath).parent.name
             df_list.append(df)
     else:
         print(f"Warning: parquet directory not found: {parquet_dir}")

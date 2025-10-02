@@ -28,7 +28,4 @@ dabest
 edfio
 
 plotly
-selenium>=4.15.0
-pytz>=2023.3
-streamlit-javascript
-reportlab
+pathlib
