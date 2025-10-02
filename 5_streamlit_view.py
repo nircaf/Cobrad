@@ -329,7 +329,7 @@ def HEP_plots(project_name, df_wnv3, controls, boxplot_columns, analysis_type,se
 # Streamlit App
 def main():
     # options to choose from folders in pickles
-    default_options = ["COBRAD", "WNV"] +  [f for f in os.listdir('parquet_results') if os.path.isdir(os.path.join('pickles', f))] 
+    default_options = ["COBRAD", "WNV"] +  [f for f in os.listdir('parquet_results') if os.path.isdir(os.path.join('parquet_results', f))] 
     # allow multiple selection for project
     # default_options = ["COBRAD", "WNV"]
     # Deduplicate while preserving order
