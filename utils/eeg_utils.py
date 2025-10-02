@@ -28,9 +28,19 @@ from statsmodels.stats.power import TTestIndPower
 from scipy.stats import wilcoxon, zscore, pearsonr, entropy, ranksums, linregress
 from statsmodels.stats.multitest import fdrcorrection
 from scipy.stats import mannwhitneyu
+import sys, mne.io.array
+sys.modules['mne.io.array.array'] = mne.io.array
+# Optional imports for plotly functionality
+try:
+    import plotly.graph_objects as go
+    import plotly.express as px
+    from plotly.subplots import make_subplots
+    PLOTLY_AVAILABLE = True
+except ImportError:
+    PLOTLY_AVAILABLE = False
 
 eeg_channels = ['Fp1', 'Fp2', 'F3', 'F4', 'C3', 'C4', 'P3', 'P4', 'O1', 'O2', 'F7',
-       'F8', 'T3', 'T4', 'T5', 'T6', 'Fz', 'Cz', 'Pz', 'A1','A2', 'Fpz', 'Oz']
+       'F8', 'T3', 'T4', 'T5', 'T6', 'Fz', 'Cz', 'Pz', 'A1','A2', 'Fpz', 'Oz','AF7','AF8']
 
 eeg_dict_convertion = {
        'Fp2-F4': 'Fp2',
@@ -55,9 +65,89 @@ eeg_dict_convertion = {
        'EOG2+': 'eog',
        'ECG1+': 'ecg',
         'ECG2+': 'ecg',
+        'C3-G2': 'C3',
+        'Fp2-G2-1': 'Fp2',
+        'T4-G2': 'T4',
+        'Fp1-G2-0': 'AF7',
+        'Fp2-G2-0': 'AF8',
+        'T3-G2': 'T3',
+    'C4-G2': 'C4',
+    'Fp1-G2-1': 'Fp1',
 }
 
-# Define power bands as a dictionary
+
+def st_progress_updater(total: int, label: str = "Progress"):
+    """Return a progress updater for Streamlit.
+
+    Usage:
+        updater = st_progress_updater(100, "Processing files")
+        for i, item in enumerate(items, start=1):
+            # do work
+            updater(i, f"Item {i} / {len(items)}")
+
+    The returned updater accepts two args: current (int) and optional message (str).
+    If Streamlit (`st`) is not available (e.g., running outside Streamlit), this
+    becomes a no-op but still callable.
+    """
+    try:
+        import streamlit as st
+    except Exception:
+        # st not available — return a no-op updater
+        def _noop(current: int, message: str | None = None):
+            return
+
+        return _noop
+
+    progress = st.progress(0)
+    placeholder = st.empty()
+
+    def _updater(current: int, message: str | None = None):
+        # clamp current to [0, total]
+        pct = int(max(0, min(total and int(current * 100 / total) or 0, 100)))
+        try:
+            progress.progress(pct)
+            if message:
+                placeholder.text(f"{label}: {message} ({pct}%)")
+        except Exception:
+            # Streamlit may raise if session ended — swallow safely
+            pass
+
+    return _updater
+
+
+class st_progress_context:
+    """Context manager convenience wrapper around `st_progress_updater`.
+
+    Example:
+        with st_progress_context(total=len(items), label="Processing") as update:
+            for i, item in enumerate(items, start=1):
+                # do work
+                update(i, f"Item {i}")
+    """
+    # Quick usage example (also works outside of Streamlit gracefully):
+    #
+    # >>> from utils.eeg_utils import st_progress_context
+    # >>> items = range(10)
+    # >>> with st_progress_context(total=len(items), label="Processing") as update:
+    # ...     for i, it in enumerate(items, start=1):
+    # ...         # do work
+    # ...         update(i, f"Processed {i}")
+    def __init__(self, total: int, label: str = "Progress"):
+        self.total = total
+        self.label = label
+        self._updater = None
+
+    def __enter__(self):
+        self._updater = st_progress_updater(self.total, self.label)
+        return self._updater
+
+    def __exit__(self, exc_type, exc, tb):
+        # on exit, set progress to 100%
+        if self._updater is not None:
+            try:
+                self._updater(self.total, "Done")
+            except Exception:
+                pass
 power_bands = {
     "delta": [.5, 4],
     "theta": [4, 8],
@@ -429,8 +519,7 @@ def remove_outliers(df, col, group_col=None, threshold=5, by_group=True):
         std = df[col].std()
         return df[np.abs(df[col] - mean) <= threshold * std].reset_index(drop=True)
     
-def boxplot_plot(results_df, combined_df, col, output_dir,figures_dir=None,is_streamlit=False,analysis_type=None, show_histograms=False):
-
+def boxplot_plot_dabest(results_df, combined_df, col, output_dir,figures_dir=None,is_streamlit=False,analysis_type=None, show_histograms=False):
     # Remove outliers from each group
     cleaned_df = remove_outliers(combined_df, col, 'Group')
     unique_groups = cleaned_df['Group'].unique()
@@ -445,9 +534,13 @@ def boxplot_plot(results_df, combined_df, col, output_dir,figures_dir=None,is_st
         p_value = dabest_results['pvalue_mann_whitney'].values[0] if 'pvalue_mann_whitney' in dabest_results else np.nan
         dabest_results.columns
 
-        def add_sig_lines(is_streamlit=False):
+        def add_sig_lines(is_streamlit=False, est=None):
             # --- Add significance lines and asterisks (including '****') for ALL pairwise comparisons ---
-            ax = plt.gca()
+            if est is not None:
+                fig = est  # est is the Figure object
+                ax = fig.axes[0]  # Get the main Axes
+            else:
+                ax = plt.gca()
             y_min, y_max = ax.get_ylim()
             xticks = ax.get_xticks()
             xticklabels = [tick.get_text() for tick in ax.get_xticklabels()]
@@ -476,9 +569,7 @@ def boxplot_plot(results_df, combined_df, col, output_dir,figures_dir=None,is_st
                     stat, pval = mannwhitneyu(data1, data2, alternative='two-sided')
                 except Exception:
                     continue
-                # Collect tuple for Streamlit display and logic
-                if is_streamlit and len(unique_groups) > 1:
-                    pval_lines.append((group1, group2, pval))
+
                 # Determine significance symbol
                 if pval < 0.0001:
                     stars = '****'
@@ -490,6 +581,9 @@ def boxplot_plot(results_df, combined_df, col, output_dir,figures_dir=None,is_st
                     stars = '*'
                 else:
                     continue  # Not significant, skip
+                # Collect tuple for Streamlit display and logic
+                if is_streamlit and len(unique_groups) > 1:
+                    pval_lines.append((group1, group2, pval))
                 x1 = group_to_x.get(str(group1), None)
                 x2 = group_to_x.get(str(group2), None)
                 if x1 is None or x2 is None:
@@ -543,138 +637,166 @@ def boxplot_plot(results_df, combined_df, col, output_dir,figures_dir=None,is_st
             else:
                 observed_power[i] = min(max(power, 0.0), 1.0)
         # Format title
-        plt_title = f"""{col} by Group\n
-    p = {p_value:.3e}, r² = {r_squared:.2f}
-    Cohen's d = {cohen_d:.2f} with 95% CI [{cd['bca_low'].values[0]:.2f}, {cd['bca_high'].values[0]:.2f}]
-    Observed power = {100*observed_power[0]:.2f}%"""
-        plt.title(plt_title)
-        plt.figure(figsize=(9, 16))
-        est = dabest_obj.mean_diff.plot(raw_marker_size=6, raw_label=col,float_contrast=True)
-
+         
+        # plt_title = f"""p = {p_value:.3e}, r² = {r_squared:.2f}
+        # Cohen's d = {cohen_d:.2f} with 95% CI [{cd['bca_low'].values[0]:.2f}, {cd['bca_high'].values[0]:.2f}]
+        # Observed power = {100*observed_power[0]:.2f}%\n\n"""
+        plt_title = f"{col} by Group\n"
+        # suptitle
+        est = dabest_obj.mean_diff.plot(raw_marker_size=3, raw_label=col,float_contrast=True,fig_size=(8,8),dpi=300)
+        plt.suptitle(plt_title, fontsize=14)
+        ax = est.axes[0]
+        annotate_pvals_with_jitter(ax, pval_lines=pval_lines, cleaned_df=cleaned_df, col=col, unique_groups=unique_groups)
         if figures_dir:
             os.makedirs(f'{figures_dir}/dabest_plots/{output_dir}', exist_ok=True)
+            plt.tight_layout()
             plt.savefig(f"{figures_dir}/dabest_plots/{output_dir}/{col}_dabest_plot.png")
             plt.close()
         if is_streamlit:
-            # Only show if at least one p-value is significant
-            if pval_lines and all(pval > 0.05 for _, _, pval in pval_lines):
-                return
-            st.divider()
-            st.subheader(f"Estimation Plot of {col} by Group")
-
             # Show p-value lines in Streamlit: first line, rest in expander
-            if is_streamlit and len(pval_lines) > 0:
-                formatted_lines = [f"{g1} vs {g2} P-value: {pval:.3e}" for g1, g2, pval in pval_lines]
-                st.write(formatted_lines[0])
-                if len(formatted_lines) > 1:
+            if len(pval_lines) > 0 and any(pval < 0.05 for _, _, pval in pval_lines) or analysis_type =='Full':
+                st.divider()
+                st.subheader(f"Estimation Plot of {col} by Group")
+                # Build DataFrame from pval_lines
+                pval_df = pd.DataFrame(pval_lines, columns=["Group 1", "Group 2", "P-value"])
+                pval_df["P-value"] = pval_df["P-value"].map(lambda x: f"{x:.3e}")  # format in scientific notation
+                if len(pval_lines) > 0:
                     with st.expander("Show numeric results"):
                         st.write(plt_title)
-                        # st write mean +- std for each group
+                        
+                        # write mean ± std for each group
                         for group in combined_df['Group'].unique():
                             group_data = combined_df[combined_df['Group'] == group][col]
                             stats_text, stat_dict = stat_text_get(group_data)
                             st.write(f"{group} mean {stat_dict['Mean']:.2e} ± {stat_dict['Std']:.2e}")
-                        for line in formatted_lines[1:]:
-                            st.write(line)
-            st_pyplot_func(plt, filename=f"{col}_dabest_plot")
+                        
+                        # Show as table instead of separate lines
+                        st.dataframe(pval_df, use_container_width=True)
+                st_pyplot_func(plt, filename=f"{col}_dabest_plot") 
     return # results_df
-    plt.show(block=True)
+    figures_dir = 'figures'
 
-def boxplot_plot_sns(results_df, combined_df, col, output_dir,figures_dir=None,is_streamlit=False,analysis_type=None, show_histograms=False):
-    # Function to remove outliers based on 5 standard deviations
-    def remove_outliers(df, col, group_col, threshold=5):
-        def filter_group(group):
-            mean = group[col].mean()
-            std = group[col].std()
-            return group[np.abs(group[col] - mean) <= threshold * std]
-        
-        return df.groupby(group_col).apply(filter_group).reset_index(drop=True)
+from collections import defaultdict
+import numpy as np
 
-    # Remove outliers from each group
-    cleaned_df = remove_outliers(combined_df, col, 'Group')
-    # Plot the cleaned data
-    plt.figure(figsize=(9, 16))
-    sns.boxplot(x='Group', y=col, data=cleaned_df, showfliers=False)
-    # Add stripplot
-    sns.stripplot(x='Group', y=col, data=cleaned_df, alpha=0.5, jitter=True, color='black')
-    # Add significance markers
-    filtered_df = results_df[results_df['Variable'] == col]
-    if filtered_df.empty:
+def annotate_pvals_with_jitter(ax, pval_lines, cleaned_df, col, unique_groups):
+    """Annotate pairwise p-values with U-bars + stars while:
+       - collapsing duplicate (g1,g2) pairs (keep smallest p),
+       - stacking overlapping bars,
+       - adding tiny deterministic jitter to avoid exact overlap.
+    """
+    # ---------- collapse duplicate pairs (keep smallest p) ----------
+    collapsed = {}
+    for g1, g2, p in pval_lines:
+        key = tuple(sorted((g1, g2)))
+        if key not in collapsed or p < collapsed[key][0]:
+            collapsed[key] = (p, key[0], key[1])
+    pval_lines_collapsed = [(v[1], v[2], v[0]) for v in collapsed.values()]
+    if not pval_lines_collapsed:
         return
-    row = results_df[results_df['Variable'] == col].iloc[0]
-    if row['adj_p_value'] < 0.001:
-        sig_symbol = '***'
-    elif row['adj_p_value'] < 0.01:
-        sig_symbol = '**'
-    elif row['adj_p_value'] < 0.05:
-        sig_symbol = '*'
-    else:
-        sig_symbol = 'ns'
-    # if sig_symbol != 'ns':
-    title_text = (
-        f"{row['Test']}\n"
-        f"p = {row['adj_p_value']:.3e} ({sig_symbol})\n"
-        f"Cohen's d = {row['Cohen_d']:.2f}\n"
-        f"{col} Comparison"
-    )
-    if sig_symbol != 'ns' or analysis_type == 'Full':
-        plt.title(title_text, ha='center')
-        # Add sample size to x-axis labels
-        group_counts = combined_df['Group'].value_counts()
-        ax = plt.gca()
-        ax.set_xticklabels([f"{label.get_text()}\nn={group_counts[label.get_text()]}" for label in ax.get_xticklabels()])
-        plt.tight_layout()
-        if is_streamlit:
-            st.divider()
-            st.subheader(f"Boxplot of {col} by Group")
-            for group_val in cleaned_df['Group'].unique():
-                group_data = cleaned_df[cleaned_df['Group'] == group_val][col]
-                stats_text, stat_dict = stat_text_get(group_data)
-                st.write(f"{group_val} mean {stat_dict['Mean']:.2e} ± {stat_dict['Std']:.2e}")
-            st.write(f"P-value: {row['adj_p_value']:.3e}, Effect size: d {row['Cohen_d']:.2f}")
-            st_pyplot_func(plt,filename=f"{col}_comparison")
+
+    # ---------- helper: p -> star string ----------
+    def pval_to_stars(p):
+        if p < 0.0001:
+            return '****'
+        if p < 0.001:
+            return '***'
+        if p < 0.01:
+            return '**'
+        if p < 0.05:
+            return '*'
+        return None
+
+    # ---------- helper: get label positions (fallback to indices) ----------
+    def get_label_positions(ax, unique_groups):
+        xticks = ax.get_xticks()
+        xticklabels = [t.get_text().strip() for t in ax.get_xticklabels()]
+        if any(lbl for lbl in xticklabels):
+            mapping = {}
+            # map first occurrence of label -> tick
+            for lbl, x in zip(xticklabels, xticks):
+                if lbl and lbl not in mapping:
+                    mapping[lbl] = x
+            # fallback for groups not found among ticklabels
+            for i, g in enumerate(unique_groups):
+                mapping.setdefault(g, xticks[i] if i < len(xticks) else i)
+            return mapping
         else:
-            os.makedirs(f'{figures_dir}/boxplots/{output_dir}', exist_ok=True)
-            plt.savefig(f"{figures_dir}/boxplots/{output_dir}/{col}_comparison.png")
-            plt.close()
-        if show_histograms:
-            # Plot histograms for each group and both groups together
-            plt.figure(figsize=(10, 6))
-            sns.histplot(data=cleaned_df, x=col, hue='Group', element='step', stat='density', common_norm=False)
-            for i, group in enumerate(cleaned_df['Group'].unique()):
-                group_data = cleaned_df[cleaned_df['Group'] == group][col]
-                stats_text, _ = stat_text_get(group_data)
-                plt.annotate(stats_text, xy=(0.25, 0.95 - i * 0.1), xycoords='axes fraction', fontsize=10,
-                        verticalalignment='top', bbox=dict(boxstyle='round,pad=0.3', edgecolor='black', facecolor='white'))
-            plt.title(f"{col} Histogram by Group")
-            if is_streamlit:
-                st.write(f"Histogram of {col} by Group")
-                st_pyplot_func(plt)
-            else:
-                os.makedirs(f'{figures_dir}/hist/{output_dir}', exist_ok=True)
-                plt.savefig(f"{figures_dir}/hist/{output_dir}/{col}_hist_by_group.png")
-                plt.close()
-            plt.figure(figsize=(10, 6))
-            sns.histplot(data=cleaned_df, x=col, element='step', stat='density')
-            combined_data = cleaned_df[col]
-            stats_text, _ = stat_text_get(combined_data)
-            plt.annotate(stats_text, xy=(0.25, 0.95), xycoords='axes fraction', fontsize=10,
-                        verticalalignment='top', bbox=dict(boxstyle='round,pad=0.3', edgecolor='black', facecolor='white'))
-            plt.title(f"{col} Histogram Combined")
-            if is_streamlit:
-                st.write(f"Histogram of {col}")
-                st_pyplot_func(plt)
-            else:
-                plt.savefig(f"{figures_dir}/hist/{output_dir}/{col}_hist_combined.png")
-                plt.close()
-    return results_df
+            return {g: i for i, g in enumerate(unique_groups)}
+
+    label_pos = get_label_positions(ax, unique_groups)
+
+    # ---------- plotting params ----------
+    yrange = ax.get_ylim()[1] - ax.get_ylim()[0]
+    spacer = 0.07 * yrange
+    stack_counter = defaultdict(int)
+
+    # sort so larger p (less significant) are drawn first; smallest p plotted last (on top)
+    pval_sorted = sorted(pval_lines_collapsed, key=lambda t: t[2], reverse=True)
+
+    for idx, (g1, g2, p) in enumerate(pval_sorted):
+        stars = pval_to_stars(p)
+        if not stars:
+            continue
+
+        # get numeric x positions (fallback to index positions)
+        x1 = label_pos.get(g1)
+        x2 = label_pos.get(g2)
+        if x1 is None or x2 is None:
+            try:
+                i1, i2 = unique_groups.index(g1), unique_groups.index(g2)
+            except ValueError:
+                continue
+            x1, x2 = i1, i2
+
+        # ensure order and tiny horizontal nudge if identical
+        if x2 < x1:
+            x1, x2 = x2, x1
+        if abs(x2 - x1) < 1e-6:
+            x1 -= 0.02
+            x2 += 0.02
+
+        # stacking key for near-identical pairs
+        key = (round(float(x1), 3), round(float(x2), 3))
+        stack_index = stack_counter[key]
+
+        # compute base y from data maxima of the two groups (safe fallback)
+        try:
+            y1 = cleaned_df[cleaned_df['Group'] == g1][col].max()
+            y2 = cleaned_df[cleaned_df['Group'] == g2][col].max()
+            base_y = max(float(y1) if not np.isnan(y1) else ax.get_ylim()[0],
+                         float(y2) if not np.isnan(y2) else ax.get_ylim()[0])
+        except Exception:
+            base_y = ax.get_ylim()[1] * 0.9
+
+        # stacking + tiny deterministic jitter to avoid exact overlap
+        jitter = ((idx % 5) * 0.05) * yrange
+        y = base_y + 0.05 * yrange + stack_index * spacer + jitter
+
+        # expand ylim if needed so the annotation is not clipped
+        top = ax.get_ylim()[1]
+        if y + 0.12 * yrange > top:
+            ax.set_ylim(ax.get_ylim()[0], y + 0.18 * yrange)
+            yrange = ax.get_ylim()[1] - ax.get_ylim()[0]
+            spacer = 0.07 * yrange
+
+        cap = 0.02 * yrange
+
+        # draw a thin U-shaped bar + stars
+        ax.plot([x1, x1, x2, x2], [y, y + cap, y + cap, y],
+                lw=1.0, color='k', clip_on=False, zorder=5, solid_capstyle='projecting')
+        ax.text((x1 + x2) / 2, y + cap + 0.01 * yrange, stars,
+                ha='center', va='bottom', fontsize=12, zorder=6, clip_on=False, alpha=0.95)
+
+        stack_counter[key] += 1
 
 def st_pyplot_func(plt,filename='plot'):
     """Function to display matplotlib figures in Streamlit."""
-    # bbox_inches="tight":
-    # plt.tight_layout()
+    bbox_inches="tight"
+    plt.tight_layout()
     st.pyplot(plt)
     # Save the plot as an SVG file in memory
+
     svg_buffer = io.BytesIO()
     plt.savefig(svg_buffer, format="svg")
     svg_buffer.seek(0)
@@ -1065,6 +1187,7 @@ def eeg_data_to_features(raw, window_size_sec=5, min_duration_sec=5):
         else:
             durations = []
             events_per_minute = {}
+            continue
 
         pswe_total = sum(durations)
         pct = (pswe_total / total_duration) * 100
@@ -1338,6 +1461,149 @@ def tga_get_files():
     df_wnv2 = df_wnv.merge(clinical_df, left_on='file_name', right_on='EEG FILE NAME', how='inner')
     cases_group_name = "TGA"
     return df_wnv, patients_folder, controls, df_wnv2, cases_group_name
+
+
+def generic_get_files(project_name: str):
+    """
+    Generic loader for projects that store per-record parquet files under
+    `parquet_results/{project_name}` and a clinical Excel table under
+    `EDF_Format/{project_name}`. The clinical table is expected to contain
+    a column named 'record_id' (per the user's description) which will be
+    matched to the EDF/parquet file names (without the .edf extension).
+
+    Returns the same 5-tuple as the specialized loaders used in the app:
+      (df_parquet_concat, patients_folder, controls_df, df_wnv2_grouped, cases_group_name)
+
+    If no clinical file or parquet files are found, the function will
+    return empty DataFrames where applicable but will not raise.
+    """
+    patients_folder = project_name
+    parquet_dir = os.path.join('parquet_results', project_name)
+    df_list = []
+    # Read parquet files
+    if os.path.isdir(parquet_dir):
+        for fname in sorted(os.listdir(parquet_dir)):
+            if not fname.lower().endswith('.parquet'):
+                continue
+            fpath = os.path.join(parquet_dir, fname)
+            try:
+                df = pd.read_parquet(fpath)
+            except Exception as e:
+                # If reading fails, try to continue
+                print(f"Warning: failed reading {fpath}: {e}")
+                continue
+            # Ensure there's a file_name column - use the parquet filename as fallback
+            if 'file_name' not in df.columns:
+                base = fname.replace('.parquet', '')
+                # remove trailing .edf if present
+                if base.lower().endswith('.edf'):
+                    base = base[:-4]
+                df['file_name'] = base
+            df_list.append(df)
+    else:
+        print(f"Warning: parquet directory not found: {parquet_dir}")
+
+    if len(df_list) == 0:
+        df_parquet = pd.DataFrame()
+    else:
+        df_parquet = pd.concat(df_list, ignore_index=True, sort=False)
+
+    # Attempt to find a clinical Excel file under EDF_Format/{project_name}
+    clinical_df = pd.DataFrame()
+    edf_proj_dir = os.path.join('EDF_Format', project_name)
+    if os.path.isdir(edf_proj_dir):
+        # look for any .xls/.xlsx files in the directory and subdirs
+        excel_files = []
+        for root, dirs, files in os.walk(edf_proj_dir):
+            for f in files:
+                if f.lower().endswith(('.xls', '.xlsx')):
+                    excel_files.append(os.path.join(root, f))
+        if excel_files:
+            clinical_path = excel_files[0]
+            try:
+                clinical_df = pd.read_excel(clinical_path)
+            except Exception as e:
+                print(f"Warning: failed reading clinical file {clinical_path}: {e}")
+    else:
+        print(f"Warning: EDF_Format project directory not found: {edf_proj_dir}")
+
+    # Normalize clinical df: prefer column 'record_id' -> 'ID'
+    if not clinical_df.empty:
+        if 'record_id' in clinical_df.columns:
+            clinical_df = clinical_df.rename(columns={'record_id': 'ID'})
+        # Ensure ID is string-like and strip whitespace / extensions
+        if 'ID' in clinical_df.columns:
+            clinical_df['ID'] = clinical_df['ID'].astype(str).str.strip().str.replace('\.edf$', '', regex=True).str.lower()
+    # find the col of sex or gender ignore case
+    gender_col = next((col for col in clinical_df.columns if col.lower() in ['sex', 'gender']), None)
+    if gender_col:
+        # clnical df column gender or sex ignore case to  convert_sex_column
+        clinical_df = convert_sex_column(clinical_df, gender_col)
+
+    # Prepare df_parquet ID column from file_name if possible
+    if not df_parquet.empty and 'file_name' in df_parquet.columns:
+        # lower case, strip whitespace, remove .edf extension
+        df_parquet['ID'] = df_parquet['file_name'].astype(str).apply(lambda x: os.path.basename(x).replace('.edf', '').lower().strip())
+
+    # Merge clinical and parquet data
+    df_wnv2 = pd.DataFrame()
+    if (not clinical_df.empty) and (not df_parquet.empty) and ('ID' in clinical_df.columns) and ('ID' in df_parquet.columns):
+        try:
+            # merge on 'ID' ignore case
+            df_merged = pd.merge(clinical_df, df_parquet, on='ID', how='inner')
+        except Exception as e:
+            print(f"Warning: merge failed: {e}")
+            df_merged = pd.DataFrame()
+    else:
+        # If we couldn't merge (missing pieces), try a looser merge by checking substring matches
+        df_merged = pd.DataFrame()
+        if (not clinical_df.empty) and (not df_parquet.empty):
+            # Try matching clinical 'ID' values as substrings of df_parquet['file_name']
+            if 'file_name' in df_parquet.columns and 'ID' in clinical_df.columns:
+                # Build a reverse index for quick lookup
+                mapping = {}
+                for idx, row in df_parquet.iterrows():
+                    fname = str(row['file_name'])
+                    key = os.path.basename(fname).replace('.edf', '')
+                    mapping.setdefault(key, []).append(idx)
+                matched_rows = []
+                for _, c in clinical_df.iterrows():
+                    cid = str(c.get('ID', ''))
+                    if cid in mapping:
+                        matched_rows.extend(mapping[cid])
+                if matched_rows:
+                    df_merged = pd.concat([clinical_df.reset_index(drop=True), df_parquet.loc[matched_rows].reset_index(drop=True)], axis=1, ignore_index=False)
+
+    # Create grouped/aggregated df (df_wnv2) similar to other loaders
+    if not df_merged.empty:
+        # Drop helper columns if present
+        if '_merge' in df_merged.columns:
+            df_merged = df_merged.drop(columns=['_merge'], errors='ignore')
+        if 'duration_min' in df_merged.columns:
+            numeric_cols = df_merged.select_dtypes(include=[np.number]).columns
+            try:
+                df_wnv2 = df_merged.groupby('ID').apply(weighted_avg, weight_col='duration_min', numeric_cols=numeric_cols).reset_index(drop=True)
+            except Exception:
+                # fallback to simple mean for numeric columns and preserve first of non-numeric
+                df_wnv2 = df_merged.groupby('ID').mean(numeric_only=True).reset_index()
+        else:
+            df_wnv2 = df_merged.groupby('ID').mean(numeric_only=True).reset_index()
+
+        # Clean up common unwanted columns and coerce numeric strings
+        cols_to_drop = ['highpass', 'lowpass', 'n_samples', 'size', 'patient_number', 'duration_sec']
+        df_wnv2 = df_wnv2.drop(columns=[col for col in df_wnv2.columns if any(drop in col for drop in cols_to_drop)], errors='ignore')
+        df_wnv2 = df_wnv2.applymap(lambda x: np.nan if isinstance(x, str) and 'nan' in x.lower() else x)
+        for col in df_wnv2.columns:
+            try:
+                df_wnv2[col] = pd.to_numeric(df_wnv2[col])
+            except Exception:
+                pass
+
+    # Controls: generic loader doesn't have controls; return empty DataFrame
+    controls = pd.DataFrame()
+
+    cases_group_name = project_name
+    return df_parquet, patients_folder, controls, df_wnv2, cases_group_name
 #%% COBRAD
 def get_cobrad_controls(patients_folder):
     controls = pd.read_csv(f'{patients_folder}_controls.csv')
@@ -1487,7 +1753,6 @@ def cobrad_get_files(sample_window_size=0,only_awake=False,sleep_only=False):
         except:
             # print(f'Could not convert {col} to numeric')
             pass
-    cases_group_name = 'COBRAD'
     # if 'COBRAD_descriptive.xlsx' doesnt exist
     if not os.path.exists('COBRAD_descriptive.xlsx'):
         # Create a dictionary to store descriptive statistics for each sheet
@@ -1502,6 +1767,7 @@ def cobrad_get_files(sample_window_size=0,only_awake=False,sleep_only=False):
             for sheet_name, df_desc in desc_stats.items():
                 df_desc.to_excel(writer, sheet_name=sheet_name)
     # df_wnv save to csv
+    cases_group_name = 'EDF' #'COBRAD'
     return df_wnv,patients_folder,controls,df_wnv2,cases_group_name
     df_merged['ID'].unique()
     df_merged['_merge'].unique()
@@ -1511,11 +1777,13 @@ def cobrad_get_files(sample_window_size=0,only_awake=False,sleep_only=False):
 def get_clinical_and_boxplot_cols(df_wnv2):
        boxplot_columns = [col for col in df_wnv2.columns if 'overall' in col.lower()]
        # split file name .[0] and then '-'[0] to get the ID
-       clinical_columns_all = df_wnv2.columns[3:].tolist()
+       clinical_columns_all = df_wnv2.columns.tolist()
        # remove boxplot_columns from clinical_columns
        clinical_columns = [col for col in clinical_columns_all if col not in boxplot_columns]
        # Remove columns that contain 'EEG'
        clinical_columns = [col for col in clinical_columns if 'EEG' not in col]
+       # remove 'ID' from clinical_columns
+       clinical_columns = [col for col in clinical_columns if col != 'ID']
        return clinical_columns,boxplot_columns
 
 def save_raw_data(df, figures_dir):
@@ -1882,54 +2150,85 @@ def raw_run(cases_group_name='EDF'):
     fig_fast = speeding_raw.plot(show=False, block=False)
     st_pyplot_func(fig_fast)
 
-def spectogram_run(group,figures_dir=None,win_sec=5):
-    import yasa
-    if figures_dir is None:
-        # read f'pickles/group_mean/{group}_mean.pkl'
-        with open(f'pickles/group_mean/{group}_mean.pkl', 'rb') as f:
-            di = pickle.load(f)
-        raw = di['raw']
-        arr_mean = di['arr_mean']
-    else:
-        # Ensure the directory exists
-        os.makedirs(f'{figures_dir}/spectograms', exist_ok=True)
-        # Read all pickle files from pickles/{group}
-        pickle_files = [f for f in os.listdir(f'pickles/{group}') if f.endswith('.pkl')] 
-        arr = []
-        for i, pickle_file in enumerate(pickle_files):
-            # Load the data
-            raw = pd.read_pickle(f'pickles/{group}/{pickle_file}')
-            data = raw.get_data()
-            arr.append(data)
-        arr_mean = mean_of_resized_arrays(arr)
-        # save arr_mean to pkl
-        os.makedirs(f'pickles/group_mean', exist_ok=True)
-        with open(f'pickles/group_mean/{figures_dir.split("_")[0]}_mean.pkl', 'wb') as f:
-            pickle.dump({'raw': raw, 'arr_mean': arr_mean}, f)
-    #%%  spectrogram
-    # get eeg channels that are in raw.info['ch_names'] and in eeg_channels
-    channels = [ch for ch in eeg_channels if ch in raw.info['ch_names']]
+import yasa
+import os, pickle, pandas as pd
+import streamlit as st
+from mne.time_frequency import psd_array_welch  # for PSD
+
+def spectogram_run(group, win_sec=5):
+    # Try to read existing group_mean pickle
+    mean_path = f'pickles/group_mean/{group}_mean.pkl'
+    # if os.path.exists(mean_path):
+    #     with open(mean_path, 'rb') as f:
+    #         di = pickle.load(f)
+    #     raw = di['raw']
+    #     arr_mean = di['arr_mean']
+    #     n_samples = di.get('n_samples', None)  # fallback if old file format
+    #     st.write(f"Loaded mean pickle with {n_samples} samples.")
+    #     plot_spectrogram_mean(group, arr_mean,
+    #                           win_sec=win_sec,
+    #                           sf=raw.info['sfreq'])
+    #     return
+    # Load pickle raw files
+    pickle_files = [f for f in os.listdir(f'pickles/{group}') if f.endswith('.pkl')]
+    default_sample_k = 5
+    load_all = st.button(f"Load all pickles ({len(pickle_files)})")
+    if not load_all:
+        pickle_files = pickle_files[:default_sample_k]
+
+    arr = []
+    progress = st.progress(0)
+    total_files = len(pickle_files)
+
+    for i, pickle_file in enumerate(pickle_files, start=1):
+        raw = pd.read_pickle(f'pickles/{group}/{pickle_file}')
+        data = raw.get_data()
+        arr.append(data)
+        channels = raw.info['ch_names']
+        # update progress bar
+        progress.progress(i / total_files)
+
+    arr_mean = mean_of_resized_arrays(arr)
+    n_samples = len(arr)
+
+    # Save mean pickle with sample count
+    os.makedirs('pickles/group_mean', exist_ok=True)
+    with open(mean_path, 'wb') as f:
+        pickle.dump({'raw': raw,
+                     'arr_mean': arr_mean,
+                     'n_samples': n_samples}, f)
+
+    # --- PSD on mean data ---
     sf = raw.info['sfreq']
-    show_per_channel = True
-    if figures_dir is None:
-        show_per_channel = st.button("Show spectrogram per channel")
-    if show_per_channel:
-        for i, ch in enumerate(channels):
-            # plot spectrogram
-            fig = yasa.plot_spectrogram(arr_mean[i, :], sf, win_sec=win_sec, ch_names=[ch], cmap='jet')
-            if figures_dir is None:
-                    st.subheader(f'{ch}')
-                    st_pyplot_func(fig)
-            else:
-                fig.savefig(f'{figures_dir}/spectograms/{group}_{ch}_spectrogram.png')
-            plt.close(fig)
+    psds, freqs = psd_array_welch(
+        arr_mean,
+        sfreq=sf,
+        fmin=0.5,
+        fmax=40.0,
+        n_fft=int(sf * win_sec)
+    )
+    # Create DataFrame with channel names as columns
+    ch_names = raw.info['ch_names']
+    eeg_channels_lower = [ch.lower() for ch in eeg_channels]
+    # get only the valid eeg channels and sort them else remove them
+    ch_names = sorted(ch_names, key=lambda x: eeg_channels_lower.index(x.lower()) if x.lower() in eeg_channels_lower else len(eeg_channels_lower))
+    # sort psds
+    psd_df = pd.DataFrame(psds.T, index=freqs, columns=ch_names)
+    st.write(f"Mean PSD over {n_samples} samples")
+    st.line_chart(psd_df)
+    # Plot spectrogram
+    sf = raw.info['sfreq']
+    # subtitle
+    st.write(f"Mean Spectrogram over {n_samples} samples")
+    plot_spectrogram_mean(group, arr_mean,
+                          win_sec=win_sec,
+                          sf=sf)
+
+
+def plot_spectrogram_mean(group,arr_mean,figures_dir=None,win_sec=5,sf=256):
     # mean over all channels
     fig = yasa.plot_spectrogram(arr_mean.mean(axis=0), sf,win_sec=win_sec, ch_names=['mean'],cmap='jet')
-    if figures_dir is None:
-        st.title(f'Spectrogram mean')
-        st_pyplot_func(fig)
-    else:
-        fig.savefig(f'{figures_dir}/spectograms/{group}_mean_spectrogram.png')
+    st_pyplot_func(fig)
 
 # Utility function to convert sex column
 def convert_sex_column(clinical_df, sex_column):

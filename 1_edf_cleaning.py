@@ -26,6 +26,7 @@ import ray
 import argparse
 # Import and run the HEP processing
 from utils.HEP_parquet_generation import process_patients_random6
+import glob
 
 @contextmanager
 def suppress_stdout():
@@ -55,15 +56,16 @@ getcwd = os.getcwd()
 
 #%% INITIALIZATION
 # Parse command line arguments
+
 parser = argparse.ArgumentParser(description='EDF Cleaning Script')
-parser.add_argument('--cases_project_name', type=str, default=None,
-                    help='Name of the cases project (default: TGA)')
+parser.add_argument('-c', '--cases_project_name', type=str, default=None,
+                    help='Name of the cases project, e.g., Seeg')
 args = parser.parse_args()
 
 # Get cases_project_name from CLI or use default
 cases_project_name = args.cases_project_name
 if not cases_project_name:
-    cases_project_name = 'CAP_Sleep_Database/1.0.0'
+    cases_project_name = 'CAP_Sleep_Database/CAP_Sleep_Database' # 'Controls' #'Seeg' #'CAP_Sleep_Database/CAP_Sleep_Database'
 
 edf_dir = 'EDF_Format'
 # Where to load the data from 
@@ -80,6 +82,49 @@ os.makedirs(temp_dir, exist_ok=True)
 # make folder
 os.makedirs(f'pickles/{project_name}', exist_ok=True)
 
+def get_seeg_clinical_data():
+    """
+    Reads SEEG clinical data, merges with folder names, and combines with parquet data for each patient.
+    Returns a DataFrame with clinical and EEG features for each patient.
+    """
+    import pandas as pd
+    import os
+    # 1. Read clinical Excel
+    excel_path = 'EDF_Format/Seeg/SEEG_26AUG25-ANONYMIZED.xlsx'
+    sheet_name = 'SEEG_PATIENTS'
+    clinical_df = pd.read_excel(excel_path, sheet_name=sheet_name)
+
+    # 2. Get folder names from Seeg folder (sub_code_PHASE2)
+    seeg_folder = 'EDF_Format/Seeg'
+    subfolders = [f for f in os.listdir(seeg_folder) if os.path.isdir(os.path.join(seeg_folder, f))]
+    # Assume sub_code_PHASE2 is a column in clinical_df, and matches folder names
+    clinical_df['folder_exists'] = clinical_df['sub_code_PHASE2'].apply(lambda x: x in subfolders)
+
+    # 3. For each patient, get their parquet data
+    parquet_dir = 'parquet_results/Seeg'
+    parquet_files = [f for f in os.listdir(parquet_dir) if f.endswith('.parquet')]
+    # Map: patient_code -> parquet file(s)
+    # Assume patient_code is in clinical_df['sub_code_PHASE2'] and in parquet file name
+    patient_tables = {}
+    for _, row in clinical_df.iterrows():
+        patient_code = str(row['sub_code_PHASE2'])
+        # Find parquet files for this patient
+        matching_files = [f for f in parquet_files if patient_code in f]
+        patient_data = []
+        for pf in matching_files:
+            try:
+                df_parquet = pd.read_parquet(os.path.join(parquet_dir, pf))
+                # Add clinical columns to each row
+                for col in clinical_df.columns:
+                    df_parquet[col] = row[col]
+                patient_data.append(df_parquet)
+            except Exception as e:
+                print(f"Error reading {pf}: {e}")
+        if patient_data:
+            patient_tables[patient_code] = pd.concat(patient_data, ignore_index=True)
+        else:
+            patient_tables[patient_code] = pd.DataFrame([row])
+    return patient_tables
 
 
 
@@ -273,13 +318,17 @@ def analyze_eeg_data(raw,is_prod,filename):
     plot_not_prod(raw,is_prod,'pre_clean1')
     # Clean data
     # Filter the data
+    raw.resample(256.)
     nyquist_freq = raw.info['sfreq'] / 2
-    raw.filter(l_freq=.5, h_freq=nyquist_freq - 0.1)
-    raw.notch_filter(np.arange(50, nyquist_freq, 50), filter_length='auto', phase='zero')
+    picks = mne.pick_types(raw.info, eeg=True, exclude='bads')
+    if len(picks) == 0:
+        print('No EEG channels found after picking. Skipping this file.')
+        return {},{}
+    raw.filter(l_freq=.5, h_freq=nyquist_freq - 0.1, picks=picks)
+    raw.notch_filter(np.arange(50, nyquist_freq, 50), filter_length='auto', phase='zero', picks=picks)
     plot_not_prod(raw,is_prod,'filter2')
     # picks = mne.pick_types(raw.info, meg=False, eeg=True, stim=False, eog=False)
     # raw.pick(picks)
-    raw.resample(256.)
     # Initialize the PrepPipeline
     prep_params = {
         "ref_chs": "eeg",
@@ -357,6 +406,7 @@ def process_file(row,filename,is_prod):
             n_segments = int(np.ceil(duration_s / max_duration_s))
             for i in range(start_i, n_segments):
                 segment_filename = f'{row["file_name"]}_{max_duration_s}_{i + 1}.parquet'
+                raw_channels = raw.ch_names
                 if os.path.exists(f'{temp_dir}/{segment_filename}'):
                     continue
                 start = i * max_duration_s  # Start time in seconds
@@ -371,8 +421,7 @@ def process_file(row,filename,is_prod):
                     # break  # Exit the for loop to recalculate segments with new max_duration_s
                 # Save connectivity DataFrame (conn_df) to its own Parquet folder
                 try:
-                    temp_conn_dir = f"{temp_dir}_conn_df"
-                    os.makedirs(temp_conn_dir, exist_ok=True)
+
                     if conn_df is not None:
                         # If conn_df is a DataFrame, save directly; if it's a dict, convert to DataFrame first
                         if isinstance(conn_df, pd.DataFrame):
@@ -383,6 +432,8 @@ def process_file(row,filename,is_prod):
                             except Exception:
                                 out_df = None
                         if out_df is not None and not out_df.empty:
+                            temp_conn_dir = f"{temp_dir}_conn_df"
+                            os.makedirs(temp_conn_dir, exist_ok=True)
                             out_path = os.path.join(temp_conn_dir, f"{segment_filename.replace('.parquet','')}_conn.parquet")
                             out_df.to_parquet(out_path, index=True)
                 except Exception as e:
@@ -443,12 +494,8 @@ def process_file(row,filename,is_prod):
     # return metadata
 
 def find_eeg_files(directory):
-    eeg_files = []
-    for root, _, files in os.walk(directory):
-        for file in files:
-            if file.endswith('.EEG'):
-                eeg_files.append(os.path.join(root, file))
-    return eeg_files
+        eeg_files = glob.glob(os.path.join(directory, '**', '*.EEG'), recursive=True)
+        return eeg_files
 
 def convert_and_remove_eeg(eeg_files):
     min_size_mb = 5  # Minimum file size in MB
@@ -480,17 +527,11 @@ def convert_and_remove_eeg(eeg_files):
         except Exception as e:
             print(f"Failed to convert {eeg_file_path}: {e}")
 
-if __name__ == "__main__":
+def eeg_edf_cleaning_pipeline():
+    # Find and convert .EEG files to .edf, then remove .EEG files
     eeg_files = find_eeg_files(directory)
     convert_and_remove_eeg(eeg_files)
-    if project_name == 'Controls':
-        temp_dir += f'_{cases_project_name}'
-        if cases_project_name == 'west_nile_virus':
-            df = choose_controls_WNV(directory)    
-        elif cases_project_name == 'EDF':
-            df = choose_controls_EDF(directory)
-    else:
-        df = list_files_and_find_duplicates(directory)
+    df = list_files_and_find_duplicates(directory)
     # remove duplicates subset file_name
     df.drop_duplicates(subset='file_name', inplace=True)
     # Set multiprocessing flag
@@ -546,4 +587,7 @@ if __name__ == "__main__":
         final_df.to_parquet(filename, index=False)
     
 
-    process_patients_random6(edf_root=f"pickles/{cases_project_name}",)
+    process_patients_random6(edf_root=f"parquet_HEP/{cases_project_name}_HEP",)
+
+if __name__ == "__main__":
+    eeg_edf_cleaning_pipeline()

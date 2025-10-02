@@ -185,7 +185,7 @@ def vs_controls_run(project_name,df_wnv2,controls,boxplot_columns,analysis_type)
     boxplots_dir = f"{project_name}_figures/boxplots/vs_controls"
     controls_dir = f'temps_Controls_EDF' if project_name == 'COBRAD' else ''
     try:
-        st.header('COBRAD Controls Demographics')
+        st.header('Controls Demographics')
         # get controls demographic from get_controls_ages_genders(controls_dir)
         controls_demographics_df = get_controls_ages_genders(controls_dir)
         cobrad_ages = df_wnv2['clinical_age_at_visit']
@@ -209,15 +209,9 @@ def vs_controls_run(project_name,df_wnv2,controls,boxplot_columns,analysis_type)
         if num_groups < 2:
             continue
         results_df = analyze_and_correct(curr_data, [col], groups=curr_data['Group'].unique())
-        boxplot_plot_sns(results_df,curr_data, col, 'vs_controls',is_streamlit=True,analysis_type=analysis_type)
-    # Display scatterplots
-    st.header("Scatterplots vs Controls")
-    if os.path.exists(scatterplots_dir):
-        scatterplot_files = [f for f in os.listdir(scatterplots_dir) if f.endswith('.png')]
-        for file in scatterplot_files:
-            st.image(os.path.join(scatterplots_dir, file), caption=file)
-    else:
-        st.write(f"No scatterplots found in {scatterplots_dir}")
+        boxplot_plot_dabest(results_df,curr_data, col, 'vs_controls',is_streamlit=True,analysis_type=analysis_type)
+import upload_project_page as upp
+
 
 def ml_plots_get_images(project_name, selected_feature):
     ml_plots_dir = f"{project_name}_figures/ml_plots"
@@ -265,7 +259,7 @@ def org_selected_feature(selected_feature):
 
 def HEP_plots(project_name, df_wnv3, controls, boxplot_columns, analysis_type,selected_feature=None):
     if project_name == 'COBRAD':
-        HEP_dir = 'temps_EDF_HEP'
+        HEP_dir = 'parquet_HEP/EDF_HEP'
     else:
         return
     # Run over power bands
@@ -331,12 +325,16 @@ def HEP_plots(project_name, df_wnv3, controls, boxplot_columns, analysis_type,se
         # run only_plots on results_df
         only_plots(results_df, save_plot='', save_dir='', edf_pickle_name="plot", band=band_name, step_sec=5,is_streamlit=True,hue=hue)
         st.divider()
-
 # Streamlit App
 def main():
-    # have user choose COBRAD or WNV
+    # options to choose from folders in pickles
+    default_options = ["COBRAD", "WNV"] +  [f for f in os.listdir('parquet_results') if os.path.isdir(os.path.join('pickles', f))] 
     # allow multiple selection for project
-    selected_projects = st.sidebar.multiselect("Select Project(s)", ["COBRAD", "WNV", "TGA"], default=["COBRAD","TGA"])
+    # default_options = ["COBRAD", "WNV"]
+    # Deduplicate while preserving order
+    seen = set()
+    opts = [x for x in default_options if not (x in seen or seen.add(x))]
+    selected_projects = st.sidebar.multiselect("Select Project(s)", opts, default=[x for x in ["COBRAD", "CAP_Sleep_Database"] if x in opts])
     if not selected_projects:
         st.error("Please select at least one project.")
         return
@@ -355,6 +353,9 @@ def main():
             df_wnv, patients_folder, temp_controls, temp_df_wnv2, temp_cases_group_name = wnv_get_files()
         elif project_name == "TGA":
             df_wnv, patients_folder, temp_controls, temp_df_wnv2, temp_cases_group_name = tga_get_files()
+        else:
+            df_wnv, patients_folder, temp_controls, temp_df_wnv2, temp_cases_group_name = generic_get_files(project_name)
+        
         if idx == 0:
             df_wnv2 = temp_df_wnv2
             controls = temp_controls
@@ -367,6 +368,11 @@ def main():
     project_name = selected_projects[0]  # Use the first selected project for downstream logic
 
     st.title("EEG Analysis")
+    # Page selector: Main app or Upload page
+    page = st.sidebar.selectbox('Page', ['Main', 'Upload Project'])
+    if page == 'Upload Project':
+        upp.run_upload_page()
+        return
     # Iterate over each frequency band and plot the topomap
     cols_to_drop = ['annotations', 'bad_channels', 'patient_number', 'csv_file_name', 'file_name', 'file_path', 'signal_labels', 'number_of_signals', 'sampling_frequency', 'sampling_rate', 'duration_min']
     # Remove specified columns and those containing dates from df_wnv2
@@ -382,13 +388,9 @@ def main():
     # Split columns into clinical and EEG features
     eeg_features = [col for col in df_wnv2.columns[separator_index:] if col != 'Group']
     clinical_features_numeric = [col for col in clinical_features if pd.api.types.is_numeric_dtype(df_wnv2[col])]
-    
-    boxplots_folder = f"{project_name}_figures/boxplots"
-    scatterplots_folder = f"{project_name}_figures/scatterplots"
-    
     # Sidebar for feature selection
     st.sidebar.header("Feature Selection")
-    feature_types = ("Clinical Feature", "EEG Feature", "ml_plots", "vs_Controls", "Pair Plot",'Spectogram','Raw',"HEP")
+    feature_types = ("Clinical Feature", "EEG Feature", "ml_plots", "vs_Controls", "Pair Plot",'Raw''Spectogram')
     feature_type = st.sidebar.selectbox("Select feature type to plot against the other type:", feature_types)
     if feature_type == "Clinical Feature" or feature_type == "EEG Feature" or feature_type == "vs_Controls":
         # ask user if they want only significant, or full.
@@ -397,21 +399,10 @@ def main():
     else:
         analysis_type = "Full"
         
-    marked_clinical_features = []
     dict_features = {}
     bool_all_features = False
     cols_to_skip = ['ID','annotations','bad_channels','Group','patient_number','size','n_samples']
     clinical_features = [feature for feature in clinical_features if feature not in cols_to_skip]
-    for feature in clinical_features:
-        if os.path.exists(os.path.join(boxplots_folder, feature)) or os.path.exists(os.path.join(scatterplots_folder, feature)):
-            feature_name = f"**{feature}**".upper()
-            marked_clinical_features.append(feature_name)
-            dict_features[feature] = feature_name
-        else:
-            feature_name = f"_{feature}_".lower()
-            if analysis_type == 'Full':
-                marked_clinical_features.append(feature_name)
-            dict_features[feature] = feature_name
     
     if not clinical_features or not eeg_features:
         st.error("Could not identify clinical or EEG features based on the 'overall_' separator.")
@@ -419,15 +410,11 @@ def main():
     if feature_type == "vs_Controls":
         vs_controls_run(project_name,df_wnv2,controls,boxplot_columns,analysis_type)
         return
-    elif feature_type == "HEP":
-        HEP_plots(project_name, df_wnv2, controls, boxplot_columns, analysis_type)
-        return
     elif feature_type == "Pair Plot":
         pairplot_columns(df_wnv2, clinical_features, eeg_features)
         return
     elif feature_type == "ml_plots":
         # get the names of folders that are in {figures_dir}/ml_plots
-        # ml_plots_features = [f for f in os.listdir(f"{project_name}_figures/ml_plots") if os.path.isdir(os.path.join(f"{project_name}_figures/ml_plots", f))]
         sorted_files = find_and_sort_ml_plots(f"{project_name}_figures/ml_plots")
         ml_plots_features = [f.split('/')[2] for f in sorted_files]
         selected_feature = st.sidebar.radio("Select a feature for ML plots:", ml_plots_features)
@@ -439,6 +426,7 @@ def main():
         # ask user for win_sec
         win_sec = st.sidebar.slider("Select window size in seconds", 1, 30, 5)
         spectogram_run(cases_group_name,win_sec=win_sec)
+        st.divider()
         st.subheader("Spectrogram Controls")
         spectogram_run(f'Controls',win_sec=win_sec)
 
@@ -458,18 +446,24 @@ def main():
         boxplot_columns = clinical_features_numeric
     else: # Clinical Feature
         clinical_features_correlation = st.sidebar.checkbox("Show Clinical Features Correlation", value=False)
-        marked_clinical_features_w_all = marked_clinical_features + ["All Features"]
+        marked_clinical_features_w_all = clinical_features + ["All Features"]
         selected_feature = st.sidebar.radio("Select a Clinical feature:", marked_clinical_features_w_all)
         if selected_feature == "All Features":
-            all_feat_list = marked_clinical_features
-            selected_feature = marked_clinical_features[0]
+            all_feat_list = clinical_features
+            selected_feature = clinical_features[0]
             bool_all_features = True
-        # map back to key of dict_features
-        selected_feature = [key for key, value in dict_features.items() if value == selected_feature][0]
         plot_title = f"Plots of {selected_feature} vs All EEG Features"
     st.header(plot_title)
-    # remove ID from selected_feature
-    feature_data = df_wnv2[selected_feature].dropna().astype(float)
+    # keep only rows that can be safely converted to float
+    feature_data = (
+        df_wnv2[selected_feature]
+        .apply(pd.to_numeric, errors='coerce')  # turn invalids into NaN
+        .dropna()
+        .astype(float)
+    )
+    if feature_data.empty:
+        st.warning(f"No valid numeric data available for the selected feature: {selected_feature}")
+        return  
     col1, col2, col3 = st.columns(3)
     col1.metric("Mean", f"{feature_data.mean():.2f}")
     col2.metric("Median", f"{feature_data.median():.2f}")
@@ -510,13 +504,6 @@ def main():
                     # group values based on band if =1, else f'not {band}'
                     org_selected_feature_for_plot = org_selected_feature(selected_feature)
                     df_wnv3['Group'] = df_wnv3[selected_feature].apply(lambda x: f'{org_selected_feature_for_plot}+' if x == 1 else f'{org_selected_feature_for_plot}-')
-                # st checkbox if HEP
-                hep_checkbox = st.checkbox("Show HEP Plots", value=False)
-                if hep_checkbox:
-                    st.subheader("HEP Plots")
-                    HEP_plots(project_name, df_wnv3, controls, boxplot_columns, analysis_type,selected_feature)
-                plot_tsne_by_group(df_wnv3)
-                st.divider()
                 # run over df_wnv2_others
                 for idx, (project_name_other, df_wnv2_other) in enumerate(df_wnv2_others):
                     if idx ==0:
@@ -543,9 +530,16 @@ def main():
                         df_wnv2_other['Group'] = project_name_other
                     # concat to df_wnv3
                     df_wnv3 = pd.concat([df_wnv3, df_wnv2_other], ignore_index=True)
+                                # st checkbox if HEP
+                hep_checkbox = st.checkbox("Show HEP & TSNE Plots", value=False)
+                if hep_checkbox:
+                    st.subheader("HEP Plots")
+                    HEP_plots(project_name, df_wnv3, controls, boxplot_columns, analysis_type,selected_feature)
+                    plot_tsne_by_group(df_wnv3)
+                st.divider()
                 for band in boxplot_columns:
                     results_df = analyze_and_correct(df_wnv3, [band], groups=df_wnv3['Group'].unique())
-                    boxplot_plot(results_df, df_wnv3, band, f'{selected_feature}',is_streamlit=True,analysis_type=analysis_type)
+                    boxplot_plot_dabest(results_df, df_wnv3, band, f'{selected_feature}',is_streamlit=True,analysis_type=analysis_type)
                     # boxplot_plot_sns(results_df, df_wnv3, band, f'{selected_feature}',is_streamlit=True,analysis_type=analysis_type)
                 # if frequency band is contained in the column name
                 # group_data = {}
@@ -561,7 +555,7 @@ def main():
                     df_wnv3[selected_feature] = df_wnv3[selected_feature].astype(float)
                     # do boxplot for each band
                     results_df = analyze_and_correct(df_wnv3, [band], groups=df_wnv3['Group'].unique())
-                    boxplot_plot(results_df, df_wnv3, band, f'{selected_feature}',is_streamlit=True,analysis_type=analysis_type)
+                    boxplot_plot_dabest(results_df, df_wnv3, band, f'{selected_feature}',is_streamlit=True,analysis_type=analysis_type)
             elif selected_feature in numeric_colunms:
                 for band in boxplot_columns:
                     scatter_plot_with_regression({}, df_wnv3, selected_feature, band, f'{selected_feature}',is_streamlit=True,analysis_type=analysis_type)

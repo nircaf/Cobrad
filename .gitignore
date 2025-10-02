@@ -14,3 +14,4 @@ venv/
 EDF.csv
 EDF_Format/*
 bin*
+__pycache__/
