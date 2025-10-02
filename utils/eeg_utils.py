@@ -1507,8 +1507,7 @@ def generic_get_files(project_name: str):
             matches = glob.glob(pattern, recursive=True)
             if matches:
                 filepath = matches[0]  # first match
-            # use split '/'[-2] to get the parent folder name
-            df['mother_folder'] = filepath.split('/')[-2]
+            df['mother_folder'] = Path(filepath).parent.name
             df_list.append(df)
     else:
         print(f"Warning: parquet directory not found: {parquet_dir}")
