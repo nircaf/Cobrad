@@ -15,7 +15,99 @@ from statsmodels.stats.multitest import fdrcorrection
 
 from sklearn.feature_selection import mutual_info_regression
 from mne_connectivity import SpectralConnectivity as spectral_connectivity
-from bct import efficiency_bin, transitivity_bu, modularity_und, assortativity_bin
+
+# Import for EEG cleaning pipeline
+from autoreject import AutoReject
+from pyprep.prep_pipeline import PrepPipeline
+from contextlib import contextmanager
+import sys
+import os
+AUTOREJECT_AVAILABLE = True
+
+@contextmanager
+def suppress_stdout():
+    with open(os.devnull, 'w') as devnull:
+        old_stdout = sys.stdout
+        sys.stdout = devnull
+        try:
+            yield
+        finally:
+            sys.stdout = old_stdout
+
+def clean_eeg_data(raw):
+    """
+    Clean EEG data using the same pipeline as in 1_edf_cleaning.py:
+    resample, filter, notch_filter, PrepPipeline, AutoReject, and make_fixed_length_epochs
+    
+    Parameters
+    ----------
+    raw : mne.io.Raw
+        Raw EEG data to clean
+        
+    Returns
+    -------
+    mne.io.Raw
+        Cleaned EEG data
+    """
+    if not AUTOREJECT_AVAILABLE:
+        print("Warning: AutoReject/PyPrep not available. Returning original data.")
+        return raw
+    
+    # Create a copy to avoid modifying the original
+    raw_clean = raw.copy()
+    
+    try:
+        # Step 1: Resample to 256 Hz
+        raw_clean.resample(256.)
+        nyquist_freq = raw_clean.info['sfreq'] / 2
+        
+        # Step 2: Pick EEG channels
+        picks = mne.pick_types(raw_clean.info, eeg=True, exclude='bads')
+        if len(picks) == 0:
+            print('No EEG channels found after picking. Returning original data.')
+            return raw
+        
+        # Step 3: Apply bandpass filter
+        raw_clean.filter(l_freq=0.5, h_freq=nyquist_freq - 0.1, picks=picks)
+        
+        # Step 4: Apply notch filter for power line noise
+        raw_clean.notch_filter(np.arange(50, nyquist_freq, 50), filter_length='auto', phase='zero', picks=picks)
+        
+        # Step 5: Apply PrepPipeline
+        prep_params = {
+            "ref_chs": "eeg",
+            "reref_chs": "eeg",
+            "line_freqs": np.arange(50, nyquist_freq, 50),
+        }
+        prep = PrepPipeline(raw_clean, prep_params, montage="standard_1020", ransac=False)
+        
+        with suppress_stdout():
+            prep.fit()  # Run the pipeline without writing to console
+        
+        raw_clean = prep.raw  # Get cleaned data
+        raw_clean.interpolate_bads()
+        
+        # Step 6: Apply AutoReject
+        ar = AutoReject()
+        epochs = mne.make_fixed_length_epochs(raw_clean, duration=2, overlap=0.5, preload=True)
+        
+        epochs_clean, reject_log = ar.fit_transform(epochs, return_log=True)
+        
+        # Step 7: Reconstruct continuous data from cleaned epochs
+        epochs_data = epochs_clean.get_data()  # Shape: (n_epochs, n_channels, n_times)
+        n_epochs, n_channels, n_times = epochs_data.shape
+        reshaped_data = epochs_data.transpose(1, 0, 2).reshape(n_channels, -1)
+        
+        # Create a new RawArray object with cleaned data
+        info = epochs_clean.info
+        raw_clean = mne.io.RawArray(reshaped_data, info)
+        
+        print(f"EEG cleaning completed. Processed {n_epochs} epochs.")
+        return raw_clean
+        
+    except Exception as e:
+        print(f'Error in EEG cleaning pipeline: {e}. Returning original data.')
+        return raw
 
 try:
     import streamlit as st
@@ -203,10 +295,15 @@ def compute_brain_heart_coupling(data_all, patient_id, bool_plots=False, save_pl
 
     for i, raw in enumerate(data_all):
         print(f"[{patient_id}] Processing EDF {i+1}/{len(data_all)}")
-        window_data = raw.get_data()
-        ch_names = raw.ch_names
-        sfreq = int(raw.info['sfreq'])
-        print(f"Sampling frequency: {sfreq}")
+        
+        # Clean the EEG data using the comprehensive pipeline
+        print(f"[{patient_id}] Cleaning EEG data for EDF {i+1}")
+        raw_clean = clean_eeg_data(raw)
+        
+        window_data = raw_clean.get_data()
+        ch_names = raw_clean.ch_names
+        sfreq = int(raw_clean.info['sfreq'])
+        print(f"Sampling frequency after cleaning: {sfreq}")
         name_prefix = f"{patient_id}_edf{i+1}"
 
         # Extract ECG and detect R-peaks
@@ -245,7 +342,6 @@ def compute_brain_heart_coupling(data_all, patient_id, bool_plots=False, save_pl
         r_times = rpeaks / sfreq
 
         # EEG channels subset
-        eeg_channels = ['Fpz', 'F7', 'T3', 'T5', 'Fp1', 'F3', 'C3', 'P3', 'Oz', 'F8', 'T4', 'T6', 'Fp2', 'F4', 'C4', 'P4', 'Fz', 'Cz']
         eeg_indices = [ch_names.index(ch) for ch in eeg_channels if ch in ch_names]
         if len(eeg_indices) == 0:
             print(f"[{patient_id}] EDF {i+1} has no expected EEG channels; skipping.")

@@ -384,6 +384,9 @@ def stat_text_get(group_data, col=None):
     lower_bound = -1e-30
     upper_bound = 1e30
     if col is None:
+        q1 = np.clip(group_data.quantile(0.25), lower_bound, upper_bound)
+        q3 = np.clip(group_data.quantile(0.75), lower_bound, upper_bound)
+        iqr = np.clip(q3 - q1, lower_bound, upper_bound)
         stats_dict = {
             "N": len(group_data),
             "Mean": np.clip(group_data.mean(), lower_bound, upper_bound),
@@ -391,8 +394,12 @@ def stat_text_get(group_data, col=None):
             "Max": np.clip(group_data.max(), lower_bound, upper_bound),
             "Min": np.clip(group_data.min(), lower_bound, upper_bound),
             "Std": np.clip(group_data.std(), lower_bound, upper_bound),
+            "IQR": iqr,
         }
     else:
+        q1 = np.clip(group_data[col].quantile(0.25), lower_bound, upper_bound)
+        q3 = np.clip(group_data[col].quantile(0.75), lower_bound, upper_bound)
+        iqr = np.clip(q3 - q1, lower_bound, upper_bound)
         stats_dict = {
             "N": len(group_data),
             "Mean": np.clip(group_data[col].mean(), lower_bound, upper_bound),
@@ -400,6 +407,7 @@ def stat_text_get(group_data, col=None):
             "Max": np.clip(group_data[col].max(), lower_bound, upper_bound),
             "Min": np.clip(group_data[col].min(), lower_bound, upper_bound),
             "Std": np.clip(group_data[col].std(), lower_bound, upper_bound),
+            "IQR": iqr,
         }
 
     stats_text = (
@@ -408,7 +416,8 @@ def stat_text_get(group_data, col=None):
         f"Median = {stats_dict['Median']:.2e}, "
         f"Max = {stats_dict['Max']:.2e}, "
         f"Min = {stats_dict['Min']:.2e}, "
-        f"Std = {stats_dict['Std']:.2e}"
+        f"Std = {stats_dict['Std']:.2e}, "
+        f"IQR = {stats_dict['IQR']:.2e}"
     )
     return stats_text, stats_dict
 
@@ -580,7 +589,7 @@ def boxplot_plot_dabest(results_df, combined_df, col, output_dir,figures_dir=Non
                 elif pval < 0.05:
                     stars = '*'
                 else:
-                    continue  # Not significant, skip
+                    stars = 'ns'
                 # Collect tuple for Streamlit display and logic
                 if is_streamlit and len(unique_groups) > 1:
                     pval_lines.append((group1, group2, pval))
@@ -660,19 +669,30 @@ def boxplot_plot_dabest(results_df, combined_df, col, output_dir,figures_dir=Non
                 # Build DataFrame from pval_lines
                 pval_df = pd.DataFrame(pval_lines, columns=["Group 1", "Group 2", "P-value"])
                 pval_df["P-value"] = pval_df["P-value"].map(lambda x: f"{x:.3e}")  # format in scientific notation
+                output_df = pd.DataFrame()
                 if len(pval_lines) > 0:
                     with st.expander("Show numeric results"):
                         st.write(plt_title)
-                        
                         # write mean ± std for each group
                         for group in combined_df['Group'].unique():
+                            stat_dict = {}
+                            stat_dict['Group'] = group
                             group_data = combined_df[combined_df['Group'] == group][col]
-                            stats_text, stat_dict = stat_text_get(group_data)
+                            stats_text, stat_dict2 = stat_text_get(group_data)
+                            stat_dict = {**stat_dict, **stat_dict2}
                             st.write(f"{group} mean {stat_dict['Mean']:.2e} ± {stat_dict['Std']:.2e}")
-                        
+                            # add stat_dict to pval_df
+                            # Find p-value for this group (if it exists in any comparison)
+                            group_pvals = pval_df[(pval_df['Group 1'] == group) | (pval_df['Group 2'] == group)]['P-value']
+                            if len(group_pvals) > 0:
+                                stat_dict['P-value'] = group_pvals.iloc[0]  # Take first p-value found
+                            else:
+                                stat_dict['P-value'] = 'N/A'
+                            stat_row = pd.DataFrame([stat_dict])
+                            output_df = pd.concat([output_df, stat_row], ignore_index=True)
                         # Show as table instead of separate lines
-                        st.dataframe(pval_df, use_container_width=True)
-                st_pyplot_func(plt, filename=f"{col}_dabest_plot") 
+                        st.dataframe(output_df, use_container_width=True)
+                st_pyplot_func(plt, filename=f"{col}_dabest_plot", pval_df=output_df) 
     return # results_df
     figures_dir = 'figures'
 
@@ -797,7 +817,7 @@ from pptx.util import Inches
 if "pptx" not in st.session_state:
     st.session_state.pptx = Presentation()
 
-def st_pyplot_func(fig, filename="plot"):
+def st_pyplot_func(fig, filename="plot",pval_df=None):
     """Show matplotlib figure in Streamlit, add SVG download,
        and append to in-memory PPTX stored in session_state."""
     
@@ -816,6 +836,10 @@ def st_pyplot_func(fig, filename="plot"):
         key=str(uuid.uuid4())
     )
 
+    # --- Initialize pptx in session_state if it doesn't exist ---
+    if "pptx" not in st.session_state:
+        st.session_state.pptx = Presentation()
+
     # --- Append PNG to pptx in session_state ---
     png_buffer = io.BytesIO()
     fig.savefig(png_buffer, format="png", dpi=300, bbox_inches="tight")
@@ -825,6 +849,33 @@ def st_pyplot_func(fig, filename="plot"):
         st.session_state.pptx.slide_layouts[6]  # blank layout
     )
     slide.shapes.add_picture(png_buffer, Inches(1), Inches(1), height=Inches(5))
+    
+    # --- Add pval_df as table to the same slide ---
+    if pval_df is not None and not pval_df.empty:
+        # Position the table below the figure
+        table_left = Inches(1)
+        table_top = Inches(6.5)  # Below the figure
+        table_width = Inches(8)
+        table_height = Inches(1.5)
+        
+        # Convert DataFrame to table format for PowerPoint
+        table_data = [list(pval_df.columns)]  # Header row
+        for _, row in pval_df.iterrows():
+            table_data.append(list(row))
+        
+        # Add table to slide
+        table = slide.shapes.add_table(
+            len(table_data), len(table_data[0]),
+            table_left, table_top, table_width, table_height
+        ).table
+        
+        # Populate table with data
+        for i, row_data in enumerate(table_data):
+            for j, cell_data in enumerate(row_data):
+                table.cell(i, j).text = str(cell_data)
+                # Style the header row
+                if i == 0:
+                    table.cell(i, j).text_frame.paragraphs[0].font.bold = True
 
 
 def download_pptx_button(label="Download all plots as PPTX"):
@@ -833,12 +884,13 @@ def download_pptx_button(label="Download all plots as PPTX"):
     st.session_state.pptx.save(pptx_buffer)
     pptx_buffer.seek(0)
 
-    st.download_button(
+    st.sidebar.download_button(
         label=label,
         data=pptx_buffer,
         file_name="plots.pptx",
         mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-        key="pptx-download"
+        key="pptx-download",
+        use_container_width=False
     )
 
 def scatter_plot_with_regression(results_df, combined_df, x_col, y_col, output_dir, figures_dir=None, is_streamlit=False, analysis_type=None, show_histograms=False):
@@ -2273,15 +2325,7 @@ import os, pickle, pandas as pd
 import streamlit as st
 from mne.time_frequency import psd_array_welch  # for PSD
 
-def spectrogram_run(group, win_sec=5):
-    # Path for cached spectrogram
-    fig_path = f"figures/spectrogram/{group}.png"
-    os.makedirs(os.path.dirname(fig_path), exist_ok=True)
-
-    # --- If spectrogram image exists, just show it ---
-    if os.path.exists(fig_path):
-        st.image(fig_path, caption=f"Spectrogram (cached) for {group}")
-        return
+def spectrogram_run(group, win_sec=5,is_streamlit=False):
 
     # --- Otherwise, generate it from pickles ---
     pickle_files = [f for f in os.listdir(f'pickles/{group}') if f.endswith('.pkl')]
@@ -2327,8 +2371,6 @@ def spectrogram_run(group, win_sec=5):
     # --- Generate spectrogram figure ---
     st.write(f"Mean Spectrogram over {n_samples} samples")
     fig = plot_spectrogram_mean(group, arr_mean, win_sec=win_sec, sf=sf)
-    # Save to PNG
-    fig.savefig(fig_path, dpi=150, bbox_inches="tight")
 
 def plot_spectrogram_mean(group,arr_mean,figures_dir=None,win_sec=5,sf=256):
     # mean over all channels

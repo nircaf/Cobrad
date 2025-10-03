@@ -386,7 +386,7 @@ def main():
     clinical_features_numeric = [col for col in clinical_features if pd.api.types.is_numeric_dtype(df_wnv2[col])]
     # Sidebar for feature selection
     st.sidebar.header("Feature Selection")
-    feature_types = ('vs_Controls',"Clinical Feature", "EEG Feature", "ml_plots", "vs_Controls", "Pair Plot",'Raw','Spectrogram')
+    feature_types = ('All', 'vs_Controls', "EEG Feature", "ml_plots", "vs_Controls", "Pair Plot",'Raw','Spectrogram')
     feature_type = st.sidebar.selectbox("Select feature type to plot against the other type:", feature_types)
     if feature_type == "Clinical Feature" or feature_type == "EEG Feature" or feature_type == "vs_Controls":
         # ask user if they want only significant, or full.
@@ -402,167 +402,176 @@ def main():
     if not clinical_features or not eeg_features:
         st.error("Could not identify clinical or EEG features based on the 'overall_' separator.")
         return
-    if feature_type == "vs_Controls":
-        vs_controls_run(project_name,df_wnv2,controls,boxplot_columns,analysis_type)
-        return
-    elif feature_type == "Pair Plot":
-        pairplot_columns(df_wnv2, clinical_features, eeg_features)
-        return
-    elif feature_type == "ml_plots":
-        # get the names of folders that are in {figures_dir}/ml_plots
-        sorted_files = find_and_sort_ml_plots(f"{project_name}_figures/ml_plots")
-        ml_plots_features = [f.split('/')[2] for f in sorted_files]
-        selected_feature = st.sidebar.radio("Select a feature for ML plots:", ml_plots_features)
-        if selected_feature:
-            ml_plots_get_images(project_name, selected_feature)
-        return
-    elif feature_type == "Spectrogram":
-        st.title("Spectrogram")
-        # ask user for win_sec
-        win_sec = st.sidebar.slider("Select window size in seconds", 1, 30, 5)
-        spectrogram_run(cases_group_name,win_sec=win_sec)
-        st.divider()
-        st.subheader("Spectrogram Controls")
-        spectrogram_run(f'Controls',win_sec=win_sec)
-
-        return
-    elif feature_type == "Raw":
-        st.title("Raw Data")
-        raw_run(cases_group_name)
-        return
-    elif feature_type == "EEG Feature":
-        eeg_feature_options =  eeg_features+ ["All Features"] 
-        selected_feature = st.sidebar.radio("Select an EEG feature:", eeg_feature_options)
-        if selected_feature == "All Features":
-            all_feat_list = eeg_features
-            selected_feature = eeg_features[0]
-            bool_all_features = True
-        plot_title = f"Plots of {selected_feature} vs All Clinical Features"
-        boxplot_columns = clinical_features_numeric
-    else: # Clinical Feature
-        clinical_features_correlation = st.sidebar.checkbox("Show Clinical Features Correlation", value=False)
-        marked_clinical_features_w_all = clinical_features + ["All Features"]
-        selected_feature = st.sidebar.radio("Select a Clinical feature:", marked_clinical_features_w_all)
-        if selected_feature == "All Features":
-            all_feat_list = clinical_features
-            selected_feature = clinical_features[0]
-            bool_all_features = True
-        plot_title = f"Plots of {selected_feature} vs All EEG Features"
-    st.header(plot_title)
-    # keep only rows that can be safely converted to float
-    feature_data = (
-        df_wnv2[selected_feature]
-        .apply(pd.to_numeric, errors='coerce')  # turn invalids into NaN
-        .dropna()
-        .astype(float)
-    )
-    if feature_data.empty:
-        st.warning(f"No valid numeric data available for the selected feature: {selected_feature}")
-        return  
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Mean", f"{feature_data.mean():.2f}")
-    col2.metric("Median", f"{feature_data.median():.2f}")
-    col3.metric("Std Dev", f"{feature_data.std():.2f}")
-    col4, col5 ,col6 = st.columns(3)
-    col4.metric("Minimum", f"{feature_data.min():.2f}")
-    col5.metric("Maximum", f"{feature_data.max():.2f}")
-    # col 6 is N with dropna
-    col6.metric("N", f"{feature_data.dropna().count()}")
-    # write text for {selected feature}, N= {}, mean ± std
-    st.write(f'{selected_feature} N= {feature_data.dropna().count()}, mean {feature_data.mean():.2f} ± {feature_data.std():.2f}')
-    numeric_colunms = df_wnv2.select_dtypes(include=[np.number]).columns
-    # sidebar checkbox - Clinical Features Correlation
-    # if EEG Fearture
-    if feature_type == "Clinical Feature":
-        if clinical_features_correlation:
-            # from clinical columns get
-            boxplot_columns = boxplot_columns + clinical_features - selected_feature
-    def run_selected_feature():
-            # Display selected feature and plots
-            df_wnv3 = df_wnv2[df_wnv2[selected_feature].notna()].copy()
-            unique_values = df_wnv3[selected_feature].unique()
-            # Save the raw data
-            print(f'Analyzing {selected_feature} with {len(unique_values)} unique values')
-            if df_wnv3.shape[0] < 3 or unique_values.shape[0] < 2:
-                return
-            if len(unique_values) == 2:  # Check if binary
-                # check that there are at least 3 in each group (0,1)
-                if len(df_wnv3[df_wnv3[selected_feature] == 1]) < 3 or len(df_wnv3[df_wnv3[selected_feature] == 0]) < 3:
-                    return
-                if selected_feature == 'sex':
-                    # if max is 2, decrease 1
-                    if int(df_wnv3[selected_feature].max()) ==2:
-                        df_wnv3[selected_feature] -= 1
-                    # if 1 'f' else 'm'
-                    df_wnv3['Group'] = df_wnv3[selected_feature].apply(lambda x: 'f' if x == 1 else 'm')
-                else:
-                    # group values based on band if =1, else f'not {band}'
-                    org_selected_feature_for_plot = org_selected_feature(selected_feature)
-                    df_wnv3['Group'] = df_wnv3[selected_feature].apply(lambda x: f'{org_selected_feature_for_plot}+' if x == 1 else f'{org_selected_feature_for_plot}-')
-                # run over df_wnv2_others
-                for idx, (project_name_other, df_wnv2_other) in enumerate(df_wnv2_others):
-                    if idx ==0:
-                        # concat with controls, df_wnv3
-                        df_wnv3 = pd.concat([controls, df_wnv3], ignore_index=True)
-                    if selected_feature == 'sex':
-                        # Build a safe string representation of sex (map numeric codes to 'f'/'m' if possible)
-                        if 'sex' in df_wnv2_other.columns:
-                            s = df_wnv2_other['sex']
-                            if pd.api.types.is_numeric_dtype(s):
-                                s_num = s.fillna(-1).astype(float)
-                                # Some datasets use {1,2} where 2 represents female -> normalize to 0/1
-                                if np.nanmax(s_num) >= 2:
-                                    s_num = s_num - 1
-                                s_str = s_num.fillna(-1).astype(int).map({1: 'f', 0: 'm'}).astype(str)
-                            else:
-                                s_str = s.astype(str).str.strip()
-                        else:
-                            s_str = pd.Series([project_name_other] * len(df_wnv2_other), index=df_wnv2_other.index)
-                        df_wnv2_other['Group'] = s_str + '_' + project_name_other
-                        # df_wnv2_other['Group'] remove rows where df_wnv2_other['Group'] is NaN
-                        df_wnv2_other = df_wnv2_other.dropna(subset=['sex'])
-                    else:
-                        df_wnv2_other['Group'] = project_name_other
-                    # concat to df_wnv3
-                    df_wnv3 = pd.concat([df_wnv3, df_wnv2_other], ignore_index=True)
-                                # st checkbox if HEP
-                hep_checkbox = st.checkbox("Show HEP & TSNE Plots", value=False)
-                if hep_checkbox:
-                    st.subheader("HEP Plots")
-                    HEP_plots(project_name, df_wnv3, controls, boxplot_columns, analysis_type,selected_feature)
-                    plot_tsne_by_group(df_wnv3)
-                st.divider()
-                for band in boxplot_columns:
-                    results_df = analyze_and_correct(df_wnv3, [band], groups=df_wnv3['Group'].unique())
-                    boxplot_plot_dabest(results_df, df_wnv3, band, f'{selected_feature}',is_streamlit=True,analysis_type=analysis_type)
-                    # boxplot_plot_sns(results_df, df_wnv3, band, f'{selected_feature}',is_streamlit=True,analysis_type=analysis_type)
-                # if frequency band is contained in the column name
-                # group_data = {}
-                # for value in unique_values:
-                #     group = selected_feature if value == 1 else f'not {selected_feature}'
-                #     run_df = df_wnv3[df_wnv3[selected_feature] == value]
-                #     group_data = process_group_data(group, run_df, frequency_bands, eeg_dict_convertion, eeg_channels, montage, group_data)
-            # If numeric non-binary
-                # if col name has ( and )
-            elif '(' in selected_feature and ')' in selected_feature:
-                for band in boxplot_columns:
-                    df_wnv3['Group'] = df_wnv3[selected_feature].astype(str)
-                    df_wnv3[selected_feature] = df_wnv3[selected_feature].astype(float)
-                    # do boxplot for each band
-                    results_df = analyze_and_correct(df_wnv3, [band], groups=df_wnv3['Group'].unique())
-                    boxplot_plot_dabest(results_df, df_wnv3, band, f'{selected_feature}',is_streamlit=True,analysis_type=analysis_type)
-            elif selected_feature in numeric_colunms:
-                for band in boxplot_columns:
-                    scatter_plot_with_regression({}, df_wnv3, selected_feature, band, f'{selected_feature}',is_streamlit=True,analysis_type=analysis_type)
-    # if selected_feature_w_all is not None
-    if bool_all_features:
-        for feature in all_feat_list:
-            selected_feature = [key for key, value in dict_features.items() if value == feature][0]
-            st.write(f"## Analyzing Feature: {selected_feature}")
-            run_selected_feature()
-            st.divider()
+    # Determine which feature types to run
+    if feature_type == "All":
+        feature_types_to_run = ['vs_Controls', 'Pair Plot', 'ml_plots', 'Spectrogram', 'Raw', 'EEG Feature', 'Clinical Feature']
+        st.title("All Feature Types Analysis")
     else:
-        run_selected_feature()
+        feature_types_to_run = [feature_type]
+    
+    # Run through each feature type
+    for current_feature_type in feature_types_to_run:
+        if feature_type == "All":
+            st.header(f"{current_feature_type} Analysis")
+        if current_feature_type == "vs_Controls":
+            vs_controls_run(project_name,df_wnv2,controls,boxplot_columns,analysis_type)
+        elif current_feature_type == "Pair Plot":
+            pairplot_columns(df_wnv2, clinical_features, eeg_features)
+        elif current_feature_type == "ml_plots":
+            # get the names of folders that are in {figures_dir}/ml_plots
+            sorted_files = find_and_sort_ml_plots(f"{project_name}_figures/ml_plots")
+            ml_plots_features = [f.split('/')[2] for f in sorted_files]
+            selected_feature = st.sidebar.radio("Select a feature for ML plots:", ml_plots_features)
+            if selected_feature:
+                ml_plots_get_images(project_name, selected_feature)
+        elif current_feature_type == "Spectrogram":
+            st.title("Spectrogram")
+            # ask user for win_sec
+            win_sec = st.sidebar.slider("Select window size in seconds", 1, 30, 5)
+            st.subheader(f"{current_feature_type} {cases_group_name}")
+            spectrogram_run(cases_group_name,win_sec=win_sec)
+            st.divider()
+            st.subheader("Spectrogram Controls")
+            spectrogram_run(f'Controls',win_sec=win_sec)
+        elif current_feature_type == "Raw":
+            st.title("Raw Data")
+            raw_run(cases_group_name)
+        elif current_feature_type == "EEG Feature":
+            eeg_feature_options =  eeg_features+ ["All Features"] 
+            selected_feature = st.sidebar.radio("Select an EEG feature:", eeg_feature_options)
+            if selected_feature == "All Features" or feature_type == "All":
+                all_feat_list = eeg_features
+                selected_feature = eeg_features[0]
+                bool_all_features = True
+            plot_title = f"Plots of {selected_feature} vs All Clinical Features"
+            boxplot_columns = clinical_features_numeric
+        elif current_feature_type == "Clinical Feature":
+            clinical_features_correlation = st.sidebar.checkbox("Show Clinical Features Correlation", value=False)
+            marked_clinical_features_w_all = clinical_features + ["All Features"]
+            selected_feature = st.sidebar.radio("Select a Clinical feature:", marked_clinical_features_w_all)
+            if selected_feature == "All Features" or feature_type == "All":
+                all_feat_list = clinical_features
+                selected_feature = clinical_features[0]
+                bool_all_features = True
+            plot_title = f"Plots of {selected_feature} vs All EEG Features"
+            st.header(plot_title)
+            # keep only rows that can be safely converted to float
+            feature_data = (
+                df_wnv2[selected_feature]
+                .apply(pd.to_numeric, errors='coerce')  # turn invalids into NaN
+                .dropna()
+                .astype(float)
+            )
+            if feature_data.empty:
+                st.warning(f"No valid numeric data available for the selected feature: {selected_feature}")
+                continue  # Skip to next feature type
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Mean", f"{feature_data.mean():.2f}")
+            col2.metric("Median", f"{feature_data.median():.2f}")
+            col3.metric("Std Dev", f"{feature_data.std():.2f}")
+            col4, col5 ,col6 = st.columns(3)
+            col4.metric("Minimum", f"{feature_data.min():.2f}")
+            col5.metric("Maximum", f"{feature_data.max():.2f}")
+            # col 6 is N with dropna
+            col6.metric("N", f"{feature_data.dropna().count()}")
+            # write text for {selected feature}, N= {}, mean ± std
+            st.write(f'{selected_feature} N= {feature_data.dropna().count()}, mean {feature_data.mean():.2f} ± {feature_data.std():.2f}')
+            numeric_colunms = df_wnv2.select_dtypes(include=[np.number]).columns
+            # sidebar checkbox - Clinical Features Correlation
+            if clinical_features_correlation:
+                # from clinical columns get
+                boxplot_columns = boxplot_columns + clinical_features - selected_feature
+            def run_selected_feature():
+                # Display selected feature and plots
+                df_wnv3 = df_wnv2[df_wnv2[selected_feature].notna()].copy()
+                unique_values = df_wnv3[selected_feature].unique()
+                # Save the raw data
+                print(f'Analyzing {selected_feature} with {len(unique_values)} unique values')
+                if df_wnv3.shape[0] < 3 or unique_values.shape[0] < 2:
+                    return
+                if len(unique_values) == 2:  # Check if binary
+                    # check that there are at least 3 in each group (0,1)
+                    if len(df_wnv3[df_wnv3[selected_feature] == 1]) < 3 or len(df_wnv3[df_wnv3[selected_feature] == 0]) < 3:
+                        return
+                    if selected_feature == 'sex':
+                        # if max is 2, decrease 1
+                        if int(df_wnv3[selected_feature].max()) ==2:
+                            df_wnv3[selected_feature] -= 1
+                        # if 1 'f' else 'm'
+                        df_wnv3['Group'] = df_wnv3[selected_feature].apply(lambda x: 'f' if x == 1 else 'm')
+                    else:
+                        # group values based on band if =1, else f'not {band}'
+                        org_selected_feature_for_plot = org_selected_feature(selected_feature)
+                        df_wnv3['Group'] = df_wnv3[selected_feature].apply(lambda x: f'{org_selected_feature_for_plot}+' if x == 1 else f'{org_selected_feature_for_plot}-')
+                    # run over df_wnv2_others
+                    for idx, (project_name_other, df_wnv2_other) in enumerate(df_wnv2_others):
+                        if idx ==0:
+                            # concat with controls, df_wnv3
+                            df_wnv3 = pd.concat([controls, df_wnv3], ignore_index=True)
+                        if selected_feature == 'sex':
+                            # Build a safe string representation of sex (map numeric codes to 'f'/'m' if possible)
+                            if 'sex' in df_wnv2_other.columns:
+                                s = df_wnv2_other['sex']
+                                if pd.api.types.is_numeric_dtype(s):
+                                    s_num = s.fillna(-1).astype(float)
+                                    # Some datasets use {1,2} where 2 represents female -> normalize to 0/1
+                                    if np.nanmax(s_num) >= 2:
+                                        s_num = s_num - 1
+                                    s_str = s_num.fillna(-1).astype(int).map({1: 'f', 0: 'm'}).astype(str)
+                                else:
+                                    s_str = s.astype(str).str.strip()
+                            else:
+                                s_str = pd.Series([project_name_other] * len(df_wnv2_other), index=df_wnv2_other.index)
+                            df_wnv2_other['Group'] = s_str + '_' + project_name_other
+                            # df_wnv2_other['Group'] remove rows where df_wnv2_other['Group'] is NaN
+                            df_wnv2_other = df_wnv2_other.dropna(subset=['sex'])
+                        else:
+                            df_wnv2_other['Group'] = project_name_other
+                        # concat to df_wnv3
+                        df_wnv3 = pd.concat([df_wnv3, df_wnv2_other], ignore_index=True)
+                                    # st checkbox if HEP
+                    hep_checkbox = st.checkbox("Show HEP & TSNE Plots", value=False)
+                    if hep_checkbox:
+                        st.subheader("HEP Plots")
+                        HEP_plots(project_name, df_wnv3, controls, boxplot_columns, analysis_type,selected_feature)
+                        plot_tsne_by_group(df_wnv3)
+                    st.divider()
+                    for band in boxplot_columns:
+                        results_df = analyze_and_correct(df_wnv3, [band], groups=df_wnv3['Group'].unique())
+                        boxplot_plot_dabest(results_df, df_wnv3, band, f'{selected_feature}',is_streamlit=True,analysis_type=analysis_type)
+                        # boxplot_plot_sns(results_df, df_wnv3, band, f'{selected_feature}',is_streamlit=True,analysis_type=analysis_type)
+                    # if frequency band is contained in the column name
+                    # group_data = {}
+                    # for value in unique_values:
+                    #     group = selected_feature if value == 1 else f'not {selected_feature}'
+                    #     run_df = df_wnv3[df_wnv3[selected_feature] == value]
+                    #     group_data = process_group_data(group, run_df, frequency_bands, eeg_dict_convertion, eeg_channels, montage, group_data)
+                # If numeric non-binary
+                    # if col name has ( and )
+                elif '(' in selected_feature and ')' in selected_feature:
+                    for band in boxplot_columns:
+                        df_wnv3['Group'] = df_wnv3[selected_feature].astype(str)
+                        df_wnv3[selected_feature] = df_wnv3[selected_feature].astype(float)
+                        # do boxplot for each band
+                        results_df = analyze_and_correct(df_wnv3, [band], groups=df_wnv3['Group'].unique())
+                        boxplot_plot_dabest(results_df, df_wnv3, band, f'{selected_feature}',is_streamlit=True,analysis_type=analysis_type)
+                elif selected_feature in numeric_colunms:
+                    for band in boxplot_columns:
+                        scatter_plot_with_regression({}, df_wnv3, selected_feature, band, f'{selected_feature}',is_streamlit=True,analysis_type=analysis_type)
+            
+            # if selected_feature_w_all is not None
+            if bool_all_features:
+                for feature in all_feat_list:
+                    selected_feature = feature
+                    st.write(f"## Analyzing Feature: {selected_feature}")
+                    run_selected_feature()
+                    st.divider()
+            else:
+                run_selected_feature()
+        
+        # Add divider between feature types when running "All"
+        if feature_type == "All" and current_feature_type != feature_types_to_run[-1]:
+            st.divider()
     download_pptx_button()
 
 
