@@ -208,7 +208,6 @@ def vs_controls_run(project_name,df_wnv2,controls,boxplot_columns,analysis_type)
             continue
         results_df = analyze_and_correct(curr_data, [col], groups=curr_data['Group'].unique())
         boxplot_plot_dabest(results_df,curr_data, col, 'vs_controls',is_streamlit=True,analysis_type=analysis_type)
-import upload_project_page as upp
 
 def ml_plots_get_images(project_name, selected_feature):
     ml_plots_dir = f"{project_name}_figures/ml_plots"
@@ -335,7 +334,7 @@ def main():
     # Deduplicate while preserving order
     seen = set()
     opts = [x for x in default_options if not (x in seen or seen.add(x))]
-    selected_projects = st.sidebar.multiselect("Select Project(s)", opts, default=[x for x in ["Reading_Epilepsy"] if x in opts])
+    selected_projects = st.sidebar.pills("Select Project(s)", opts, default=[x for x in ["Seeg"] if x in opts],selection_mode ="multi")
     if not selected_projects:
         st.error("Please select at least one project.")
         return
@@ -386,12 +385,12 @@ def main():
     clinical_features_numeric = [col for col in clinical_features if pd.api.types.is_numeric_dtype(df_wnv2[col])]
     # Sidebar for feature selection
     st.sidebar.header("Feature Selection")
-    feature_types = ('All', 'vs_Controls', "EEG Feature", "ml_plots", "vs_Controls", "Pair Plot",'Raw','Spectrogram')
+    feature_types = ('All', 'Clinical Feature', "EEG Feature", "ml_plots", "vs_Controls", "Pair Plot",'Raw','Spectrogram')
     feature_type = st.sidebar.selectbox("Select feature type to plot against the other type:", feature_types)
-    if feature_type == "Clinical Feature" or feature_type == "EEG Feature" or feature_type == "vs_Controls":
+    if feature_type in ["Clinical Feature", "EEG Feature", "vs_Controls","All"]:
         # ask user if they want only significant, or full.
         st.sidebar.header("Select Analysis Type")
-        analysis_type = st.sidebar.selectbox("Select Analysis Type", ["Full", "Significant"])
+        analysis_type = st.sidebar.pills("Select Analysis Type", ["Full", "Significant"],default=["Significant"])
     else:
         analysis_type = "Full"
         
@@ -404,13 +403,15 @@ def main():
         return
     # Determine which feature types to run
     if feature_type == "All":
-        feature_types_to_run = ['vs_Controls', 'Pair Plot', 'ml_plots', 'Spectrogram', 'Raw', 'EEG Feature', 'Clinical Feature']
+        # remove all from feature_types
+        feature_types_to_run = [feature for feature in feature_types if feature != 'All']
         st.title("All Feature Types Analysis")
     else:
         feature_types_to_run = [feature_type]
     
     # Run through each feature type
     for current_feature_type in feature_types_to_run:
+        clinical_features, boxplot_columns = get_clinical_and_boxplot_cols(df_wnv2=df_wnv2)
         if feature_type == "All":
             st.header(f"{current_feature_type} Analysis")
         if current_feature_type == "vs_Controls":
@@ -437,18 +438,25 @@ def main():
             st.title("Raw Data")
             raw_run(cases_group_name)
         elif current_feature_type == "EEG Feature":
+            forest_plot_eeg = st.sidebar.checkbox("Show Forest Plot vs All Clinical Features", value=False)
             eeg_feature_options =  eeg_features+ ["All Features"] 
-            selected_feature = st.sidebar.radio("Select an EEG feature:", eeg_feature_options)
+            selected_feature = st.sidebar.selectbox("Select an EEG feature:", eeg_feature_options)
             if selected_feature == "All Features" or feature_type == "All":
                 all_feat_list = eeg_features
                 selected_feature = eeg_features[0]
                 bool_all_features = True
             plot_title = f"Plots of {selected_feature} vs All Clinical Features"
             boxplot_columns = clinical_features_numeric
+            
+            # Add forest plot if requested
+            if forest_plot_eeg:
+                st.subheader("Forest Plot Analysis")
+                forest_plot_all_features(df_wnv2, selected_feature, clinical_features_numeric, analysis_type)
         elif current_feature_type == "Clinical Feature":
             clinical_features_correlation = st.sidebar.checkbox("Show Clinical Features Correlation", value=False)
+            forest_plot_clinical = st.sidebar.checkbox("Show Forest Plot vs All EEG Features", value=False)
             marked_clinical_features_w_all = clinical_features + ["All Features"]
-            selected_feature = st.sidebar.radio("Select a Clinical feature:", marked_clinical_features_w_all)
+            selected_feature = st.sidebar.selectbox("Select a Clinical feature:", marked_clinical_features_w_all)
             if selected_feature == "All Features" or feature_type == "All":
                 all_feat_list = clinical_features
                 selected_feature = clinical_features[0]
@@ -539,15 +547,6 @@ def main():
                     for band in boxplot_columns:
                         results_df = analyze_and_correct(df_wnv3, [band], groups=df_wnv3['Group'].unique())
                         boxplot_plot_dabest(results_df, df_wnv3, band, f'{selected_feature}',is_streamlit=True,analysis_type=analysis_type)
-                        # boxplot_plot_sns(results_df, df_wnv3, band, f'{selected_feature}',is_streamlit=True,analysis_type=analysis_type)
-                    # if frequency band is contained in the column name
-                    # group_data = {}
-                    # for value in unique_values:
-                    #     group = selected_feature if value == 1 else f'not {selected_feature}'
-                    #     run_df = df_wnv3[df_wnv3[selected_feature] == value]
-                    #     group_data = process_group_data(group, run_df, frequency_bands, eeg_dict_convertion, eeg_channels, montage, group_data)
-                # If numeric non-binary
-                    # if col name has ( and )
                 elif '(' in selected_feature and ')' in selected_feature:
                     for band in boxplot_columns:
                         df_wnv3['Group'] = df_wnv3[selected_feature].astype(str)
@@ -565,15 +564,188 @@ def main():
                     selected_feature = feature
                     st.write(f"## Analyzing Feature: {selected_feature}")
                     run_selected_feature()
+                    # Add forest plot if requested
+                    if forest_plot_clinical:
+                        st.subheader("Forest Plot Analysis")
+                        forest_plot_all_features(df_wnv2, selected_feature, eeg_features, analysis_type)
                     st.divider()
             else:
                 run_selected_feature()
+                # Add forest plot if requested
+                if forest_plot_clinical:
+                    st.subheader("Forest Plot Analysis")
+                    forest_plot_all_features(df_wnv2, selected_feature, eeg_features, analysis_type)
         
         # Add divider between feature types when running "All"
         if feature_type == "All" and current_feature_type != feature_types_to_run[-1]:
             st.divider()
     download_pptx_button()
 
+
+def forest_plot_all_features(df_wnv3, selected_feature, target_features, analysis_type="Full"):
+    """
+    Create a forest plot showing effect sizes (Cohen's d) for the selected feature
+    against all target features (either all EEG or all Clinical features).
+    
+    Parameters:
+    - df_wnv3: DataFrame with the data
+    - selected_feature: The feature being analyzed
+    - target_features: List of features to compare against
+    - analysis_type: "Full" or "Significant" to filter results
+    """
+    from scipy.stats import mannwhitneyu, ttest_ind
+    from statsmodels.stats.multitest import multipletests
+    import matplotlib.patches as patches
+    
+    # Prepare data for analysis
+    df_clean = df_wnv3[df_wnv3[selected_feature].notna()].copy()
+    
+    # Convert selected feature to binary if it's not already
+    if df_clean[selected_feature].nunique() == 2:
+        # Already binary
+        unique_vals = sorted(df_clean[selected_feature].unique())
+        df_clean['Group'] = df_clean[selected_feature].apply(lambda x: f"{selected_feature}+" if x == unique_vals[1] else f"{selected_feature}-")
+    else:
+        # Convert to binary using median split
+        median_val = df_clean[selected_feature].median()
+        df_clean['Group'] = df_clean[selected_feature].apply(lambda x: f"{selected_feature}+" if x >= median_val else f"{selected_feature}-")
+    
+    # Calculate effect sizes for each target feature
+    results = []
+    for feature in target_features:
+        if feature not in df_clean.columns:
+            continue
+            
+        # Get data for both groups
+        group1_data = df_clean[df_clean['Group'] == f"{selected_feature}+"][feature].dropna()
+        group2_data = df_clean[df_clean['Group'] == f"{selected_feature}-"][feature].dropna()
+        
+        if len(group1_data) < 2 or len(group2_data) < 2:
+            continue
+            
+        # Calculate effect size (Cohen's d)
+        n1, n2 = len(group1_data), len(group2_data)
+        mean1, mean2 = group1_data.mean(), group2_data.mean()
+        std1, std2 = group1_data.std(), group2_data.std()
+        
+        # Pooled standard deviation
+        pooled_std = np.sqrt(((n1 - 1) * std1**2 + (n2 - 1) * std2**2) / (n1 + n2 - 2))
+        cohens_d = (mean1 - mean2) / pooled_std if pooled_std > 0 else 0
+        
+        # Statistical test
+        try:
+            # Normality test
+            _, normal_p1 = stats.normaltest(group1_data)
+            _, normal_p2 = stats.normaltest(group2_data)
+            
+            if normal_p1 < 0.05 or normal_p2 < 0.05:  # Non-parametric
+                stat, p_value = mannwhitneyu(group1_data, group2_data, alternative='two-sided')
+                test_used = "Mann-Whitney U"
+            else:  # Parametric
+                stat, p_value = ttest_ind(group1_data, group2_data)
+                test_used = "T-test"
+        except:
+            p_value = np.nan
+            test_used = "Failed"
+        
+        results.append({
+            'Feature': feature,
+            'Cohen_d': cohens_d,
+            'P_value': p_value,
+            'Test': test_used,
+            'N1': n1,
+            'N2': n2,
+            'Mean1': mean1,
+            'Mean2': mean2
+        })
+    
+    if not results:
+        st.warning("No valid comparisons could be made.")
+        return
+    
+    # Convert to DataFrame
+    results_df = pd.DataFrame(results)
+    
+    # Multiple comparison correction
+    valid_pvals = results_df['P_value'].dropna()
+    if len(valid_pvals) > 1:
+        _, pvals_corrected, _, _ = multipletests(valid_pvals, method='fdr_bh')
+        results_df.loc[valid_pvals.index, 'P_corrected'] = pvals_corrected
+    else:
+        results_df['P_corrected'] = results_df['P_value']
+    
+    # Filter by significance if requested
+    if analysis_type == "Significant":
+        results_df = results_df[results_df['P_corrected'] < 0.05]
+    
+    if results_df.empty:
+        st.warning("No significant results found.")
+        return
+    
+    # Sort by effect size
+    results_df = results_df.sort_values('Cohen_d', key=abs, ascending=False)
+    
+    # Create forest plot
+    fig, ax = plt.subplots(figsize=(12, max(6, len(results_df) * 0.4)))
+    
+    # Colors based on significance
+    colors = ['red' if p < 0.05 else 'blue' for p in results_df['P_corrected']]
+    
+    # Plot effect sizes
+    y_pos = np.arange(len(results_df))
+    bars = ax.barh(y_pos, results_df['Cohen_d'], color=colors, alpha=0.7)
+    
+    # Add vertical line at 0
+    ax.axvline(x=0, color='black', linestyle='-', alpha=0.3)
+    
+    # Add confidence intervals (simplified)
+    for i, (idx, row) in enumerate(results_df.iterrows()):
+        # Simple 95% CI approximation
+        se = 1 / np.sqrt(row['N1'] + row['N2'] - 2)  # Simplified standard error
+        ci_lower = row['Cohen_d'] - 1.96 * se
+        ci_upper = row['Cohen_d'] + 1.96 * se
+        
+        ax.plot([ci_lower, ci_upper], [i, i], 'k-', linewidth=2)
+        ax.plot([ci_lower, ci_lower], [i-0.1, i+0.1], 'k-', linewidth=2)
+        ax.plot([ci_upper, ci_upper], [i-0.1, i+0.1], 'k-', linewidth=2)
+    
+    # Customize plot
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(results_df['Feature'], fontsize=10)
+    ax.set_xlabel("Cohen's d (Effect Size)", fontsize=12)
+    ax.set_title(f"Forest Plot: {selected_feature} vs All {len(target_features)} Features\n"
+                f"Effect Sizes (Cohen's d) with 95% Confidence Intervals", fontsize=14)
+    
+    # Add legend
+    red_patch = patches.Patch(color='red', alpha=0.7, label='Significant (p < 0.05)')
+    blue_patch = patches.Patch(color='blue', alpha=0.7, label='Non-significant')
+    ax.legend(handles=[red_patch, blue_patch], loc='upper right')
+    
+    # Add effect size interpretation
+    ax.text(0.02, 0.98, "Effect Size Interpretation:\n"
+                        "|d| < 0.2: Small\n"
+                        "0.2 ≤ |d| < 0.5: Medium\n"
+                        "0.5 ≤ |d| < 0.8: Large\n"
+                        "|d| ≥ 0.8: Very Large",
+            transform=ax.transAxes, fontsize=9, verticalalignment='top',
+            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+    
+    plt.tight_layout()
+    
+    # Display in Streamlit
+    st.subheader(f"Forest Plot: {selected_feature} vs All Features")
+    st_pyplot_func(fig, filename=f'forest_plot_{selected_feature}_vs_all.png')
+    
+    # Display summary statistics table
+    st.subheader("Summary Statistics")
+    display_df = results_df[['Feature', 'Cohen_d', 'P_value', 'P_corrected', 'Test', 'N1', 'N2']].copy()
+    display_df['Cohen_d'] = display_df['Cohen_d'].round(3)
+    display_df['P_value'] = display_df['P_value'].apply(lambda x: f"{x:.3e}" if not pd.isna(x) else "N/A")
+    display_df['P_corrected'] = display_df['P_corrected'].apply(lambda x: f"{x:.3e}" if not pd.isna(x) else "N/A")
+    display_df.columns = ['Feature', "Cohen's d", 'P-value', 'P-corrected', 'Test', 'N+', 'N-']
+    st.dataframe(display_df, use_container_width=True)
+    
+    plt.close(fig)
 
 def nilearn_plotting(df_wnv3):
     # leave all columns that say 'EEG' and group column

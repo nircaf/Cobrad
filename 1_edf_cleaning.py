@@ -431,11 +431,11 @@ def process_file(row,filename,is_prod):
                                 out_df = pd.DataFrame(conn_df)
                             except Exception:
                                 out_df = None
-                        if out_df is not None and not out_df.empty:
-                            temp_conn_dir = f"{temp_dir}_conn_df"
-                            os.makedirs(temp_conn_dir, exist_ok=True)
-                            out_path = os.path.join(temp_conn_dir, f"{segment_filename.replace('.parquet','')}_conn.parquet")
-                            out_df.to_parquet(out_path, index=True)
+                        # if out_df is not None and not out_df.empty:
+                        #     temp_conn_dir = f"{temp_dir}_conn_df"
+                        #     os.makedirs(temp_conn_dir, exist_ok=True)
+                        #     out_path = os.path.join(temp_conn_dir, f"{segment_filename.replace('.parquet','')}_conn.parquet")
+                        #     out_df.to_parquet(out_path, index=True)
                 except Exception as e:
                     print(f"Failed to save conn_df for {segment_filename}: {e}")
                 # Update and write segment metadata
@@ -474,22 +474,22 @@ def process_file(row,filename,is_prod):
                 df = pd.DataFrame([metadata])
                 df.to_parquet(f'{temp_dir}/{row["file_name"]}.parquet', index=False)
                 # Save connectivity DataFrame (conn_df) to its own Parquet folder
-                try:
-                    temp_conn_dir = f"{temp_dir}_conn_df"
-                    os.makedirs(temp_conn_dir, exist_ok=True)
-                    if conn_df is not None:
-                        if isinstance(conn_df, pd.DataFrame):
-                            out_df = conn_df
-                        else:
-                            try:
-                                out_df = pd.DataFrame(conn_df)
-                            except Exception:
-                                out_df = None
-                        if out_df is not None and not out_df.empty:
-                            out_path = os.path.join(temp_conn_dir, f"{row['file_name']}_conn.parquet")
-                            out_df.to_parquet(out_path, index=True)
-                except Exception as e:
-                    print(f"Failed to save conn_df for {row['file_name']}: {e}")
+                # try:
+                #     temp_conn_dir = f"{temp_dir}_conn_df"
+                #     os.makedirs(temp_conn_dir, exist_ok=True)
+                #     if conn_df is not None:
+                #         if isinstance(conn_df, pd.DataFrame):
+                #             out_df = conn_df
+                #         else:
+                #             try:
+                #                 out_df = pd.DataFrame(conn_df)
+                #             except Exception:
+                #                 out_df = None
+                #         if out_df is not None and not out_df.empty:
+                #             out_path = os.path.join(temp_conn_dir, f"{row['file_name']}_conn.parquet")
+                #             out_df.to_parquet(out_path, index=True)
+                # except Exception as e:
+                #     print(f"Failed to save conn_df for {row['file_name']}: {e}")
         # return metadata
     # return metadata
 

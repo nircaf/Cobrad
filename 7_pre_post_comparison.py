@@ -405,204 +405,279 @@ def main():
     
     # Feature selection
     st.sidebar.header("Analysis Settings")
-    selected_feature = st.sidebar.selectbox("Select EEG Feature", eeg_features)
+    feature_options = ["All Features"] + eeg_features
+    selected_feature = st.sidebar.selectbox("Select EEG Feature", feature_options)
     
     # Analysis options
     show_dabest = st.sidebar.checkbox("Show Dabest Plots", value=True)
     show_topomaps = st.sidebar.checkbox("Show Topomaps", value=True)
     show_statistics = st.sidebar.checkbox("Show Detailed Statistics", value=True)
     
-    st.markdown(f"## Analysis of: {selected_feature}")
-    
-    # Create expandable containers for different analyses
-    with st.expander("📊 Descriptive Statistics", expanded=True):
-        col1, col2, col3 = st.columns(3)
+    # Check if "All Features" is selected
+    if selected_feature == "All Features":
+        st.markdown("## Analysis of: All EEG Features")
         
-        # Get paired data for this feature
-        pre_subjects = set(pre_df['Subject_ID'].unique()) if len(pre_df) > 0 else set()
-        post_subjects = set(post_df['Subject_ID'].unique()) if len(post_df) > 0 else set()
-        common_subjects = pre_subjects.intersection(post_subjects)
+        # Create a grid layout for all features
+        num_features = len(eeg_features)
+        cols_per_row = 3  # Number of columns per row
+        num_rows = (num_features + cols_per_row - 1) // cols_per_row
         
-        pre_vals = []
-        post_vals = []
-        for subject in common_subjects:
-            pre_val = pre_df[pre_df['Subject_ID'] == subject][selected_feature].iloc[0] if len(pre_df[pre_df['Subject_ID'] == subject]) > 0 else np.nan
-            post_val = post_df[post_df['Subject_ID'] == subject][selected_feature].iloc[0] if len(post_df[post_df['Subject_ID'] == subject]) > 0 else np.nan
+        for row in range(num_rows):
+            start_idx = row * cols_per_row
+            end_idx = min(start_idx + cols_per_row, num_features)
+            current_features = eeg_features[start_idx:end_idx]
             
-            if not np.isnan(pre_val) and not np.isnan(post_val):
-                pre_vals.append(pre_val)
-                post_vals.append(post_val)
+            # Create columns for this row
+            cols = st.columns(len(current_features))
+            
+            for i, feature in enumerate(current_features):
+                with cols[i]:
+                    st.markdown(f"### {feature}")
+                    
+                    # Get paired data for this feature
+                    pre_subjects = set(pre_df['Subject_ID'].unique()) if len(pre_df) > 0 else set()
+                    post_subjects = set(post_df['Subject_ID'].unique()) if len(post_df) > 0 else set()
+                    common_subjects = pre_subjects.intersection(post_subjects)
+                    
+                    pre_vals = []
+                    post_vals = []
+                    for subject in common_subjects:
+                        pre_val = pre_df[pre_df['Subject_ID'] == subject][feature].iloc[0] if len(pre_df[pre_df['Subject_ID'] == subject]) > 0 else np.nan
+                        post_val = post_df[post_df['Subject_ID'] == subject][feature].iloc[0] if len(post_df[post_df['Subject_ID'] == subject]) > 0 else np.nan
+                        
+                        if not np.isnan(pre_val) and not np.isnan(post_val):
+                            pre_vals.append(pre_val)
+                            post_vals.append(post_val)
+                    
+                    # Show basic statistics
+                    if len(pre_vals) > 0 and len(post_vals) > 0:
+                        differences = np.array(post_vals) - np.array(pre_vals)
+                        
+                        # Statistical analysis
+                        p_value, cohen_d, effect_size_desc, power = calculate_effect_size_and_power(pre_df, post_df, feature)
+                        
+                        st.write(f"**N:** {len(pre_vals)}")
+                        st.write(f"**PRE:** {np.mean(pre_vals):.3f} ± {np.std(pre_vals):.3f}")
+                        st.write(f"**POST:** {np.mean(post_vals):.3f} ± {np.std(post_vals):.3f}")
+                        st.write(f"**Change:** {np.mean(differences):.3f} ± {np.std(differences):.3f}")
+                        
+                        if p_value is not None:
+                            if p_value < 0.05:
+                                st.write(f"**p:** {p_value:.3e} *")
+                            else:
+                                st.write(f"**p:** {p_value:.3e}")
+                            st.write(f"**d:** {cohen_d:.3f}")
+                        else:
+                            st.write("**Insufficient data**")
+                    else:
+                        st.write("**No paired data**")
+                    
+                    # Create a small comparison plot
+                    if len(pre_vals) > 0 and len(post_vals) > 0:
+                        fig, ax = plt.subplots(figsize=(4, 3))
+                        
+                        data_for_box = [pre_vals, post_vals]
+                        labels = ['PRE', 'POST']
+                        
+                        ax.boxplot(data_for_box, labels=labels)
+                        ax.set_ylabel(feature)
+                        ax.set_title(f'{feature}')
+                        ax.grid(True, alpha=0.3)
+                        
+                        st.pyplot(fig)
+                        plt.close(fig)
+    else:
+        st.markdown(f"## Analysis of: {selected_feature}")
         
-        with col1:
-            st.subheader("PRE Group (Paired)")
+        # Create expandable containers for different analyses
+        with st.expander("📊 Descriptive Statistics", expanded=True):
+            col1, col2, col3 = st.columns(3)
+            
+            # Get paired data for this feature
+            pre_subjects = set(pre_df['Subject_ID'].unique()) if len(pre_df) > 0 else set()
+            post_subjects = set(post_df['Subject_ID'].unique()) if len(post_df) > 0 else set()
+            common_subjects = pre_subjects.intersection(post_subjects)
+            
+            pre_vals = []
+            post_vals = []
+            for subject in common_subjects:
+                pre_val = pre_df[pre_df['Subject_ID'] == subject][selected_feature].iloc[0] if len(pre_df[pre_df['Subject_ID'] == subject]) > 0 else np.nan
+                post_val = post_df[post_df['Subject_ID'] == subject][selected_feature].iloc[0] if len(post_df[post_df['Subject_ID'] == subject]) > 0 else np.nan
+                
+                if not np.isnan(pre_val) and not np.isnan(post_val):
+                    pre_vals.append(pre_val)
+                    post_vals.append(post_val)
+            
+            with col1:
+                st.subheader("PRE Group (Paired)")
+                if len(pre_vals) > 0:
+                    st.write(f"**N:** {len(pre_vals)}")
+                    st.write(f"**Mean ± SD:** {np.mean(pre_vals):.3f} ± {np.std(pre_vals):.3f}")
+                    st.write(f"**Median (IQR):** {np.median(pre_vals):.3f} ({np.percentile(pre_vals, 25):.3f} - {np.percentile(pre_vals, 75):.3f})")
+                    st.write(f"**Range:** {np.min(pre_vals):.3f} - {np.max(pre_vals):.3f}")
+                else:
+                    st.write("No paired PRE data available")
+            
+            with col2:
+                st.subheader("POST Group (Paired)")
+                if len(post_vals) > 0:
+                    st.write(f"**N:** {len(post_vals)}")
+                    st.write(f"**Mean ± SD:** {np.mean(post_vals):.3f} ± {np.std(post_vals):.3f}")
+                    st.write(f"**Median (IQR):** {np.median(post_vals):.3f} ({np.percentile(post_vals, 25):.3f} - {np.percentile(post_vals, 75):.3f})")
+                    st.write(f"**Range:** {np.min(post_vals):.3f} - {np.max(post_vals):.3f}")
+                else:
+                    st.write("No paired POST data available")
+            
+            with col3:
+                st.subheader("Change (POST - PRE)")
+                if len(pre_vals) > 0 and len(post_vals) > 0:
+                    differences = np.array(post_vals) - np.array(pre_vals)
+                    st.write(f"**N:** {len(differences)}")
+                    st.write(f"**Mean ± SD:** {np.mean(differences):.3f} ± {np.std(differences):.3f}")
+                    st.write(f"**Median (IQR):** {np.median(differences):.3f} ({np.percentile(differences, 25):.3f} - {np.percentile(differences, 75):.3f})")
+                    st.write(f"**Range:** {np.min(differences):.3f} - {np.max(differences):.3f}")
+                else:
+                    st.write("No paired data available")
+    
+        # Statistical analysis
+        if show_statistics:
+            with st.expander("📈 Statistical Analysis (Paired)", expanded=True):
+                p_value, cohen_d, effect_size_desc, power = calculate_effect_size_and_power(pre_df, post_df, selected_feature)
+            
+                if p_value is not None:
+                    col1, col2, col3, col4 = st.columns(4)
+                    
+                    with col1:
+                        st.metric("P-value (Wilcoxon)", f"{p_value:.3e}")
+                    with col2:
+                        st.metric("Cohen's d (Paired)", f"{cohen_d:.3f}")
+                    with col3:
+                        st.metric("Effect Size", effect_size_desc.title())
+                    with col4:
+                        st.metric("Statistical Power", f"{power:.1%}" if not np.isnan(power) else "N/A")
+                    
+                    # Significance interpretation
+                    if p_value < 0.001:
+                        sig_text = "*** (p < 0.001)"
+                    elif p_value < 0.01:
+                        sig_text = "** (p < 0.01)"
+                    elif p_value < 0.05:
+                        sig_text = "* (p < 0.05)"
+                    else:
+                        sig_text = "ns (p ≥ 0.05)"
+                    
+                    st.write(f"**Significance (Wilcoxon signed-rank test):** {sig_text}")
+                    
+                    # Effect size interpretation
+                    st.write(f"**Effect Size Interpretation:** {effect_size_desc.title()} effect size (Cohen's d = {cohen_d:.3f})")
+                    
+                    # Additional info about paired analysis
+                    st.info("This analysis uses paired comparisons (Wilcoxon signed-rank test) for subjects with both PRE and POST data.")
+                else:
+                    st.warning("Insufficient data for statistical analysis")
+    
+        # Dabest plots
+        if show_dabest:
+            with st.expander("🎯 Dabest Estimation Plots", expanded=True):
+                fig, p_val, cohen_d = create_dabest_plot(pre_df, post_df, selected_feature)
+                if fig is not None:
+                    st.pyplot(fig)
+                    plt.close(fig)
+                else:
+                    st.warning("Insufficient data for Dabest plot")
+        
+        # Topomaps or Simple Comparison Plots
+        if show_topomaps:
+            with st.expander("🧠 Topographic Maps", expanded=True):
+                if 'overall_' in selected_feature:
+                    # For overall features, show simple comparison plots
+                    fig = create_simple_comparison_plot(pre_df, post_df, selected_feature)
+                    if fig is not None:
+                        st.pyplot(fig)
+                        plt.close(fig)
+                    else:
+                        st.warning("Insufficient data for comparison plot")
+                else:
+                    # For channel-specific features, show topomaps
+                    fig, pre_evoked, post_evoked = create_topomap_comparison(pre_df, post_df, selected_feature, montage)
+                    if fig is not None:
+                        st.pyplot(fig)
+                        plt.close(fig)
+                    else:
+                        st.warning("Insufficient channel data for topomap generation")
+    
+        # Distribution plots
+        with st.expander("📈 Distribution Comparison (Paired)", expanded=True):
+            fig, ax = plt.subplots(figsize=(10, 6))
+            
+            # Get paired data for this feature
+            pre_subjects = set(pre_df['Subject_ID'].unique()) if len(pre_df) > 0 else set()
+            post_subjects = set(post_df['Subject_ID'].unique()) if len(post_df) > 0 else set()
+            common_subjects = pre_subjects.intersection(post_subjects)
+            
+            pre_vals = []
+            post_vals = []
+            for subject in common_subjects:
+                pre_val = pre_df[pre_df['Subject_ID'] == subject][selected_feature].iloc[0] if len(pre_df[pre_df['Subject_ID'] == subject]) > 0 else np.nan
+                post_val = post_df[post_df['Subject_ID'] == subject][selected_feature].iloc[0] if len(post_df[post_df['Subject_ID'] == subject]) > 0 else np.nan
+                
+                if not np.isnan(pre_val) and not np.isnan(post_val):
+                    pre_vals.append(pre_val)
+                    post_vals.append(post_val)
+            
             if len(pre_vals) > 0:
-                st.write(f"**N:** {len(pre_vals)}")
-                st.write(f"**Mean ± SD:** {np.mean(pre_vals):.3f} ± {np.std(pre_vals):.3f}")
-                st.write(f"**Median (IQR):** {np.median(pre_vals):.3f} ({np.percentile(pre_vals, 25):.3f} - {np.percentile(pre_vals, 75):.3f})")
-                st.write(f"**Range:** {np.min(pre_vals):.3f} - {np.max(pre_vals):.3f}")
-            else:
-                st.write("No paired PRE data available")
-        
-        with col2:
-            st.subheader("POST Group (Paired)")
+                ax.hist(pre_vals, alpha=0.7, label='PRE (Paired)', bins=20, density=True)
+            
             if len(post_vals) > 0:
-                st.write(f"**N:** {len(post_vals)}")
-                st.write(f"**Mean ± SD:** {np.mean(post_vals):.3f} ± {np.std(post_vals):.3f}")
-                st.write(f"**Median (IQR):** {np.median(post_vals):.3f} ({np.percentile(post_vals, 25):.3f} - {np.percentile(post_vals, 75):.3f})")
-                st.write(f"**Range:** {np.min(post_vals):.3f} - {np.max(post_vals):.3f}")
-            else:
-                st.write("No paired POST data available")
-        
-        with col3:
-            st.subheader("Change (POST - PRE)")
-            if len(pre_vals) > 0 and len(post_vals) > 0:
-                differences = np.array(post_vals) - np.array(pre_vals)
-                st.write(f"**N:** {len(differences)}")
-                st.write(f"**Mean ± SD:** {np.mean(differences):.3f} ± {np.std(differences):.3f}")
-                st.write(f"**Median (IQR):** {np.median(differences):.3f} ({np.percentile(differences, 25):.3f} - {np.percentile(differences, 75):.3f})")
-                st.write(f"**Range:** {np.min(differences):.3f} - {np.max(differences):.3f}")
-            else:
-                st.write("No paired data available")
-    
-    # Statistical analysis
-    if show_statistics:
-        with st.expander("📈 Statistical Analysis (Paired)", expanded=True):
-            p_value, cohen_d, effect_size_desc, power = calculate_effect_size_and_power(pre_df, post_df, selected_feature)
+                ax.hist(post_vals, alpha=0.7, label='POST (Paired)', bins=20, density=True)
             
-            if p_value is not None:
-                col1, col2, col3, col4 = st.columns(4)
-                
-                with col1:
-                    st.metric("P-value (Wilcoxon)", f"{p_value:.3e}")
-                with col2:
-                    st.metric("Cohen's d (Paired)", f"{cohen_d:.3f}")
-                with col3:
-                    st.metric("Effect Size", effect_size_desc.title())
-                with col4:
-                    st.metric("Statistical Power", f"{power:.1%}" if not np.isnan(power) else "N/A")
-                
-                # Significance interpretation
-                if p_value < 0.001:
-                    sig_text = "*** (p < 0.001)"
-                elif p_value < 0.01:
-                    sig_text = "** (p < 0.01)"
-                elif p_value < 0.05:
-                    sig_text = "* (p < 0.05)"
-                else:
-                    sig_text = "ns (p ≥ 0.05)"
-                
-                st.write(f"**Significance (Wilcoxon signed-rank test):** {sig_text}")
-                
-                # Effect size interpretation
-                st.write(f"**Effect Size Interpretation:** {effect_size_desc.title()} effect size (Cohen's d = {cohen_d:.3f})")
-                
-                # Additional info about paired analysis
-                st.info("This analysis uses paired comparisons (Wilcoxon signed-rank test) for subjects with both PRE and POST data.")
-            else:
-                st.warning("Insufficient data for statistical analysis")
-    
-    # Dabest plots
-    if show_dabest:
-        with st.expander("🎯 Dabest Estimation Plots", expanded=True):
-            fig, p_val, cohen_d = create_dabest_plot(pre_df, post_df, selected_feature)
-            if fig is not None:
-                st.pyplot(fig)
-                plt.close(fig)
-            else:
-                st.warning("Insufficient data for Dabest plot")
-    
-    # Topomaps or Simple Comparison Plots
-    if show_topomaps:
-        with st.expander("🧠 Topographic Maps", expanded=True):
-            if 'overall_' in selected_feature:
-                # For overall features, show simple comparison plots
-                fig = create_simple_comparison_plot(pre_df, post_df, selected_feature)
-                if fig is not None:
-                    st.pyplot(fig)
-                    plt.close(fig)
-                else:
-                    st.warning("Insufficient data for comparison plot")
-            else:
-                # For channel-specific features, show topomaps
-                fig, pre_evoked, post_evoked = create_topomap_comparison(pre_df, post_df, selected_feature, montage)
-                if fig is not None:
-                    st.pyplot(fig)
-                    plt.close(fig)
-                else:
-                    st.warning("Insufficient channel data for topomap generation")
-    
-    # Distribution plots
-    with st.expander("📈 Distribution Comparison (Paired)", expanded=True):
-        fig, ax = plt.subplots(figsize=(10, 6))
-        
-        # Get paired data for this feature
-        pre_subjects = set(pre_df['Subject_ID'].unique()) if len(pre_df) > 0 else set()
-        post_subjects = set(post_df['Subject_ID'].unique()) if len(post_df) > 0 else set()
-        common_subjects = pre_subjects.intersection(post_subjects)
-        
-        pre_vals = []
-        post_vals = []
-        for subject in common_subjects:
-            pre_val = pre_df[pre_df['Subject_ID'] == subject][selected_feature].iloc[0] if len(pre_df[pre_df['Subject_ID'] == subject]) > 0 else np.nan
-            post_val = post_df[post_df['Subject_ID'] == subject][selected_feature].iloc[0] if len(post_df[post_df['Subject_ID'] == subject]) > 0 else np.nan
-            
-            if not np.isnan(pre_val) and not np.isnan(post_val):
-                pre_vals.append(pre_val)
-                post_vals.append(post_val)
-        
-        if len(pre_vals) > 0:
-            ax.hist(pre_vals, alpha=0.7, label='PRE (Paired)', bins=20, density=True)
-        
-        if len(post_vals) > 0:
-            ax.hist(post_vals, alpha=0.7, label='POST (Paired)', bins=20, density=True)
-        
-        ax.set_xlabel(selected_feature)
-        ax.set_ylabel('Density')
-        ax.set_title(f'Distribution Comparison: {selected_feature} (Paired Data)')
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        
-        st.pyplot(fig)
-        plt.close(fig)
-    
-    # Box plots
-    with st.expander("📦 Box Plot Comparison (Paired)", expanded=True):
-        fig, ax = plt.subplots(figsize=(8, 6))
-        
-        # Get paired data for this feature
-        pre_subjects = set(pre_df['Subject_ID'].unique()) if len(pre_df) > 0 else set()
-        post_subjects = set(post_df['Subject_ID'].unique()) if len(post_df) > 0 else set()
-        common_subjects = pre_subjects.intersection(post_subjects)
-        
-        pre_vals = []
-        post_vals = []
-        for subject in common_subjects:
-            pre_val = pre_df[pre_df['Subject_ID'] == subject][selected_feature].iloc[0] if len(pre_df[pre_df['Subject_ID'] == subject]) > 0 else np.nan
-            post_val = post_df[post_df['Subject_ID'] == subject][selected_feature].iloc[0] if len(post_df[post_df['Subject_ID'] == subject]) > 0 else np.nan
-            
-            if not np.isnan(pre_val) and not np.isnan(post_val):
-                pre_vals.append(pre_val)
-                post_vals.append(post_val)
-        
-        data_for_box = []
-        labels = []
-        
-        if len(pre_vals) > 0:
-            data_for_box.append(pre_vals)
-            labels.append('PRE (Paired)')
-        
-        if len(post_vals) > 0:
-            data_for_box.append(post_vals)
-            labels.append('POST (Paired)')
-        
-        if data_for_box:
-            ax.boxplot(data_for_box, labels=labels)
-            ax.set_ylabel(selected_feature)
-            ax.set_title(f'Box Plot Comparison: {selected_feature} (Paired Data)')
+            ax.set_xlabel(selected_feature)
+            ax.set_ylabel('Density')
+            ax.set_title(f'Distribution Comparison: {selected_feature} (Paired Data)')
+            ax.legend()
             ax.grid(True, alpha=0.3)
             
             st.pyplot(fig)
             plt.close(fig)
+        
+        # Box plots
+        with st.expander("📦 Box Plot Comparison (Paired)", expanded=True):
+            fig, ax = plt.subplots(figsize=(8, 6))
+            
+            # Get paired data for this feature
+            pre_subjects = set(pre_df['Subject_ID'].unique()) if len(pre_df) > 0 else set()
+            post_subjects = set(post_df['Subject_ID'].unique()) if len(post_df) > 0 else set()
+            common_subjects = pre_subjects.intersection(post_subjects)
+            
+            pre_vals = []
+            post_vals = []
+            for subject in common_subjects:
+                pre_val = pre_df[pre_df['Subject_ID'] == subject][selected_feature].iloc[0] if len(pre_df[pre_df['Subject_ID'] == subject]) > 0 else np.nan
+                post_val = post_df[post_df['Subject_ID'] == subject][selected_feature].iloc[0] if len(post_df[post_df['Subject_ID'] == subject]) > 0 else np.nan
+                
+                if not np.isnan(pre_val) and not np.isnan(post_val):
+                    pre_vals.append(pre_val)
+                    post_vals.append(post_val)
+            
+            data_for_box = []
+            labels = []
+            
+            if len(pre_vals) > 0:
+                data_for_box.append(pre_vals)
+                labels.append('PRE (Paired)')
+            
+            if len(post_vals) > 0:
+                data_for_box.append(post_vals)
+                labels.append('POST (Paired)')
+            
+            if data_for_box:
+                ax.boxplot(data_for_box, labels=labels)
+                ax.set_ylabel(selected_feature)
+                ax.set_title(f'Box Plot Comparison: {selected_feature} (Paired Data)')
+                ax.grid(True, alpha=0.3)
+                
+                st.pyplot(fig)
+                plt.close(fig)
 
 if __name__ == "__main__":
     main()

@@ -1,4 +1,5 @@
 import os
+import glob
 import numpy as np
 import pandas as pd
 from scipy.io import loadmat
@@ -1582,24 +1583,32 @@ def generic_get_files(project_name: str):
                 if base.lower().endswith('.edf'):
                     base = base[:-4]
                 df['file_name'] = base
-            filebase = '.'.join(fname.split('.')[:2])
+            filebase = fname.split('.edf')[0]
             # find file path in 'EDF_Format' folder and subfolders with glob
-            import glob
-            pattern = os.path.join('EDF_Format', patients_folder, '**', filebase)
+            pattern = os.path.join('EDF_Format', patients_folder, '**', filebase+'*')
             matches = glob.glob(pattern, recursive=True)
             if matches:
                 filepath = matches[0]  # first match
-            df['mother_folder'] = Path(filepath).parent.name
+            else:
+                print(f"Warning: file not found: {pattern}")
+                continue
+            # Find the least common (most specific) folder in the path
+            path_parts = Path(filepath).parts
+            # Remove 'EDF_Format' and the project folder to get the relevant path
+            relevant_parts = path_parts[path_parts.index('EDF_Format')+2:]  # Skip 'EDF_Format' and project folder
+            if relevant_parts:
+                # The least common folder is the first part after removing EDF_Format and project folder
+                df['mother_folder'] = relevant_parts[0]
             df_list.append(df)
     else:
-        print(f"Warning: parquet directory not found: {parquet_dir}")
+        raise ValueError(f"No parquet files found for {project_name}")
 
     if len(df_list) == 0:
-        df_parquet = pd.DataFrame()
+        raise ValueError(f"No parquet files found for {project_name}")
     else:
         df_parquet = pd.concat(df_list, ignore_index=True, sort=False)
-
-
+    # df_parquet ID = file_name.split'.'[0]
+    df_parquet['ID'] = df_parquet['file_name'].astype(str).apply(lambda x: os.path.basename(x).replace('.edf', '').lower().strip())
     # Attempt to find a clinical Excel file under EDF_Format/{project_name}
     clinical_df = pd.DataFrame()
     edf_proj_dir = os.path.join('EDF_Format', project_name)
@@ -1613,7 +1622,12 @@ def generic_get_files(project_name: str):
         if excel_files:
             clinical_path = excel_files[0]
             try:
-                clinical_df = pd.read_excel(clinical_path)
+                # if project_name == project_name read sheet SEEG_PATIENTS
+                if project_name == 'Seeg':
+                    sheet_name = 'SEEG_PATIENTS'
+                    clinical_df = pd.read_excel(clinical_path, sheet_name=sheet_name)
+                else:
+                    clinical_df = pd.read_excel(clinical_path)
             except Exception as e:
                 print(f"Warning: failed reading clinical file {clinical_path}: {e}")
     else:
@@ -1632,17 +1646,93 @@ def generic_get_files(project_name: str):
         # clnical df column gender or sex ignore case to  convert_sex_column
         clinical_df = convert_sex_column(clinical_df, gender_col)
 
-    # Prepare df_parquet ID column from file_name if possible
-    if not df_parquet.empty and 'file_name' in df_parquet.columns:
-        # lower case, strip whitespace, remove .edf extension
-        df_parquet['ID'] = df_parquet['file_name'].astype(str).apply(lambda x: os.path.basename(x).replace('.edf', '').lower().strip())
-
+    # Determine which column in df_parquet best matches clinical_df['ID']
+    def find_best_matching_column(clinical_df, df_parquet):
+        """Determine which column in df_parquet best matches clinical_df['ID'] values"""
+        if clinical_df.empty or df_parquet.empty or 'ID' not in clinical_df.columns:
+            return None
+        
+        clinical_ids = clinical_df['ID'].astype(str).str.lower().str.strip()
+        best_column = None
+        best_match_count = 0
+        
+        # Check 'ID' column in df_parquet
+        if 'ID' in df_parquet.columns:
+            parquet_ids = df_parquet['ID'].astype(str).str.lower().str.strip()
+            matches = 0
+            for clinical_id in clinical_ids:
+                for parquet_id in parquet_ids:
+                    if str(clinical_id) in str(parquet_id) or str(parquet_id) in str(clinical_id):
+                        matches += 1
+                        break
+            if matches > best_match_count:
+                best_match_count = matches
+                best_column = 'ID'
+        
+        # Check 'mother_folder' column in df_parquet
+        if 'mother_folder' in df_parquet.columns:
+            parquet_folders = df_parquet['mother_folder'].astype(str).str.lower().str.strip()
+            matches = 0
+            for clinical_id in clinical_ids:
+                for parquet_folder in parquet_folders:
+                    if str(clinical_id) in str(parquet_folder) or str(parquet_folder) in str(clinical_id):
+                        matches += 1
+                        break
+            if matches > best_match_count:
+                best_match_count = matches
+                best_column = 'mother_folder'
+        
+        print(f"Best matching column: {best_column} with {best_match_count} matches out of {len(clinical_ids)} clinical IDs")
+        return best_column
+    
+    # Find the best matching column and create ID column if needed
+    best_match_col = find_best_matching_column(clinical_df, df_parquet)
+    if best_match_col and best_match_col != 'ID':
+        # Create ID column from the best matching column
+        if best_match_col == 'mother_folder':
+            df_parquet['ID'] = df_parquet['mother_folder']
+        elif best_match_col == 'file_name':
+            df_parquet['ID'] = df_parquet['file_name'].astype(str).apply(lambda x: os.path.basename(x).replace('.edf', '').lower().strip())
+    
     # Merge clinical and parquet data
     df_wnv2 = pd.DataFrame()
     if (not clinical_df.empty) and (not df_parquet.empty) and ('ID' in clinical_df.columns) and ('ID' in df_parquet.columns):
         try:
-            # merge on 'ID' ignore case
-            df_merged = pd.merge(clinical_df, df_parquet, on='ID', how='inner')
+            # Create a mapping where df_parquet ID contains clinical_df ID
+            def find_matching_id(clinical_id):
+                """Find df_parquet ID that contains the clinical_id"""
+                for parquet_id in df_parquet['ID']:
+                    if str(clinical_id).lower() in str(parquet_id).lower():
+                        return parquet_id
+                return None
+            
+            # Add matching parquet ID to clinical_df
+            clinical_df['matched_parquet_id'] = clinical_df['ID'].apply(find_matching_id)
+            
+            # Filter out rows where no match was found
+            clinical_df_matched = clinical_df[clinical_df['matched_parquet_id'].notna()].copy()
+            
+            if len(clinical_df_matched) == 0:
+                print(f"Warning: No matching IDs found between clinical and parquet data")
+                df_merged = pd.DataFrame()
+            else:
+                # Merge using the matched parquet ID
+                df_merged = pd.merge(clinical_df_matched, df_parquet, 
+                                   left_on='matched_parquet_id', right_on='ID', 
+                                   how='inner', suffixes=('_clinical', '_parquet'))
+                
+                # Merge ID columns into one ID column
+                if 'ID_clinical' in df_merged.columns and 'ID_parquet' in df_merged.columns:
+                    # Use parquet ID as primary, fallback to clinical ID
+                    df_merged['ID'] = df_merged['ID_parquet'].fillna(df_merged['ID_clinical'])
+                    # Drop the separate ID columns
+                    df_merged = df_merged.drop(columns=['ID_clinical', 'ID_parquet'], errors='ignore')
+                elif 'ID_clinical' in df_merged.columns:
+                    df_merged['ID'] = df_merged['ID_clinical']
+                    df_merged = df_merged.drop(columns=['ID_clinical'], errors='ignore')
+                elif 'ID_parquet' in df_merged.columns:
+                    df_merged['ID'] = df_merged['ID_parquet']
+                    df_merged = df_merged.drop(columns=['ID_parquet'], errors='ignore')
         except Exception as e:
             print(f"Warning: merge failed: {e}")
             df_merged = pd.DataFrame()
@@ -1666,13 +1756,15 @@ def generic_get_files(project_name: str):
                 if matched_rows:
                     df_merged = pd.concat([clinical_df.reset_index(drop=True), df_parquet.loc[matched_rows].reset_index(drop=True)], axis=1, ignore_index=False)
 
-
-    df_merged, df_wnv2 = aggregate_dataframe(df_merged, weighted_avg)
+    # assess if df_merged is empty
+    if df_merged.empty:
+        raise ValueError(f"No matching IDs found between clinical and parquet data")
+    df_wnv2 = aggregate_dataframe(df_merged, weighted_avg)
     # Create grouped/aggregated df (df_wnv2) similar to other loaders
-    if not df_merged.empty:
+    if not df_wnv2.empty:
         # Drop helper columns if present
-        if '_merge' in df_merged.columns:
-            df_merged = df_merged.drop(columns=['_merge'], errors='ignore')
+        if '_merge' in df_wnv2.columns:
+            df_wnv2 = df_wnv2.drop(columns=['_merge'], errors='ignore')
         # Clean up common unwanted columns and coerce numeric strings
         cols_to_drop = ['highpass', 'lowpass', 'n_samples', 'size', 'patient_number', 'duration_sec']
         df_wnv2 = df_wnv2.drop(columns=[col for col in df_wnv2.columns if any(drop in col for drop in cols_to_drop)], errors='ignore')
@@ -1687,6 +1779,7 @@ def generic_get_files(project_name: str):
     controls = get_cobrad_controls()
     cases_group_name = project_name
     return df_parquet, patients_folder, controls, df_wnv2, cases_group_name
+    df_merged.columns.unique().tolist()
 
 def aggregate_dataframe(df_merged, weighted_avg):
     """
@@ -1709,8 +1802,6 @@ def aggregate_dataframe(df_merged, weighted_avg):
     df_wnv2 : pd.DataFrame
         Aggregated dataframe (ID level).
     """
-    df_wnv2 = pd.DataFrame()
-
     # --- Handle mother_folder level aggregation ---
     if 'mother_folder' in df_merged.columns and df_merged['mother_folder'].nunique() > 1:
         count_mother = df_merged['mother_folder'].value_counts()
@@ -1737,17 +1828,8 @@ def aggregate_dataframe(df_merged, weighted_avg):
                 .agg(lambda x: x.mean() if pd.api.types.is_numeric_dtype(x) else x.iloc[0])
                 .reset_index()
             )
-
-        # Add counts
-        df_merged = df_merged.merge(
-            count_mother.rename('num_records'),
-            left_on='mother_folder',
-            right_index=True,
-            how='left'
-        )
-
     # --- Handle ID level aggregation ---
-    if not df_merged.empty:
+    elif not df_merged.empty:
         if '_merge' in df_merged.columns:
             df_merged = df_merged.drop(columns=['_merge'], errors='ignore')
 
@@ -1772,8 +1854,14 @@ def aggregate_dataframe(df_merged, weighted_avg):
                 .mean(numeric_only=True)
                 .reset_index()
             )
-
-    return df_merged, df_wnv2
+    # Add counts
+    df_merged = df_merged.merge(
+        count_mother.rename('num_records'),
+        left_on='mother_folder',
+        right_index=True,
+        how='left'
+    )
+    return df_merged
 #%% COBRAD
 def get_cobrad_controls(patients_folder='EDF'):
     controls = pd.read_csv(f'{patients_folder}_controls.csv')

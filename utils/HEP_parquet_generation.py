@@ -2,6 +2,7 @@ import os
 import re
 import glob
 import pickle
+import argparse
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -125,7 +126,7 @@ from utils.eeg_utils import *
 # Global settings
 # ------------------------------------------------------------------------------
 SAVE_DIR = "figures_HEP/compute_brain_heart_coupling"
-TEMPS_DIR = "temps_EDF_HEP"
+TEMPS_DIR = "parquets_HEP"
 os.makedirs(SAVE_DIR, exist_ok=True)
 os.makedirs(TEMPS_DIR, exist_ok=True)
 
@@ -308,11 +309,12 @@ def compute_brain_heart_coupling(data_all, patient_id, bool_plots=False, save_pl
 
         # Extract ECG and detect R-peaks
         ch_lower = [ch.lower() for ch in ch_names]
-        if 'ecg' not in ch_lower:
+        ecg_indices = [i for i, ch in enumerate(ch_lower) if 'ecg' in ch]
+        if not ecg_indices:
             print(f"[{patient_id}] EDF {i+1} has no ECG channel; skipping.")
             continue
 
-        ecg_idx = ch_lower.index('ecg')
+        ecg_idx = ecg_indices[0]  # Use the first ECG channel found
         ecg_signal = np.asarray(window_data[ecg_idx], dtype=float)
         ecg_signal = _ensure_finite_1d(_interpolate_nans_1d(ecg_signal))
         plot_ecg_signal(ecg_signal, sfreq, name_prefix, save_plot, SAVE_DIR, label="raw", bool_plots=bool_plots)
@@ -610,10 +612,145 @@ def edf_has_ecg(edf_path):
         else:
             ch_names = []
         ch_lower = [ch.lower() for ch in ch_names]
-        return 'ecg' in ch_lower
+        if any('ecg' in ch for ch in ch_lower):
+            return True
+        else:
+            ecg_channels, channel_metrics = detect_ecg_channels_from_data(raw)
+            if len(ecg_channels) > 0:
+                return True
+            else:
+                return False
     except Exception as e:
         print(f"Failed to read pickle {edf_path}: {e}")
         return False
+
+def detect_ecg_channels_from_data(raw, sfreq=None):
+    """
+    Analyze MNE Raw EEG data to detect ECG channels based on signal characteristics.
+    
+    Parameters:
+    -----------
+    raw : mne.io.Raw
+        MNE Raw object containing EEG data
+    sfreq : float, optional
+        Sampling frequency. If None, will be extracted from raw.info['sfreq']
+    
+    Returns:
+    --------
+    list : List of channel names that are detected as ECG channels
+    dict : Dictionary with detailed metrics for each channel
+    
+    Criteria for ECG detection:
+    - Dominant frequency: ~1 Hz (ECG) vs 4-12 Hz (EEG)
+    - Kurtosis: High (ECG) vs Low-moderate (EEG)  
+    - Amplitude: 0.2-2 mV (ECG) vs 10-100 µV (EEG)
+    - Channel must meet ALL criteria to be classified as ECG
+    """
+    import sys, mne.io.array
+    sys.modules['mne.io.array.array'] = mne.io.array
+    # clean data; resample 256, notch 50, bandpass 0.5-40
+    sf = 256
+    raw.resample(sf)
+    # notch every 10hz
+    raw.notch_filter(np.arange(10, sf/2, 10))
+    raw.filter(0.5, 40)
+    # Get channel names and data
+    ch_names = raw.ch_names
+    data = raw.get_data()  # Shape: (n_channels, n_times)
+    
+    ecg_channels = []
+    channel_metrics = {}
+    
+    for i, ch_name in enumerate(ch_names):
+        signal = data[i, :]
+        # Calculate metrics
+        metrics = {}
+        
+        # 1. Dominant frequency analysis
+        from scipy.fft import fft, fftfreq
+        freqs = fftfreq(len(signal), 1/sf)
+        fft_vals = np.abs(fft(signal))
+        
+        # Find dominant frequency (excluding DC component)
+        freqs_positive = freqs[1:len(freqs)//2]
+        fft_positive = fft_vals[1:len(fft_vals)//2]
+        dominant_freq_idx = np.argmax(fft_positive)
+        dominant_freq = freqs_positive[dominant_freq_idx]
+        metrics['dominant_frequency'] = dominant_freq
+        
+        # 2. Kurtosis (measure of tail heaviness)
+        from scipy.stats import kurtosis
+        kurt = kurtosis(signal)
+        metrics['kurtosis'] = kurt
+        
+        # 3. Amplitude (peak-to-peak amplitude)
+        amplitude_pp = np.max(signal) - np.min(signal)
+        # Convert to mV if needed (assuming data is in V)
+        amplitude_mv = amplitude_pp * 1000  # Convert V to mV
+        metrics['amplitude_mv'] = amplitude_mv
+        
+        # 4. Additional ECG-specific metrics
+        # Heart rate variability (if we can detect peaks)
+        try:
+            # Simple peak detection for heart rate estimation
+            from scipy.signal import find_peaks
+            # Filter for typical ECG frequency range
+            from scipy.signal import butter, filtfilt
+            nyquist = sf / 2
+            low = 0.5 / nyquist
+            high = 5.0 / nyquist
+            b, a = butter(4, [low, high], btype='band')
+            filtered_signal = filtfilt(b, a, signal)
+            
+            # Find peaks
+            peaks, _ = find_peaks(filtered_signal, distance=int(sf * 0.3))  # Min 0.3s between peaks
+            
+            if len(peaks) > 1:
+                # Calculate heart rate
+                rr_intervals = np.diff(peaks) / sf  # in seconds
+                heart_rate = 60 / np.mean(rr_intervals)  # BPM
+                metrics['heart_rate_bpm'] = heart_rate
+                metrics['peak_count'] = len(peaks)
+            else:
+                metrics['heart_rate_bpm'] = None
+                metrics['peak_count'] = 0
+                
+        except Exception as e:
+            metrics['heart_rate_bpm'] = None
+            metrics['peak_count'] = 0
+        
+        channel_metrics[ch_name] = metrics
+        
+        # Apply ECG detection criteria
+        is_ecg = True
+        
+        # Criterion 1: Dominant frequency around 1 Hz (ECG) vs 4-12 Hz (EEG)
+        # ECG should have dominant frequency close to heart rate (~1 Hz)
+        if not (0.8 <= dominant_freq <= 3.0):  # Allow some tolerance around 1 Hz
+            is_ecg = False
+        
+        # Criterion 2: High kurtosis (ECG has sharp peaks)
+        # ECG typically has higher kurtosis due to sharp QRS complexes
+        if kurt < 4:  # Threshold for high kurtosis
+            is_ecg = False
+        
+        # Criterion 3: Amplitude in ECG range (0.2-2 mV)
+        # Convert criteria to same units (mV)
+        if not (0.2 <= amplitude_mv <= 2.0):
+            is_ecg = False
+        
+        # Additional criterion: Should have detectable heart rate
+        if metrics['heart_rate_bpm'] is not None:
+            if not (40 <= metrics['heart_rate_bpm'] <= 200):  # Reasonable heart rate range
+                is_ecg = False
+        else:
+            is_ecg = False
+        
+        if is_ecg:
+            ecg_channels.append(ch_name)
+    
+    return ecg_channels, channel_metrics
+
 
 def select_random_edfs_with_ecg(file_list, k=6, seed=42):
     rng = np.random.default_rng(seed)
@@ -654,13 +791,18 @@ def process_patients_random6(edf_root="EDF", k=6, step_sec=5, seed=42):
       - load those k files (only), and
       - run compute_brain_heart_coupling with data_all as that list of Raw objects.
     """
+    # get form edf_root the project name the is after the last /
+    project_name = edf_root.split('/')[-1]
+    # get TEMPS_DIR from globals
+    TEMPS_DIR = globals()['TEMPS_DIR']
+    TEMPS_DIR = os.path.join(TEMPS_DIR, project_name)
     patient_to_files = group_edf_files_by_patient(edf_root=edf_root)
     if not patient_to_files:
         print(f"No EDF files found under {edf_root}.")
         return
     
     # Check which patients are already processed
-    processed_patients = get_processed_patients()
+    processed_patients = get_processed_patients(temps_dir=TEMPS_DIR)
     if processed_patients:
         print(f"Already processed patients: {', '.join(processed_patients)}")
     else:
@@ -670,7 +812,7 @@ def process_patients_random6(edf_root="EDF", k=6, step_sec=5, seed=42):
         print(f"Patient {patient_id}: {len(files)} PKL files found.")
         
         # Check if patient was already processed
-        if is_patient_processed(patient_id):
+        if is_patient_processed(patient_id, temps_dir=TEMPS_DIR):
             print(f"Patient {patient_id}: already processed (parquet files exist). Skipping.")
             continue
         
@@ -696,6 +838,8 @@ def process_patients_random6(edf_root="EDF", k=6, step_sec=5, seed=42):
         for band, results_df in results_df_dict.items():
             results_path = os.path.join(TEMPS_DIR, f"{patient_id}_results_{band}.parquet")
             print(f"Saving results for patient {patient_id}, band {band} to {results_path}")
+            # create the directory if it doesn't exist
+            os.makedirs(os.path.dirname(results_path), exist_ok=True)
             results_df.to_parquet(results_path, index=False)
 
     # Aggregate across all patients
@@ -706,5 +850,17 @@ def process_patients_random6(edf_root="EDF", k=6, step_sec=5, seed=42):
 # Entry point
 # ------------------------------------------------------------------------------
 if __name__ == "__main__":
-    # RAM-conscious processing: 6 random PKLs per patient from pickles/EDF
-    process_patients_random6(edf_root="pickles/EDF", k=6, step_sec=5, seed=42)
+    parser = argparse.ArgumentParser(description='Process EDF files for brain-heart coupling analysis')
+    parser.add_argument('-c', '--edf_root', type=str, default="pickles/Controls",
+                        help='Root directory containing EDF pickle files (default: pickles/CAP_Sleep_Database)')
+    parser.add_argument('-k', '--k_files', type=int, default=6,
+                        help='Number of random EDF files to select per patient (default: 6)')
+    parser.add_argument('-s', '--step_sec', type=int, default=5,
+                        help='Step size in seconds for sliding window (default: 5)')
+    parser.add_argument('--seed', type=int, default=42,
+                        help='Random seed for reproducible file selection (default: 42)')
+    
+    args = parser.parse_args()
+    
+    # RAM-conscious processing: k random PKLs per patient from specified edf_root
+    process_patients_random6(edf_root=args.edf_root, k=args.k_files, step_sec=args.step_sec, seed=args.seed)

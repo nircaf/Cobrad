@@ -10,89 +10,7 @@ from scipy import stats
 from scipy.stats import ttest_ind, mannwhitneyu, chi2_contingency
 import warnings
 warnings.filterwarnings('ignore')
-
-# Optional LightningChart 3D helper
-def plot_lightning_3d(vals_pat, vals_ctrl, pos, channels_names):
-    """
-    Attempt to render a simple 3D chart using LightningChart (v0.9.3).
-    Inputs:
-      - vals_pat: array-like of patient values (per channel)
-      - vals_ctrl: array-like of control values (per channel)
-      - pos: array-like of (x,y) positions for each channel (shape: n_channels x 2)
-      - channels_names: list of channel names in the same order as pos/vals
-    Returns:
-      - (chart_3d, brain_model) on success, (None, None) on failure
-    Notes:
-      - This function is defensive: it will catch import/usage errors and return (None, None).
-      - The LightningChart Python API and available primitives can vary; this function uses a minimal approach
-        and falls back gracefully if the exact API is not available in the runtime.
-    """
-    try:
-        # Import LightningChart dashboard module. This requires lightningchart==0.9.3 to be installed.
-        import lightningchart as lc
-        import streamlit.components.v1 as components
-
-        lc.set_license('P001-ZqGqPDvXFDmhqXa92cd6KHJyCoswDwCnqkxCo3xWz6x2jOv0Ths=-MEQCIGOG4bzJwFvTBOAvYndMWc3cTt1zfL6+Y1C3GXN7lk6gAiAXwpJuBgm74Fz6F7slZbGbeym+gnL2+qClV6GZe8em8A==')
-        
-        dashboard = lc.Dashboard(rows=1, columns=1)
-
-        chart_3d = dashboard.Chart3D(column_index=1,row_index=1)
-        # Create a mesh model placeholder on the chart
-        brain_model = chart_3d.add_mesh_model()
-        
-        # Prepare data
-        vals_pat = np.asarray(vals_pat, dtype=float)
-        vals_ctrl = np.asarray(vals_ctrl, dtype=float)
-        diff = vals_pat - vals_ctrl
-        pos_arr = np.asarray(pos, dtype=float)
-        
-        # If there is a point-series API, use it to add colored points at electrode positions.
-        # We'll attempt a point-series first; if unavailable, we leave the mesh_model as a placeholder.
-        try:
-            # Many lightningchart versions expose add_point_series3d / add_point_series. Try common names.
-            if hasattr(chart_3d, "add_point_series3d"):
-                series = chart_3d.add_point_series3d()
-            elif hasattr(chart_3d, "add_point_series"):
-                series = chart_3d.add_point_series()
-            else:
-                series = None
-
-            if series is not None:
-                # Add each electrode as a small point with the difference value as an attribute (for coloring)
-                for i, name in enumerate(channels_names):
-                    if i >= len(pos_arr):
-                        break
-                    x, y = pos_arr[i, 0], pos_arr[i, 1]
-                    z = 0.0  # flat on z plane; LightningChart supports 3D points
-                    value = float(diff[i]) if i < len(diff) else 0.0
-                    # The exact method to add a point differs across API versions; try common ones.
-                    if hasattr(series, "add"):
-                        # (x, y, z, value) or (x, y, z)
-                        try:
-                            series.add(x, y, z, value)
-                        except TypeError:
-                            # fallback to add(x,y,z)
-                            series.add(x, y, z)
-                    elif hasattr(series, "add_point"):
-                        try:
-                            series.add_point(x, y, z, value)
-                        except TypeError:
-                            series.add_point(x, y, z)
-                # Optionally configure series coloring by value if API supports it
-                try:
-                    if hasattr(series, "set_color_map"):
-                        series.set_color_map('RdBu')
-                except Exception:
-                    pass
-        except Exception:
-            # If point series cannot be created, keep the mesh placeholder
-            pass
-
-        return chart_3d, brain_model
-    except Exception as e:
-        # If LightningChart is not installed or any error occurs, warn and return None
-        st.warning(f"LightningChart 3D unavailable or failed to initialize: {e}")
-        return None, None
+from utils.eeg_utils import cobrad_get_files
 
 # Page configuration
 st.set_page_config(
@@ -142,22 +60,18 @@ st.markdown("""
 def load_data():
     """Load and preprocess the data"""
     try:
-        # Load main datasets
-        edf_data = pd.read_csv('EDF.csv')
-        controls_data = pd.read_csv('EDF_controls.csv')
+        # Get data from cobrad_get_files function
+        df_wnv, patients_folder, temp_controls, temp_df_wnv2, temp_cases_group_name = cobrad_get_files(sample_window_size=0, only_awake=False)
         
-        # Group EDF data by patient_number and calculate mean
-        print("Grouping EDF data by patient...")
-        numeric_cols = edf_data.select_dtypes(include=[np.number]).columns.tolist()
-        # If 'patient_number' was detected as numeric, remove it so reset_index() won't try to insert a duplicate column
-        if 'patient_number' in numeric_cols:
-            numeric_cols.remove('patient_number')
-        edf_patient_means = edf_data.groupby('patient_number')[numeric_cols].mean().reset_index()
+        # Use the returned data
+        edf_patient_means = temp_df_wnv2.copy()
+        controls_data = temp_controls.copy()
         
         # Add group labels
         edf_patient_means['Group'] = 'Patients'
         controls_data['Group'] = 'Controls'
-        # print channels from columns that contain EEG and split by ' '[-1]
+        
+        # Print channels from columns that contain EEG and split by ' '[-1]
         p_ch = set([col.split(' ')[-1] for col in edf_patient_means.columns if 'EEG' in col])
         c_ch = set([col.split(' ')[-1] for col in controls_data.columns if 'EEG' in col])
         print(f'Patients channels: {p_ch}')
@@ -165,9 +79,6 @@ def load_data():
         print(f"Patients channels - Controls channels: {p_ch - c_ch}")
         print(f"Controls channels - Patients channels: {c_ch - p_ch}")
         
-        
-        
-        # Combine datasets for comparison
         # Combine datasets for comparison - only include mutual columns
         mutual_columns = list(set(edf_patient_means.columns) & set(controls_data.columns))
         combined_data = pd.concat([
@@ -299,6 +210,69 @@ def create_comparison_plot(df, measurement, group_col='Group'):
     )
     return fig
 
+def create_multi_histogram_plot(df, columns):
+    """Create multiple histograms in one figure"""
+    if len(columns) == 1:
+        # Single histogram
+        fig = px.histogram(
+            df, 
+            x=columns[0], 
+            title=f"Distribution of {columns[0]}",
+            nbins=50,
+            opacity=0.7
+        )
+        fig.update_layout(
+            xaxis_title=columns[0],
+            yaxis_title="Count"
+        )
+    else:
+        # Multiple histograms in subplots
+        from plotly.subplots import make_subplots
+        import plotly.graph_objects as go
+        
+        # Calculate subplot layout
+        n_cols = min(2, len(columns))
+        n_rows = (len(columns) + n_cols - 1) // n_cols
+        
+        fig = make_subplots(
+            rows=n_rows, 
+            cols=n_cols,
+            subplot_titles=columns,
+            vertical_spacing=0.1
+        )
+        
+        for i, col in enumerate(columns):
+            row = (i // n_cols) + 1
+            col_idx = (i % n_cols) + 1
+            
+            # Get data for this column, removing NaN values
+            data = df[col].dropna()
+            
+            if len(data) > 0:
+                fig.add_trace(
+                    go.Histogram(
+                        x=data,
+                        name=col,
+                        nbinsx=50,
+                        opacity=0.7
+                    ),
+                    row=row, col=col_idx
+                )
+        
+        fig.update_layout(
+            title="Patient Data Distributions",
+            showlegend=False,
+            height=300 * n_rows
+        )
+        
+        # Update x-axis labels
+        for i in range(1, n_rows + 1):
+            for j in range(1, n_cols + 1):
+                fig.update_xaxes(title_text="Value", row=i, col=j)
+                fig.update_yaxes(title_text="Count", row=i, col=j)
+    
+    return fig
+
 def main():
     # Header
     st.markdown('<h1 class="main-header">🧠 EEG Data Analysis Dashboard</h1>', unsafe_allow_html=True)
@@ -369,249 +343,36 @@ def main():
     st.markdown("---")
     
     # Section: Data Distributions
-    st.markdown('<h2 class="section-header">Data Distributions</h2>', unsafe_allow_html=True)
+    st.markdown('<h2 class="section-header">Patient Data Distributions</h2>', unsafe_allow_html=True)
     
-    # Measurement selection
-    measurement_categories = list(measurements.keys())
-    selected_category = st.selectbox("Select Measurement Category", measurement_categories)
+    # Get numeric columns from patients data
+    numeric_columns = patients_df.select_dtypes(include=[np.number]).columns.tolist()
     
-    if selected_category:
-        category_measurements = list(measurements[selected_category].keys())
-        selected_measurement = st.selectbox("Select Measurement", category_measurements)
+    # Remove 'Group' column if it exists
+    if 'Group' in numeric_columns:
+        numeric_columns.remove('Group')
+    
+    # Multi-select for columns
+    selected_columns = st.multiselect(
+        "Select columns to visualize (multi-select enabled)",
+        numeric_columns,
+        default=numeric_columns[:3] if len(numeric_columns) >= 3 else numeric_columns,
+        help="Select one or more columns to display histograms. Multiple selections will be shown in subplots."
+    )
+    
+    if selected_columns:
+        # Create multi-histogram plot
+        st.plotly_chart(
+            create_multi_histogram_plot(patients_df, selected_columns),
+            use_container_width=True
+        )
         
-        if selected_measurement:
-            # Check if measurement exists in data
-            available_measurements = [col for col in combined_df.columns if selected_measurement in col]
-            
-            if available_measurements:
-                # Show overall measurement
-                if f'overall_{selected_measurement}' in combined_df.columns:
-                    measurement_col = f'overall_{selected_measurement}'
-                else:
-                    measurement_col = available_measurements[0]
-                
-                # Create plots
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    st.plotly_chart(
-                        create_distribution_plot(combined_df, measurement_col),
-                        use_container_width=True
-                    )
-                
-                with col2:
-                    st.plotly_chart(
-                        create_comparison_plot(combined_df, measurement_col),
-                        use_container_width=True
-                    )
-                
-                # Show channel-specific measurements if available
-                if len(available_measurements) > 1:
-                    st.markdown("### Channel-Specific Measurements")
-                    channel_measurements = [m for m in available_measurements if 'EEG' in m]
-                    
-                    if channel_measurements:
-                        # electrode_options.split ' '[0]
-                        measurement_options = [ch.split(' ')[0] for ch in channel_measurements]
-                        # Allow user to choose a specific electrode or the overall measurement
-                        measurement_col = st.selectbox("Choose electrode", measurement_options, index=0)
-                        # get the vals of the columns that is in measurement_col
-                        p_measurement_cols = [col for col in patients_df.columns if measurement_col in col]
-                        patients_vals = patients_df[p_measurement_cols].dropna()
-
-                        c_measurement_cols = [col for col in controls_df.columns if measurement_col in col]
-                        controls_vals = controls_df[c_measurement_cols].dropna()
-                        
-                        # Build summary table (mean, std, n) for both groups
-                        summary_table = pd.DataFrame([{
-                            'Group': 'Patients',
-                            'N': len(patients_vals),
-                            'Mean': patients_vals.mean() if len(patients_vals) > 0 else np.nan,
-                            'Std': patients_vals.std() if len(patients_vals) > 0 else np.nan
-                        },{
-                            'Group': 'Controls',
-                            'N': len(controls_vals),
-                            'Mean': controls_vals.mean() if len(controls_vals) > 0 else np.nan,
-                            'Std': controls_vals.std() if len(controls_vals) > 0 else np.nan
-                        }])
-                        
-                        # Compute statistical test and effect size from the raw arrays (robust to temp column)
-                        def _compute_test(a, b):
-                            if len(a) == 0 or len(b) == 0:
-                                return None, None, None, None
-                            try:
-                                p_normal_a = stats.shapiro(a)[1] if len(a) >= 3 else 0.0
-                                p_normal_b = stats.shapiro(b)[1] if len(b) >= 3 else 0.0
-                            except Exception:
-                                p_normal_a, p_normal_b = 0.0, 0.0
-                            
-                            if (p_normal_a > 0.05) and (p_normal_b > 0.05):
-                                statistic, p_value = ttest_ind(a, b, nan_policy='omit')
-                                test_name = "Independent t-test"
-                            else:
-                                try:
-                                    statistic, p_value = mannwhitneyu(a, b, alternative='two-sided')
-                                except Exception:
-                                    statistic, p_value = None, None
-                                test_name = "Mann-Whitney U test"
-                            
-                            # Cohen's d (pooled std)
-                            try:
-                                pooled_std = np.sqrt(((len(a) - 1) * a.std()**2 + (len(b) - 1) * b.std()**2) / (len(a) + len(b) - 2))
-                                cohens_d = (a.mean() - b.mean()) / pooled_std if pooled_std != 0 else np.nan
-                            except Exception:
-                                cohens_d = np.nan
-                            
-                            return test_name, statistic, p_value, cohens_d
-                        
-                        test_name, statistic, p_value, cohens_d = _compute_test(patients_vals, controls_vals)
-                        
-                        stats_row = {
-                            'Measurement': measurement_col,
-                            'Test': test_name,
-                            'Statistic': statistic,
-                            'P-value': p_value,
-                            "Effect Size (Cohen's d)": cohens_d
-                        }
-                        
-                        # Display summary and statistical comparison
-                        st.markdown(f"#### {measurement_col} — Summary")
-                        st.dataframe(summary_table.set_index('Group').round(4))
-                        
-                        st.markdown("#### Statistical Comparison (Patients vs Controls)")
-                        stats_df = pd.DataFrame([stats_row])
-                        st.dataframe(stats_df.round(6), use_container_width=True)
-                        
-                        channels_names = set([ch.split(' ')[-1] for ch in channel_measurements])
-                        # Create topomap(s) of channel measurements (averaged by group)
-                        channel_data = combined_df[['Group'] + channel_measurements]
-                        channel_pivot = channel_data.groupby('Group')[channel_measurements].mean()
-                        
-                        # Attempt to plot with MNE topomap; fall back to heatmap if MNE is not available
-                        try:
-                            import mne
-                            
-                            # Use standard 10-20 montage to get channel positions
-                            montage = mne.channels.make_standard_montage('standard_1020')
-                            ch_pos = montage.get_positions()['ch_pos']
-                            # Build position array and values aligned to ch_names (only keep channels with known positions)
-                            pos_list = []
-                            vals_pat = []
-                            vals_ctrl = []
-                            ch_names_order = []
-                            for ch in channels_names:
-                                ch_and_measurement = f'{measurement_col} {ch}'
-                                # lookup position in montage (returns (x,y,z))
-                                p = ch_pos.get(ch)
-                                if p is None:
-                                    # skip channels without known montage position
-                                    continue
-                                # keep only x, y for topomap
-                                pos_list.append([p[0], p[1]])
-                                # safely get values; fall back to NaN when missing
-                                try:
-                                    vals_pat.append(channel_pivot.loc['Patients', ch_and_measurement])
-                                except Exception:
-                                    vals_pat.append(np.nan)
-                                try:
-                                    vals_ctrl.append(channel_pivot.loc['Controls', ch_and_measurement])
-                                except Exception:
-                                    vals_ctrl.append(np.nan)
-                                ch_names_order.append(ch)
-                            
-                            # Convert to numpy arrays with proper shapes
-                            if len(pos_list) == 0:
-                                raise RuntimeError("No matching channel positions found for topomap.")
-                            pos = np.array(pos_list, dtype=float)  # shape (n_channels, 2)
-                            vals_pat = np.array(vals_pat, dtype=float)
-                            vals_ctrl = np.array(vals_ctrl, dtype=float)
-                            
-                            # Plot Patients & Controls side-by-side in one figure, Difference in a separate figure below
-                            # Top figure: Patients (left) and Controls (right)
-                            top_fig, top_axes = plt.subplots(1, 2, figsize=(12, 5))
-                            # Determine common scale for Patients/Controls
-                            try:
-                                combined_vals = np.concatenate([vals_pat, vals_ctrl])
-                                if np.all(np.isnan(combined_vals)):
-                                    vmin_all, vmax_all = None, None
-                                else:
-                                    vmin_all = np.nanmin(combined_vals)
-                                    vmax_all = np.nanmax(combined_vals)
-                            except Exception:
-                                vmin_all, vmax_all = None, None
-                            
-                            top_im, _ = mne.viz.plot_topomap(
-                                vals_pat, pos, axes=top_axes[0], show=False, names=ch_names_order,
-                                vlim = (vmin_all, vmax_all)
-                            )
-                            top_axes[0].set_title('Patients')
-                            
-                            top_im2, _ = mne.viz.plot_topomap(
-                                vals_ctrl, pos, axes=top_axes[1], show=False, names=ch_names_order,
-                                vlim = (vmin_all, vmax_all)
-                            )
-                            top_axes[1].set_title('Controls')
-                            
-                            # Add shared colorbar for top figure (Patients/Controls) at far right outside axes
-                            try:
-                                if (vmin_all is not None) and (vmax_all is not None):
-                                    # create a dedicated colorbar axis on the right side of the figure
-                                    # [left, bottom, width, height] in figure coordinates
-                                    cax = top_fig.add_axes([0.92, 0.15, 0.02, 0.7])
-                                    cbar_top = top_fig.colorbar(top_im, cax=cax, orientation='vertical')
-                                    cbar_top.ax.set_ylabel(measurement_col)
-                            except Exception:
-                                pass
-                            
-                            plt.suptitle(f"Topomap: {measurement_col} (Patients / Controls)")
-                            plt.tight_layout()
-                            st.pyplot(top_fig)
-                            
-                            # Bottom figure: Difference (full width)
-                            diff = vals_pat - vals_ctrl
-                            vmax_diff = np.nanmax(np.abs(diff)) if np.any(~np.isnan(diff)) else None
-                            
-                            diff_fig, diff_ax = plt.subplots(1, 1, figsize=(6, 4))
-                            diff_im, _ = mne.viz.plot_topomap(
-                                diff, pos, axes=diff_ax, show=False, cmap='RdBu_r',
-                                vlim = (-vmax_diff if vmax_diff is not None else None, vmax_diff if vmax_diff is not None else None),
-                                names=ch_names_order
-                            )
-                            diff_ax.set_title('Patients - Controls')
-                            
-                            # Colorbar for difference map
-                            try:
-                                if vmax_diff is not None:
-                                    cbar_diff = diff_fig.colorbar(diff_im, ax=diff_ax, orientation='vertical')
-                                    cbar_diff.ax.set_ylabel('Difference')
-                            except Exception:
-                                pass
-                            
-                            plt.suptitle(f"Topomap: Difference — Average {measurement_col}")
-                            plt.tight_layout()
-                            st.pyplot(diff_fig)
-                        except Exception as e:
-                            # Fallback to heatmap if mne is not installed or plotting fails
-                            fig = px.imshow(
-                                channel_pivot.T,
-                                title=f"Average {measurement_col} by Channel and Group",
-                                color_continuous_scale='RdBu_r'
-                            )
-                            fig.update_layout(
-                                xaxis_title="Group",
-                                yaxis_title="EEG Channel"
-                            )
-                            st.plotly_chart(fig, use_container_width=True)
-                            st.warning(f"Topomap unavailable (MNE missing or error): {e}")
-                        
-                        # Clean up temporary column if created
-                        if '_temp_channel_mean' in combined_df.columns:
-                            combined_df.drop(columns=['_temp_channel_mean'], inplace=True)
-                        # plot_lightning_3d
-                        # plot_lightning_3d(vals_pat,vals_ctrl, pos, ch_names_order)
-
-            else:
-                st.warning(f"Measurement '{measurement_col}' not found in the data.")
+        # Show summary statistics for selected columns
+        st.markdown("### Summary Statistics for Selected Columns")
+        summary_stats = patients_df[selected_columns].describe()
+        st.dataframe(summary_stats.round(4), use_container_width=True)
+    else:
+        st.info("Please select at least one column to visualize.")
     
     st.markdown("---")
     
