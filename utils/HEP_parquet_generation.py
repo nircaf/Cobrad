@@ -299,17 +299,17 @@ def compute_brain_heart_coupling(data_all, patient_id, bool_plots=False, save_pl
         
         # Clean the EEG data using the comprehensive pipeline
         print(f"[{patient_id}] Cleaning EEG data for EDF {i+1}")
-        raw_clean = clean_eeg_data(raw)
+        # raw_clean = clean_eeg_data(raw)
         
-        window_data = raw_clean.get_data()
-        ch_names = raw_clean.ch_names
-        sfreq = int(raw_clean.info['sfreq'])
+        window_data = raw.get_data()
+        ch_names = raw.ch_names
+        sfreq = int(raw.info['sfreq'])
         print(f"Sampling frequency after cleaning: {sfreq}")
         name_prefix = f"{patient_id}_edf{i+1}"
 
         # Extract ECG and detect R-peaks
         ch_lower = [ch.lower() for ch in ch_names]
-        ecg_indices = [i for i, ch in enumerate(ch_lower) if 'ecg' in ch]
+        ecg_indices = [i for i, ch in enumerate(ch_lower) if 'ecg' in ch or 'ekg' in ch]
         if not ecg_indices:
             print(f"[{patient_id}] EDF {i+1} has no ECG channel; skipping.")
             continue
@@ -612,7 +612,7 @@ def edf_has_ecg(edf_path):
         else:
             ch_names = []
         ch_lower = [ch.lower() for ch in ch_names]
-        if any('ecg' in ch for ch in ch_lower):
+        if any('ecg' in ch or 'ekg' in ch for ch in ch_lower):
             return True
         else:
             ecg_channels, channel_metrics = detect_ecg_channels_from_data(raw)
@@ -750,6 +750,7 @@ def detect_ecg_channels_from_data(raw, sfreq=None):
             ecg_channels.append(ch_name)
     
     return ecg_channels, channel_metrics
+    # plot raw 
 
 
 def select_random_edfs_with_ecg(file_list, k=6, seed=42):
@@ -851,8 +852,9 @@ def process_patients_random6(edf_root="EDF", k=6, step_sec=5, seed=42):
 # ------------------------------------------------------------------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Process EDF files for brain-heart coupling analysis')
-    parser.add_argument('-c', '--edf_root', type=str, default="pickles/Controls",
+    parser.add_argument('-c', '--edf_root', type=str, default="pickles/CAP_Sleep_Database",
                         help='Root directory containing EDF pickle files (default: pickles/CAP_Sleep_Database)')
+                        # Controls
     parser.add_argument('-k', '--k_files', type=int, default=6,
                         help='Number of random EDF files to select per patient (default: 6)')
     parser.add_argument('-s', '--step_sec', type=int, default=5,

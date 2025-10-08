@@ -213,42 +213,221 @@ def create_comparison_plot(df, measurement, group_col='Group'):
 def create_multi_histogram_plot(df, columns):
     """Create multiple histograms in one figure"""
     if len(columns) == 1:
-        # Single histogram
-        fig = px.histogram(
-            df, 
-            x=columns[0], 
-            title=f"Distribution of {columns[0]}",
-            nbins=50,
-            opacity=0.7
-        )
-        fig.update_layout(
-            xaxis_title=columns[0],
-            yaxis_title="Count"
-        )
+        # Single plot - check if binary or continuous
+        data = df[columns[0]].dropna()
+        unique_values = data.nunique()
+        
+        if unique_values == 2:
+            # Create pie chart for binary data
+            value_counts = data.value_counts()
+            fig = go.Figure(data=[go.Pie(
+                labels=value_counts.index.tolist(),
+                values=value_counts.values.tolist(),
+                textinfo='label+percent'
+            )])
+            fig.update_layout(title=f"Distribution of {columns[0]}")
+        else:
+            # Create histogram for continuous data
+            fig = px.histogram(
+                df, 
+                x=columns[0], 
+                title=f"Distribution of {columns[0]}",
+                nbins=50,
+                opacity=0.7
+            )
+            fig.update_layout(
+                xaxis_title=columns[0],
+                yaxis_title="Count"
+            )
     else:
-        # Multiple histograms in subplots
-        from plotly.subplots import make_subplots
-        import plotly.graph_objects as go
+        # Separate binary and continuous columns
+        binary_columns = []
+        continuous_columns = []
         
-        # Calculate subplot layout
-        n_cols = min(2, len(columns))
-        n_rows = (len(columns) + n_cols - 1) // n_cols
-        
-        fig = make_subplots(
-            rows=n_rows, 
-            cols=n_cols,
-            subplot_titles=columns,
-            vertical_spacing=0.1
-        )
-        
-        for i, col in enumerate(columns):
-            row = (i // n_cols) + 1
-            col_idx = (i % n_cols) + 1
-            
-            # Get data for this column, removing NaN values
+        for col in columns:
             data = df[col].dropna()
-            
             if len(data) > 0:
+                unique_values = data.nunique()
+                if unique_values == 2:
+                    binary_columns.append(col)
+                else:
+                    continuous_columns.append(col)
+        
+        # Create separate figures for binary and continuous data
+        if binary_columns and continuous_columns:
+            # Both types exist - create two separate figures
+            st.markdown("### Binary/Categorical Variables")
+            if len(binary_columns) == 1:
+                # Single pie chart
+                data = df[binary_columns[0]].dropna()
+                value_counts = data.value_counts()
+                fig_binary = go.Figure(data=[go.Pie(
+                    labels=value_counts.index.tolist(),
+                    values=value_counts.values.tolist(),
+                    textinfo='label+percent',
+                    textposition='outside',
+                    textfont_size=14,
+                    rotation=90
+                )])
+                fig_binary.update_layout(
+                    title=f"Distribution of {binary_columns[0]}",
+                    margin=dict(t=50, b=50, l=50, r=50),
+                    showlegend=False
+                )
+                st.plotly_chart(fig_binary, use_container_width=True)
+            else:
+                # Multiple pie charts in subplots
+                from plotly.subplots import make_subplots
+                n_cols = min(2, len(binary_columns))
+                n_rows = (len(binary_columns) + n_cols - 1) // n_cols
+                
+                fig_binary = make_subplots(
+                    rows=n_rows, 
+                    cols=n_cols,
+                    specs=[[{"type": "pie"}] * n_cols for _ in range(n_rows)],
+                    subplot_titles=binary_columns,
+                    vertical_spacing=0.1
+                )
+                
+                for i, col in enumerate(binary_columns):
+                    row = (i // n_cols) + 1
+                    col_idx = (i % n_cols) + 1
+                    data = df[col].dropna()
+                    value_counts = data.value_counts()
+                    fig_binary.add_trace(
+                        go.Pie(
+                            labels=value_counts.index.tolist(),
+                            values=value_counts.values.tolist(),
+                            textinfo='label+percent',
+                            textposition='outside',
+                            textfont_size=14,
+                            rotation=90
+                        ),
+                        row=row, col=col_idx
+                    )
+                
+                fig_binary.update_layout(
+                    title="Binary/Categorical Variables",
+                    showlegend=False,
+                    height=300 * n_rows,
+                    margin=dict(t=50, b=50, l=50, r=50)
+                )
+                st.plotly_chart(fig_binary, use_container_width=True)
+            
+            st.markdown("### Continuous Variables")
+            # Create histogram subplots for continuous data
+            from plotly.subplots import make_subplots
+            n_cols = min(2, len(continuous_columns))
+            n_rows = (len(continuous_columns) + n_cols - 1) // n_cols
+            
+            fig_continuous = make_subplots(
+                rows=n_rows, 
+                cols=n_cols,
+                subplot_titles=continuous_columns,
+                vertical_spacing=0.1
+            )
+            
+            for i, col in enumerate(continuous_columns):
+                row = (i // n_cols) + 1
+                col_idx = (i % n_cols) + 1
+                data = df[col].dropna()
+                fig_continuous.add_trace(
+                    go.Histogram(
+                        x=data,
+                        name=col,
+                        nbinsx=50,
+                        opacity=0.7
+                    ),
+                    row=row, col=col_idx
+                )
+            
+            fig_continuous.update_layout(
+                title="Continuous Variables",
+                showlegend=False,
+                height=300 * n_rows
+            )
+            
+            # Update x-axis labels
+            for i in range(1, n_rows + 1):
+                for j in range(1, n_cols + 1):
+                    fig_continuous.update_xaxes(title_text="Value", row=i, col=j)
+                    fig_continuous.update_yaxes(title_text="Count", row=i, col=j)
+            
+            st.plotly_chart(fig_continuous, use_container_width=True)
+            return None  # Return None since we've already displayed the charts
+            
+        elif binary_columns:
+            # Only binary columns
+            if len(binary_columns) == 1:
+                data = df[binary_columns[0]].dropna()
+                value_counts = data.value_counts()
+                fig = go.Figure(data=[go.Pie(
+                    labels=value_counts.index.tolist(),
+                    values=value_counts.values.tolist(),
+                    textinfo='label+percent',
+                    textposition='outside',
+                    textfont_size=14,
+                    rotation=90
+                )])
+                fig.update_layout(
+                    title=f"Distribution of {binary_columns[0]}",
+                    margin=dict(t=50, b=50, l=50, r=50),
+                    showlegend=False
+                )
+            else:
+                from plotly.subplots import make_subplots
+                n_cols = min(2, len(binary_columns))
+                n_rows = (len(binary_columns) + n_cols - 1) // n_cols
+                
+                fig = make_subplots(
+                    rows=n_rows, 
+                    cols=n_cols,
+                    specs=[[{"type": "pie"}] * n_cols for _ in range(n_rows)],
+                    subplot_titles=binary_columns,
+                    vertical_spacing=0.1
+                )
+                
+                for i, col in enumerate(binary_columns):
+                    row = (i // n_cols) + 1
+                    col_idx = (i % n_cols) + 1
+                    data = df[col].dropna()
+                    value_counts = data.value_counts()
+                    fig.add_trace(
+                        go.Pie(
+                            labels=value_counts.index.tolist(),
+                            values=value_counts.values.tolist(),
+                            textinfo='label+percent',
+                            textposition='outside',
+                            textfont_size=14,
+                            rotation=90
+                        ),
+                        row=row, col=col_idx
+                    )
+                
+                fig.update_layout(
+                    title="Binary/Categorical Variables",
+                    showlegend=False,
+                    height=300 * n_rows,
+                    margin=dict(t=50, b=50, l=50, r=50)
+                )
+        
+        else:
+            # Only continuous columns - create histogram subplots
+            from plotly.subplots import make_subplots
+            n_cols = min(2, len(continuous_columns))
+            n_rows = (len(continuous_columns) + n_cols - 1) // n_cols
+            
+            fig = make_subplots(
+                rows=n_rows, 
+                cols=n_cols,
+                subplot_titles=continuous_columns,
+                vertical_spacing=0.1
+            )
+            
+            for i, col in enumerate(continuous_columns):
+                row = (i // n_cols) + 1
+                col_idx = (i % n_cols) + 1
+                data = df[col].dropna()
                 fig.add_trace(
                     go.Histogram(
                         x=data,
@@ -258,18 +437,18 @@ def create_multi_histogram_plot(df, columns):
                     ),
                     row=row, col=col_idx
                 )
-        
-        fig.update_layout(
-            title="Patient Data Distributions",
-            showlegend=False,
-            height=300 * n_rows
-        )
-        
-        # Update x-axis labels
-        for i in range(1, n_rows + 1):
-            for j in range(1, n_cols + 1):
-                fig.update_xaxes(title_text="Value", row=i, col=j)
-                fig.update_yaxes(title_text="Count", row=i, col=j)
+            
+            fig.update_layout(
+                title="Patient Data Distributions",
+                showlegend=False,
+                height=300 * n_rows
+            )
+            
+            # Update x-axis labels
+            for i in range(1, n_rows + 1):
+                for j in range(1, n_cols + 1):
+                    fig.update_xaxes(title_text="Value", row=i, col=j)
+                    fig.update_yaxes(title_text="Count", row=i, col=j)
     
     return fig
 
@@ -362,17 +541,15 @@ def main():
     
     if selected_columns:
         # Create multi-histogram plot
-        st.plotly_chart(
-            create_multi_histogram_plot(patients_df, selected_columns),
-            use_container_width=True
-        )
-        
-        # Show summary statistics for selected columns
-        st.markdown("### Summary Statistics for Selected Columns")
-        summary_stats = patients_df[selected_columns].describe()
-        st.dataframe(summary_stats.round(4), use_container_width=True)
-    else:
-        st.info("Please select at least one column to visualize.")
+        fig = create_multi_histogram_plot(patients_df, selected_columns)
+        if fig is not None:
+            st.plotly_chart(fig, use_container_width=True)
+            # Show summary statistics for selected columns
+            st.markdown("### Summary Statistics for Selected Columns")
+            summary_stats = patients_df[selected_columns].describe()
+            st.dataframe(summary_stats.round(4), use_container_width=True)
+        else:
+            st.info("Please select at least one column to visualize.")
     
     st.markdown("---")
     
