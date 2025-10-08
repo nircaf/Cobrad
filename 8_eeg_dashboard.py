@@ -210,7 +210,7 @@ def create_comparison_plot(df, measurement, group_col='Group'):
     )
     return fig
 
-def create_multi_histogram_plot(df, columns):
+def create_multi_histogram_plot(df, columns, color_by_binary=None):
     """Create multiple histograms in one figure"""
     if len(columns) == 1:
         # Single plot - check if binary or continuous
@@ -228,17 +228,39 @@ def create_multi_histogram_plot(df, columns):
             fig.update_layout(title=f"Distribution of {columns[0]}")
         else:
             # Create histogram for continuous data
-            fig = px.histogram(
-                df, 
-                x=columns[0], 
-                title=f"Distribution of {columns[0]}",
-                nbins=50,
-                opacity=0.7
-            )
-            fig.update_layout(
-                xaxis_title=columns[0],
-                yaxis_title="Count"
-            )
+            if color_by_binary and color_by_binary in df.columns:
+                # Create colored histogram by binary groups
+                combined_data = df[[columns[0], color_by_binary]].dropna()
+                fig = go.Figure()
+                
+                for binary_value in combined_data[color_by_binary].unique():
+                    group_data = combined_data[combined_data[color_by_binary] == binary_value][columns[0]]
+                    fig.add_trace(go.Histogram(
+                        x=group_data,
+                        name=f"{binary_value}",
+                        nbinsx=50,
+                        opacity=0.7
+                    ))
+                
+                fig.update_layout(
+                    title=f"Distribution of {columns[0]} by {color_by_binary}",
+                    xaxis_title=columns[0],
+                    yaxis_title="Count",
+                    barmode='overlay'
+                )
+            else:
+                # Regular histogram without color grouping
+                fig = px.histogram(
+                    df, 
+                    x=columns[0], 
+                    title=f"Distribution of {columns[0]}",
+                    nbins=50,
+                    opacity=0.7
+                )
+                fig.update_layout(
+                    xaxis_title=columns[0],
+                    yaxis_title="Count"
+                )
     else:
         # Separate binary and continuous columns
         binary_columns = []
@@ -331,19 +353,39 @@ def create_multi_histogram_plot(df, columns):
                 row = (i // n_cols) + 1
                 col_idx = (i % n_cols) + 1
                 data = df[col].dropna()
-                fig_continuous.add_trace(
-                    go.Histogram(
-                        x=data,
-                        name=col,
-                        nbinsx=50,
-                        opacity=0.7
-                    ),
-                    row=row, col=col_idx
-                )
+                
+                if color_by_binary and color_by_binary in df.columns:
+                    # Create colored histogram by binary groups
+                    binary_data = df[color_by_binary].dropna()
+                    combined_data = df[[col, color_by_binary]].dropna()
+                    
+                    for binary_value in combined_data[color_by_binary].unique():
+                        group_data = combined_data[combined_data[color_by_binary] == binary_value][col]
+                        fig_continuous.add_trace(
+                            go.Histogram(
+                                x=group_data,
+                                name=f"{col} ({binary_value})",
+                                nbinsx=50,
+                                opacity=0.7,
+                                legendgroup=col
+                            ),
+                            row=row, col=col_idx
+                        )
+                else:
+                    # Regular histogram without color grouping
+                    fig_continuous.add_trace(
+                        go.Histogram(
+                            x=data,
+                            name=col,
+                            nbinsx=50,
+                            opacity=0.7
+                        ),
+                        row=row, col=col_idx
+                    )
             
             fig_continuous.update_layout(
                 title="Continuous Variables",
-                showlegend=False,
+                showlegend=color_by_binary is not None,
                 height=300 * n_rows
             )
             
@@ -428,19 +470,38 @@ def create_multi_histogram_plot(df, columns):
                 row = (i // n_cols) + 1
                 col_idx = (i % n_cols) + 1
                 data = df[col].dropna()
-                fig.add_trace(
-                    go.Histogram(
-                        x=data,
-                        name=col,
-                        nbinsx=50,
-                        opacity=0.7
-                    ),
-                    row=row, col=col_idx
-                )
+                
+                if color_by_binary and color_by_binary in df.columns:
+                    # Create colored histogram by binary groups
+                    combined_data = df[[col, color_by_binary]].dropna()
+                    
+                    for binary_value in combined_data[color_by_binary].unique():
+                        group_data = combined_data[combined_data[color_by_binary] == binary_value][col]
+                        fig.add_trace(
+                            go.Histogram(
+                                x=group_data,
+                                name=f"{col} ({binary_value})",
+                                nbinsx=50,
+                                opacity=0.7,
+                                legendgroup=col
+                            ),
+                            row=row, col=col_idx
+                        )
+                else:
+                    # Regular histogram without color grouping
+                    fig.add_trace(
+                        go.Histogram(
+                            x=data,
+                            name=col,
+                            nbinsx=50,
+                            opacity=0.7
+                        ),
+                        row=row, col=col_idx
+                    )
             
             fig.update_layout(
                 title="Patient Data Distributions",
-                showlegend=False,
+                showlegend=color_by_binary is not None,
                 height=300 * n_rows
             )
             
@@ -539,17 +600,29 @@ def main():
         help="Select one or more columns to display histograms. Multiple selections will be shown in subplots."
     )
     
+    # Binary column selection for color grouping
+    binary_columns_for_color = [col for col in numeric_columns if patients_df[col].nunique() == 2]
+    color_by_binary = None
+    if binary_columns_for_color:
+        color_by_binary = st.selectbox(
+            "Color histograms by binary group (optional)",
+            ["None"] + binary_columns_for_color,
+            help="Select a binary column to color the histograms by different groups"
+        )
+        if color_by_binary == "None":
+            color_by_binary = None
+    
     if selected_columns:
         # Create multi-histogram plot
-        fig = create_multi_histogram_plot(patients_df, selected_columns)
+        fig = create_multi_histogram_plot(patients_df, selected_columns, color_by_binary)
         if fig is not None:
             st.plotly_chart(fig, use_container_width=True)
-            # Show summary statistics for selected columns
-            st.markdown("### Summary Statistics for Selected Columns")
-            summary_stats = patients_df[selected_columns].describe()
-            st.dataframe(summary_stats.round(4), use_container_width=True)
-        else:
-            st.info("Please select at least one column to visualize.")
+        
+        # Show summary statistics for selected columns
+        st.markdown("### Summary Statistics for Selected Columns")
+        summary_stats = patients_df[selected_columns].describe()
+        st.dataframe(summary_stats.round(4), use_container_width=True)
+
     
     st.markdown("---")
     
