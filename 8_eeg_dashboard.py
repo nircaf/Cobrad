@@ -223,7 +223,7 @@ def create_multi_histogram_plot(df, columns, color_by_binary=None):
             fig = go.Figure(data=[go.Pie(
                 labels=value_counts.index.tolist(),
                 values=value_counts.values.tolist(),
-                textinfo='label+percent'
+                textinfo='label+value'
             )])
             fig.update_layout(title=f"Distribution of {columns[0]}")
         else:
@@ -320,7 +320,7 @@ def create_multi_histogram_plot(df, columns, color_by_binary=None):
                         go.Pie(
                             labels=value_counts.index.tolist(),
                             values=value_counts.values.tolist(),
-                            textinfo='label+percent',
+                            textinfo='label+value',
                             textposition='outside',
                             textfont_size=14,
                             rotation=90
@@ -406,7 +406,7 @@ def create_multi_histogram_plot(df, columns, color_by_binary=None):
                 fig = go.Figure(data=[go.Pie(
                     labels=value_counts.index.tolist(),
                     values=value_counts.values.tolist(),
-                    textinfo='label+percent',
+                    textinfo='label+value',
                     textposition='outside',
                     textfont_size=14,
                     rotation=90
@@ -438,7 +438,7 @@ def create_multi_histogram_plot(df, columns, color_by_binary=None):
                         go.Pie(
                             labels=value_counts.index.tolist(),
                             values=value_counts.values.tolist(),
-                            textinfo='label+percent',
+                            textinfo='label+value',
                             textposition='outside',
                             textfont_size=14,
                             rotation=90
