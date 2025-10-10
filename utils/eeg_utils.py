@@ -26,9 +26,10 @@ from concurrent.futures import ProcessPoolExecutor
 from scipy.signal import welch
 import dabest
 from statsmodels.stats.power import TTestIndPower
-from scipy.stats import wilcoxon, zscore, pearsonr, entropy, ranksums, linregress
+from scipy.stats import wilcoxon, zscore, pearsonr, entropy, ranksums, linregress, spearmanr
 from statsmodels.stats.multitest import fdrcorrection
 from scipy.stats import mannwhitneyu
+from sklearn.linear_model import HuberRegressor
 import sys, mne.io.array
 sys.modules['mne.io.array.array'] = mne.io.array
 # Optional imports for plotly functionality
@@ -1546,6 +1547,40 @@ def tga_get_files():
     return df_wnv, patients_folder, controls, df_wnv2, cases_group_name
 
 from pathlib import Path
+def get_clinical_data(project_name):
+    # Attempt to find a clinical Excel file under EDF_Format/{project_name}
+    clinical_df = pd.DataFrame()
+    edf_proj_dir = os.path.join('EDF_Format', project_name)
+    if os.path.isdir(edf_proj_dir):
+        # look for any .xls/.xlsx files in the directory and subdirs
+        excel_files = []
+        for root, dirs, files in os.walk(edf_proj_dir):
+            for f in files:
+                if f.lower().endswith(('.xls', '.xlsx')):
+                    excel_files.append(os.path.join(root, f))
+        if excel_files:
+            clinical_path = excel_files[0]
+            try:
+                clinical_df = pd.read_excel(clinical_path)
+            except Exception as e:
+                raise ValueError(f"Failed reading clinical file {clinical_path}: {e}")
+                print(f"Warning: failed reading clinical file {clinical_path}: {e}")
+    else:
+        print(f"Warning: EDF_Format project directory not found: {edf_proj_dir}")
+
+    # Normalize clinical df: prefer column 'record_id' -> 'ID'
+    if not clinical_df.empty:
+        if 'record_id' in clinical_df.columns:
+            clinical_df = clinical_df.rename(columns={'record_id': 'ID'})
+        # Ensure ID is string-like and strip whitespace / extensions
+        if 'ID' in clinical_df.columns:
+            clinical_df['ID'] = clinical_df['ID'].astype(str).str.strip().str.replace('\.edf$', '', regex=True).str.lower()
+    # find the col of sex or gender ignore case
+    gender_col = next((col for col in clinical_df.columns if col.lower() in ['sex', 'gender']), None)
+    if gender_col:
+        # clnical df column gender or sex ignore case to  convert_sex_column
+        clinical_df = convert_sex_column(clinical_df, gender_col)
+    return clinical_df
 
 def generic_get_files(project_name: str):
     """
@@ -1609,43 +1644,9 @@ def generic_get_files(project_name: str):
         df_parquet = pd.concat(df_list, ignore_index=True, sort=False)
     # df_parquet ID = file_name.split'.'[0]
     df_parquet['ID'] = df_parquet['file_name'].astype(str).apply(lambda x: os.path.basename(x).replace('.edf', '').lower().strip())
-    # Attempt to find a clinical Excel file under EDF_Format/{project_name}
-    clinical_df = pd.DataFrame()
-    edf_proj_dir = os.path.join('EDF_Format', project_name)
-    if os.path.isdir(edf_proj_dir):
-        # look for any .xls/.xlsx files in the directory and subdirs
-        excel_files = []
-        for root, dirs, files in os.walk(edf_proj_dir):
-            for f in files:
-                if f.lower().endswith(('.xls', '.xlsx')):
-                    excel_files.append(os.path.join(root, f))
-        if excel_files:
-            clinical_path = excel_files[0]
-            try:
-                # if project_name == project_name read sheet SEEG_PATIENTS
-                if project_name == 'Seeg':
-                    sheet_name = 'SEEG_PATIENTS'
-                    clinical_df = pd.read_excel(clinical_path, sheet_name=sheet_name)
-                else:
-                    clinical_df = pd.read_excel(clinical_path)
-            except Exception as e:
-                print(f"Warning: failed reading clinical file {clinical_path}: {e}")
-    else:
-        print(f"Warning: EDF_Format project directory not found: {edf_proj_dir}")
 
-    # Normalize clinical df: prefer column 'record_id' -> 'ID'
-    if not clinical_df.empty:
-        if 'record_id' in clinical_df.columns:
-            clinical_df = clinical_df.rename(columns={'record_id': 'ID'})
-        # Ensure ID is string-like and strip whitespace / extensions
-        if 'ID' in clinical_df.columns:
-            clinical_df['ID'] = clinical_df['ID'].astype(str).str.strip().str.replace('\.edf$', '', regex=True).str.lower()
-    # find the col of sex or gender ignore case
-    gender_col = next((col for col in clinical_df.columns if col.lower() in ['sex', 'gender']), None)
-    if gender_col:
-        # clnical df column gender or sex ignore case to  convert_sex_column
-        clinical_df = convert_sex_column(clinical_df, gender_col)
 
+    clinical_df = get_clinical_data(project_name)
     # Determine which column in df_parquet best matches clinical_df['ID']
     def find_best_matching_column(clinical_df, df_parquet):
         """Determine which column in df_parquet best matches clinical_df['ID'] values"""
@@ -2633,6 +2634,8 @@ def _plot_metric_vs_hrv(t, arrs, labels, save_plot, name, save_dir, is_streamlit
             plt.close(fig)
         else:
             if is_streamlit:
+                # Ensure the figure is properly managed by pyplot
+                plt.figure(fig.number)
                 st.pyplot(fig)
             else:
                 plt.show()
@@ -2701,24 +2704,38 @@ def _plot_metric_vs_hrv(t, arrs, labels, save_plot, name, save_dir, is_streamlit
                 print(f"Error processing hue: {e}")
 
         g = sns.PairGrid(df_pair, diag_sharey=False)
+        def calculate_robust_correlations(df_pair, var_names):
+            """Calculate robust correlations for all variable pairs with FDR correction."""
+            n_vars = len(var_names)
+            pair_indices, r_vals, p_vals = [], [], []
+            
+            for i in range(n_vars):
+                for j in range(i+1, n_vars):
+                    x = df_pair[var_names[i]]
+                    y = df_pair[var_names[j]]
+                    mask = ~np.isnan(x) & ~np.isnan(y)
+                    x_clean = np.array(x)[mask]
+                    y_clean = np.array(y)[mask]
+                    
+                    if len(x_clean) > 1 and len(y_clean) > 1:
+                        # Use normal linear regression
+                        r, p = spearmanr(x_clean, y_clean)
+                    else:
+                        r, p = np.nan, np.nan
+                    
+                    pair_indices.append((i, j))
+                    r_vals.append(r)
+                    p_vals.append(p)
+            
+            # Apply FDR correction
+            p_vals_array = np.array([p if not np.isnan(p) else 1.0 for p in p_vals])
+            reject, pvals_fdr = fdrcorrection(p_vals_array, alpha=0.05, method='indep')
+            pair_to_stats = {(i, j): (r_vals[idx], pvals_fdr[idx]) for idx, (i, j) in enumerate(pair_indices)}
+            
+            return pair_to_stats
+        
         var_names = [c for c in df_pair.columns if c != '__hue__']
-        n_vars = len(var_names)
-        pair_indices, r_vals, p_vals = [], [], []
-        for i in range(n_vars):
-            for j in range(i+1, n_vars):
-                x = df_pair[var_names[i]]
-                y = df_pair[var_names[j]]
-                mask = ~np.isnan(x) & ~np.isnan(y)
-                x_clean = np.array(x)[mask]
-                y_clean = np.array(y)[mask]
-                if len(x_clean) > 1 and len(y_clean) > 1:
-                    r, p = pearsonr(x_clean, y_clean)
-                else:
-                    r, p = np.nan, np.nan
-                pair_indices.append((i, j)); r_vals.append(r); p_vals.append(p)
-        p_vals_array = np.array([p if not np.isnan(p) else 1.0 for p in p_vals])
-        reject, pvals_fdr = fdrcorrection(p_vals_array, alpha=0.05, method='indep')
-        pair_to_stats = {(i, j): (r_vals[idx], pvals_fdr[idx]) for idx, (i, j) in enumerate(pair_indices)}
+        pair_to_stats = calculate_robust_correlations(df_pair, var_names)
 
         def scatter_with_stats(x, y, hue=None, palette_dict=None, **kwargs):
             ax = kwargs.get('ax', plt.gca())
@@ -2744,15 +2761,43 @@ def _plot_metric_vs_hrv(t, arrs, labels, save_plot, name, save_dir, is_streamlit
                     hue_clean = None
             if hue_clean is not None:
                 sns.scatterplot(x=x_clean, y=y_clean, hue=hue_clean, ax=ax, alpha=0.7, s=20, palette=palette_dict, legend=False)
+                # Create normal regression lines and calculate stats for each hue group
+                unique_hues = np.unique(hue_clean)
+                hue_stats = []
+                for hue_val in unique_hues:
+                    hue_mask = hue_clean == hue_val
+                    if np.sum(hue_mask) > 1:  # Need at least 2 points for regression
+                        x_hue = x_clean[hue_mask]
+                        y_hue = y_clean[hue_mask]
+                        if len(x_hue) > 1 and len(y_hue) > 1:
+                            color = palette_dict.get(hue_val, 'gray') if palette_dict else 'gray'
+                            sns.regplot(x=x_hue, y=y_hue, ax=ax, scatter=False, color=color, 
+                                      line_kws={'alpha':0.4})
+                            
+                            # Calculate correlation for this hue group
+                            r_hue, p_hue = spearmanr(x_hue, y_hue)
+                            hue_stats.append((hue_val, r_hue, p_hue))
+                
+                # Display statistics for each hue group with colored text
+                if hue_stats:
+                    y_pos = 0.85
+                    for i, (hue_val, r_hue, p_hue) in enumerate(hue_stats):
+                        if not np.isnan(r_hue) and not np.isnan(p_hue):
+                            color = palette_dict.get(hue_val, 'gray') if palette_dict else 'gray'
+                            stats_text = f"R²={r_hue**2:.2f}, p={p_hue:.3g}"
+                            ax.annotate(stats_text,
+                                      xy=(0.05, y_pos - i*0.08), xycoords='axes fraction', 
+                                      fontsize=8, color=color, ha='left', va='center',
+                                      bbox=dict(boxstyle="round,pad=0.2", fc="white", ec=color, alpha=0.3))
             else:
                 sns.scatterplot(x=x_clean, y=y_clean, ax=ax, alpha=0.7, s=20)
-
-            if len(x_clean) > 1 and len(y_clean) > 1:
-                sns.regplot(x=x_clean, y=y_clean, ax=ax, scatter=False, color='gray', line_kws={'alpha':0.5})
-            if not np.isnan(r) and not np.isnan(p_fdr) and p_fdr < 0.05:
-                ax.annotate(f"$R^2$={r**2:.2f}\np={p_fdr:.3g}",
-                            xy=(0.05, 0.85), xycoords='axes fraction', fontsize=9,
-                            bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="gray", alpha=0.7))
+                if len(x_clean) > 1 and len(y_clean) > 1:
+                    sns.regplot(x=x_clean, y=y_clean, ax=ax, scatter=False, color='gray', line_kws={'alpha':0.5})
+                # Display overall statistics when no hue grouping
+                if not np.isnan(r) and not np.isnan(p_fdr) and p_fdr < 0.05:
+                    ax.annotate(f"$R^2$={r**2:.2f}\np={p_fdr:.3g}",
+                                xy=(0.05, 0.85), xycoords='axes fraction', fontsize=9,
+                                bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="gray", alpha=0.7))
 
         def lineplot_with_time(x, y,palette_dict=None, **kwargs):
             ax = kwargs.get('ax', plt.gca())
@@ -2824,6 +2869,8 @@ def _plot_metric_vs_hrv(t, arrs, labels, save_plot, name, save_dir, is_streamlit
             plt.close(g.fig)
         else:
             if is_streamlit:
+                # Ensure the figure is properly managed by pyplot
+                plt.figure(g.fig.number)
                 st.pyplot(g.fig)
             else:
                 plt.show()
@@ -2841,6 +2888,8 @@ def _plot_metric_vs_hrv(t, arrs, labels, save_plot, name, save_dir, is_streamlit
             plt.close(fig)
         else:
             if is_streamlit:
+                # Ensure the figure is properly managed by pyplot
+                plt.figure(fig.number)
                 st.pyplot(fig)
             else:
                 plt.show()

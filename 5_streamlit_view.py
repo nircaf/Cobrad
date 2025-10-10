@@ -253,65 +253,91 @@ def org_selected_feature(selected_feature):
         return 'CF'
     return selected_feature
 
+def get_cap_sleep_group(file_prefix):
+    """
+    Determine group (Dementia/Control) based on file prefix from CAP_Sleep_Database.
+    Based on naming patterns observed in the database.
+    """
+    # Control group prefixes (typically start with 'n')
+    control_prefixes = ['n3', 'n5', 'n8', 'n10', 'n11']
+    
+    # Check if any control prefix matches
+    for prefix in control_prefixes:
+        if file_prefix.startswith(prefix):
+            return 'Control'
+    
+    # All other prefixes are considered Dementia cases
+    return 'Dementia'
+
 def HEP_plots(project_name, df_wnv3, controls, boxplot_columns, analysis_type,selected_feature=None):
     if project_name == 'COBRAD':
-        HEP_dir = 'parquet_HEP/EDF_HEP'
+        # Define both directories
+        edf_hep_dir = 'parquets_HEP/EDF_HEP'
+        cap_sleep_dir = 'parquets_HEP/CAP_Sleep_Database'
     else:
         return
     # Run over power bands
     for band_name, band_range in power_bands.items():
         st.write(f"Analyzing power band: {band_name}")
-        # glob all files in HEP_dir that match f"*_{band_name}.parquet"
-        band_files = [f for f in os.listdir(HEP_dir) if f.endswith(f"_{band_name}.parquet")]
         dfs = []
         hue = None
-        for file in band_files:
-            file_path = os.path.join(HEP_dir, file)
-            if selected_feature:
-                ID = file.split('_')[0][1:]
-                id_group = df_wnv3[df_wnv3['ID'] == ID]['Group'].values
-            try:
-                df = pd.read_parquet(file_path)
-                if selected_feature:
-                    # Attach group info to each df
-                    if len(id_group) > 0 and not df.empty:
-                        df['Group'] = id_group[0]
+        
+        # Process EDF_HEP directory (Dementia group)
+        if os.path.exists(edf_hep_dir):
+            edf_band_files = [f for f in os.listdir(edf_hep_dir) if f.endswith(f"_{band_name}.parquet")]
+            for file in edf_band_files:
+                file_path = os.path.join(edf_hep_dir, file)
+                try:
+                    df = pd.read_parquet(file_path)
+                    if not df.empty:
+                        df['Group'] = 'Dementia'
                         dfs.append(df)
-            except Exception as e:
-                st.warning(f"Could not read {file}: {e}")
+                except Exception as e:
+                    st.warning(f"Could not read {file} from EDF_HEP: {e}")
+        
+        # Process CAP_Sleep_Database directory (Control group)
+        if os.path.exists(cap_sleep_dir):
+            cap_band_files = [f for f in os.listdir(cap_sleep_dir) if f.endswith(f"_{band_name}.parquet")]
+            for file in cap_band_files:
+                file_path = os.path.join(cap_sleep_dir, file)
+                try:
+                    df = pd.read_parquet(file_path)
+                    if not df.empty:
+                        df['Group'] = 'Control'
+                        dfs.append(df)
+                except Exception as e:
+                    st.warning(f"Could not read {file} from CAP_Sleep_Database: {e}")
         if dfs:
-            if selected_feature:
-                # Group by 'Group' and compute mean for each group
-                group_dfs = []
-                for group in df_wnv3['Group'].unique():
-                    group_patients2 = []
-                    for df in dfs:
-                        if 'Group' in df.columns and df['Group'].iloc[0] == group:
-                            group_patients2.append(df)
-                    # group_patients = pd.concat(group_patients2, ignore_index=False, axis=0)
-                    # Filter out dfs shorter than 50 rows
-                    group_patients = [df for df in group_patients2 if df.shape[0] >= 50]
-                    if group_patients:
-                        min_len = min(df.shape[0] for df in group_patients)
-                        if min_len < 50:
-                            continue
-                        # Truncate all dfs to min_len rows
-                        truncated = [df.drop(columns=['Group'], errors='ignore').iloc[:min_len] for df in group_patients]
-                        # Get mean of each df (returns a Series) and concat to DataFrame
-                        group_mean_df = pd.concat([t.mean() for t in truncated], axis=1).T
-                        group_mean_df['Group'] = group
-                        group_dfs.append(group_mean_df)
-                results_df = pd.concat(group_dfs, ignore_index=True)
-                # remove cols more than 50% NaN
-                results_df = results_df.loc[:, results_df.isnull().mean() < 0.5]
-                # remove rows with any NaN
-                results_df = results_df.dropna()
-                hue = results_df['Group']
-                st.write(f"Loaded {len(results_df)} group means for band {band_name}")
-            else:
-                # Compute the mean of all DataFrames (row-wise, column-wise)
-                results_df = pd.concat(dfs, ignore_index=True).groupby(level=0).mean()
-                st.write(f"Loaded {len(results_df)} rows (mean of all files) for band {band_name}")
+            # Group by 'Group' and compute mean for each group
+            group_dfs = []
+            # Get unique groups from the loaded data (Dementia and Control)
+            unique_groups = list(set([df['Group'].iloc[0] for df in dfs if 'Group' in df.columns and not df.empty]))
+            
+            for group in unique_groups:
+                group_patients2 = []
+                for df in dfs:
+                    if 'Group' in df.columns and df['Group'].iloc[0] == group:
+                        group_patients2.append(df)
+                # group_patients = pd.concat(group_patients2, ignore_index=False, axis=0)
+                # Filter out dfs shorter than 50 rows
+                group_patients = [df for df in group_patients2 if df.shape[0] >= 50]
+                if group_patients:
+                    min_len = min(df.shape[0] for df in group_patients)
+                    if min_len < 50:
+                        continue
+                    # Truncate all dfs to min_len rows
+                    truncated = [df.drop(columns=['Group'], errors='ignore').iloc[:min_len] for df in group_patients]
+                    # Get mean of each df (returns a Series) and concat to DataFrame
+                    group_mean_df = pd.concat([t.mean() for t in truncated], axis=1).T
+                    group_mean_df['Group'] = group
+                    group_dfs.append(group_mean_df)
+            results_df = pd.concat(group_dfs, ignore_index=True)
+            # remove cols more than 50% NaN
+            results_df = results_df.loc[:, results_df.isnull().mean() < 0.5]
+            # remove rows with any NaN
+            results_df = results_df.dropna()
+            hue = results_df['Group']
+            st.write(f"Loaded {len(results_df)} group means for band {band_name}")
         else:
             st.write(f"No data found for band {band_name}")
         #  apply zscore each column (only numeric columns)
@@ -319,6 +345,7 @@ def HEP_plots(project_name, df_wnv3, controls, boxplot_columns, analysis_type,se
         results_df[numeric_cols] = results_df[numeric_cols].apply(zscore)
         # if selected_feature not None. 
         # run only_plots on results_df
+        st.dataframe(results_df)    
         only_plots(results_df, save_plot='', save_dir='', edf_pickle_name="plot", band=band_name, step_sec=5,is_streamlit=True,hue=hue)
         st.divider()
 
@@ -385,7 +412,7 @@ def main():
     clinical_features_numeric = [col for col in clinical_features if pd.api.types.is_numeric_dtype(df_wnv2[col])]
     # Sidebar for feature selection
     st.sidebar.header("Feature Selection")
-    feature_types = ('All', 'Clinical Feature', "EEG Feature", "ml_plots", "vs_Controls", "Pair Plot",'Raw','Spectrogram')
+    feature_types = ('Longitudinal','HEP', 'All', 'Clinical Feature', "EEG Feature", "ml_plots", "vs_Controls", "Pair Plot",'Raw','Spectrogram')
     feature_type = st.sidebar.selectbox("Select feature type to plot against the other type:", feature_types)
     if feature_type in ["Clinical Feature", "EEG Feature", "vs_Controls","All"]:
         # ask user if they want only significant, or full.
@@ -416,6 +443,8 @@ def main():
             st.header(f"{current_feature_type} Analysis")
         if current_feature_type == "vs_Controls":
             vs_controls_run(project_name,df_wnv2,controls,boxplot_columns,analysis_type)
+        elif current_feature_type == "HEP":
+            HEP_plots(project_name,df_wnv2,controls,boxplot_columns,analysis_type)
         elif current_feature_type == "Pair Plot":
             pairplot_columns(df_wnv2, clinical_features, eeg_features)
         elif current_feature_type == "ml_plots":
@@ -437,6 +466,8 @@ def main():
         elif current_feature_type == "Raw":
             st.title("Raw Data")
             raw_run(cases_group_name)
+        elif current_feature_type == "Longitudinal":
+            longitudinal_analysis(project_name)
         elif current_feature_type == "EEG Feature":
             forest_plot_eeg = st.sidebar.checkbox("Show Forest Plot vs All Clinical Features", value=False)
             eeg_feature_options =  eeg_features+ ["All Features"] 
@@ -744,6 +775,425 @@ def forest_plot_all_features(df_wnv3, selected_feature, target_features, analysi
     display_df['P_corrected'] = display_df['P_corrected'].apply(lambda x: f"{x:.3e}" if not pd.isna(x) else "N/A")
     display_df.columns = ['Feature', "Cohen's d", 'P-value', 'P-corrected', 'Test', 'N+', 'N-']
     st.dataframe(display_df, use_container_width=True)
+    
+    plt.close(fig)
+
+def longitudinal_analysis(project_name):
+    """
+    Longitudinal analysis function that reads clinical data with date columns
+    and raw parquet files to create time-series plots showing changes over time.
+    """
+    st.header("Longitudinal Analysis")
+    
+    # Load clinical data with dates
+    clinical_df = get_clinical_data(project_name)
+    
+    if clinical_df.empty:
+        raise ValueError(f"No clinical data found for project {project_name}")
+    
+    # Load raw parquet files
+    parquet_df = load_raw_parquet_files(project_name)
+    
+    if parquet_df.empty:
+        raise ValueError(f"No parquet files found for project {project_name}")
+    
+    # Display available date columns
+    date_columns = find_date_columns(clinical_df)
+    if not date_columns:
+        raise ValueError("No date columns found in clinical data")
+    
+    # Let user select date column
+    date_col = st.sidebar.selectbox("Select date column:", date_columns)
+    
+    # Get numeric columns for y-axis from both clinical and parquet data
+    numeric_columns = get_numeric_columns(clinical_df, parquet_df)
+    if not numeric_columns:
+        raise ValueError("No numeric columns found for plotting")
+    
+    # Let user select y-axis column
+    y_col = st.sidebar.selectbox("Select numeric column for y-axis:", numeric_columns)
+    
+    # Patient selection
+    if 'ID' in clinical_df.columns:
+        available_patients = clinical_df['ID'].unique()
+        selected_patients = st.sidebar.multiselect(
+            "Select patients (leave empty for all):", 
+            available_patients
+        )
+        if selected_patients:
+            clinical_df = clinical_df[clinical_df['ID'].isin(selected_patients)]
+            parquet_df = parquet_df[parquet_df['ID'].isin(selected_patients)]
+    
+    # Create the longitudinal plot
+    create_longitudinal_plot(clinical_df, parquet_df, date_col, y_col, project_name)
+
+def load_clinical_data_with_dates(project_name):
+    """
+    Load clinical data from EDF_Format folder for the given project.
+    """
+    import os
+    import pandas as pd
+    from pathlib import Path
+    
+    clinical_df = pd.DataFrame()
+    edf_proj_dir = os.path.join('EDF_Format', project_name)
+    
+    if os.path.isdir(edf_proj_dir):
+        # Look for Excel/CSV files in the directory and subdirs
+        data_files = []
+        for root, dirs, files in os.walk(edf_proj_dir):
+            for f in files:
+                if f.lower().endswith(('.xls', '.xlsx', '.csv')):
+                    data_files.append(os.path.join(root, f))
+        
+        if data_files:
+            # Try to read the first available file
+            for file_path in data_files:
+                try:
+                    if file_path.lower().endswith('.csv'):
+                        clinical_df = pd.read_csv(file_path)
+                    else:
+                        # For Excel files, try different sheets
+                        if project_name == 'Seeg':
+                            clinical_df = pd.read_excel(file_path, sheet_name='SEEG_PATIENTS')
+                        else:
+                            clinical_df = pd.read_excel(file_path)
+                    
+                    if not clinical_df.empty:
+                        break
+                except Exception as e:
+                    st.warning(f"Could not read {file_path}: {e}")
+                    continue
+    
+    return clinical_df
+
+def load_raw_parquet_files(project_name):
+    """
+    Load raw parquet files from parquet_results/{project_name} directory.
+    """
+    import os
+    import pandas as pd
+    import glob
+    from pathlib import Path
+    
+    parquet_dir = os.path.join('parquet_results', project_name)
+    df_list = []
+    
+    if os.path.isdir(parquet_dir):
+        for fname in sorted(os.listdir(parquet_dir)):
+            if not fname.lower().endswith('.parquet'):
+                continue
+            fpath = os.path.join(parquet_dir, fname)
+            try:
+                df = pd.read_parquet(fpath)
+                # Ensure there's a file_name column - use the parquet filename as fallback
+                if 'file_name' not in df.columns:
+                    base = fname.replace('.parquet', '')
+                    # remove trailing .edf if present
+                    if base.lower().endswith('.edf'):
+                        base = base[:-4]
+                    df['file_name'] = base
+                
+                # Create ID column from file_name
+                df['ID'] = df['file_name'].astype(str).apply(lambda x: os.path.basename(x).replace('.edf', '').lower().strip())
+                
+                df_list.append(df)
+            except Exception as e:
+                st.warning(f"Warning: failed reading {fpath}: {e}")
+                continue
+    
+    if len(df_list) == 0:
+        return pd.DataFrame()
+    else:
+        return pd.concat(df_list, ignore_index=True, sort=False)
+
+def find_date_columns(df):
+    """
+    Find columns that contain date information.
+    """
+    date_columns = []
+    
+    for col in df.columns:
+        # Check if column name suggests it's a date
+        if any(keyword in col.lower() for keyword in ['date', 'time', 'visit', 'onset', 'final', 'eeg']):
+            date_columns.append(col)
+        # Check if column contains date-like data
+        elif df[col].dtype == 'object':
+            # Sample a few non-null values to check if they look like dates
+            sample_values = df[col].dropna().head(5)
+            if len(sample_values) > 0:
+                try:
+                    pd.to_datetime(sample_values.iloc[0])
+                    date_columns.append(col)
+                except:
+                    pass
+    
+    return date_columns
+
+def get_numeric_columns(clinical_df, parquet_df):
+    """
+    Get numeric columns from both clinical and parquet data.
+    """
+    numeric_cols = []
+    
+    # From clinical data
+    for col in clinical_df.columns:
+        if pd.api.types.is_numeric_dtype(clinical_df[col]):
+            numeric_cols.append(f"clinical_{col}")
+    
+    # From parquet data
+    for col in parquet_df.columns:
+        if pd.api.types.is_numeric_dtype(parquet_df[col]) and col not in ['ID', 'file_name']:
+            numeric_cols.append(f"parquet_{col}")
+    
+    return sorted(numeric_cols)
+
+def create_average_trajectory_plot(df_plot_normalized, x_col, actual_y_col, project_name):
+    """
+    Create a plot showing the average trajectory across all patients with statistical analysis.
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+    from scipy import stats
+    import statsmodels.api as sm
+    
+    # Calculate average trajectory
+    avg_trajectory = df_plot_normalized.groupby(x_col)[actual_y_col].agg(['mean', 'std', 'count']).reset_index()
+    avg_trajectory = avg_trajectory[avg_trajectory['count'] > 0]  # Remove time points with no data
+    
+    if len(avg_trajectory) < 2:
+        st.warning("Not enough data points for average trajectory analysis")
+        return
+    
+    # Create the plot
+    fig, ax = plt.subplots(figsize=(12, 8))
+    
+    # Plot average trajectory with error bars
+    ax.errorbar(avg_trajectory[x_col], avg_trajectory['mean'], 
+                yerr=avg_trajectory['std'], 
+                marker='o', capsize=5, capthick=2, 
+                label='Average ± 1 SD', alpha=0.8, linewidth=2)
+    
+    # Add individual patient trajectories in background (lighter)
+    for patient_id in df_plot_normalized['ID'].unique():
+        patient_data = df_plot_normalized[df_plot_normalized['ID'] == patient_id].sort_values(x_col)
+        if len(patient_data) > 1:
+            ax.plot(patient_data[x_col], patient_data[actual_y_col], 
+                   alpha=0.2, linewidth=1, color='gray')
+    
+    # Statistical analysis: test if slope is significantly different from zero
+    X = sm.add_constant(avg_trajectory[x_col])
+    model = sm.OLS(avg_trajectory['mean'], X).fit()
+    r_squared = model.rsquared
+    p_value = model.pvalues[1]  # p-value for the slope
+    slope = model.params[1]
+    
+    # Add regression line
+    x_range = np.linspace(avg_trajectory[x_col].min(), avg_trajectory[x_col].max(), 100)
+    y_pred = model.predict(sm.add_constant(x_range))
+    ax.plot(x_range, y_pred, 'r--', linewidth=2, alpha=0.8, label=f'Regression Line (slope={slope:.2e})')
+    
+    # Customize plot
+    ax.set_xlabel('Days from First Visit', fontsize=12)
+    ax.set_ylabel(f'{actual_y_col}', fontsize=12)
+    ax.set_title(f'Average Trajectory: {actual_y_col} over Time\n'
+                f'R² = {r_squared:.3f}, p-value = {p_value:.2e}', fontsize=14)
+    
+    # Add grid
+    ax.grid(True, alpha=0.3)
+    
+    # Add legend
+    ax.legend(loc='best')
+    
+    # Add statistical significance annotation
+    if p_value < 0.001:
+        sig_text = "p < 0.001"
+    elif p_value < 0.01:
+        sig_text = "p < 0.01"
+    elif p_value < 0.05:
+        sig_text = "p < 0.05"
+    else:
+        sig_text = "p ≥ 0.05 (not significant)"
+    
+    plt.tight_layout()
+    
+    # Display the plot
+    st.subheader("Average Trajectory Analysis")
+    st_pyplot_func(fig, filename=f'average_trajectory_{project_name}_{actual_y_col}.png')
+    
+    # Display statistical summary
+    st.subheader("Statistical Analysis")
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        st.metric("R²", f"{r_squared:.3f}")
+    
+    with col2:
+        st.metric("Slope", f"{slope:.3f}")
+    
+    with col3:
+        st.metric("P-value", f"{p_value:.3e}")
+    
+    with col4:
+        significance = "Significant" if p_value < 0.05 else "Not Significant"
+        st.metric("Slope Significance", significance)
+    
+    # Interpretation
+    if p_value < 0.05:
+        direction = "increasing" if slope > 0 else "decreasing"
+        st.success(f"The average trajectory shows a statistically significant {direction} trend (p < 0.05)")
+    else:
+        st.info("The average trajectory does not show a statistically significant trend (p ≥ 0.05)")
+    
+    plt.close(fig)
+
+def create_longitudinal_plot(clinical_df, parquet_df, date_col, y_col, project_name):
+    """
+    Create a longitudinal plot with date on x-axis and selected column on y-axis.
+    """
+    import matplotlib.pyplot as plt
+    
+    # Determine if we're using clinical or parquet data for the y-axis
+    if y_col.startswith('clinical_'):
+        # Use clinical data
+        df_plot = clinical_df.copy()
+        actual_y_col = y_col.replace('clinical_', '')
+        
+        # Parse dates from clinical data
+        try:
+            df_plot[date_col] = pd.to_datetime(df_plot[date_col], errors='coerce')
+        except Exception as e:
+            raise ValueError(f"Error parsing dates: {e}")
+        
+        # Remove rows with invalid dates
+        df_plot = df_plot.dropna(subset=[date_col])
+        
+    elif y_col.startswith('parquet_'):
+        # Use parquet data - need to merge with clinical data for dates
+        actual_y_col = y_col.replace('parquet_', '')
+        
+        # Check if y column exists in parquet data
+        if actual_y_col not in parquet_df.columns:
+            raise ValueError(f"Column {actual_y_col} not found in parquet data")
+        
+        # Merge parquet data with clinical data to get dates
+        if 'ID' in clinical_df.columns and 'ID' in parquet_df.columns:
+            df_plot = parquet_df.merge(clinical_df[['ID', date_col]], on='ID', how='left')
+        else:
+            raise ValueError("Cannot merge parquet and clinical data - missing ID columns")
+        
+        # Parse dates
+        try:
+            df_plot[date_col] = pd.to_datetime(df_plot[date_col], errors='coerce')
+        except Exception as e:
+            raise ValueError(f"Error parsing dates: {e}")
+        
+        # Remove rows with invalid dates
+        df_plot = df_plot.dropna(subset=[date_col])
+    
+    else:
+        raise ValueError("Invalid column selection")
+    
+    if df_plot.empty:
+        raise ValueError("No valid data found after merging and filtering")
+    
+    # Convert y column to numeric
+    try:
+        df_plot[actual_y_col] = pd.to_numeric(df_plot[actual_y_col], errors='coerce')
+    except Exception as e:
+        raise ValueError(f"Error converting {actual_y_col} to numeric: {e}")
+    
+    # Remove rows with invalid y values
+    df_plot = df_plot.dropna(subset=[actual_y_col])
+    
+    if df_plot.empty:
+        raise ValueError("No valid numeric data found")
+    
+    # Normalize dates to start from day 0 for each patient
+    df_plot_normalized = df_plot.copy()
+    if 'ID' in df_plot.columns:
+        # Calculate days from first visit for each patient
+        df_plot_normalized['days_from_start'] = df_plot_normalized.groupby('ID')[date_col].transform(
+            lambda x: (x - x.min()).dt.days
+        )
+        x_col = 'days_from_start'
+        x_label = 'Days from First Visit'
+    else:
+        # If no ID column, normalize all dates to start from 0
+        min_date = df_plot[date_col].min()
+        df_plot_normalized['days_from_start'] = (df_plot[date_col] - min_date).dt.days
+        x_col = 'days_from_start'
+        x_label = 'Days from First Visit'
+    
+    # Create the plot
+    fig, ax = plt.subplots(figsize=(12, 8))
+    
+    # If there's an ID column, plot lines for each patient
+    if 'ID' in df_plot_normalized.columns:
+        for patient_id in df_plot_normalized['ID'].unique():
+            patient_data = df_plot_normalized[df_plot_normalized['ID'] == patient_id].sort_values(x_col)
+            if len(patient_data) > 1:
+                ax.plot(patient_data[x_col], patient_data[actual_y_col], 
+                       marker='o', label=f'Patient {patient_id}', alpha=0.7)
+            else:
+                ax.scatter(patient_data[x_col], patient_data[actual_y_col], 
+                          label=f'Patient {patient_id}', alpha=0.7)
+    else:
+        # Plot all points
+        ax.scatter(df_plot_normalized[x_col], df_plot_normalized[actual_y_col], alpha=0.7)
+    
+    # Customize plot
+    ax.set_xlabel(x_label, fontsize=12)
+    ax.set_ylabel(f'{actual_y_col}', fontsize=12)
+    ax.set_title(f'Longitudinal Analysis: {actual_y_col} over Time (Normalized)', fontsize=14)
+    
+    # Rotate x-axis labels for better readability
+    plt.xticks(rotation=45)
+    
+    # Add legend if there are multiple patients
+    if 'ID' in df_plot.columns and df_plot['ID'].nunique() > 1:
+        ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    
+    # Add grid
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    # Display the plot
+    st_pyplot_func(fig, filename=f'longitudinal_{project_name}_{actual_y_col}.png')
+    
+    # Create average trajectory plot
+    if 'ID' in df_plot_normalized.columns and df_plot_normalized['ID'].nunique() > 1:
+        create_average_trajectory_plot(df_plot_normalized, x_col, actual_y_col, project_name)
+    
+    # Display summary statistics
+    st.subheader("Summary Statistics")
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        st.metric("Total Records", len(df_plot))
+    
+    with col2:
+        if 'ID' in df_plot.columns:
+            st.metric("Unique Patients", df_plot['ID'].nunique())
+        else:
+            st.metric("Data Points", len(df_plot))
+    
+    with col3:
+        if 'days_from_start' in df_plot_normalized.columns:
+            max_days = df_plot_normalized['days_from_start'].max()
+            st.metric("Max Days from Start", max_days)
+        else:
+            date_range = (df_plot[date_col].max() - df_plot[date_col].min()).days
+            st.metric("Date Range (days)", date_range)
+    
+    # Show data table
+    st.subheader("Data Preview")
+    display_cols = [x_col, actual_y_col]
+    if 'ID' in df_plot_normalized.columns:
+        display_cols = ['ID'] + display_cols
+    
+    st.dataframe(df_plot_normalized[display_cols].head(20), use_container_width=True)
     
     plt.close(fig)
 
