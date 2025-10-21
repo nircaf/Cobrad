@@ -5,6 +5,8 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import os
 import re
+import pickle
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from utils.eeg_utils import *
 import mne
 import pandas as pd
@@ -269,11 +271,654 @@ def get_cap_sleep_group(file_prefix):
     # All other prefixes are considered Dementia cases
     return 'Dementia'
 
-def HEP_plots(project_name, df_wnv3, controls, boxplot_columns, analysis_type,selected_feature=None):
+def HEP_plots2(project_name, df_wnv3, controls, boxplot_columns, analysis_type, selected_feature=None, size_feature=None):
+    """
+    New HEP analysis function that reads EDF files directly from pickles/EDF directory,
+    calculates HEP measurements for each patient, and shows a pairgrid of results.
+    """
+    print(f"HEP_plots2: Starting analysis for project: {project_name}")
+    
+    if project_name != 'COBRAD':
+        print("HEP_plots2: Project is not COBRAD, exiting")
+        return
+    
+    # Define the pickles directory
+    pickles_dir = 'pickles/EDF'
+    print(f"HEP_plots2: Looking for pickle files in: {pickles_dir}")
+    
+    if not os.path.exists(pickles_dir):
+        print(f"HEP_plots2: Directory not found: {pickles_dir}")
+        st.error(f"Directory not found: {pickles_dir}")
+        return
+    
+    # Get all pickle files
+    pickle_files = [f for f in os.listdir(pickles_dir) if f.endswith('.pkl')]
+    print(f"HEP_plots2: Found {len(pickle_files)} pickle files")
+    
+    if not pickle_files:
+        print("HEP_plots2: No pickle files found")
+        st.warning(f"No pickle files found in {pickles_dir}")
+        return
+    
+    # Group files by patient ID and select only the first file per patient
+    patient_files = {}
+    print("HEP_plots2: Grouping files by patient ID...")
+    
+    for pickle_file in pickle_files:
+        # Extract patient ID from filename using regex pattern (\d{4}-\d{3})
+        import re
+        m = re.search(r'(\d{4}-\d{3})', pickle_file)
+        if m:
+            patient_id = m.group(1)
+            print(f"HEP_plots2: Extracted patient ID {patient_id} from {pickle_file}")
+        else:
+            # Fallback: use filename without extension
+            patient_id = pickle_file.replace('.pkl', '')
+            print(f"HEP_plots2: Using fallback patient ID {patient_id} from {pickle_file}")
+        
+        # If this is the first file for this patient, add it
+        if patient_id not in patient_files:
+            patient_files[patient_id] = pickle_file
+            print(f"HEP_plots2: Added {pickle_file} for patient {patient_id}")
+        else:
+            print(f"HEP_plots2: Skipping {pickle_file} for patient {patient_id} (already have {patient_files[patient_id]})")
+    
+    # Get the list of files to process (one per patient)
+    files_to_process = list(patient_files.values())
+    print(f"HEP_plots2: Will process {len(files_to_process)} files (1 per patient)")
+    
+    st.write(f"Found {len(pickle_files)} total files, processing {len(files_to_process)} files (1 per patient)")
+    st.info("⚠️ Processing limited to first 10 minutes of data per patient for faster analysis")
+    st.info("🚀 Processing patients in parallel for faster execution")
+    st.info("📊 Converting raw data from volts to microvolts for standard EEG analysis")
+    st.info("⚡ Calculating power bands for each time window")
+    st.info("📈 Results will show mean values across patients for each time window")
+    
+    # Add checkbox for processing all patients
+    process_all_patients = st.checkbox("Process all patients (unchecked = first 5 patients only)", value=False)
+    
+    # Check for existing cache and determine which patients need processing
+    cache_dir = 'Cache'
+    os.makedirs(cache_dir, exist_ok=True)
+    
+    # Check which patients are already cached
+    cached_patients = set()
+    if os.path.exists(cache_dir):
+        # Look for individual patient cache files
+        patient_cache_files = [f for f in os.listdir(cache_dir) if f.startswith('HEP_patient_') and f.endswith('.parquet')]
+        for cache_file in patient_cache_files:
+            # Extract patient ID from filename (format: HEP_patient_XXXX-XXX_band.parquet)
+            import re
+            match = re.search(r'HEP_patient_(\d{4}-\d{3})_', cache_file)
+            if match:
+                patient_id = match.group(1)
+                cached_patients.add(patient_id)
+    
+    st.info(f"📁 Found {len(cached_patients)} patients already cached: {sorted(cached_patients)}")
+    
+    # If we have cached data and not processing all patients, show cached results
+    if cached_patients and not process_all_patients:
+        try:
+            # Load all cached patient data
+            all_cached_data = []
+            for patient_id in cached_patients:
+                for band_name in power_bands.keys():
+                    cache_file = f"HEP_patient_{patient_id}_{band_name}.parquet"
+                    cache_path = os.path.join(cache_dir, cache_file)
+                    if os.path.exists(cache_path):
+                        patient_df = pd.read_parquet(cache_path)
+                        all_cached_data.append(patient_df)
+            
+            if all_cached_data:
+                # Combine all cached data
+                cached_df = pd.concat(all_cached_data, ignore_index=True)
+                
+                # Calculate mean values across patients for each window_id
+                numeric_cols = cached_df.select_dtypes(include=[np.number]).columns.tolist()
+                exclude_cols = ['patient_id', 'window_id', 'time_start', 'time_end']
+                metric_cols = [col for col in numeric_cols if col not in exclude_cols]
+                
+                # Group by window_id and calculate mean
+                mean_results = cached_df.groupby('window_id')[metric_cols].mean().reset_index()
+                
+                # Add time information
+                time_info = cached_df.groupby('window_id')[['time_start', 'time_end']].mean().reset_index()
+                mean_results = mean_results.merge(time_info, on='window_id')
+                
+                # Add patient count for each window
+                patient_counts = cached_df.groupby('window_id')['patient_id'].nunique().reset_index()
+                patient_counts.columns = ['window_id', 'patient_count']
+                mean_results = mean_results.merge(patient_counts, on='window_id')
+                
+                # Filter to max patient count
+                mean_results = mean_results[mean_results['patient_count'] == mean_results['patient_count'].max()]
+                mean_results['Group'] = 'Dementia'
+                
+                st.info(f"📁 Loading cached results from {len(cached_patients)} patients")
+                st.success(f"✅ Loaded {len(mean_results)} time windows from cache")
+                
+                # Display the cached data
+                st.write("**Cached Results Preview:**")
+                st.dataframe(mean_results.head())
+                
+                # Show plots using cached data
+                for band_name in power_bands.keys():
+                    st.write(f"Analyzing power band: {band_name}")
+                    only_plots(
+                        results_df=mean_results,
+                        save_plot=False,
+                        save_dir='',
+                        edf_pickle_name=f"hep_analysis_{band_name}",
+                        band=band_name,
+                        step_sec=5,
+                        is_streamlit=True
+                    )
+                    st.success(f"Completed analysis for {band_name} band with {len(mean_results)} time windows (from cache)")
+                    st.divider()
+                
+                return  # Exit function after using cached data
+                
+        except Exception as e:
+            st.warning(f"Could not load cached data: {e}")
+            st.info("Proceeding with new data processing...")
+    
+    # Filter out already cached patients
+    files_to_process_filtered = []
+    for pickle_file in files_to_process:
+        # Extract patient ID from filename
+        import re
+        m = re.search(r'(\d{4}-\d{3})', pickle_file)
+        if m:
+            patient_id = m.group(1)
+            if patient_id not in cached_patients:
+                files_to_process_filtered.append(pickle_file)
+        else:
+            # Fallback: use filename without extension
+            patient_id = pickle_file.replace('.pkl', '')
+            if patient_id not in cached_patients:
+                files_to_process_filtered.append(pickle_file)
+    
+    # Limit to 5 patients unless checkbox is checked
+    if not process_all_patients:
+        # from the end
+        files_to_process_filtered = files_to_process_filtered[-2:]
+        st.info(f"🔢 Processing only {len(files_to_process_filtered)} new patients. Check the box above to process all {len(files_to_process_filtered)} patients.")
+    else:
+        st.info(f"🔢 Processing all {len(files_to_process_filtered)} new patients.")
+    
+    # Update files_to_process to the filtered list
+    files_to_process = files_to_process_filtered
+    
+    if not files_to_process:
+        st.info("✅ All patients are already cached! Loading from cache...")
+        # Load and display cached results
+        try:
+            all_cached_data = []
+            for patient_id in cached_patients:
+                for band_name in power_bands.keys():
+                    cache_file = f"HEP_patient_{patient_id}_{band_name}.parquet"
+                    cache_path = os.path.join(cache_dir, cache_file)
+                    if os.path.exists(cache_path):
+                        patient_df = pd.read_parquet(cache_path)
+                        all_cached_data.append(patient_df)
+            
+            if all_cached_data:
+                # Combine all cached data and process as before
+                cached_df = pd.concat(all_cached_data, ignore_index=True)
+                
+                # Calculate mean values across patients for each window_id
+                numeric_cols = cached_df.select_dtypes(include=[np.number]).columns.tolist()
+                exclude_cols = ['patient_id', 'window_id', 'time_start', 'time_end']
+                metric_cols = [col for col in numeric_cols if col not in exclude_cols]
+                
+                # Group by window_id and calculate mean
+                mean_results = cached_df.groupby('window_id')[metric_cols].mean().reset_index()
+                
+                # Add time information
+                time_info = cached_df.groupby('window_id')[['time_start', 'time_end']].mean().reset_index()
+                mean_results = mean_results.merge(time_info, on='window_id')
+                
+                # Add patient count for each window
+                patient_counts = cached_df.groupby('window_id')['patient_id'].nunique().reset_index()
+                patient_counts.columns = ['window_id', 'patient_count']
+                mean_results = mean_results.merge(patient_counts, on='window_id')
+                
+                # Filter to max patient count
+                mean_results = mean_results[mean_results['patient_count'] == mean_results['patient_count'].max()]
+                mean_results['Group'] = 'Dementia'
+                
+                # Show plots using cached data
+                for band_name in power_bands.keys():
+                    st.write(f"Analyzing power band: {band_name}")
+                    only_plots(
+                        results_df=mean_results,
+                        save_plot=False,
+                        save_dir='',
+                        edf_pickle_name=f"hep_analysis_{band_name}",
+                        band=band_name,
+                        step_sec=5,
+                        is_streamlit=True
+                    )
+                    st.success(f"Completed analysis for {band_name} band with {len(mean_results)} time windows (from cache)")
+                    st.divider()
+                
+                return  # Exit function after using cached data
+        except Exception as e:
+            st.warning(f"Could not load cached data: {e}")
+            st.info("Proceeding with new data processing...")
+    
+    # Process each frequency band
+    for band_name, band_range in power_bands.items():
+        print(f"HEP_plots2: Processing band {band_name} with range {band_range}")
+        st.write(f"Analyzing power band: {band_name}")
+        
+        all_patient_results = []
+        
+        # Create progress bar for file processing
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        # Process files in parallel
+        def process_single_file(pickle_file):
+            """Process a single pickle file and return results"""
+            try:
+                print(f"HEP_plots2: Processing file {pickle_file} for band {band_name}")
+                
+                # Extract patient ID from filename
+                import re
+                m = re.search(r'(\d{4}-\d{3})', pickle_file)
+                if m:
+                    patient_id = m.group(1)
+                else:
+                    patient_id = pickle_file.replace('.pkl', '')
+                
+                # Check if this patient is already cached for this band
+                cache_file = f"HEP_patient_{patient_id}_{band_name}.parquet"
+                cache_path = os.path.join(cache_dir, cache_file)
+                
+                if os.path.exists(cache_path):
+                    print(f"HEP_plots2: Loading cached data for patient {patient_id}, band {band_name}")
+                    try:
+                        cached_df = pd.read_parquet(cache_path)
+                        print(f"HEP_plots2: Loaded {len(cached_df)} time windows from cache for patient {patient_id}")
+                        return cached_df, patient_id
+                    except Exception as e:
+                        print(f"HEP_plots2: Error loading cached data for patient {patient_id}: {e}")
+                        # Continue with processing if cache load fails
+                
+                # Load the raw EEG data
+                print(f"HEP_plots2: Loading pickle file {pickle_file}")
+                with open(os.path.join(pickles_dir, pickle_file), 'rb') as f:
+                    raw = pickle.load(f)
+                
+                print(f"HEP_plots2: Processing patient {patient_id}")
+                
+                # Calculate HEP measurements for this patient
+                patient_results = calculate_hep_measurements_for_patient(raw, patient_id, band_name, band_range)
+                
+                if patient_results is not None:
+                    print(f"HEP_plots2: Got {len(patient_results)} time windows for patient {patient_id}")
+                    
+                    # Save individual patient data to cache
+                    try:
+                        patient_results.to_parquet(cache_path, index=False)
+                        print(f"HEP_plots2: Saved patient {patient_id} data to cache: {cache_path}")
+                    except Exception as e:
+                        print(f"HEP_plots2: Error saving cache for patient {patient_id}: {e}")
+                    
+                    return patient_results, patient_id
+                else:
+                    print(f"HEP_plots2: No results for patient {patient_id}")
+                    return None, patient_id
+                    
+            except Exception as e:
+                print(f"HEP_plots2: Error processing {pickle_file}: {e}")
+                return None, pickle_file
+        
+        # Use ThreadPoolExecutor for parallel processing
+        max_workers = min(16, len(files_to_process))  # Limit to 4 workers to avoid overwhelming the system
+        print(f"HEP_plots2: Processing {len(files_to_process)} files in parallel with {max_workers} workers")
+        
+        # Update status text to show current processing mode
+        if len(files_to_process) <= 5:
+            st.info(f"🔬 Processing {len(files_to_process)} patients for quick analysis")
+        else:
+            st.info(f"🔬 Processing {len(files_to_process)} patients for comprehensive analysis")
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all tasks
+            future_to_file = {executor.submit(process_single_file, pickle_file): pickle_file 
+                             for pickle_file in files_to_process}
+            
+            # Process completed tasks
+            completed_count = 0
+            for future in as_completed(future_to_file):
+                completed_count += 1
+                pickle_file = future_to_file[future]
+                
+                # Update progress bar
+                progress = completed_count / len(files_to_process)
+                progress_bar.progress(progress)
+                status_text.text(f"Processing file {completed_count}/{len(files_to_process)}: {pickle_file}")
+                
+                try:
+                    patient_results, patient_id = future.result()
+                    if patient_results is not None:
+                        all_patient_results.append(patient_results)
+                        print(f"HEP_plots2: Completed patient {patient_id}")
+                    else:
+                        print(f"HEP_plots2: Skipped patient {patient_id} (no ECG channel or other issue)")
+                except Exception as e:
+                    print(f"HEP_plots2: Error processing file {pickle_file}: {e}")
+                    st.warning(f"Error processing file {pickle_file}: {e}")
+                    continue
+        
+        print(f"HEP_plots2: Total patient results for band {band_name}: {len(all_patient_results)}")
+        
+        if not all_patient_results:
+            print(f"HEP_plots2: No valid results for band {band_name}")
+            st.warning(f"No valid results for band {band_name}")
+            continue
+        
+        # Combine all patient results
+        print(f"HEP_plots2: Combining results for band {band_name}")
+        results_df = pd.concat(all_patient_results, ignore_index=True)
+        print(f"HEP_plots2: Combined DataFrame shape: {results_df.shape}")
+        
+        # Calculate mean values across patients for each window_id
+        print(f"HEP_plots2: Calculating mean values across patients for each window_id")
+        
+        # Get numeric columns (exclude patient_id, window_id, time_start, time_end)
+        numeric_cols = results_df.select_dtypes(include=[np.number]).columns.tolist()
+        exclude_cols = ['patient_id', 'window_id', 'time_start', 'time_end']
+        metric_cols = [col for col in numeric_cols if col not in exclude_cols]
+        
+        # Group by window_id and calculate mean
+        mean_results = results_df.groupby('window_id')[metric_cols].mean().reset_index()
+        
+        # Add time information (use mean time across patients for each window)
+        time_info = results_df.groupby('window_id')[['time_start', 'time_end']].mean().reset_index()
+        mean_results = mean_results.merge(time_info, on='window_id')
+        
+        # Add patient count for each window
+        patient_counts = results_df.groupby('window_id')['patient_id'].nunique().reset_index()
+        patient_counts.columns = ['window_id', 'patient_count']
+        mean_results = mean_results.merge(patient_counts, on='window_id')
+        # Save combined results to parquet file (for backward compatibility)
+        patient_count_max = mean_results['patient_count'].max()
+        combined_filename = f"HEP_time_avg_{int(patient_count_max)}.parquet"
+        combined_path = os.path.join(cache_dir, combined_filename)
+        
+        try:
+            mean_results.to_parquet(combined_path, index=False)
+            print(f"HEP_plots2: Saved combined results to {combined_path}")
+            st.success(f"💾 Combined results saved to {combined_filename}")
+        except Exception as e:
+            print(f"HEP_plots2: Error saving combined parquet file: {e}")
+            st.warning(f"Could not save combined results to parquet: {e}")
+        # only the rows where mean_results patient_count is max
+        mean_results = mean_results[mean_results['patient_count'] == mean_results['patient_count'].max()]
+        print(f"HEP_plots2: Mean results DataFrame shape: {mean_results.shape}")
+        print(f"HEP_plots2: Mean results columns: {mean_results.columns.tolist()}")
+        print(f"HEP_plots2: Max patient count: {patient_count_max}")
+        
+
+        
+        # Use mean_results instead of results_df for plotting
+        results_df = mean_results
+        
+        # Add group information
+        results_df['Group'] = 'Dementia'  # All patients are from Dementia group
+        print(f"HEP_plots2: Added Group column")
+        
+        # Add size feature if specified
+        if size_feature and size_feature in df_wnv3.columns:
+            print(f"HEP_plots2: Adding size feature {size_feature}")
+            for idx, row in results_df.iterrows():
+                patient_id = row['patient_id']
+                matching_rows = df_wnv3[df_wnv3['ID'] == patient_id]
+                if not matching_rows.empty:
+                    results_df.loc[idx, size_feature] = matching_rows[size_feature].iloc[0]
+                else:
+                    results_df.loc[idx, size_feature] = df_wnv3[size_feature].mean() if size_feature in df_wnv3.columns else 1.0
+        
+        st.write(f"Processed {len(results_df)} time windows for band {band_name}")
+        print(f"HEP_plots2: Final results shape: {results_df.shape}")
+        print(f"HEP_plots2: Columns: {list(results_df.columns)}")
+        
+        # Use only_plots function instead of custom pairgrid
+        print(f"HEP_plots2: Calling only_plots for band {band_name}")    
+        only_plots(
+            results_df=results_df,
+            save_plot=False,
+            save_dir='',
+            edf_pickle_name=f"hep_analysis_{band_name}",
+            band=band_name,
+            step_sec=5,
+            is_streamlit=True
+        )
+        
+        print(f"HEP_plots2: Completed band {band_name}")
+        
+        # Clear progress bars
+        progress_bar.empty()
+        status_text.empty()
+        
+        st.success(f"Completed analysis for {band_name} band with {len(results_df)} time windows (averaged across {len(all_patient_results)} patients)")
+        st.info(f"📊 Results show mean values across patients for each time window")
+        st.divider()
+
+
+def calculate_hep_measurements_for_patient(raw, patient_id, band_name, band_range):
+    """
+    Calculate HEP measurements for a single patient's EEG data.
+    Returns a DataFrame with measurements for each time window.
+    """
+    print(f"calculate_hep_measurements_for_patient: Processing patient {patient_id}, band {band_name}")
+    
+    try:
+        # Check for ECG channel first - skip patient if none found
+        ecg_channel = None
+        for i, ch_name in enumerate(raw.ch_names):
+            if 'ecg' in ch_name.lower() or 'ekg' in ch_name.lower():
+                ecg_channel = i
+                break
+        
+        if ecg_channel is None:
+            print(f"calculate_hep_measurements_for_patient: No ECG channel found for patient {patient_id} - skipping patient")
+            return None
+        
+        print(f"calculate_hep_measurements_for_patient: Found ECG channel {ecg_channel} for patient {patient_id}")
+        
+        # Extract EEG data and convert from volts to microvolts
+        eeg_data = raw.get_data() * 1e6  # Convert V to μV
+        sfreq = raw.info['sfreq']
+        print(f"calculate_hep_measurements_for_patient: EEG data shape: {eeg_data.shape}, sfreq: {sfreq}, converted to microvolts")
+        
+        # Define window parameters (same as ECG analysis)
+        window_size_sec = 15  # 15-second windows
+        step_size_sec = 5     # 5-second steps
+        
+        window_size = int(window_size_sec * sfreq)
+        step_size = int(step_size_sec * sfreq)
+        
+        print(f"calculate_hep_measurements_for_patient: Window size: {window_size} samples, Step size: {step_size} samples")
+        
+        # Limit to first 10 minutes of data
+        max_samples_10min = int(10 * 60 * sfreq)  # 10 minutes in samples
+        original_duration = eeg_data.shape[1] / sfreq / 60  # Original duration in minutes
+        if eeg_data.shape[1] > max_samples_10min:
+            eeg_data = eeg_data[:, :max_samples_10min]
+            print(f"calculate_hep_measurements_for_patient: Limited to first 10 minutes for patient {patient_id} (original: {original_duration:.1f} min)")
+        else:
+            print(f"calculate_hep_measurements_for_patient: Using full duration for patient {patient_id} ({original_duration:.1f} min)")
+        
+        # Calculate number of windows
+        n_windows = max(0, (eeg_data.shape[1] - window_size) // step_size + 1)
+        print(f"calculate_hep_measurements_for_patient: Number of windows: {n_windows}")
+        
+        if n_windows == 0:
+            print(f"calculate_hep_measurements_for_patient: No windows possible for patient {patient_id}")
+            return None
+        
+        # Initialize storage for this patient
+        patient_results = []
+        
+        # Create progress bar for window processing
+        if n_windows > 0:
+            window_progress_bar = st.progress(0)
+            window_status_text = st.empty()
+        
+        # Process each window
+        for w in range(n_windows):
+            # Update window progress bar
+            if n_windows > 0:
+                window_progress = (w + 1) / n_windows
+                window_progress_bar.progress(window_progress)
+                window_status_text.text(f"Processing window {w+1}/{n_windows} for patient {patient_id}")
+            start = w * step_size
+            end = start + window_size
+            
+            if end > eeg_data.shape[1]:
+                print(f"calculate_hep_measurements_for_patient: Window {w} would exceed data length, stopping")
+                break
+                
+            # Extract window data
+            window_data = eeg_data[:, start:end]
+            print(f"calculate_hep_measurements_for_patient: Processing window {w}/{n_windows}, shape: {window_data.shape}")
+            
+            # Calculate network features for this frequency band
+            try:
+                efficiency, clustering, assortativity, modularity = compute_network_features(
+                    window_data, sfreq, band_range
+                )
+                print(f"calculate_hep_measurements_for_patient: Window {w} - Efficiency: {efficiency:.3f}, Clustering: {clustering:.3f}, Assortativity: {assortativity:.3f}, Modularity: {modularity:.3f}")
+            except Exception as e:
+                print(f"calculate_hep_measurements_for_patient: Error computing network features for window {w}: {e}")
+                continue
+            
+            # Calculate power bands for this window
+            try:
+                from scipy.signal import welch
+                
+                # Calculate power spectral density for each channel
+                power_bands_window = {}
+                for ch_idx in range(window_data.shape[0]):
+                    # Calculate PSD for this channel
+                    freqs, psd = welch(window_data[ch_idx], fs=sfreq, nperseg=min(256, len(window_data[ch_idx])//4))
+                    
+                    # Calculate power in each frequency band
+                    for band_name, (fmin, fmax) in power_bands.items():
+                        band_mask = (freqs >= fmin) & (freqs <= fmax)
+                        band_power = np.trapezoid(psd[band_mask], freqs[band_mask])
+                        
+                        if band_name not in power_bands_window:
+                            power_bands_window[band_name] = []
+                        power_bands_window[band_name].append(band_power)
+                
+                # Calculate mean power across all channels for each band
+                mean_power_bands = {}
+                for band_name in power_bands_window:
+                    mean_power_bands[f"{band_name}_power"] = np.mean(power_bands_window[band_name])
+                
+                print(f"calculate_hep_measurements_for_patient: Window {w} - Power bands: {mean_power_bands}")
+                
+            except Exception as e:
+                print(f"calculate_hep_measurements_for_patient: Error calculating power bands for window {w}: {e}")
+                # Set default values for power bands
+                mean_power_bands = {}
+                for band_name in power_bands:
+                    mean_power_bands[f"{band_name}_power"] = np.nan
+            
+            # Calculate HRV features (Vagal_SD1 and Sympathetic_SD2) using the same method as HEP_parquet_generation.py
+            try:
+                # ECG channel already verified at the beginning of the function
+                # Get ECG data for this window and convert from volts to microvolts
+                ecg_data = raw.get_data()[ecg_channel, start:end] * 1e6  # Convert V to μV
+                
+                # Use the same approach as in HEP_parquet_generation.py
+                import neurokit2 as nk
+                
+                # Clean ECG signal
+                ecg_clean = nk.ecg_clean(ecg_data, sampling_rate=sfreq)
+                
+                # Find R-peaks
+                try:
+                    signals, info = nk.ecg_process(ecg_clean, sampling_rate=sfreq)
+                    rpeaks = signals['ECG_R_Peaks']
+                    
+                    # Calculate SD1 and SD2 using the same method as HEP_parquet_generation.py
+                    if len(rpeaks) > 2:
+                        # Convert R-peak indices to times
+                        r_times = rpeaks / sfreq
+                        
+                        # Calculate inter-beat intervals (IBI)
+                        ibi = np.diff(rpeaks) / sfreq
+                        
+                        # Calculate differences between consecutive IBIs
+                        dibi = np.diff(ibi)
+                        
+                        # Calculate SD1 and SD2 using the same formulas
+                        vagal_sd1 = np.std(dibi) / np.sqrt(2)
+                        sympathetic_sd2 = np.sqrt(max(0, 2 * np.std(ibi)**2 - 0.5 * np.std(dibi)**2))
+                        
+                        print(f"calculate_hep_measurements_for_patient: Window {w} - Vagal_SD1: {vagal_sd1:.3f}, Sympathetic_SD2: {sympathetic_sd2:.3f}")
+                    else:
+                        print(f"calculate_hep_measurements_for_patient: Not enough R-peaks in window {w} ({len(rpeaks)} found)")
+                        vagal_sd1 = np.nan
+                        sympathetic_sd2 = np.nan
+                    
+                except Exception as e:
+                    print(f"calculate_hep_measurements_for_patient: Error processing ECG for window {w}: {e}")
+                    vagal_sd1 = np.nan
+                    sympathetic_sd2 = np.nan
+                    
+            except Exception as e:
+                print(f"calculate_hep_measurements_for_patient: Error calculating HRV for window {w}: {e}")
+                vagal_sd1 = np.nan
+                sympathetic_sd2 = np.nan
+            
+            # Store results for this window
+            window_result = {
+                'patient_id': patient_id,
+                'window_id': w,
+                'time_start': start / sfreq,
+                'time_end': end / sfreq,
+                'Efficiency': efficiency,
+                'Clustering': clustering,
+                'Assortativity': assortativity,
+                'Modularity': modularity,
+                'Vagal_SD1': vagal_sd1,
+                'Sympathetic_SD2': sympathetic_sd2
+            }
+            
+            # Add power bands to the result
+            window_result.update(mean_power_bands)
+            
+            patient_results.append(window_result)
+        
+        print(f"calculate_hep_measurements_for_patient: Completed {len(patient_results)} windows for patient {patient_id}")
+        
+        # Clear window progress bar
+        if n_windows > 0:
+            window_progress_bar.empty()
+            window_status_text.empty()
+        
+        return pd.DataFrame(patient_results)
+        
+    except Exception as e:
+        print(f"calculate_hep_measurements_for_patient: Error processing patient {patient_id}: {e}")
+        st.warning(f"Error processing patient {patient_id}: {e}")
+        return None
+
+
+def HEP_plots(project_name, df_wnv3, controls, boxplot_columns, analysis_type, selected_feature=None, size_feature=None):
+    # if size_feature is None:
+    #     size_feature = 'clinical_moca'
     if project_name == 'COBRAD':
         # Define both directories
         edf_hep_dir = 'parquets_HEP/EDF_HEP'
-        cap_sleep_dir = 'parquets_HEP/CAP_Sleep_Database'
+        # cap_sleep_dir = 'parquets_HEP/CAP_Sleep_Database'
     else:
         return
     # Run over power bands
@@ -281,7 +926,7 @@ def HEP_plots(project_name, df_wnv3, controls, boxplot_columns, analysis_type,se
         st.write(f"Analyzing power band: {band_name}")
         dfs = []
         hue = None
-        
+        df_wnv3_clean = pd.DataFrame()
         # Process EDF_HEP directory (Dementia group)
         if os.path.exists(edf_hep_dir):
             edf_band_files = [f for f in os.listdir(edf_hep_dir) if f.endswith(f"_{band_name}.parquet")]
@@ -290,23 +935,43 @@ def HEP_plots(project_name, df_wnv3, controls, boxplot_columns, analysis_type,se
                 try:
                     df = pd.read_parquet(file_path)
                     if not df.empty:
-                        df['Group'] = 'Dementia'
-                        dfs.append(df)
+                        # Extract patient ID from filename (assuming format like "patient_123_band.parquet")
+                        patient_id = file.split('_')[0][1:]
+                        matching_rows = df_wnv3[df_wnv3['ID'] == patient_id]
+                        if not matching_rows.empty:
+                            # df = pd.concat([matching_rows, df], ignore_index=True,axis=1)
+                            # add to df_wnv3_clean matching_rows rows
+                            df_wnv3_clean = pd.concat([df_wnv3_clean, matching_rows], ignore_index=True,axis=0)
+                            df['Group'] = 'Dementia'
+                            dfs.append(df)
                 except Exception as e:
                     st.warning(f"Could not read {file} from EDF_HEP: {e}")
         
         # Process CAP_Sleep_Database directory (Control group)
-        if os.path.exists(cap_sleep_dir):
-            cap_band_files = [f for f in os.listdir(cap_sleep_dir) if f.endswith(f"_{band_name}.parquet")]
-            for file in cap_band_files:
-                file_path = os.path.join(cap_sleep_dir, file)
-                try:
-                    df = pd.read_parquet(file_path)
-                    if not df.empty:
-                        df['Group'] = 'Control'
-                        dfs.append(df)
-                except Exception as e:
-                    st.warning(f"Could not read {file} from CAP_Sleep_Database: {e}")
+        # if cap_sleep_dir exists
+        if 'cap_sleep_dir' in locals():
+            if os.path.exists(cap_sleep_dir):
+                cap_band_files = [f for f in os.listdir(cap_sleep_dir) if f.endswith(f"_{band_name}.parquet")]
+                for file in cap_band_files:
+                    file_path = os.path.join(cap_sleep_dir, file)
+                    try:
+                        df = pd.read_parquet(file_path)
+                        if not df.empty:
+                            df['Group'] = 'Control'
+                            # add size_feature from df_wnv3 where df_wnv3['ID'] == file.split('_')[0][1:]
+                            if size_feature and size_feature in df_wnv3.columns:
+                                try:
+                                    # Extract patient ID from filename (assuming format like "patient_123_band.parquet")
+                                    patient_id = file.split('_')[0]
+                                    matching_rows = df_wnv3[df_wnv3['ID'] == patient_id]
+                                    if not matching_rows.empty:
+                                        df[size_feature] = matching_rows[size_feature].iloc[0]
+                                except Exception as e:
+                                    st.warning(f"Could not add size_feature to {file}: {e}")
+                                    df[size_feature] = df_wnv3[size_feature].mean() if size_feature in df_wnv3.columns else 1.0
+                            dfs.append(df)
+                    except Exception as e:
+                        st.warning(f"Could not read {file} from CAP_Sleep_Database: {e}")
         if dfs:
             # Group by 'Group' and compute mean for each group
             group_dfs = []
@@ -343,10 +1008,23 @@ def HEP_plots(project_name, df_wnv3, controls, boxplot_columns, analysis_type,se
         #  apply zscore each column (only numeric columns)
         numeric_cols = results_df.select_dtypes(include=[np.number]).columns
         results_df[numeric_cols] = results_df[numeric_cols].apply(zscore)
-        # if selected_feature not None. 
-        # run only_plots on results_df
+        # results_df size_feature fillna max
+        if size_feature:
+            # remove rows where size_feature is NaN
+            results_df = results_df[results_df[size_feature].notna()]
         st.dataframe(results_df)    
-        only_plots(results_df, save_plot='', save_dir='', edf_pickle_name="plot", band=band_name, step_sec=5,is_streamlit=True,hue=hue)
+        if size_feature:
+            # results_df leave columns 'Vagal_SD1','Sympathetic_SD2','Efficiency','Clustering','Modularity','Assortativity',size_feature
+            results_df = results_df[['Vagal_SD1','Sympathetic_SD2','Efficiency','Clustering','Modularity','Assortativity',size_feature]]
+        # Add cluster number selection
+        n_clusters = st.sidebar.slider("Number of clusters for K-means", 2, 6, 3)
+        
+        # Use the original only_plots function
+        only_plots(results_df, save_plot='', save_dir='', edf_pickle_name="plot", band=band_name, step_sec=5, is_streamlit=True, hue=hue, size_feature=size_feature)
+        
+        # Add enhanced clustering analysis
+        st.subheader("Enhanced Clustering Analysis")
+        enhanced_clustering_plots(results_df, df_wnv3_clean, save_plot='', save_dir='', edf_pickle_name="enhanced_plot", band=band_name, n_clusters=n_clusters, is_streamlit=True, size_feature=size_feature)
         st.divider()
 
 
@@ -361,7 +1039,7 @@ def main():
     # Deduplicate while preserving order
     seen = set()
     opts = [x for x in default_options if not (x in seen or seen.add(x))]
-    selected_projects = st.sidebar.pills("Select Project(s)", opts, default=[x for x in ["Seeg"] if x in opts],selection_mode ="multi")
+    selected_projects = st.sidebar.pills("Select Project(s)", opts, default=[x for x in ["COBRAD"] if x in opts],selection_mode ="multi")
     if not selected_projects:
         st.error("Please select at least one project.")
         return
@@ -412,8 +1090,15 @@ def main():
     clinical_features_numeric = [col for col in clinical_features if pd.api.types.is_numeric_dtype(df_wnv2[col])]
     # Sidebar for feature selection
     st.sidebar.header("Feature Selection")
-    feature_types = ('Longitudinal','HEP', 'All', 'Clinical Feature', "EEG Feature", "ml_plots", "vs_Controls", "Pair Plot",'Raw','Spectrogram')
+    feature_types = ( 'HEP', 'All', 'Clinical Feature', "EEG Feature", "ml_plots", "vs_Controls", "Pair Plot",'Raw','Spectrogram') # 'Longitudinal',
     feature_type = st.sidebar.selectbox("Select feature type to plot against the other type:", feature_types)
+    
+    # Sidebar for scatterplot size feature selection
+    st.sidebar.header("Scatterplot Size Control")
+    size_feature_options = ['None'] + clinical_features_numeric + eeg_features
+    size_feature = st.sidebar.selectbox("Select feature for scatterplot circle size:", size_feature_options, index=0)
+    if size_feature == 'None':
+        size_feature = None
     if feature_type in ["Clinical Feature", "EEG Feature", "vs_Controls","All"]:
         # ask user if they want only significant, or full.
         st.sidebar.header("Select Analysis Type")
@@ -441,10 +1126,11 @@ def main():
         clinical_features, boxplot_columns = get_clinical_and_boxplot_cols(df_wnv2=df_wnv2)
         if feature_type == "All":
             st.header(f"{current_feature_type} Analysis")
+            bool_all_features = True
         if current_feature_type == "vs_Controls":
             vs_controls_run(project_name,df_wnv2,controls,boxplot_columns,analysis_type)
         elif current_feature_type == "HEP":
-            HEP_plots(project_name,df_wnv2,controls,boxplot_columns,analysis_type)
+            HEP_plots2(project_name,df_wnv2,controls,boxplot_columns,analysis_type,size_feature=size_feature)
         elif current_feature_type == "Pair Plot":
             pairplot_columns(df_wnv2, clinical_features, eeg_features)
         elif current_feature_type == "ml_plots":
@@ -475,7 +1161,6 @@ def main():
             if selected_feature == "All Features" or feature_type == "All":
                 all_feat_list = eeg_features
                 selected_feature = eeg_features[0]
-                bool_all_features = True
             plot_title = f"Plots of {selected_feature} vs All Clinical Features"
             boxplot_columns = clinical_features_numeric
             
@@ -491,36 +1176,35 @@ def main():
             if selected_feature == "All Features" or feature_type == "All":
                 all_feat_list = clinical_features
                 selected_feature = clinical_features[0]
-                bool_all_features = True
             plot_title = f"Plots of {selected_feature} vs All EEG Features"
             st.header(plot_title)
-            # keep only rows that can be safely converted to float
-            feature_data = (
-                df_wnv2[selected_feature]
-                .apply(pd.to_numeric, errors='coerce')  # turn invalids into NaN
-                .dropna()
-                .astype(float)
-            )
-            if feature_data.empty:
-                st.warning(f"No valid numeric data available for the selected feature: {selected_feature}")
-                continue  # Skip to next feature type
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Mean", f"{feature_data.mean():.2f}")
-            col2.metric("Median", f"{feature_data.median():.2f}")
-            col3.metric("Std Dev", f"{feature_data.std():.2f}")
-            col4, col5 ,col6 = st.columns(3)
-            col4.metric("Minimum", f"{feature_data.min():.2f}")
-            col5.metric("Maximum", f"{feature_data.max():.2f}")
-            # col 6 is N with dropna
-            col6.metric("N", f"{feature_data.dropna().count()}")
-            # write text for {selected feature}, N= {}, mean ± std
-            st.write(f'{selected_feature} N= {feature_data.dropna().count()}, mean {feature_data.mean():.2f} ± {feature_data.std():.2f}')
-            numeric_colunms = df_wnv2.select_dtypes(include=[np.number]).columns
-            # sidebar checkbox - Clinical Features Correlation
-            if clinical_features_correlation:
-                # from clinical columns get
-                boxplot_columns = boxplot_columns + clinical_features - selected_feature
-            def run_selected_feature():
+            def run_selected_feature(boxplot_columns, hep_checkbox=None):
+                # keep only rows that can be safely converted to float
+                feature_data = (
+                    df_wnv2[selected_feature]
+                    .apply(pd.to_numeric, errors='coerce')  # turn invalids into NaN
+                    .dropna()
+                    .astype(float)
+                )
+                if feature_data.empty:
+                    st.warning(f"No valid numeric data available for the selected feature: {selected_feature}")
+                    return  # Skip to next feature type
+                col1, col2, col3 = st.columns(3)
+                col1.metric("Mean", f"{feature_data.mean():.2f}")
+                col2.metric("Median", f"{feature_data.median():.2f}")
+                col3.metric("Std Dev", f"{feature_data.std():.2f}")
+                col4, col5 ,col6 = st.columns(3)
+                col4.metric("Minimum", f"{feature_data.min():.2f}")
+                col5.metric("Maximum", f"{feature_data.max():.2f}")
+                # col 6 is N with dropna
+                col6.metric("N", f"{feature_data.dropna().count()}")
+                # write text for {selected feature}, N= {}, mean ± std
+                st.write(f'{selected_feature} N= {feature_data.dropna().count()}, mean {feature_data.mean():.2f} ± {feature_data.std():.2f}')
+                numeric_colunms = df_wnv2.select_dtypes(include=[np.number]).columns
+                # sidebar checkbox - Clinical Features Correlation
+                if clinical_features_correlation:
+                    # from clinical columns get
+                    boxplot_columns = boxplot_columns + clinical_features - selected_feature
                 # Display selected feature and plots
                 df_wnv3 = df_wnv2[df_wnv2[selected_feature].notna()].copy()
                 unique_values = df_wnv3[selected_feature].unique()
@@ -569,10 +1253,11 @@ def main():
                         # concat to df_wnv3
                         df_wnv3 = pd.concat([df_wnv3, df_wnv2_other], ignore_index=True)
                                     # st checkbox if HEP
-                    hep_checkbox = st.checkbox("Show HEP & TSNE Plots", value=False)
+                    if hep_checkbox is None:
+                        hep_checkbox = st.checkbox("Show HEP & TSNE Plots", value=False, key=f"hep_checkbox_{selected_feature}")
                     if hep_checkbox:
                         st.subheader("HEP Plots")
-                        HEP_plots(project_name, df_wnv3, controls, boxplot_columns, analysis_type,selected_feature)
+                        HEP_plots(project_name, df_wnv3, controls, boxplot_columns, analysis_type, selected_feature, size_feature)
                         plot_tsne_by_group(df_wnv3)
                     st.divider()
                     for band in boxplot_columns:
@@ -591,17 +1276,21 @@ def main():
             
             # if selected_feature_w_all is not None
             if bool_all_features:
+                # Show HEP checkbox only once for all features
+                hep_checkbox = st.checkbox("Show HEP & TSNE Plots", value=False, key="hep_checkbox_all")
+                
                 for feature in all_feat_list:
+                    clinical_features, boxplot_columns = get_clinical_and_boxplot_cols(df_wnv2=df_wnv2)
                     selected_feature = feature
                     st.write(f"## Analyzing Feature: {selected_feature}")
-                    run_selected_feature()
+                    run_selected_feature(boxplot_columns, hep_checkbox)
                     # Add forest plot if requested
                     if forest_plot_clinical:
                         st.subheader("Forest Plot Analysis")
                         forest_plot_all_features(df_wnv2, selected_feature, eeg_features, analysis_type)
                     st.divider()
             else:
-                run_selected_feature()
+                run_selected_feature(boxplot_columns)
                 # Add forest plot if requested
                 if forest_plot_clinical:
                     st.subheader("Forest Plot Analysis")
@@ -1047,7 +1736,7 @@ def create_average_trajectory_plot(df_plot_normalized, x_col, actual_y_col, proj
     
     plt.close(fig)
 
-def create_longitudinal_plot(clinical_df, parquet_df, date_col, y_col, project_name):
+def create_longitudinal_plot(clinical_df, parquet_df, date_col, y_col='overall_pswe_median_percentage', project_name='Seeg'):
     """
     Create a longitudinal plot with date on x-axis and selected column on y-axis.
     """

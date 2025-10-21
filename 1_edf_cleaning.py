@@ -65,11 +65,15 @@ args = parser.parse_args()
 # Get cases_project_name from CLI or use default
 cases_project_name = args.cases_project_name
 if not cases_project_name:
-    cases_project_name = 'CAP_Sleep_Database/CAP_Sleep_Database' # 'Controls' #'Seeg' #'CAP_Sleep_Database/CAP_Sleep_Database'
+    cases_project_name = 'sleep_controls' # 'Controls' #'Seeg' #'CAP_Sleep_Database/CAP_Sleep_Database'
 
 edf_dir = 'EDF_Format'
 # Where to load the data from 
-directory = os.path.join(getcwd, edf_dir,cases_project_name)
+# If cases_project_name already contains 'EDF_Format', ignore it from edf_dir
+if 'EDF_Format' in cases_project_name:
+    directory = os.path.join(getcwd, cases_project_name)
+else:
+    directory = os.path.join(getcwd, edf_dir, cases_project_name)
 # directory = os.path.join(getcwd, 'Controls')
 os_splittor = '\\' if 'nt' in os.name else '/'
 
@@ -258,6 +262,9 @@ def list_files_and_find_duplicates(directory):
                 file_size = os.path.getsize(file_path)
                 file_size_map[file_size].append(file_path)
 
+    # raise if file_size_map is empty
+    if not file_size_map:
+        raise ValueError('.edf files not found in directory: ' + directory)
     data = []
     for size, files in file_size_map.items():
         for file in files:
@@ -275,8 +282,8 @@ def list_files_and_find_duplicates(directory):
                 if re.search(r'\d{3}-(\d{3})', x) 
                 else x.split('.')[0]
     )
-    # sort by patient number
-    df.sort_values(by='patient_number', inplace=True)
+    # sort by patient number desc
+    df.sort_values(by='patient_number', inplace=True, ascending=False)
     return df
 
 
@@ -375,13 +382,15 @@ def analyze_eeg_data(raw,is_prod,filename):
 
 def process_file(row,filename,is_prod):
     print(f'Processing {row["file_name"]}')
+    file_name = row['file_name']
     # read file
     metadata, raw = read_edf_mne(row['file_path'])
     metadata.update(row)
     # make folder if not exist
     os.makedirs(temp_dir, exist_ok=True)
     # if file temps/{row['file_name']}.parquet exists
-    if f'{row["file_name"]}.parquet' in os.listdir(temp_dir):
+    if f'{file_name}.parquet' in os.listdir(temp_dir):
+        print(f'{file_name}.parquet already exists')
         return 
     if metadata:
         channels = raw.ch_names
@@ -398,14 +407,14 @@ def process_file(row,filename,is_prod):
             start_i = 0
             # while eeg_metadata is None:
                 # if max_duration_s == 0:
-                #     pd.DataFrame().to_parquet(f'{temp_dir}/{row["file_name"]}_{max_duration_s}_{start_i}.parquet', index=False)
+                #     pd.DataFrame().to_parquet(f'{temp_dir}/{file_name}_{max_duration_s}_{start_i}.parquet', index=False)
                 #     start_i += 1
                 #     max_duration_s = 60 * 60
-                #     print(f'Error processing {row["file_name"]}_{max_duration_s}_{start_i}, skipping...')
+                #     print(f'Error processing {file_name}_{max_duration_s}_{start_i}, skipping...')
                 # Split the data into 60-minute segments
             n_segments = int(np.ceil(duration_s / max_duration_s))
             for i in range(start_i, n_segments):
-                segment_filename = f'{row["file_name"]}_{max_duration_s}_{i + 1}.parquet'
+                segment_filename = f'{file_name}_{max_duration_s}_{i + 1}.parquet'
                 raw_channels = raw.ch_names
                 if os.path.exists(f'{temp_dir}/{segment_filename}'):
                     continue
@@ -416,7 +425,7 @@ def process_file(row,filename,is_prod):
                 if eeg_metadata is None:
                     # Reduce max_duration_s by 10 minutes but not below 0
                     continue
-                    # print(f'Error processing {row["file_name"]}_{max_duration_s}_{start_i}, retrying with max_duration_s={max_duration_s-600}...')
+                    # print(f'Error processing {file_name}_{max_duration_s}_{start_i}, retrying with max_duration_s={max_duration_s-600}...')
                     # max_duration_s = max(max_duration_s - 5 * 60, 0)
                     # break  # Exit the for loop to recalculate segments with new max_duration_s
                 # Save connectivity DataFrame (conn_df) to its own Parquet folder
@@ -551,7 +560,10 @@ def eeg_edf_cleaning_pipeline():
     else:
         print(f'Processing {len(df)} files sequentially...')
         # Process files sequentially
-        metadata_list = [process_file(row, filename, is_prod) for _, row in tqdm(df.iterrows(), total=len(df))]
+        metadata_list = []
+        for _, row in tqdm(df.iterrows(), total=len(df)):
+            file_name = row['file_name']
+            metadata_list.append(process_file(row, filename, is_prod))
     if project_name == 'Controls':
         # Combine all the temporary Parquet files into a single Parquet file
         filename = f'{cases_project_name}_controls.parquet'

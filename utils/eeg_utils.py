@@ -44,6 +44,10 @@ except ImportError:
 eeg_channels = ['Fp1', 'Fp2', 'F3', 'F4', 'C3', 'C4', 'P3', 'P4', 'O1', 'O2', 'F7',
        'F8', 'T3', 'T4', 'T5', 'T6', 'Fz', 'Cz', 'Pz', 'A1','A2', 'Fpz', 'Oz','AF7','AF8']
 
+# Base color palette for consistent plotting across functions
+BASE_PALETTE = ["#1F77B4", "#E41A1C", "#2CA02C", "#FF7F0E", "#9467BD",
+               "#8C564B", "#17BECF", "#D62728", "#BCBD22", "#7F7F7F"]
+
 eeg_dict_convertion = {
        'Fp2-F4': 'Fp2',
        'F4-C4': 'F4',
@@ -2583,13 +2587,62 @@ def compute_network_features(eeg_data, sfreq, freq_band, threshold_density=0.2):
     coh_matrix = np.zeros((n_channels, n_channels))
     # sfreq to int
     sfreq = int(sfreq)
+    
+    # Validate input data
+    if n_channels < 2:
+        return 0.0, 0.0, 0.0, 0.0
+    
+    # Check for valid data
+    if np.any(~np.isfinite(eeg_data)):
+        # Replace non-finite values with zeros
+        eeg_data = np.nan_to_num(eeg_data, nan=0.0, posinf=0.0, neginf=0.0)
     # Compute coherence between all pairs
     for i, j in combinations(range(n_channels), 2):
-        f, Cxy = coherence(eeg_data[i], eeg_data[j], fs=sfreq, window=windows.hann(sfreq),
-                           nperseg=sfreq, noverlap=sfreq//2)
-        freq_mask = (f >= freq_band[0]) & (f <= freq_band[1])
-        mean_coh = np.mean(Cxy[freq_mask])
-        coh_matrix[i, j] = coh_matrix[j, i] = mean_coh
+        try:
+            # Check for valid data before computing coherence
+            if (np.std(eeg_data[i]) < 1e-10 or np.std(eeg_data[j]) < 1e-10 or 
+                np.allclose(eeg_data[i], eeg_data[j], atol=1e-10)):
+                # Skip if signals are too similar or have no variance
+                coh_matrix[i, j] = coh_matrix[j, i] = 0.0
+                continue
+                
+            # Suppress the RuntimeWarning from scipy coherence
+            import warnings
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                # Use a smaller window size to avoid division by zero issues
+                window_size = min(sfreq, 512)  # Use smaller window size
+                try:
+                    f, Cxy = coherence(eeg_data[i], eeg_data[j], fs=sfreq, 
+                                       window=windows.hann(window_size),
+                                       nperseg=window_size, noverlap=window_size//2)
+                except:
+                    # If coherence fails, use correlation as fallback
+                    corr = np.corrcoef(eeg_data[i], eeg_data[j])[0, 1]
+                    if np.isfinite(corr):
+                        mean_coh = abs(corr)
+                    else:
+                        mean_coh = 0.0
+                    coh_matrix[i, j] = coh_matrix[j, i] = mean_coh
+                    continue
+            freq_mask = (f >= freq_band[0]) & (f <= freq_band[1])
+            
+            # Handle potential NaN or infinite values
+            Cxy_clean = Cxy[freq_mask]
+            Cxy_clean = Cxy_clean[np.isfinite(Cxy_clean)]
+            
+            if len(Cxy_clean) > 0:
+                mean_coh = np.mean(Cxy_clean)
+                # Ensure coherence is between 0 and 1
+                mean_coh = np.clip(mean_coh, 0.0, 1.0)
+            else:
+                mean_coh = 0.0
+                
+            coh_matrix[i, j] = coh_matrix[j, i] = mean_coh
+            
+        except Exception as e:
+            # If coherence calculation fails, set to 0
+            coh_matrix[i, j] = coh_matrix[j, i] = 0.0
 
     # Binarize: keep top X% of connections (thresholding by density)
     n_possible = n_channels * (n_channels - 1) / 2
@@ -2602,14 +2655,224 @@ def compute_network_features(eeg_data, sfreq, freq_band, threshold_density=0.2):
     # Build graph and compute features
     G = nx.from_numpy_array(binarized)
 
-    clustering = nx.transitivity(G)
-    efficiency = nx.global_efficiency(G)
-    assortativity = nx.degree_pearson_correlation_coefficient(G)
-    modularity = nx.algorithms.community.modularity(G, nx.community.label_propagation_communities(G))
+    try:
+        clustering = nx.transitivity(G)
+        if not np.isfinite(clustering):
+            clustering = 0.0
+    except:
+        clustering = 0.0
+
+    try:
+        efficiency = nx.global_efficiency(G)
+        if not np.isfinite(efficiency):
+            efficiency = 0.0
+    except:
+        efficiency = 0.0
+
+    try:
+        assortativity = nx.degree_pearson_correlation_coefficient(G)
+        if not np.isfinite(assortativity):
+            assortativity = 0.0
+    except:
+        assortativity = 0.0
+
+    try:
+        modularity = nx.algorithms.community.modularity(G, nx.community.label_propagation_communities(G))
+        if not np.isfinite(modularity):
+            modularity = 0.0
+    except:
+        modularity = 0.0
 
     return efficiency, clustering, assortativity, modularity
 
-def _plot_metric_vs_hrv(t, arrs, labels, save_plot, name, save_dir, is_streamlit=False, hue=None):
+def _create_interactive_significant_pairs_plot(df_pair, var_names, pair_to_stats, name, save_plot, save_dir, is_streamlit, hue, size_values, palette_dict):
+    """Create an interactive scatter plot showing only significant pairs using Plotly."""
+    import plotly.graph_objects as go
+    import plotly.express as px
+    from plotly.subplots import make_subplots
+    import numpy as np
+    from scipy.stats import spearmanr
+    import pandas as pd
+    
+    # Find significant pairs (p < 0.05)
+    significant_pairs = []
+    for (i, j), (r, p_fdr) in pair_to_stats.items():
+        if not np.isnan(r) and not np.isnan(p_fdr) and p_fdr < 0.05:
+            significant_pairs.append((i, j, r, p_fdr, var_names[i], var_names[j]))
+    
+    if not significant_pairs:
+        print("No significant pairs found for interactive plot.")
+        return
+    
+    # Create subplots layout - 1 column, rows = number of pairs
+    n_pairs = len(significant_pairs)
+    rows, cols = n_pairs, 1
+    
+    # Create subplots
+    fig = make_subplots(
+        rows=rows, cols=cols,
+        subplot_titles=[f"{var_names[i]} vs {var_names[j]}" for i, j, r, p_fdr, x_name, y_name in significant_pairs],
+        specs=[[{"secondary_y": False}] for _ in range(rows)]
+    )
+    
+    # Plot each significant pair
+    for idx, (i, j, r, p_fdr, x_name, y_name) in enumerate(significant_pairs):
+        row = idx + 1  # Since we have 1 column, row = index + 1
+        col = 1
+        
+        x_data = df_pair[var_names[i]]
+        y_data = df_pair[var_names[j]]
+        
+        # Clean data
+        mask = ~np.isnan(x_data) & ~np.isnan(y_data)
+        x_clean = np.array(x_data)[mask]
+        y_clean = np.array(y_data)[mask]
+        
+        if '__hue__' in df_pair.columns and hue is not None:
+            hue_clean = np.array(df_pair['__hue__'])[mask]
+            unique_hues = np.unique(hue_clean)
+            
+            # Plot with hue
+            for hue_val in unique_hues:
+                hue_mask = hue_clean == hue_val
+                if np.sum(hue_mask) > 0:
+                    x_hue = x_clean[hue_mask]
+                    y_hue = y_clean[hue_mask]
+                    color = palette_dict.get(hue_val, 'gray') if palette_dict else 'gray'
+                    
+                    # Add size variation if size_values provided
+                    if size_values is not None:
+                        size_clean = np.array(size_values)[mask]
+                        size_hue = size_clean[hue_mask]
+                        size_normalized = (size_hue - np.min(size_hue)) / (np.max(size_hue) - np.min(size_hue) + 1e-8)
+                        marker_size = 8 + 12 * size_normalized  # Size between 8 and 20
+                    else:
+                        marker_size = 10
+                    
+                    # Create hover text
+                    hover_text = [f"{x_name}: {x:.3f}<br>{y_name}: {y:.3f}<br>Group: {hue_val}" 
+                                 for x, y in zip(x_hue, y_hue)]
+                    
+                    # Add scatter plot
+                    fig.add_trace(
+                        go.Scatter(
+                            x=x_hue, y=y_hue,
+                            mode='markers',
+                            name=str(hue_val),
+                            marker=dict(
+                                color=color,
+                                size=marker_size,
+                                opacity=0.7
+                            ),
+                            text=hover_text,
+                            hovertemplate='%{text}<extra></extra>',
+                            showlegend=True
+                        ),
+                        row=row, col=col
+                    )
+                    
+                    # Add regression line for this hue group
+                    if len(x_hue) > 1:
+                        z = np.polyfit(x_hue, y_hue, 1)
+                        x_line = np.linspace(x_hue.min(), x_hue.max(), 100)
+                        y_line = z[0] * x_line + z[1]
+                        
+                        # Calculate correlation for this group
+                        r_hue, p_hue = spearmanr(x_hue, y_hue)
+                        
+                        fig.add_trace(
+                            go.Scatter(
+                                x=x_line, y=y_line,
+                                mode='lines',
+                                name=f"{hue_val} trend",
+                                line=dict(color=color, width=2),
+                                showlegend=False,
+                                hovertemplate=f"{hue_val} trend<br>R²={r_hue**2:.3f}, p={p_hue:.3g}<extra></extra>"
+                            ),
+                            row=row, col=col
+                        )
+        else:
+            # Plot without hue
+            if size_values is not None:
+                size_clean = np.array(size_values)[mask]
+                size_normalized = (size_clean - np.min(size_clean)) / (np.max(size_clean) - np.min(size_clean) + 1e-8)
+                marker_size = 8 + 12 * size_normalized
+            else:
+                marker_size = 10
+            
+            # Use base palette color for this pair
+            marker_color = BASE_PALETTE[idx % len(BASE_PALETTE)]
+            
+            # Create hover text
+            hover_text = [f"{x_name}: {x:.3f}<br>{y_name}: {y:.3f}" for x, y in zip(x_clean, y_clean)]
+            
+            # Add scatter plot
+            fig.add_trace(
+                go.Scatter(
+                    x=x_clean, y=y_clean,
+                    mode='markers',
+                    name='Data',
+                    marker=dict(
+                        color=marker_color,
+                        size=marker_size,
+                        opacity=0.7
+                    ),
+                    text=hover_text,
+                    hovertemplate='%{text}<extra></extra>',
+                    showlegend=False
+                ),
+                row=row, col=col
+            )
+            
+            # Add regression line
+            if len(x_clean) > 1:
+                z = np.polyfit(x_clean, y_clean, 1)
+                x_line = np.linspace(x_clean.min(), x_clean.max(), 100)
+                y_line = z[0] * x_line + z[1]
+                
+                fig.add_trace(
+                    go.Scatter(
+                        x=x_line, y=y_line,
+                        mode='lines',
+                        name='Trend',
+                        line=dict(color=marker_color, width=2),
+                        showlegend=False,
+                        hovertemplate=f"Trend line<br>R²={r**2:.3f}, p={p_fdr:.3g}<extra></extra>"
+                    ),
+                    row=row, col=col
+                )
+        
+        # Update axes labels
+        fig.update_xaxes(title_text=x_name, row=row, col=col)
+        fig.update_yaxes(title_text=y_name, row=row, col=col)
+    
+    # Update layout
+    fig.update_layout(
+        title=f'Significant Pairs - {name.replace("_", " ")} (N={len(df_pair)})',
+        height=400 * rows,  # Each subplot gets 400px height
+        width=800,  # Fixed width for single column
+        showlegend=True,
+        hovermode='closest'
+    )
+    
+    # Add grid
+    fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor='lightgray')
+    fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor='lightgray')
+    
+    if save_plot:
+        import os
+        os.makedirs(save_dir, exist_ok=True)
+        fname = f"{save_dir}/interactive_significant_pairs_{name}.html"
+        fig.write_html(fname)
+        print(f"Interactive plot saved to: {fname}")
+    else:
+        if is_streamlit:
+            # For streamlit, show the plotly figure
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            fig.show()
+
+def _plot_metric_vs_hrv(t, arrs, labels, save_plot, name, save_dir, is_streamlit=False, hue=None, size_values=None):
     if len(arrs) == 2:
         import dabest
         df = pd.DataFrame({
@@ -2649,57 +2912,25 @@ def _plot_metric_vs_hrv(t, arrs, labels, save_plot, name, save_dir, is_streamlit
             'group': np.concatenate([[label]*n for label in labels]),
             'pair_id': np.tile(np.arange(n), len(arrs))
         })
-        # fig, ax = plt.subplots(figsize=(10, 6))
-        # sns.swarmplot(data=df, x='group', y='value', ax=ax)
-        # ax.set_title("Swarm plot of all metrics and HRV indices")
-        # ax.set_xlabel('Metric/Index')
-        # ax.set_ylabel('Value')
-        # plt.tight_layout()
-        # if save_plot:
-        #     os.makedirs(save_dir, exist_ok=True)
-        #     fname = f"{save_dir}/swarmplot_all_{name}.png"
-        #     fig.savefig(fname, dpi=300, bbox_inches='tight')
-        #     plt.close(fig)
-        # else:
-        #     if is_streamlit:
-        #         st.pyplot(fig)
-        #     else:
-        #         plt.show()
-
-        # fig2, ax2 = plt.subplots(figsize=(10, 6))
-        # for arr, label in zip(arrs, labels):
-        #     ax2.plot(t, arr, label=label)
-        # ax2.set_title("Time series of all metrics and HRV indices")
-        # ax2.set_xlabel('Time (s)')
-        # ax2.set_ylabel('Value')
-        # ax2.legend()
-        # plt.tight_layout()
-        # if save_plot:
-        #     fname2 = f"{save_dir}/xyplot_all_{name}.png"
-        #     fig2.savefig(fname2, dpi=300, bbox_inches='tight')
-        #     plt.close(fig2)
-        # else:
-        #     if is_streamlit:
-        #         st.pyplot(fig2)
-        #     else:
-        #         plt.show()
-
         df_pair = pd.DataFrame({label: arr for label, arr in zip(labels, arrs)})
         if hue is not None:
             try:
                 if len(hue) == len(df_pair):
-                    df_pair['__hue__'] = hue
+                    # ignore index
+                    df_pair['__hue__'] = hue.reset_index(drop=True)
                     hue_arr = np.array(hue)
                     # Create a custom palette of distinct RGB colors
                     import matplotlib.colors as mcolors
-                    unique_groups = np.unique(hue_arr)
+                    unique_groups = list(pd.Series(hue_arr).dropna().unique())
                     n_groups = len(unique_groups)
-                    def distinct_rgb_colors(n_groups):
-                        # colors blue and red
-                        colors = [(0, 0, 1), (1, 0, 0)]
-                        return colors
-                    custom_palette = distinct_rgb_colors(n_groups)
-                    palette_dict = {group: custom_palette[i] for i, group in enumerate(unique_groups)}
+                    # If more groups than palette, extend with distinct colors
+                    if n_groups > len(BASE_PALETTE):
+                        extra_colors = list(mcolors.CSS4_COLORS.values())
+                        extra_colors = [c for c in extra_colors if c not in BASE_PALETTE]
+                        custom_palette = BASE_PALETTE + extra_colors[:n_groups-len(BASE_PALETTE)]
+                    else:
+                        custom_palette = BASE_PALETTE[:n_groups]
+                    palette_dict = {group: custom_palette[i % len(custom_palette)] for i, group in enumerate(unique_groups)}
             except Exception as e:
                 print(f"Error processing hue: {e}")
 
@@ -2713,9 +2944,22 @@ def _plot_metric_vs_hrv(t, arrs, labels, save_plot, name, save_dir, is_streamlit
                 for j in range(i+1, n_vars):
                     x = df_pair[var_names[i]]
                     y = df_pair[var_names[j]]
-                    mask = ~np.isnan(x) & ~np.isnan(y)
-                    x_clean = np.array(x)[mask]
-                    y_clean = np.array(y)[mask]
+                    
+                    # Convert to numeric, coercing errors to NaN
+                    try:
+                        x_numeric = pd.to_numeric(x, errors='coerce')
+                        y_numeric = pd.to_numeric(y, errors='coerce')
+                    except:
+                        r, p = np.nan, np.nan
+                        pair_indices.append((i, j))
+                        r_vals.append(r)
+                        p_vals.append(p)
+                        continue
+                    
+                    # Create mask for valid numeric values
+                    mask = ~np.isnan(x_numeric) & ~np.isnan(y_numeric)
+                    x_clean = np.array(x_numeric)[mask]
+                    y_clean = np.array(y_numeric)[mask]
                     
                     if len(x_clean) > 1 and len(y_clean) > 1:
                         # Use normal linear regression
@@ -2749,9 +2993,17 @@ def _plot_metric_vs_hrv(t, arrs, labels, save_plot, name, save_dir, is_streamlit
             else:
                 r, p_fdr = np.nan, np.nan
 
-            mask = ~np.isnan(x) & ~np.isnan(y)
-            x_clean = np.array(x)[mask]
-            y_clean = np.array(y)[mask]
+            # Convert to numeric, coercing errors to NaN
+            try:
+                x_numeric = pd.to_numeric(x, errors='coerce')
+                y_numeric = pd.to_numeric(y, errors='coerce')
+            except:
+                # If conversion fails, skip this plot
+                return
+            
+            mask = ~np.isnan(x_numeric) & ~np.isnan(y_numeric)
+            x_clean = np.array(x_numeric)[mask]
+            y_clean = np.array(y_numeric)[mask]
             hue_clean = None
             if hue is not None:
                 try:
@@ -2760,7 +3012,12 @@ def _plot_metric_vs_hrv(t, arrs, labels, save_plot, name, save_dir, is_streamlit
                 except Exception:
                     hue_clean = None
             if hue_clean is not None:
-                sns.scatterplot(x=x_clean, y=y_clean, hue=hue_clean, ax=ax, alpha=0.7, s=20, palette=palette_dict, legend=False)
+                # Normalize size_values to 0-1 range for alpha if size_values is available
+                if size_values is not None:
+                    size_normalized = (size_values - np.min(size_values)) / (np.max(size_values) - np.min(size_values))
+                    sns.scatterplot(x=x_clean, y=y_clean, hue=hue_clean, ax=ax, alpha=size_normalized, palette=palette_dict, legend=False)
+                else:
+                    sns.scatterplot(x=x_clean, y=y_clean, hue=hue_clean, ax=ax, alpha=0.7, palette=palette_dict, legend=False)
                 # Create normal regression lines and calculate stats for each hue group
                 unique_hues = np.unique(hue_clean)
                 hue_stats = []
@@ -2772,7 +3029,7 @@ def _plot_metric_vs_hrv(t, arrs, labels, save_plot, name, save_dir, is_streamlit
                         if len(x_hue) > 1 and len(y_hue) > 1:
                             color = palette_dict.get(hue_val, 'gray') if palette_dict else 'gray'
                             sns.regplot(x=x_hue, y=y_hue, ax=ax, scatter=False, color=color, 
-                                      line_kws={'alpha':0.4})
+                                      line_kws={'alpha':0.8})
                             
                             # Calculate correlation for this hue group
                             r_hue, p_hue = spearmanr(x_hue, y_hue)
@@ -2790,9 +3047,14 @@ def _plot_metric_vs_hrv(t, arrs, labels, save_plot, name, save_dir, is_streamlit
                                       fontsize=8, color=color, ha='left', va='center',
                                       bbox=dict(boxstyle="round,pad=0.2", fc="white", ec=color, alpha=0.3))
             else:
-                sns.scatterplot(x=x_clean, y=y_clean, ax=ax, alpha=0.7, s=20)
+                # Normalize size_values to 0-1 range for alpha if size_values is available
+                if size_values is not None:
+                    size_normalized = (size_values - np.min(size_values)) / (np.max(size_values) - np.min(size_values))
+                    sns.scatterplot(x=x_clean, y=y_clean, ax=ax, alpha=size_normalized)
+                else:
+                    sns.scatterplot(x=x_clean, y=y_clean, ax=ax, alpha=0.7)
                 if len(x_clean) > 1 and len(y_clean) > 1:
-                    sns.regplot(x=x_clean, y=y_clean, ax=ax, scatter=False, color='gray', line_kws={'alpha':0.5})
+                    sns.regplot(x=x_clean, y=y_clean, ax=ax, scatter=False, color='gray', line_kws={'alpha':0.8})
                 # Display overall statistics when no hue grouping
                 if not np.isnan(r) and not np.isnan(p_fdr) and p_fdr < 0.05:
                     ax.annotate(f"$R^2$={r**2:.2f}\np={p_fdr:.3g}",
@@ -2801,7 +3063,24 @@ def _plot_metric_vs_hrv(t, arrs, labels, save_plot, name, save_dir, is_streamlit
 
         def lineplot_with_time(x, y,palette_dict=None, **kwargs):
             ax = kwargs.get('ax', plt.gca())
-            t_temp = np.linspace(min(min(x), min(y)), max(max(x), max(y)), num=len(x))
+            
+            # Convert to numeric, coercing errors to NaN
+            try:
+                x_numeric = pd.to_numeric(x, errors='coerce')
+                y_numeric = pd.to_numeric(y, errors='coerce')
+            except:
+                # If conversion fails, skip this plot
+                return
+            
+            # Filter out NaN values
+            mask = ~np.isnan(x_numeric) & ~np.isnan(y_numeric)
+            if mask.sum() < 2:  # Need at least 2 points
+                return
+                
+            x_clean = x_numeric[mask]
+            y_clean = y_numeric[mask]
+            
+            t_temp = np.linspace(min(min(x_clean), min(y_clean)), max(max(x_clean), max(y_clean)), num=len(x_clean))
             i = j = None
             for idx, col in enumerate(var_names):
                 if np.all(x == df_pair[col]): i = idx
@@ -2812,8 +3091,8 @@ def _plot_metric_vs_hrv(t, arrs, labels, save_plot, name, save_dir, is_streamlit
             else:
                 r, p_fdr = np.nan, np.nan
             
-            ax.plot(t_temp, x, label='x', alpha=0.5,color= 'blue')
-            ax.plot(t_temp, y, label='y', alpha=0.5,color='red')
+            ax.plot(t_temp, x_clean, label='x', alpha=0.5,color= 'blue')
+            ax.plot(t_temp, y_clean, label='y', alpha=0.5,color='red')
             if not np.isnan(r) and not np.isnan(p_fdr) and p_fdr < 0.05:
                 ax.annotate(f"$R^2$={r**2:.2f}\np={p_fdr:.3g}",
                             xy=(0.05, 0.85), xycoords='axes fraction', fontsize=9,
@@ -2838,29 +3117,30 @@ def _plot_metric_vs_hrv(t, arrs, labels, save_plot, name, save_dir, is_streamlit
             if leg is not None:
                 leg.remove()
 
-        # 2) Build one legend and put it on the first row, last col
-        first_ax = g.axes[0, -1]  # top-right subplot
-        levels = pd.Index(df_pair['__hue__'].dropna().unique())
-        import matplotlib as mpl
-        handles = []
-        for lvl in levels:
-            color = palette_dict.get(lvl) if palette_dict is not None else None
-            handles.append(
-                mpl.lines.Line2D(
-                    [], [], marker='o', linestyle='',
-                    markerfacecolor=color, markeredgecolor='none',
-                    markersize=6, label=str(lvl)
+        # 2) Build one legend and put it on the first row, last col (only if hue exists)
+        if '__hue__' in df_pair.columns:
+            first_ax = g.axes[0, -1]  # top-right subplot
+            levels = pd.Index(df_pair['__hue__'].dropna().unique())
+            import matplotlib as mpl
+            handles = []
+            for lvl in levels:
+                color = palette_dict.get(lvl) if palette_dict is not None else None
+                handles.append(
+                    mpl.lines.Line2D(
+                        [], [], marker='o', linestyle='',
+                        markerfacecolor=color, markeredgecolor='none',
+                        markersize=6, label=str(lvl)
+                    )
                 )
-            )
 
-        leg = first_ax.legend(
-            handles=handles,
-            title="Group",          # <- new title
-            loc="best",
-            frameon=True,
-            fontsize=8,             # <- smaller labels
-            title_fontsize=9
-        )
+            leg = first_ax.legend(
+                handles=handles,
+                title="Group",          # <- new title
+                loc="best",
+                frameon=True,
+                fontsize=8,             # <- smaller labels
+                title_fontsize=9
+            )
         plt.tight_layout()
         if save_plot:
             os.makedirs(save_dir, exist_ok=True)
@@ -2874,6 +3154,9 @@ def _plot_metric_vs_hrv(t, arrs, labels, save_plot, name, save_dir, is_streamlit
                 st.pyplot(g.fig)
             else:
                 plt.show()
+        
+        # Create interactive scatter plot for significant pairs only
+        # _create_interactive_significant_pairs_plot(df_pair, var_names, pair_to_stats, name, save_plot, save_dir, is_streamlit, hue, size_values, palette_dict)
     else:
         fig, ax = plt.subplots(figsize=(6, 4))
         ax.plot(t, arrs[0], label=labels[0])
@@ -2894,7 +3177,7 @@ def _plot_metric_vs_hrv(t, arrs, labels, save_plot, name, save_dir, is_streamlit
             else:
                 plt.show()
 
-def only_plots(results_df, save_plot, save_dir, edf_pickle_name="plot", band="band", step_sec=5,is_streamlit=False,hue=None):
+def only_plots(results_df, save_plot, save_dir, edf_pickle_name="plot", band="band", step_sec=5,is_streamlit=False,hue=None,size_feature=None):
 
     labels = [
         'Vagal_SD1',
@@ -2906,7 +3189,275 @@ def only_plots(results_df, save_plot, save_dir, edf_pickle_name="plot", band="ba
     ]
     arrs_zscore = [results_df[col].values for col in labels if col in results_df]
     t = np.arange(len(results_df)) * step_sec
-    _plot_metric_vs_hrv(t, arrs_zscore, labels, save_plot, f"{edf_pickle_name}_{band}", save_dir, is_streamlit=is_streamlit,hue=hue)
+    
+    # Get size_feature data if specified
+    size_values = None
+    if size_feature and size_feature in results_df.columns:
+        size_values = results_df[size_feature].values
+    elif size_feature:
+        # If size_feature is specified but not in results_df, try to find it in the original data
+        # This might happen if the feature was in the original data but not in the processed results_df
+        st.warning(f"Size feature '{size_feature}' not found in results data. Using default size.")
+        size_values = None
+    
+    _plot_metric_vs_hrv(t, arrs_zscore, labels, save_plot, f"{edf_pickle_name}_{band}", save_dir, is_streamlit=is_streamlit,hue=hue,size_values=size_values)
+    return
+    hue.unique()
+
+def enhanced_clustering_plots(results_df, df_wnv3_clean, save_plot, save_dir, edf_pickle_name="plot", band="band", n_clusters=3, is_streamlit=False, size_feature=None):
+    """
+    Enhanced clustering plots function that performs K-means clustering and classification analysis.
+    
+    Parameters:
+    -----------
+    results_df : pd.DataFrame
+        DataFrame with clustering features (Vagal_SD1, Sympathetic_SD2, etc.)
+    df_wnv3_clean : pd.DataFrame
+        DataFrame with clinical features for classifier training
+    n_clusters : int
+        Number of clusters for K-means (default: 3)
+    """
+    from sklearn.cluster import KMeans
+    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.model_selection import train_test_split
+    from sklearn.metrics import classification_report, confusion_matrix
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    
+    # Define the clustering features
+    cluster_features = [
+        'Vagal_SD1',
+        'Sympathetic_SD2', 
+        'Efficiency',
+        'Clustering',
+        'Modularity',
+        'Assortativity'
+    ]
+    
+    # Filter to only include features that exist in results_df
+    available_features = [col for col in cluster_features if col in results_df.columns]
+    if len(available_features) < 2:
+        if is_streamlit:
+            st.error(f"Not enough clustering features available. Found: {available_features}")
+        return
+    
+    # Prepare data for clustering
+    X_cluster = results_df[available_features].dropna()
+    if len(X_cluster) < n_clusters:
+        if is_streamlit:
+            st.error(f"Not enough data points for clustering. Need at least {n_clusters}, got {len(X_cluster)}")
+        return
+    
+    # Perform K-means clustering
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X_cluster)
+    
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+    cluster_labels = kmeans.fit_predict(X_scaled)
+    # print unique from cluster_labels
+    np.unique(cluster_labels)
+    # Add cluster labels to results_df
+    results_df_with_clusters = results_df.copy()
+    results_df_with_clusters['cluster'] = cluster_labels
+    
+    if is_streamlit:
+        st.write(f"K-means clustering completed with {n_clusters} clusters")
+        st.write(f"Cluster distribution: {pd.Series(cluster_labels).value_counts().to_dict()}")
+    
+    # Train classifier if df_wnv3_clean is provided
+    feature_importance = None
+    if df_wnv3_clean is not None and not df_wnv3_clean.empty:
+        # Find common indices between results_df and df_wnv3_clean
+        common_indices = results_df_with_clusters.index.intersection(df_wnv3_clean.index)
+        if len(common_indices) > 10:  # Need sufficient data for training
+            # Prepare features for classification
+            # Get numeric columns from df_wnv3_clean
+            numeric_cols = df_wnv3_clean.select_dtypes(include=[np.number]).columns
+            X_classifier = df_wnv3_clean.loc[common_indices, numeric_cols].dropna(axis=1)
+            
+            # Remove columns with too many missing values or constant values
+            X_classifier = X_classifier.loc[:, X_classifier.nunique() > 1]
+            X_classifier = X_classifier.loc[:, X_classifier.isnull().mean() < 0.5]
+            
+            if len(X_classifier.columns) > 0:
+                # Get cluster labels for common indices - ensure we only use indices that exist in both
+                y_classifier = results_df_with_clusters.loc[common_indices, 'cluster'].dropna()
+                
+                # Find the intersection of indices that exist in both X and y after all filtering
+                final_common_indices = X_classifier.index.intersection(y_classifier.index)
+                
+                if len(final_common_indices) > 10:
+                    X_final = X_classifier.loc[final_common_indices]
+                    y_final = y_classifier.loc[final_common_indices]
+                    
+                    # Ensure X_final and y_final have the same number of samples
+                    if len(X_final) == len(y_final):
+                        # Train Random Forest classifier
+                        rf = RandomForestClassifier(n_estimators=100, random_state=42)
+                        rf.fit(X_final, y_final)
+                        
+                        # Get feature importance
+                        feature_importance = pd.DataFrame({
+                            'feature': X_final.columns,
+                            'importance': rf.feature_importances_
+                        }).sort_values('importance', ascending=False)
+                        
+                        if is_streamlit:
+                            st.write("Classifier trained successfully")
+                            st.write(f"Training data: {len(X_final)} samples, {len(X_final.columns)} features")
+                            st.write("Top 10 most important features:")
+                            st.dataframe(feature_importance.head(10))
+                    else:
+                        if is_streamlit:
+                            st.warning(f"Data dimension mismatch: X has {len(X_final)} samples, y has {len(y_final)} samples. Skipping classifier training.")
+                else:
+                    if is_streamlit:
+                        st.warning(f"Not enough common data for classifier training. Found {len(final_common_indices)} samples, need at least 10.")
+    
+    # Create PairGrid with enhanced functionality
+    _create_enhanced_pairgrid(results_df_with_clusters, available_features, cluster_labels, 
+                             feature_importance, edf_pickle_name, band, save_plot, save_dir, 
+                             is_streamlit, size_feature)
+    
+    return results_df_with_clusters, feature_importance
+
+def _create_enhanced_pairgrid(results_df, features, cluster_labels, feature_importance, 
+                            name, band, save_plot, save_dir, is_streamlit, size_feature):
+    """Create enhanced PairGrid with clustering and feature importance."""
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    from scipy.stats import spearmanr
+    from statsmodels.stats.multitest import fdrcorrection
+    
+    # Prepare data for plotting
+    df_plot = results_df[features + ['cluster']].dropna()
+    
+    # Create color palette for clusters
+    n_clusters = len(np.unique(cluster_labels))
+    colors = plt.cm.Set1(np.linspace(0, 1, n_clusters))
+    cluster_colors = {i: colors[i] for i in range(n_clusters)}
+    
+    # Create PairGrid
+    g = sns.PairGrid(df_plot, diag_sharey=False)
+    
+    def plot_upper(x, y, **kwargs):
+        """Plot upper triangle with cluster-colored scatter plots."""
+        ax = kwargs.get('ax', plt.gca())
+        
+        # Get cluster labels for this plot
+        x_name = x.name
+        y_name = y.name
+        
+        # Create scatter plot with cluster colors
+        for cluster_id in range(n_clusters):
+            mask = df_plot['cluster'] == cluster_id
+            if mask.sum() > 0:
+                ax.scatter(x[mask], y[mask], 
+                          c=cluster_colors[cluster_id], 
+                          label=f'Cluster {cluster_id}',
+                          alpha=0.7, s=50)
+        
+        # Add regression line for each cluster
+        for cluster_id in range(n_clusters):
+            mask = df_plot['cluster'] == cluster_id
+            if mask.sum() > 2:  # Need at least 3 points for regression
+                x_cluster = x[mask]
+                y_cluster = y[mask]
+                if len(x_cluster) > 2:
+                    # Clean data: remove NaN and infinite values
+                    valid_mask = np.isfinite(x_cluster) & np.isfinite(y_cluster)
+                    x_clean = x_cluster[valid_mask]
+                    y_clean = y_cluster[valid_mask]
+                    
+                    # Check if we have enough valid data points and variance
+                    if (len(x_clean) > 2 and 
+                        np.var(x_clean) > 1e-10 and 
+                        np.var(y_clean) > 1e-10):
+                        try:
+                            z = np.polyfit(x_clean, y_clean, 1)
+                            p = np.poly1d(z)
+                            x_line = np.linspace(x_clean.min(), x_clean.max(), 100)
+                            ax.plot(x_line, p(x_line), color=cluster_colors[cluster_id], 
+                                   linestyle='--', alpha=0.8, linewidth=2)
+                        except (np.linalg.LinAlgError, ValueError):
+                            # Skip this cluster if polyfit fails
+                            continue
+        
+        ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8)
+    
+    def plot_lower(x, y, **kwargs):
+        """Plot lower triangle with feature importance or correlation matrix."""
+        ax = kwargs.get('ax', plt.gca())
+        
+        if feature_importance is not None:
+            # Show feature importance as text
+            x_name = x.name
+            y_name = y.name
+            
+            # Find importance for these features if they exist
+            x_imp = feature_importance[feature_importance['feature'] == x_name]['importance'].values
+            y_imp = feature_importance[feature_importance['feature'] == y_name]['importance'].values
+            
+            if len(x_imp) > 0 and len(y_imp) > 0:
+                ax.text(0.5, 0.7, f'{x_name} importance:\n{x_imp[0]:.3f}', 
+                       transform=ax.transAxes, ha='center', va='center',
+                       bbox=dict(boxstyle="round,pad=0.3", facecolor='lightblue', alpha=0.7))
+                ax.text(0.5, 0.3, f'{y_name} importance:\n{y_imp[0]:.3f}', 
+                       transform=ax.transAxes, ha='center', va='center',
+                       bbox=dict(boxstyle="round,pad=0.3", facecolor='lightgreen', alpha=0.7))
+            else:
+                # Fallback to correlation
+                r, p = spearmanr(x, y)
+                ax.text(0.5, 0.5, f'R = {r:.3f}\np = {p:.3f}', 
+                       transform=ax.transAxes, ha='center', va='center',
+                       bbox=dict(boxstyle="round,pad=0.3", facecolor='lightgray', alpha=0.7))
+        else:
+            # Show correlation
+            r, p = spearmanr(x, y)
+            ax.text(0.5, 0.5, f'R = {r:.3f}\np = {p:.3f}', 
+                   transform=ax.transAxes, ha='center', va='center',
+                   bbox=dict(boxstyle="round,pad=0.3", facecolor='lightgray', alpha=0.7))
+        
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.set_xticks([])
+        ax.set_yticks([])
+    
+    def plot_diag(x, **kwargs):
+        """Plot diagonal with histograms for each cluster."""
+        ax = kwargs.get('ax', plt.gca())
+        
+        for cluster_id in range(n_clusters):
+            mask = df_plot['cluster'] == cluster_id
+            if mask.sum() > 0:
+                ax.hist(x[mask], alpha=0.6, color=cluster_colors[cluster_id], 
+                       label=f'Cluster {cluster_id}', bins=10)
+        
+        ax.legend(fontsize=8)
+    
+    # Apply the plotting functions
+    g.map_upper(plot_upper)
+    g.map_lower(plot_lower)
+    g.map_diag(plot_diag)
+    
+    # Set title
+    g.fig.suptitle(f'{name.replace("_"," ")} - Clustering Analysis\nN={len(df_plot)}, Clusters={n_clusters}', 
+                   fontsize=14, y=1.02)
+    
+    plt.tight_layout()
+    
+    # Save or display
+    if save_plot:
+        os.makedirs(save_dir, exist_ok=True)
+        fname = f"{save_dir}/enhanced_pairgrid_{name}_{band}.png"
+        g.savefig(fname, dpi=300, bbox_inches='tight')
+        plt.close(g.fig)
+    else:
+        if is_streamlit:
+            st.pyplot(g.fig)
+        else:
+            plt.show()
 
 def detect_hep_bands(temp_dir='temps_EDF_HEP', candidates=('delta','theta','alpha','beta','gamma')):
     """
