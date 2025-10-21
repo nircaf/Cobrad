@@ -8,6 +8,10 @@ import re
 import pickle
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from utils.eeg_utils import *
+
+# Suppress PyDev debugger warnings for large data structures
+import os
+os.environ['PYDEVD_WARN_SLOW_RESOLVE_TIMEOUT'] = '10.0'
 import mne
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -276,33 +280,24 @@ def HEP_plots2(project_name, df_wnv3, controls, boxplot_columns, analysis_type, 
     New HEP analysis function that reads EDF files directly from pickles/EDF directory,
     calculates HEP measurements for each patient, and shows a pairgrid of results.
     """
-    print(f"HEP_plots2: Starting analysis for project: {project_name}")
-    
     if project_name != 'COBRAD':
-        print("HEP_plots2: Project is not COBRAD, exiting")
         return
     
     # Define the pickles directory
     pickles_dir = 'pickles/EDF'
-    print(f"HEP_plots2: Looking for pickle files in: {pickles_dir}")
-    
     if not os.path.exists(pickles_dir):
-        print(f"HEP_plots2: Directory not found: {pickles_dir}")
         st.error(f"Directory not found: {pickles_dir}")
         return
     
     # Get all pickle files
     pickle_files = [f for f in os.listdir(pickles_dir) if f.endswith('.pkl')]
-    print(f"HEP_plots2: Found {len(pickle_files)} pickle files")
     
     if not pickle_files:
-        print("HEP_plots2: No pickle files found")
         st.warning(f"No pickle files found in {pickles_dir}")
         return
     
     # Group files by patient ID and select only the first file per patient
     patient_files = {}
-    print("HEP_plots2: Grouping files by patient ID...")
     
     for pickle_file in pickle_files:
         # Extract patient ID from filename using regex pattern (\d{4}-\d{3})
@@ -310,25 +305,19 @@ def HEP_plots2(project_name, df_wnv3, controls, boxplot_columns, analysis_type, 
         m = re.search(r'(\d{4}-\d{3})', pickle_file)
         if m:
             patient_id = m.group(1)
-            print(f"HEP_plots2: Extracted patient ID {patient_id} from {pickle_file}")
         else:
             # Fallback: use filename without extension
             patient_id = pickle_file.replace('.pkl', '')
-            print(f"HEP_plots2: Using fallback patient ID {patient_id} from {pickle_file}")
         
         # If this is the first file for this patient, add it
         if patient_id not in patient_files:
             patient_files[patient_id] = pickle_file
-            print(f"HEP_plots2: Added {pickle_file} for patient {patient_id}")
-        else:
-            print(f"HEP_plots2: Skipping {pickle_file} for patient {patient_id} (already have {patient_files[patient_id]})")
     
     # Get the list of files to process (one per patient)
     files_to_process = list(patient_files.values())
-    print(f"HEP_plots2: Will process {len(files_to_process)} files (1 per patient)")
     
     st.write(f"Found {len(pickle_files)} total files, processing {len(files_to_process)} files (1 per patient)")
-    st.info("⚠️ Processing limited to first 10 minutes of data per patient for faster analysis")
+    st.info("⚠️ Processing limited to first 5 minutes of data per patient for faster analysis")
     st.info("🚀 Processing patients in parallel for faster execution")
     st.info("📊 Converting raw data from volts to microvolts for standard EEG analysis")
     st.info("⚡ Calculating power bands for each time window")
@@ -359,24 +348,47 @@ def HEP_plots2(project_name, df_wnv3, controls, boxplot_columns, analysis_type, 
     # If we have cached data and not processing all patients, show cached results
     if cached_patients and not process_all_patients:
         try:
-            # Load all cached patient data
-            all_cached_data = []
+            # Load all cached patient data efficiently
+            cached_dataframes = []
             for patient_id in cached_patients:
                 for band_name in power_bands.keys():
                     cache_file = f"HEP_patient_{patient_id}_{band_name}.parquet"
                     cache_path = os.path.join(cache_dir, cache_file)
                     if os.path.exists(cache_path):
                         patient_df = pd.read_parquet(cache_path)
-                        all_cached_data.append(patient_df)
+                        cached_dataframes.append(patient_df)
             
-            if all_cached_data:
+            if cached_dataframes:
                 # Combine all cached data
-                cached_df = pd.concat(all_cached_data, ignore_index=True)
+                cached_df = pd.concat(cached_dataframes, ignore_index=True)
+                # Clear the list to free memory immediately
+                cached_dataframes.clear()
                 
-                # Calculate mean values across patients for each window_id
+                # Apply z-score normalization to metric columns
                 numeric_cols = cached_df.select_dtypes(include=[np.number]).columns.tolist()
                 exclude_cols = ['patient_id', 'window_id', 'time_start', 'time_end']
                 metric_cols = [col for col in numeric_cols if col not in exclude_cols]
+                
+                # Z-score normalize the metric columns
+                from scipy import stats
+                for col in metric_cols:
+                    # Check for NaN values and replace them
+                    if cached_df[col].isna().any():
+                        cached_df[col] = cached_df[col].fillna(cached_df[col].mean())
+                    
+                    # Calculate standard deviation
+                    std_val = cached_df[col].std()
+                    
+                    if std_val > 1e-10:  # Use a very small threshold instead of 0
+                        z_scores = stats.zscore(cached_df[col], nan_policy='omit')
+                        # Handle any remaining NaN values in z_scores
+                        if np.isnan(z_scores).any():
+                            cached_df[col] = cached_df[col]  # Keep original values
+                        else:
+                            cached_df[col] = z_scores
+                    else:
+                        # Keep original values instead of setting to 0
+                        pass
                 
                 # Group by window_id and calculate mean
                 mean_results = cached_df.groupby('window_id')[metric_cols].mean().reset_index()
@@ -390,8 +402,8 @@ def HEP_plots2(project_name, df_wnv3, controls, boxplot_columns, analysis_type, 
                 patient_counts.columns = ['window_id', 'patient_count']
                 mean_results = mean_results.merge(patient_counts, on='window_id')
                 
-                # Filter to max patient count
-                mean_results = mean_results[mean_results['patient_count'] == mean_results['patient_count'].max()]
+                # get where patient count is higher than 50
+                mean_results = mean_results[mean_results['patient_count'] > 50]
                 mean_results['Group'] = 'Dementia'
                 
                 st.info(f"📁 Loading cached results from {len(cached_patients)} patients")
@@ -441,7 +453,7 @@ def HEP_plots2(project_name, df_wnv3, controls, boxplot_columns, analysis_type, 
     # Limit to 5 patients unless checkbox is checked
     if not process_all_patients:
         # from the end
-        files_to_process_filtered = files_to_process_filtered[-2:]
+        files_to_process_filtered = files_to_process_filtered[-5:]
         st.info(f"🔢 Processing only {len(files_to_process_filtered)} new patients. Check the box above to process all {len(files_to_process_filtered)} patients.")
     else:
         st.info(f"🔢 Processing all {len(files_to_process_filtered)} new patients.")
@@ -453,23 +465,46 @@ def HEP_plots2(project_name, df_wnv3, controls, boxplot_columns, analysis_type, 
         st.info("✅ All patients are already cached! Loading from cache...")
         # Load and display cached results
         try:
-            all_cached_data = []
+            cached_dataframes = []
             for patient_id in cached_patients:
                 for band_name in power_bands.keys():
                     cache_file = f"HEP_patient_{patient_id}_{band_name}.parquet"
                     cache_path = os.path.join(cache_dir, cache_file)
                     if os.path.exists(cache_path):
                         patient_df = pd.read_parquet(cache_path)
-                        all_cached_data.append(patient_df)
+                        cached_dataframes.append(patient_df)
             
-            if all_cached_data:
+            if cached_dataframes:
                 # Combine all cached data and process as before
-                cached_df = pd.concat(all_cached_data, ignore_index=True)
+                cached_df = pd.concat(cached_dataframes, ignore_index=True)
+                # Clear the list to free memory immediately
+                cached_dataframes.clear()
                 
-                # Calculate mean values across patients for each window_id
+                # Apply z-score normalization to metric columns
                 numeric_cols = cached_df.select_dtypes(include=[np.number]).columns.tolist()
                 exclude_cols = ['patient_id', 'window_id', 'time_start', 'time_end']
                 metric_cols = [col for col in numeric_cols if col not in exclude_cols]
+                
+                # Z-score normalize the metric columns
+                from scipy import stats
+                for col in metric_cols:
+                    # Check for NaN values and replace them
+                    if cached_df[col].isna().any():
+                        cached_df[col] = cached_df[col].fillna(cached_df[col].mean())
+                    
+                    # Calculate standard deviation
+                    std_val = cached_df[col].std()
+                    
+                    if std_val > 1e-10:  # Use a very small threshold instead of 0
+                        z_scores = stats.zscore(cached_df[col], nan_policy='omit')
+                        # Handle any remaining NaN values in z_scores
+                        if np.isnan(z_scores).any():
+                            cached_df[col] = cached_df[col]  # Keep original values
+                        else:
+                            cached_df[col] = z_scores
+                    else:
+                        # Keep original values instead of setting to 0
+                        pass
                 
                 # Group by window_id and calculate mean
                 mean_results = cached_df.groupby('window_id')[metric_cols].mean().reset_index()
@@ -509,7 +544,6 @@ def HEP_plots2(project_name, df_wnv3, controls, boxplot_columns, analysis_type, 
     
     # Process each frequency band
     for band_name, band_range in power_bands.items():
-        print(f"HEP_plots2: Processing band {band_name} with range {band_range}")
         st.write(f"Analyzing power band: {band_name}")
         
         all_patient_results = []
@@ -522,8 +556,6 @@ def HEP_plots2(project_name, df_wnv3, controls, boxplot_columns, analysis_type, 
         def process_single_file(pickle_file):
             """Process a single pickle file and return results"""
             try:
-                print(f"HEP_plots2: Processing file {pickle_file} for band {band_name}")
-                
                 # Extract patient ID from filename
                 import re
                 m = re.search(r'(\d{4}-\d{3})', pickle_file)
@@ -537,47 +569,36 @@ def HEP_plots2(project_name, df_wnv3, controls, boxplot_columns, analysis_type, 
                 cache_path = os.path.join(cache_dir, cache_file)
                 
                 if os.path.exists(cache_path):
-                    print(f"HEP_plots2: Loading cached data for patient {patient_id}, band {band_name}")
                     try:
                         cached_df = pd.read_parquet(cache_path)
-                        print(f"HEP_plots2: Loaded {len(cached_df)} time windows from cache for patient {patient_id}")
                         return cached_df, patient_id
                     except Exception as e:
-                        print(f"HEP_plots2: Error loading cached data for patient {patient_id}: {e}")
                         # Continue with processing if cache load fails
+                        pass
                 
                 # Load the raw EEG data
-                print(f"HEP_plots2: Loading pickle file {pickle_file}")
                 with open(os.path.join(pickles_dir, pickle_file), 'rb') as f:
                     raw = pickle.load(f)
-                
-                print(f"HEP_plots2: Processing patient {patient_id}")
                 
                 # Calculate HEP measurements for this patient
                 patient_results = calculate_hep_measurements_for_patient(raw, patient_id, band_name, band_range)
                 
                 if patient_results is not None:
-                    print(f"HEP_plots2: Got {len(patient_results)} time windows for patient {patient_id}")
-                    
                     # Save individual patient data to cache
                     try:
                         patient_results.to_parquet(cache_path, index=False)
-                        print(f"HEP_plots2: Saved patient {patient_id} data to cache: {cache_path}")
                     except Exception as e:
-                        print(f"HEP_plots2: Error saving cache for patient {patient_id}: {e}")
+                        pass
                     
                     return patient_results, patient_id
                 else:
-                    print(f"HEP_plots2: No results for patient {patient_id}")
                     return None, patient_id
                     
             except Exception as e:
-                print(f"HEP_plots2: Error processing {pickle_file}: {e}")
                 return None, pickle_file
         
         # Use ThreadPoolExecutor for parallel processing
         max_workers = min(16, len(files_to_process))  # Limit to 4 workers to avoid overwhelming the system
-        print(f"HEP_plots2: Processing {len(files_to_process)} files in parallel with {max_workers} workers")
         
         # Update status text to show current processing mode
         if len(files_to_process) <= 5:
@@ -605,33 +626,44 @@ def HEP_plots2(project_name, df_wnv3, controls, boxplot_columns, analysis_type, 
                     patient_results, patient_id = future.result()
                     if patient_results is not None:
                         all_patient_results.append(patient_results)
-                        print(f"HEP_plots2: Completed patient {patient_id}")
-                    else:
-                        print(f"HEP_plots2: Skipped patient {patient_id} (no ECG channel or other issue)")
                 except Exception as e:
-                    print(f"HEP_plots2: Error processing file {pickle_file}: {e}")
                     st.warning(f"Error processing file {pickle_file}: {e}")
                     continue
         
-        print(f"HEP_plots2: Total patient results for band {band_name}: {len(all_patient_results)}")
-        
         if not all_patient_results:
-            print(f"HEP_plots2: No valid results for band {band_name}")
             st.warning(f"No valid results for band {band_name}")
             continue
         
         # Combine all patient results
-        print(f"HEP_plots2: Combining results for band {band_name}")
         results_df = pd.concat(all_patient_results, ignore_index=True)
-        print(f"HEP_plots2: Combined DataFrame shape: {results_df.shape}")
         
-        # Calculate mean values across patients for each window_id
-        print(f"HEP_plots2: Calculating mean values across patients for each window_id")
-        
-        # Get numeric columns (exclude patient_id, window_id, time_start, time_end)
+        # Apply z-score normalization to metric columns
         numeric_cols = results_df.select_dtypes(include=[np.number]).columns.tolist()
         exclude_cols = ['patient_id', 'window_id', 'time_start', 'time_end']
         metric_cols = [col for col in numeric_cols if col not in exclude_cols]
+        
+        # Z-score normalize the metric columns
+        from scipy import stats
+        for col in metric_cols:
+            # Check for NaN values and replace them
+            if results_df[col].isna().any():
+                results_df[col] = results_df[col].fillna(results_df[col].mean())
+            
+            # Calculate standard deviation
+            std_val = results_df[col].std()
+            
+            if std_val > 1e-10:  # Use a very small threshold instead of 0
+                z_scores = stats.zscore(results_df[col], nan_policy='omit')
+                # Handle any remaining NaN values in z_scores
+                if np.isnan(z_scores).any():
+                    results_df[col] = results_df[col]  # Keep original values
+                else:
+                    results_df[col] = z_scores
+            else:
+                # Keep original values instead of setting to 0
+                pass
+        
+        # Calculate mean values across patients for each window_id
         
         # Group by window_id and calculate mean
         mean_results = results_df.groupby('window_id')[metric_cols].mean().reset_index()
@@ -651,16 +683,11 @@ def HEP_plots2(project_name, df_wnv3, controls, boxplot_columns, analysis_type, 
         
         try:
             mean_results.to_parquet(combined_path, index=False)
-            print(f"HEP_plots2: Saved combined results to {combined_path}")
             st.success(f"💾 Combined results saved to {combined_filename}")
         except Exception as e:
-            print(f"HEP_plots2: Error saving combined parquet file: {e}")
             st.warning(f"Could not save combined results to parquet: {e}")
         # only the rows where mean_results patient_count is max
         mean_results = mean_results[mean_results['patient_count'] == mean_results['patient_count'].max()]
-        print(f"HEP_plots2: Mean results DataFrame shape: {mean_results.shape}")
-        print(f"HEP_plots2: Mean results columns: {mean_results.columns.tolist()}")
-        print(f"HEP_plots2: Max patient count: {patient_count_max}")
         
 
         
@@ -669,11 +696,9 @@ def HEP_plots2(project_name, df_wnv3, controls, boxplot_columns, analysis_type, 
         
         # Add group information
         results_df['Group'] = 'Dementia'  # All patients are from Dementia group
-        print(f"HEP_plots2: Added Group column")
         
         # Add size feature if specified
         if size_feature and size_feature in df_wnv3.columns:
-            print(f"HEP_plots2: Adding size feature {size_feature}")
             for idx, row in results_df.iterrows():
                 patient_id = row['patient_id']
                 matching_rows = df_wnv3[df_wnv3['ID'] == patient_id]
@@ -683,11 +708,8 @@ def HEP_plots2(project_name, df_wnv3, controls, boxplot_columns, analysis_type, 
                     results_df.loc[idx, size_feature] = df_wnv3[size_feature].mean() if size_feature in df_wnv3.columns else 1.0
         
         st.write(f"Processed {len(results_df)} time windows for band {band_name}")
-        print(f"HEP_plots2: Final results shape: {results_df.shape}")
-        print(f"HEP_plots2: Columns: {list(results_df.columns)}")
         
         # Use only_plots function instead of custom pairgrid
-        print(f"HEP_plots2: Calling only_plots for band {band_name}")    
         only_plots(
             results_df=results_df,
             save_plot=False,
@@ -697,8 +719,6 @@ def HEP_plots2(project_name, df_wnv3, controls, boxplot_columns, analysis_type, 
             step_sec=5,
             is_streamlit=True
         )
-        
-        print(f"HEP_plots2: Completed band {band_name}")
         
         # Clear progress bars
         progress_bar.empty()
@@ -714,8 +734,6 @@ def calculate_hep_measurements_for_patient(raw, patient_id, band_name, band_rang
     Calculate HEP measurements for a single patient's EEG data.
     Returns a DataFrame with measurements for each time window.
     """
-    print(f"calculate_hep_measurements_for_patient: Processing patient {patient_id}, band {band_name}")
-    
     try:
         # Check for ECG channel first - skip patient if none found
         ecg_channel = None
@@ -725,15 +743,11 @@ def calculate_hep_measurements_for_patient(raw, patient_id, band_name, band_rang
                 break
         
         if ecg_channel is None:
-            print(f"calculate_hep_measurements_for_patient: No ECG channel found for patient {patient_id} - skipping patient")
             return None
-        
-        print(f"calculate_hep_measurements_for_patient: Found ECG channel {ecg_channel} for patient {patient_id}")
         
         # Extract EEG data and convert from volts to microvolts
         eeg_data = raw.get_data() * 1e6  # Convert V to μV
         sfreq = raw.info['sfreq']
-        print(f"calculate_hep_measurements_for_patient: EEG data shape: {eeg_data.shape}, sfreq: {sfreq}, converted to microvolts")
         
         # Define window parameters (same as ECG analysis)
         window_size_sec = 15  # 15-second windows
@@ -742,23 +756,15 @@ def calculate_hep_measurements_for_patient(raw, patient_id, band_name, band_rang
         window_size = int(window_size_sec * sfreq)
         step_size = int(step_size_sec * sfreq)
         
-        print(f"calculate_hep_measurements_for_patient: Window size: {window_size} samples, Step size: {step_size} samples")
-        
-        # Limit to first 10 minutes of data
-        max_samples_10min = int(10 * 60 * sfreq)  # 10 minutes in samples
-        original_duration = eeg_data.shape[1] / sfreq / 60  # Original duration in minutes
-        if eeg_data.shape[1] > max_samples_10min:
-            eeg_data = eeg_data[:, :max_samples_10min]
-            print(f"calculate_hep_measurements_for_patient: Limited to first 10 minutes for patient {patient_id} (original: {original_duration:.1f} min)")
-        else:
-            print(f"calculate_hep_measurements_for_patient: Using full duration for patient {patient_id} ({original_duration:.1f} min)")
+        # Limit to first 5 minutes of data
+        max_samples_5min = int(5 * 60 * sfreq)  # 5 minutes in samples
+        if eeg_data.shape[1] > max_samples_5min:
+            eeg_data = eeg_data[:, :max_samples_5min]
         
         # Calculate number of windows
         n_windows = max(0, (eeg_data.shape[1] - window_size) // step_size + 1)
-        print(f"calculate_hep_measurements_for_patient: Number of windows: {n_windows}")
         
         if n_windows == 0:
-            print(f"calculate_hep_measurements_for_patient: No windows possible for patient {patient_id}")
             return None
         
         # Initialize storage for this patient
@@ -780,21 +786,17 @@ def calculate_hep_measurements_for_patient(raw, patient_id, band_name, band_rang
             end = start + window_size
             
             if end > eeg_data.shape[1]:
-                print(f"calculate_hep_measurements_for_patient: Window {w} would exceed data length, stopping")
                 break
                 
             # Extract window data
             window_data = eeg_data[:, start:end]
-            print(f"calculate_hep_measurements_for_patient: Processing window {w}/{n_windows}, shape: {window_data.shape}")
             
             # Calculate network features for this frequency band
             try:
                 efficiency, clustering, assortativity, modularity = compute_network_features(
                     window_data, sfreq, band_range
                 )
-                print(f"calculate_hep_measurements_for_patient: Window {w} - Efficiency: {efficiency:.3f}, Clustering: {clustering:.3f}, Assortativity: {assortativity:.3f}, Modularity: {modularity:.3f}")
             except Exception as e:
-                print(f"calculate_hep_measurements_for_patient: Error computing network features for window {w}: {e}")
                 continue
             
             # Calculate power bands for this window
@@ -821,10 +823,7 @@ def calculate_hep_measurements_for_patient(raw, patient_id, band_name, band_rang
                 for band_name in power_bands_window:
                     mean_power_bands[f"{band_name}_power"] = np.mean(power_bands_window[band_name])
                 
-                print(f"calculate_hep_measurements_for_patient: Window {w} - Power bands: {mean_power_bands}")
-                
             except Exception as e:
-                print(f"calculate_hep_measurements_for_patient: Error calculating power bands for window {w}: {e}")
                 # Set default values for power bands
                 mean_power_bands = {}
                 for band_name in power_bands:
@@ -862,19 +861,15 @@ def calculate_hep_measurements_for_patient(raw, patient_id, band_name, band_rang
                         vagal_sd1 = np.std(dibi) / np.sqrt(2)
                         sympathetic_sd2 = np.sqrt(max(0, 2 * np.std(ibi)**2 - 0.5 * np.std(dibi)**2))
                         
-                        print(f"calculate_hep_measurements_for_patient: Window {w} - Vagal_SD1: {vagal_sd1:.3f}, Sympathetic_SD2: {sympathetic_sd2:.3f}")
                     else:
-                        print(f"calculate_hep_measurements_for_patient: Not enough R-peaks in window {w} ({len(rpeaks)} found)")
                         vagal_sd1 = np.nan
                         sympathetic_sd2 = np.nan
                     
                 except Exception as e:
-                    print(f"calculate_hep_measurements_for_patient: Error processing ECG for window {w}: {e}")
                     vagal_sd1 = np.nan
                     sympathetic_sd2 = np.nan
                     
             except Exception as e:
-                print(f"calculate_hep_measurements_for_patient: Error calculating HRV for window {w}: {e}")
                 vagal_sd1 = np.nan
                 sympathetic_sd2 = np.nan
             
@@ -897,8 +892,6 @@ def calculate_hep_measurements_for_patient(raw, patient_id, band_name, band_rang
             
             patient_results.append(window_result)
         
-        print(f"calculate_hep_measurements_for_patient: Completed {len(patient_results)} windows for patient {patient_id}")
-        
         # Clear window progress bar
         if n_windows > 0:
             window_progress_bar.empty()
@@ -907,7 +900,6 @@ def calculate_hep_measurements_for_patient(raw, patient_id, band_name, band_rang
         return pd.DataFrame(patient_results)
         
     except Exception as e:
-        print(f"calculate_hep_measurements_for_patient: Error processing patient {patient_id}: {e}")
         st.warning(f"Error processing patient {patient_id}: {e}")
         return None
 
@@ -918,7 +910,6 @@ def HEP_plots(project_name, df_wnv3, controls, boxplot_columns, analysis_type, s
     if project_name == 'COBRAD':
         # Define both directories
         edf_hep_dir = 'parquets_HEP/EDF_HEP'
-        # cap_sleep_dir = 'parquets_HEP/CAP_Sleep_Database'
     else:
         return
     # Run over power bands
@@ -947,31 +938,6 @@ def HEP_plots(project_name, df_wnv3, controls, boxplot_columns, analysis_type, s
                 except Exception as e:
                     st.warning(f"Could not read {file} from EDF_HEP: {e}")
         
-        # Process CAP_Sleep_Database directory (Control group)
-        # if cap_sleep_dir exists
-        if 'cap_sleep_dir' in locals():
-            if os.path.exists(cap_sleep_dir):
-                cap_band_files = [f for f in os.listdir(cap_sleep_dir) if f.endswith(f"_{band_name}.parquet")]
-                for file in cap_band_files:
-                    file_path = os.path.join(cap_sleep_dir, file)
-                    try:
-                        df = pd.read_parquet(file_path)
-                        if not df.empty:
-                            df['Group'] = 'Control'
-                            # add size_feature from df_wnv3 where df_wnv3['ID'] == file.split('_')[0][1:]
-                            if size_feature and size_feature in df_wnv3.columns:
-                                try:
-                                    # Extract patient ID from filename (assuming format like "patient_123_band.parquet")
-                                    patient_id = file.split('_')[0]
-                                    matching_rows = df_wnv3[df_wnv3['ID'] == patient_id]
-                                    if not matching_rows.empty:
-                                        df[size_feature] = matching_rows[size_feature].iloc[0]
-                                except Exception as e:
-                                    st.warning(f"Could not add size_feature to {file}: {e}")
-                                    df[size_feature] = df_wnv3[size_feature].mean() if size_feature in df_wnv3.columns else 1.0
-                            dfs.append(df)
-                    except Exception as e:
-                        st.warning(f"Could not read {file} from CAP_Sleep_Database: {e}")
         if dfs:
             # Group by 'Group' and compute mean for each group
             group_dfs = []
@@ -983,20 +949,15 @@ def HEP_plots(project_name, df_wnv3, controls, boxplot_columns, analysis_type, s
                 for df in dfs:
                     if 'Group' in df.columns and df['Group'].iloc[0] == group:
                         group_patients2.append(df)
-                # group_patients = pd.concat(group_patients2, ignore_index=False, axis=0)
-                # Filter out dfs shorter than 50 rows
-                group_patients = [df for df in group_patients2 if df.shape[0] >= 50]
+                group_patients = [df for df in group_patients2]
                 if group_patients:
-                    min_len = min(df.shape[0] for df in group_patients)
-                    if min_len < 50:
-                        continue
-                    # Truncate all dfs to min_len rows
-                    truncated = [df.drop(columns=['Group'], errors='ignore').iloc[:min_len] for df in group_patients]
                     # Get mean of each df (returns a Series) and concat to DataFrame
-                    group_mean_df = pd.concat([t.mean() for t in truncated], axis=1).T
+                    group_mean_df = pd.concat([df.drop(columns=['Group'], errors='ignore').mean() for df in group_patients], axis=1).T
                     group_mean_df['Group'] = group
                     group_dfs.append(group_mean_df)
             results_df = pd.concat(group_dfs, ignore_index=True)
+            # # concat with df_wnv3_clean assume same index
+            # results_df = pd.concat([pd.concat(group_dfs), df_wnv3_clean], axis=1)
             # remove cols more than 50% NaN
             results_df = results_df.loc[:, results_df.isnull().mean() < 0.5]
             # remove rows with any NaN
@@ -1021,13 +982,450 @@ def HEP_plots(project_name, df_wnv3, controls, boxplot_columns, analysis_type, s
         
         # Use the original only_plots function
         only_plots(results_df, save_plot='', save_dir='', edf_pickle_name="plot", band=band_name, step_sec=5, is_streamlit=True, hue=hue, size_feature=size_feature)
+        # Add pair-wise clustering analysis
+        st.subheader("Pair-wise Clustering Analysis")
+        pair_clustering_analysis(results_df, df_wnv3_clean, n_clusters=n_clusters)
         
-        # Add enhanced clustering analysis
-        st.subheader("Enhanced Clustering Analysis")
-        enhanced_clustering_plots(results_df, df_wnv3_clean, save_plot='', save_dir='', edf_pickle_name="enhanced_plot", band=band_name, n_clusters=n_clusters, is_streamlit=True, size_feature=size_feature)
         st.divider()
 
 
+def pair_clustering_analysis(results_df, df_wnv3_clean, n_clusters=2):
+    """
+    Perform clustering analysis on pairs of columns from results_df and classify clusters using group information.
+    
+    Parameters:
+    -----------
+    results_df : pd.DataFrame
+        DataFrame with clustering features and Group column
+    df_wnv3_clean : pd.DataFrame  
+        DataFrame with clinical features for classification
+    n_clusters : int
+        Number of clusters for K-means (default: 2)
+    """
+    from sklearn.cluster import KMeans
+    from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, AdaBoostClassifier
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.svm import SVC
+    from sklearn.neighbors import KNeighborsClassifier
+    from sklearn.tree import DecisionTreeClassifier
+    from sklearn.naive_bayes import GaussianNB
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.metrics import classification_report, confusion_matrix
+    from sklearn.model_selection import train_test_split
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    from itertools import combinations
+    
+    # Classifier selection
+    st.subheader("Classifier Configuration")
+    classifier_options = {
+        'Random Forest': RandomForestClassifier(n_estimators=100, random_state=42),
+        'Gradient Boosting': GradientBoostingClassifier(random_state=42),
+        'AdaBoost': AdaBoostClassifier(random_state=42),
+        'Logistic Regression': LogisticRegression(random_state=42, max_iter=1000),
+        'SVM': SVC(random_state=42, probability=True),
+        'K-Nearest Neighbors': KNeighborsClassifier(),
+        'Decision Tree': DecisionTreeClassifier(random_state=42),
+        'Naive Bayes': GaussianNB()
+    }
+    
+    selected_classifier = st.selectbox(
+        "Choose Classification Algorithm:",
+        options=list(classifier_options.keys()),
+        index=0
+    )
+    
+    classifier = classifier_options[selected_classifier]
+    
+    # Get numeric columns from results_df (excluding Group)
+    numeric_cols = results_df.select_dtypes(include=[np.number]).columns.tolist()
+    if 'Group' in numeric_cols:
+        numeric_cols.remove('Group')
+    
+    if len(numeric_cols) < 2:
+        st.error("Not enough numeric columns for pair analysis")
+        return
+    
+    st.subheader("Pair-wise Clustering Analysis")
+    st.write(f"Analyzing {len(numeric_cols)} features in pairs with {n_clusters} clusters each")
+    st.write(f"Using classifier: **{selected_classifier}**")
+    
+    # Create all possible pairs
+    pairs = list(combinations(numeric_cols, 2))
+    st.write(f"Total pairs to analyze: {len(pairs)}")
+    
+    # Create columns for displaying results
+    col1, col2 = st.columns(2)
+    
+    results_summary = []
+    
+    for i, (col1_name, col2_name) in enumerate(pairs):
+        with st.expander(f"Pair {i+1}: {col1_name} vs {col2_name}", expanded=False):
+            
+            # Prepare data for this pair
+            pair_data = results_df[[col1_name, col2_name, 'Group']].dropna()
+            
+            if len(pair_data) < n_clusters:
+                st.warning(f"Not enough data points for pair {col1_name} vs {col2_name}")
+                continue
+            
+            # Perform K-means clustering
+            X_pair = pair_data[[col1_name, col2_name]]
+            scaler = StandardScaler()
+            X_scaled = scaler.fit_transform(X_pair)
+            
+            kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+            cluster_labels = kmeans.fit_predict(X_scaled)
+            
+            # Add cluster labels to data
+            pair_data_with_clusters = pair_data.copy()
+            pair_data_with_clusters['cluster'] = cluster_labels
+            
+            # Create confusion matrix
+            st.subheader("Confusion Matrix")
+            # Convert all labels to strings to avoid type mixing
+            group_labels = pair_data_with_clusters['Group'].astype(str)
+            cluster_labels = pair_data_with_clusters['cluster'].astype(str)
+            confusion_mat = confusion_matrix(group_labels, cluster_labels)
+            
+            # Plot confusion matrix
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+            
+            # Confusion matrix heatmap
+            sns.heatmap(confusion_mat, annot=True, fmt='d', cmap='Blues', 
+                       xticklabels=[f'Cluster {i}' for i in range(n_clusters)],
+                       yticklabels=sorted(pair_data['Group'].unique()),
+                       ax=ax1)
+            ax1.set_title(f'Confusion Matrix: {col1_name} vs {col2_name}')
+            ax1.set_xlabel('Predicted Cluster')
+            ax1.set_ylabel('True Group')
+            
+            # Scatter plot with clusters
+            unique_groups = pair_data['Group'].unique()
+            colors = plt.cm.Set1(np.linspace(0, 1, len(unique_groups)))
+            group_colors = {group: colors[i] for i, group in enumerate(unique_groups)}
+            
+            for group in unique_groups:
+                mask = pair_data_with_clusters['Group'] == group
+                ax2.scatter(pair_data_with_clusters.loc[mask, col1_name], 
+                           pair_data_with_clusters.loc[mask, col2_name],
+                           c=[group_colors[group]], label=group, alpha=0.7, s=50)
+            
+            # Add cluster centers
+            centers = scaler.inverse_transform(kmeans.cluster_centers_)
+            ax2.scatter(centers[:, 0], centers[:, 1], c='red', marker='x', s=200, linewidths=3, label='Centroids')
+            
+            ax2.set_xlabel(col1_name)
+            ax2.set_ylabel(col2_name)
+            ax2.set_title(f'Clustering Results: {col1_name} vs {col2_name}')
+            ax2.legend()
+            ax2.grid(True, alpha=0.3)
+            
+            plt.tight_layout()
+            st.pyplot(fig)
+            plt.close(fig)
+            
+            # Feature importance analysis
+            st.subheader("Feature Importance Analysis")
+            
+            # Train Random Forest to predict Group from cluster features
+            try:
+                # Prepare features for classification
+                X_class = pair_data_with_clusters[[col1_name, col2_name, 'cluster']]
+                y_class = pair_data_with_clusters['Group']
+                
+                # Split data
+                X_train, X_test, y_train, y_test = train_test_split(
+                    X_class, y_class, test_size=0.3, random_state=42, stratify=y_class
+                )
+                
+                # Train selected classifier
+                clf = classifier
+                clf.fit(X_train, y_train)
+                
+                # Get feature importance (if available)
+                feature_names = [col1_name, col2_name, 'cluster']
+                if hasattr(clf, 'feature_importances_'):
+                    importance_df = pd.DataFrame({
+                        'feature': feature_names,
+                        'importance': clf.feature_importances_
+                    }).sort_values('importance', ascending=False)
+                else:
+                    # For classifiers without feature_importances_, use coefficients or other metrics
+                    if hasattr(clf, 'coef_'):
+                        # For linear models, use absolute coefficients
+                        importance_df = pd.DataFrame({
+                            'feature': feature_names,
+                            'importance': np.abs(clf.coef_[0]) if len(clf.coef_.shape) > 1 else np.abs(clf.coef_)
+                        }).sort_values('importance', ascending=False)
+                    else:
+                        # Fallback: equal importance
+                        importance_df = pd.DataFrame({
+                            'feature': feature_names,
+                            'importance': [1.0/len(feature_names)] * len(feature_names)
+                        })
+                
+                # Plot feature importance
+                fig, ax = plt.subplots(figsize=(10, 6))
+                sns.barplot(data=importance_df, x='importance', y='feature', ax=ax)
+                ax.set_title(f'Feature Importance ({selected_classifier}): {col1_name} vs {col2_name}')
+                ax.set_xlabel('Importance')
+                plt.tight_layout()
+                st.pyplot(fig)
+                plt.close(fig)
+                
+                # Display importance values
+                st.write("Feature Importance Values:")
+                st.dataframe(importance_df)
+                
+                # Classification report
+                y_pred = clf.predict(X_test)
+                st.write("Classification Report:")
+                st.text(classification_report(y_test, y_pred))
+                
+                # Store results for summary
+                results_summary.append({
+                    'pair': f"{col1_name} vs {col2_name}",
+                    'n_samples': len(pair_data),
+                    'accuracy': clf.score(X_test, y_test),
+                    'top_feature': importance_df.iloc[0]['feature'],
+                    'top_importance': importance_df.iloc[0]['importance']
+                })
+                
+            except Exception as e:
+                st.error(f"Error in feature importance analysis: {str(e)}")
+    
+    # Create comprehensive pairgrid for all features
+    st.subheader("Comprehensive Feature Pairgrid")
+    
+    # Prepare data for pairgrid
+    pairgrid_data = results_df[numeric_cols + ['Group']].dropna()
+    
+    if len(pairgrid_data) > 0:
+        # Create pairgrid
+        g = sns.PairGrid(pairgrid_data, hue='Group', diag_sharey=False)
+        
+        def plot_upper(x, y, **kwargs):
+            """Plot upper triangle with group-colored scatter plots."""
+            ax = kwargs.get('ax', plt.gca())
+            
+            # Get unique groups and colors
+            unique_groups = pairgrid_data['Group'].unique()
+            colors = plt.cm.Set1(np.linspace(0, 1, len(unique_groups)))
+            group_colors = {group: colors[i] for i, group in enumerate(unique_groups)}
+            
+            # Create scatter plot with group colors
+            for group in unique_groups:
+                mask = pairgrid_data['Group'] == group
+                if mask.sum() > 0:
+                    ax.scatter(x[mask], y[mask], 
+                              c=[group_colors[group]], 
+                              label=group, 
+                              alpha=0.7, s=50)
+            
+            # Add regression line
+            try:
+                from scipy.stats import linregress
+                slope, intercept, r_value, p_value, std_err = linregress(x, y)
+                line_x = np.linspace(x.min(), x.max(), 100)
+                line_y = slope * line_x + intercept
+                ax.plot(line_x, line_y, 'r--', alpha=0.8, linewidth=2)
+                ax.text(0.05, 0.95, f'R² = {r_value**2:.3f}', 
+                       transform=ax.transAxes, fontsize=8, 
+                       bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+            except:
+                pass
+        
+        def plot_lower(x, y, **kwargs):
+            """Plot lower triangle with correlation heatmap."""
+            ax = kwargs.get('ax', plt.gca())
+            
+            # Calculate correlation
+            try:
+                from scipy.stats import pearsonr
+                corr, p_val = pearsonr(x, y)
+                
+                # Create scatter plot
+                ax.scatter(x, y, alpha=0.6, s=30)
+                
+                # Add correlation text
+                ax.text(0.05, 0.95, f'r = {corr:.3f}\np = {p_val:.3f}', 
+                       transform=ax.transAxes, fontsize=8,
+                       bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+            except:
+                ax.scatter(x, y, alpha=0.6, s=30)
+        
+        def plot_diag(x, **kwargs):
+            """Plot diagonal with histograms for each group."""
+            ax = kwargs.get('ax', plt.gca())
+            
+            # Get unique groups and colors
+            unique_groups = pairgrid_data['Group'].unique()
+            colors = plt.cm.Set1(np.linspace(0, 1, len(unique_groups)))
+            group_colors = {group: colors[i] for i, group in enumerate(unique_groups)}
+            
+            for group in unique_groups:
+                mask = pairgrid_data['Group'] == group
+                if mask.sum() > 0:
+                    ax.hist(x[mask], alpha=0.6, color=group_colors[group], 
+                           label=group, bins=15, density=True)
+            
+            ax.legend(fontsize=8)
+        
+        # Apply the plotting functions
+        g.map_upper(plot_upper)
+        g.map_lower(plot_lower)
+        g.map_diag(plot_diag)
+        
+        # Set title
+        g.fig.suptitle(f'Comprehensive Feature Analysis - All Pairs\nN={len(pairgrid_data)}', 
+                       fontsize=16, y=1.02)
+        
+        plt.tight_layout()
+        st.pyplot(g.fig)
+        plt.close(g.fig)
+    
+    # Create clustering results pairgrid
+    st.subheader("Clustering Results Pairgrid")
+    
+    if len(pairgrid_data) > 0:
+        # Perform clustering on all features for the pairgrid
+        X_all = pairgrid_data[numeric_cols]
+        scaler_all = StandardScaler()
+        X_scaled_all = scaler_all.fit_transform(X_all)
+        
+        kmeans_all = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+        cluster_labels_all = kmeans_all.fit_predict(X_scaled_all)
+        
+        # Add cluster labels to data
+        pairgrid_data_with_clusters = pairgrid_data.copy()
+        pairgrid_data_with_clusters['cluster'] = cluster_labels_all
+        
+        # Create pairgrid with clusters
+        g_cluster = sns.PairGrid(pairgrid_data_with_clusters, hue='cluster', diag_sharey=False)
+        
+        def plot_upper_cluster(x, y, **kwargs):
+            """Plot upper triangle with cluster-colored scatter plots."""
+            ax = kwargs.get('ax', plt.gca())
+            
+            # Get unique clusters and colors
+            unique_clusters = pairgrid_data_with_clusters['cluster'].unique()
+            colors = plt.cm.Set1(np.linspace(0, 1, len(unique_clusters)))
+            cluster_colors = {cluster: colors[i] for i, cluster in enumerate(unique_clusters)}
+            
+            # Create scatter plot with cluster colors
+            for cluster in unique_clusters:
+                mask = pairgrid_data_with_clusters['cluster'] == cluster
+                if mask.sum() > 0:
+                    ax.scatter(x[mask], y[mask], 
+                              c=[cluster_colors[cluster]], 
+                              label=f'Cluster {cluster}', 
+                              alpha=0.7, s=50)
+            
+            # Add cluster centers if this is a 2D plot
+            if len(np.unique(x)) > 1 and len(np.unique(y)) > 1:
+                try:
+                    # Find the centers for this specific pair
+                    col1_name = x.name
+                    col2_name = y.name
+                    if col1_name in numeric_cols and col2_name in numeric_cols:
+                        # Get the centers for this specific pair
+                        pair_idx = [numeric_cols.index(col1_name), numeric_cols.index(col2_name)]
+                        centers_2d = kmeans_all.cluster_centers_[:, pair_idx]
+                        ax.scatter(centers_2d[:, 0], centers_2d[:, 1], 
+                                 c='red', marker='x', s=200, linewidths=3, 
+                                 label='Centroids')
+                except:
+                    pass
+        
+        def plot_lower_cluster(x, y, **kwargs):
+            """Plot lower triangle with cluster-colored scatter plots."""
+            ax = kwargs.get('ax', plt.gca())
+            
+            # Get unique clusters and colors
+            unique_clusters = pairgrid_data_with_clusters['cluster'].unique()
+            colors = plt.cm.Set1(np.linspace(0, 1, len(unique_clusters)))
+            cluster_colors = {cluster: colors[i] for i, cluster in enumerate(unique_clusters)}
+            
+            # Create scatter plot with cluster colors
+            for cluster in unique_clusters:
+                mask = pairgrid_data_with_clusters['cluster'] == cluster
+                if mask.sum() > 0:
+                    ax.scatter(x[mask], y[mask], 
+                              c=[cluster_colors[cluster]], 
+                              alpha=0.6, s=30)
+        
+        def plot_diag_cluster(x, **kwargs):
+            """Plot diagonal with histograms for each cluster."""
+            ax = kwargs.get('ax', plt.gca())
+            
+            # Get unique clusters and colors
+            unique_clusters = pairgrid_data_with_clusters['cluster'].unique()
+            colors = plt.cm.Set1(np.linspace(0, 1, len(unique_clusters)))
+            cluster_colors = {cluster: colors[i] for i, cluster in enumerate(unique_clusters)}
+            
+            for cluster in unique_clusters:
+                mask = pairgrid_data_with_clusters['cluster'] == cluster
+                if mask.sum() > 0:
+                    ax.hist(x[mask], alpha=0.6, color=cluster_colors[cluster], 
+                           label=f'Cluster {cluster}', bins=15, density=True)
+            
+            ax.legend(fontsize=8)
+        
+        # Apply the plotting functions
+        g_cluster.map_upper(plot_upper_cluster)
+        g_cluster.map_lower(plot_lower_cluster)
+        g_cluster.map_diag(plot_diag_cluster)
+        
+        # Set title
+        g_cluster.fig.suptitle(f'Clustering Results - All Features\nN={len(pairgrid_data)}, Clusters={n_clusters}', 
+                              fontsize=16, y=1.02)
+        
+        plt.tight_layout()
+        st.pyplot(g_cluster.fig)
+        plt.close(g_cluster.fig)
+        
+        # Show cluster vs group confusion matrix
+        st.subheader("Overall Clustering vs Group Confusion Matrix")
+        # Convert all labels to strings to avoid type mixing
+        group_labels_overall = pairgrid_data_with_clusters['Group'].astype(str)
+        cluster_labels_overall = pairgrid_data_with_clusters['cluster'].astype(str)
+        confusion_mat_overall = confusion_matrix(group_labels_overall, cluster_labels_overall)
+        
+        fig, ax = plt.subplots(figsize=(8, 6))
+        sns.heatmap(confusion_mat_overall, annot=True, fmt='d', cmap='Blues', 
+                   xticklabels=[f'Cluster {i}' for i in range(n_clusters)],
+                   yticklabels=sorted(group_labels_overall.unique()),
+                   ax=ax)
+        ax.set_title('Overall Clustering vs Group Confusion Matrix')
+        ax.set_xlabel('Predicted Cluster')
+        ax.set_ylabel('True Group')
+        plt.tight_layout()
+        st.pyplot(fig)
+        plt.close(fig)
+    
+    # Summary table
+    if results_summary:
+        st.subheader("Analysis Summary")
+        summary_df = pd.DataFrame(results_summary)
+        st.dataframe(summary_df)
+        
+        # Plot summary
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+        
+        # Accuracy by pair
+        sns.barplot(data=summary_df, x='accuracy', y='pair', ax=ax1)
+        ax1.set_title('Classification Accuracy by Feature Pair')
+        ax1.set_xlabel('Accuracy')
+        
+        # Top feature importance
+        sns.barplot(data=summary_df, x='top_importance', y='pair', ax=ax2)
+        ax2.set_title('Top Feature Importance by Pair')
+        ax2.set_xlabel('Importance')
+        
+        plt.tight_layout()
+        st.pyplot(fig)
+        plt.close(fig)
 
 
 # Streamlit App
@@ -1130,7 +1528,7 @@ def main():
         if current_feature_type == "vs_Controls":
             vs_controls_run(project_name,df_wnv2,controls,boxplot_columns,analysis_type)
         elif current_feature_type == "HEP":
-            HEP_plots2(project_name,df_wnv2,controls,boxplot_columns,analysis_type,size_feature=size_feature)
+            HEP_plots(project_name,df_wnv2,controls,boxplot_columns,analysis_type,size_feature=size_feature)
         elif current_feature_type == "Pair Plot":
             pairplot_columns(df_wnv2, clinical_features, eeg_features)
         elif current_feature_type == "ml_plots":
