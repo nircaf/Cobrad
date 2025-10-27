@@ -1036,7 +1036,7 @@ def pair_clustering_analysis(results_df, df_wnv3_clean, n_clusters=2):
         ),
     }
     # let user choose
-    selected_classifier = st.selectbox('Select classifier', list(classifier_options.keys()))
+    selected_classifier = st.selectbox('Select classifier', list(classifier_options.keys()), key='pair_clustering_classifier')
     
     classifier = classifier_options[selected_classifier]
     
