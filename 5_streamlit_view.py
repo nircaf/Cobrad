@@ -909,7 +909,7 @@ def HEP_plots(project_name, df_wnv3, controls, boxplot_columns, analysis_type, s
     #     size_feature = 'clinical_moca'
     if project_name == 'COBRAD':
         # Define both directories
-        edf_hep_dir = 'parquets_HEP/EDF_HEP'
+        edf_hep_dir = 'parquets_HEP/EDF_N1' #'parquets_HEP/EDF_N1'
     else:
         return
     # Run over power bands
@@ -978,7 +978,7 @@ def HEP_plots(project_name, df_wnv3, controls, boxplot_columns, analysis_type, s
             # results_df leave columns 'Vagal_SD1','Sympathetic_SD2','Efficiency','Clustering','Modularity','Assortativity',size_feature
             results_df = results_df[['Vagal_SD1','Sympathetic_SD2','Efficiency','Clustering','Modularity','Assortativity',size_feature]]
         # Add cluster number selection
-        n_clusters = st.sidebar.slider("Number of clusters for K-means", 2, 6, 3)
+        n_clusters = 2
         
         # Use the original only_plots function
         only_plots(results_df, save_plot='', save_dir='', edf_pickle_name="plot", band=band_name, step_sec=5, is_streamlit=True, hue=hue, size_feature=size_feature)
@@ -1003,37 +1003,40 @@ def pair_clustering_analysis(results_df, df_wnv3_clean, n_clusters=2):
         Number of clusters for K-means (default: 2)
     """
     from sklearn.cluster import KMeans
-    from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, AdaBoostClassifier
+    from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, StackingClassifier
     from sklearn.linear_model import LogisticRegression
-    from sklearn.svm import SVC
-    from sklearn.neighbors import KNeighborsClassifier
-    from sklearn.tree import DecisionTreeClassifier
-    from sklearn.naive_bayes import GaussianNB
+    from sklearn.neural_network import MLPClassifier
     from sklearn.preprocessing import StandardScaler
     from sklearn.metrics import classification_report, confusion_matrix
     from sklearn.model_selection import train_test_split
     import matplotlib.pyplot as plt
     import seaborn as sns
     from itertools import combinations
+    from xgboost import XGBClassifier
+    from lightgbm import LGBMClassifier
+    
+
     
     # Classifier selection
     st.subheader("Classifier Configuration")
     classifier_options = {
-        'Random Forest': RandomForestClassifier(n_estimators=100, random_state=42),
         'Gradient Boosting': GradientBoostingClassifier(random_state=42),
-        'AdaBoost': AdaBoostClassifier(random_state=42),
+        'Random Forest': RandomForestClassifier(n_estimators=100, random_state=42),
+        'XGBoost': XGBClassifier(random_state=42),
+        'LightGBM': LGBMClassifier(random_state=42),
+        'MLP (Feedforward Neural Net)': MLPClassifier(random_state=42, max_iter=1000),
         'Logistic Regression': LogisticRegression(random_state=42, max_iter=1000),
-        'SVM': SVC(random_state=42, probability=True),
-        'K-Nearest Neighbors': KNeighborsClassifier(),
-        'Decision Tree': DecisionTreeClassifier(random_state=42),
-        'Naive Bayes': GaussianNB()
+        'Stacking Classifier': StackingClassifier(
+            estimators=[
+                ('rf', RandomForestClassifier(n_estimators=100, random_state=42)),
+                ('gb', GradientBoostingClassifier(random_state=42)),
+                ('xgb', XGBClassifier(random_state=42))
+            ],
+            final_estimator=LogisticRegression(random_state=42)
+        ),
     }
-    
-    selected_classifier = st.selectbox(
-        "Choose Classification Algorithm:",
-        options=list(classifier_options.keys()),
-        index=0
-    )
+    # let user choose
+    selected_classifier = st.selectbox('Select classifier', list(classifier_options.keys()))
     
     classifier = classifier_options[selected_classifier]
     
@@ -1051,14 +1054,25 @@ def pair_clustering_analysis(results_df, df_wnv3_clean, n_clusters=2):
     st.write(f"Using classifier: **{selected_classifier}**")
     
     # Create all possible pairs
-    pairs = list(combinations(numeric_cols, 2))
-    st.write(f"Total pairs to analyze: {len(pairs)}")
+    all_pairs = list(combinations(numeric_cols, 2))
+    total_pairs = len(all_pairs)
+    st.write(f"Total pairs to analyze: {total_pairs}")
+    
+    # Add checkbox to run all pairs
+    run_all_pairs = st.checkbox("Run all pairs", value=False)
+    
+    # Limit to first 2 pairs unless checkbox is checked
+    if not run_all_pairs:
+        pairs = all_pairs[:2]
+        st.info(f"Running first 2 pairs only. Check 'Run all pairs' to analyze all {total_pairs} pairs.")
+    else:
+        pairs = all_pairs
     
     # Create columns for displaying results
     col1, col2 = st.columns(2)
     
     results_summary = []
-    
+
     for i, (col1_name, col2_name) in enumerate(pairs):
         with st.expander(f"Pair {i+1}: {col1_name} vs {col2_name}", expanded=False):
             
@@ -1080,63 +1094,98 @@ def pair_clustering_analysis(results_df, df_wnv3_clean, n_clusters=2):
             # Add cluster labels to data
             pair_data_with_clusters = pair_data.copy()
             pair_data_with_clusters['cluster'] = cluster_labels
+            # Find common indices between pair data and clinical data
+            common_indices = pair_data_with_clusters.index.intersection(df_wnv3_clean.index)
             
-            # Create confusion matrix
-            st.subheader("Confusion Matrix")
-            # Convert all labels to strings to avoid type mixing
-            group_labels = pair_data_with_clusters['Group'].astype(str)
-            cluster_labels = pair_data_with_clusters['cluster'].astype(str)
-            confusion_mat = confusion_matrix(group_labels, cluster_labels)
+            if len(common_indices) > 0:
+                # Get the pair features
+                pair_features = pair_data_with_clusters.loc[common_indices, [col1_name, col2_name, 'Group', 'cluster']]
+                
+                # Get clinical features (select a subset of important ones to avoid too wide table)
+                clinical_subset = df_wnv3_clean.loc[common_indices].select_dtypes(include=[np.number])
+                
+                # If too many clinical features, select top 10 most variable ones
+                if clinical_subset.shape[1] > 10:
+                    clinical_variance = clinical_subset.var().sort_values(ascending=False)
+                    clinical_subset = clinical_subset[clinical_variance.head(10).index]
+                
+                # Combine the data
+                combined_data = pd.concat([pair_features, clinical_subset], axis=1)
+                
+                # Add cluster column with proper naming
+                combined_data['Cluster_Assignment'] = combined_data['cluster'].map({i: f'Cluster_{i}' for i in range(n_clusters)})
+                
+                # Reorder columns to put cluster assignment near the beginning
+                cols = ['Cluster_Assignment', col1_name, col2_name, 'Group'] + [col for col in combined_data.columns if col not in ['Cluster_Assignment', col1_name, col2_name, 'Group', 'cluster']]
+                combined_data = combined_data[cols]
+                
+                st.write(f"Showing data for {len(combined_data)} samples with common indices")
+                st.dataframe(combined_data, use_container_width=True)
+                
+                # Show cluster distribution
+                st.subheader("Cluster Distribution")
+                cluster_dist = combined_data['Cluster_Assignment'].value_counts()
+                st.dataframe(cluster_dist.to_frame('Count'))
+                
+            else:
+                st.warning("No common indices found between pair data and clinical data")
             
-            # Plot confusion matrix
-            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+            # Create scatter plot with clusters - color each cluster differently
+            fig, ax = plt.subplots(1, 1, figsize=(10, 8))
+            unique_clusters = pair_data_with_clusters['cluster'].unique()
+            # Use a vibrant color palette for clusters
+            color_palette = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7', '#DDA0DD', '#98D8C8', '#F7DC6F']
+            cluster_colors = {cluster: color_palette[i % len(color_palette)] for i, cluster in enumerate(unique_clusters)}
             
-            # Confusion matrix heatmap
-            sns.heatmap(confusion_mat, annot=True, fmt='d', cmap='Blues', 
-                       xticklabels=[f'Cluster {i}' for i in range(n_clusters)],
-                       yticklabels=sorted(pair_data['Group'].unique()),
-                       ax=ax1)
-            ax1.set_title(f'Confusion Matrix: {col1_name} vs {col2_name}')
-            ax1.set_xlabel('Predicted Cluster')
-            ax1.set_ylabel('True Group')
-            
-            # Scatter plot with clusters
-            unique_groups = pair_data['Group'].unique()
-            colors = plt.cm.Set1(np.linspace(0, 1, len(unique_groups)))
-            group_colors = {group: colors[i] for i, group in enumerate(unique_groups)}
-            
-            for group in unique_groups:
-                mask = pair_data_with_clusters['Group'] == group
-                ax2.scatter(pair_data_with_clusters.loc[mask, col1_name], 
+            for cluster in unique_clusters:
+                mask = pair_data_with_clusters['cluster'] == cluster
+                ax.scatter(pair_data_with_clusters.loc[mask, col1_name], 
                            pair_data_with_clusters.loc[mask, col2_name],
-                           c=[group_colors[group]], label=group, alpha=0.7, s=50)
+                           c=[cluster_colors[cluster]], label=f'Cluster {cluster}', alpha=0.7, s=50)
             
             # Add cluster centers
             centers = scaler.inverse_transform(kmeans.cluster_centers_)
-            ax2.scatter(centers[:, 0], centers[:, 1], c='red', marker='x', s=200, linewidths=3, label='Centroids')
+            ax.scatter(centers[:, 0], centers[:, 1], c='red', marker='x', s=200, linewidths=3, label='Centroids')
             
-            ax2.set_xlabel(col1_name)
-            ax2.set_ylabel(col2_name)
-            ax2.set_title(f'Clustering Results: {col1_name} vs {col2_name}')
-            ax2.legend()
-            ax2.grid(True, alpha=0.3)
+            ax.set_xlabel(col1_name)
+            ax.set_ylabel(col2_name)
+            ax.set_title(f'Clustering Results: {col1_name} vs {col2_name}')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
             
             plt.tight_layout()
             st.pyplot(fig)
             plt.close(fig)
             
-            # Feature importance analysis
-            st.subheader("Feature Importance Analysis")
+            # Feature importance analysis - predict clusters using clinical features
+            st.subheader("Feature Importance Analysis - Clinical Features Predicting Clusters")
             
-            # Train Random Forest to predict Group from cluster features
+            # Use clinical features from df_wnv3_clean to predict clusters
             try:
-                # Prepare features for classification
-                X_class = pair_data_with_clusters[[col1_name, col2_name, 'cluster']]
-                y_class = pair_data_with_clusters['Group']
+                # Find common indices between results_df and df_wnv3_clean
+                common_indices = pair_data_with_clusters.index.intersection(df_wnv3_clean.index)
+                
+                if len(common_indices) < 10:  # Need sufficient data
+                    # raise using func
+                    raise_error(f"Not enough common data points ({len(common_indices)}) for clinical feature analysis")
+                    return
+                # Get clinical features (numeric columns from df_wnv3_clean)
+                clinical_features = df_wnv3_clean.select_dtypes(include=[np.number]).columns.tolist()
+                if len(clinical_features) == 0:
+                    st.warning("No numeric clinical features found in df_wnv3_clean")
+                    continue
+                # remove clinical features end_time, segmnent, start_time, duration_min, number_of_signals
+                clinical_features = [feature for feature in clinical_features if feature not in ['end_time', 'segment', 'start_time', 'duration_min', 'number_of_signals']]
+                # Prepare data for classification
+                X_clinical = df_wnv3_clean[clinical_features]
+                # dropna columns where 50% + is Nan. otherwise, use median for the rest
+                X_clinical = X_clinical.dropna(axis=1, thresh=int(X_clinical.shape[0]/2))
+                X_clinical = X_clinical.fillna(X_clinical.median())
+                y_clusters = pair_data_with_clusters['cluster']
                 
                 # Split data
                 X_train, X_test, y_train, y_test = train_test_split(
-                    X_class, y_class, test_size=0.3, random_state=42, stratify=y_class
+                    X_clinical, y_clusters, test_size=0.3, random_state=42, stratify=y_clusters
                 )
                 
                 # Train selected classifier
@@ -1144,51 +1193,125 @@ def pair_clustering_analysis(results_df, df_wnv3_clean, n_clusters=2):
                 clf.fit(X_train, y_train)
                 
                 # Get feature importance (if available)
-                feature_names = [col1_name, col2_name, 'cluster']
                 if hasattr(clf, 'feature_importances_'):
+                    # Align features with their importances
+                    # Get the actual features used by the classifier (after dropping NaN columns)
+                    actual_features = X_clinical.columns.tolist()
+                    actual_importances = clf.feature_importances_
+                    
+                    st.write(f"Actual features used: {len(actual_features)}")
+                    st.write(f"Feature importances: {len(actual_importances)}")
+                    
+                    # For tree-based models (Random Forest, Gradient Boosting, etc.)
                     importance_df = pd.DataFrame({
-                        'feature': feature_names,
-                        'importance': clf.feature_importances_
+                        'feature': actual_features,
+                        'importance': actual_importances
+                    }).sort_values('importance', ascending=False)
+                elif hasattr(clf, 'coef_'):
+                    # For linear models (Logistic Regression, SVM with linear kernel)
+                    if len(clf.coef_.shape) > 1:
+                        # Multi-class case - use mean of absolute coefficients
+                        coef_values = np.mean(np.abs(clf.coef_), axis=0)
+                    else:
+                        # Binary case
+                        coef_values = np.abs(clf.coef_[0])
+                    importance_df = pd.DataFrame({
+                        'feature': clinical_features,
+                        'importance': coef_values
                     }).sort_values('importance', ascending=False)
                 else:
-                    # For classifiers without feature_importances_, use coefficients or other metrics
-                    if hasattr(clf, 'coef_'):
-                        # For linear models, use absolute coefficients
+                    # For models without feature importance (KNN, Naive Bayes, etc.)
+                    # Use permutation importance as fallback
+                    try:
+                        from sklearn.inspection import permutation_importance
+                        perm_importance = permutation_importance(clf, X_test, y_test, random_state=42)
                         importance_df = pd.DataFrame({
-                            'feature': feature_names,
-                            'importance': np.abs(clf.coef_[0]) if len(clf.coef_.shape) > 1 else np.abs(clf.coef_)
+                            'feature': clinical_features,
+                            'importance': perm_importance.importances_mean
                         }).sort_values('importance', ascending=False)
-                    else:
-                        # Fallback: equal importance
+                    except:
+                        # Final fallback: equal importance
                         importance_df = pd.DataFrame({
-                            'feature': feature_names,
-                            'importance': [1.0/len(feature_names)] * len(feature_names)
+                            'feature': clinical_features,
+                            'importance': [1.0/len(clinical_features)] * len(clinical_features)
                         })
+                # Run classifier comparison on all features first
+                run_classifier_comparison_on_results(pair_data_with_clusters, X_clinical)
                 
-                # Plot feature importance
+                # Plot feature importance - show top 10 features
+                top_features = importance_df.head(10)
                 fig, ax = plt.subplots(figsize=(10, 6))
-                sns.barplot(data=importance_df, x='importance', y='feature', ax=ax)
-                ax.set_title(f'Feature Importance ({selected_classifier}): {col1_name} vs {col2_name}')
-                ax.set_xlabel('Importance')
+                sns.barplot(data=top_features, x='importance', y='feature', ax=ax)
+                ax.set_title(f'Top 10 Clinical Features Predicting Clusters ({selected_classifier})\nPair: {col1_name} vs {col2_name}')
+                ax.set_xlabel('Feature Importance')
+                ax.set_ylabel('Clinical Features')
                 plt.tight_layout()
                 st.pyplot(fig)
                 plt.close(fig)
                 
                 # Display importance values
-                st.write("Feature Importance Values:")
-                st.dataframe(importance_df)
+                st.write("Top Clinical Features Predicting Clusters:")
+                st.dataframe(top_features)
                 
                 # Classification report
                 y_pred = clf.predict(X_test)
-                st.write("Classification Report:")
+                st.write("Classification Report (Predicting Clusters from Clinical Features):")
                 st.text(classification_report(y_test, y_pred))
+                
+                # Confusion matrix with percentages
+                st.subheader("Confusion Matrix with Accuracy Metrics")
+                from sklearn.metrics import confusion_matrix
+                cm = confusion_matrix(y_test, y_pred)
+                
+                # Calculate percentages
+                cm_percent = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis] * 100
+                
+                # Create confusion matrix plot
+                fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+                
+                # Raw counts
+                sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax1,
+                           xticklabels=[f'Pred Cluster {i}' for i in range(n_clusters)],
+                           yticklabels=[f'True Cluster {i}' for i in range(n_clusters)])
+                ax1.set_title('Confusion Matrix (Counts)')
+                ax1.set_xlabel('Predicted Cluster')
+                ax1.set_ylabel('True Cluster')
+                
+                # Percentages
+                sns.heatmap(cm_percent, annot=True, fmt='.1f', cmap='viridis', ax=ax2,
+                           xticklabels=[f'Pred Cluster {i}' for i in range(n_clusters)],
+                           yticklabels=[f'True Cluster {i}' for i in range(n_clusters)])
+                ax2.set_title('Confusion Matrix (Percentages)')
+                ax2.set_xlabel('Predicted Cluster')
+                ax2.set_ylabel('True Cluster')
+                
+                plt.tight_layout()
+                st.pyplot(fig)
+                plt.close(fig)
+                
+                # Calculate and display accuracy metrics
+                from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+                accuracy = accuracy_score(y_test, y_pred)
+                precision = precision_score(y_test, y_pred, average='weighted')
+                recall = recall_score(y_test, y_pred, average='weighted')
+                f1 = f1_score(y_test, y_pred, average='weighted')
+                
+                metrics_df = pd.DataFrame({
+                    'Metric': ['Accuracy', 'Precision', 'Recall', 'F1-Score'],
+                    'Value': [accuracy, precision, recall, f1],
+                    'Percentage': [f'{accuracy*100:.1f}%', f'{precision*100:.1f}%', 
+                                 f'{recall*100:.1f}%', f'{f1*100:.1f}%']
+                })
+                
+                st.write("Model Performance Metrics:")
+                st.dataframe(metrics_df, use_container_width=True)
                 
                 # Store results for summary
                 results_summary.append({
                     'pair': f"{col1_name} vs {col2_name}",
-                    'n_samples': len(pair_data),
+                    'n_samples': len(X_clinical),
                     'accuracy': clf.score(X_test, y_test),
-                    'top_feature': importance_df.iloc[0]['feature'],
+                    'top_clinical_feature': importance_df.iloc[0]['feature'],
                     'top_importance': importance_df.iloc[0]['importance']
                 })
                 
@@ -1198,8 +1321,21 @@ def pair_clustering_analysis(results_df, df_wnv3_clean, n_clusters=2):
     # Create comprehensive pairgrid for all features
     st.subheader("Comprehensive Feature Pairgrid")
     
-    # Prepare data for pairgrid
-    pairgrid_data = results_df[numeric_cols + ['Group']].dropna()
+    # Define the specific order based on labels array
+    labels_order = [
+        'Vagal_SD1',
+        'Sympathetic_SD2', 
+        'Efficiency',
+        'Clustering',
+        'Modularity',
+        'Assortativity'
+    ]
+    
+    # Filter to only include labels that exist in the data
+    available_labels = [label for label in labels_order if label in results_df.columns]
+    
+    # Prepare data for pairgrid with specific order
+    pairgrid_data = results_df[available_labels + ['Group']].dropna()
     
     if len(pairgrid_data) > 0:
         # Create pairgrid
@@ -1209,10 +1345,10 @@ def pair_clustering_analysis(results_df, df_wnv3_clean, n_clusters=2):
             """Plot upper triangle with group-colored scatter plots."""
             ax = kwargs.get('ax', plt.gca())
             
-            # Get unique groups and colors
+            # Get unique groups and colors - use vibrant palette
             unique_groups = pairgrid_data['Group'].unique()
-            colors = plt.cm.Set1(np.linspace(0, 1, len(unique_groups)))
-            group_colors = {group: colors[i] for i, group in enumerate(unique_groups)}
+            color_palette = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7', '#DDA0DD', '#98D8C8', '#F7DC6F']
+            group_colors = {group: color_palette[i % len(color_palette)] for i, group in enumerate(unique_groups)}
             
             # Create scatter plot with group colors
             for group in unique_groups:
@@ -1285,12 +1421,12 @@ def pair_clustering_analysis(results_df, df_wnv3_clean, n_clusters=2):
         st.pyplot(g.fig)
         plt.close(g.fig)
     
-    # Create clustering results pairgrid
-    st.subheader("Clustering Results Pairgrid")
+    # Create clustering results pairgrid with classifier performance groups
+    st.subheader("Clustering Results Pairgrid - Classifier Performance Groups")
     
     if len(pairgrid_data) > 0:
-        # Perform clustering on all features for the pairgrid
-        X_all = pairgrid_data[numeric_cols]
+        # Perform clustering on all features for the pairgrid using the ordered labels
+        X_all = pairgrid_data[available_labels]
         scaler_all = StandardScaler()
         X_scaled_all = scaler_all.fit_transform(X_all)
         
@@ -1301,25 +1437,49 @@ def pair_clustering_analysis(results_df, df_wnv3_clean, n_clusters=2):
         pairgrid_data_with_clusters = pairgrid_data.copy()
         pairgrid_data_with_clusters['cluster'] = cluster_labels_all
         
-        # Create pairgrid with clusters
-        g_cluster = sns.PairGrid(pairgrid_data_with_clusters, hue='cluster', diag_sharey=False)
+        # Get classifier predictions for the data that has clinical features
+        if len(X_clinical) > 0:
+            classifier_predictions = classifier.predict(X_clinical)
+            
+            # Create performance groups based on classifier vs K-means clusters
+            performance_groups = []
+            for i, (true_cluster, pred_cluster) in enumerate(zip(cluster_labels_all, classifier_predictions)):
+                if true_cluster == 1 and pred_cluster == 1:
+                    performance_groups.append('TP')
+                elif true_cluster == 0 and pred_cluster == 0:
+                    performance_groups.append('TN')
+                elif true_cluster == 0 and pred_cluster == 1:
+                    performance_groups.append('FP')
+                else:  # true_cluster == 1 and pred_cluster == 0
+                    performance_groups.append('FN')
+            pairgrid_data_with_clusters['classifier_pred'] = classifier_predictions
+            pairgrid_data_with_clusters['performance_group'] =  performance_groups
+        # remove column cluster and classifier_pred
+        pairgrid_data_with_clusters = pairgrid_data_with_clusters.drop(columns=['cluster', 'classifier_pred'])
+        # Create pairgrid with performance groups
+        g_cluster = sns.PairGrid(pairgrid_data_with_clusters, hue='performance_group', diag_sharey=False)
         
         def plot_upper_cluster(x, y, **kwargs):
-            """Plot upper triangle with cluster-colored scatter plots."""
+            """Plot upper triangle with performance group-colored scatter plots."""
             ax = kwargs.get('ax', plt.gca())
             
-            # Get unique clusters and colors
-            unique_clusters = pairgrid_data_with_clusters['cluster'].unique()
-            colors = plt.cm.Set1(np.linspace(0, 1, len(unique_clusters)))
-            cluster_colors = {cluster: colors[i] for i, cluster in enumerate(unique_clusters)}
+            # Get unique performance groups and colors
+            unique_groups = pairgrid_data_with_clusters['performance_group'].unique()
+            # Use specific colors for TP, TN, FP, FN
+            performance_colors = {
+                'TP': '#2E8B57',    # Green
+                'TN': '#4169E1',    # Blue  
+                'FP': '#FF6347',    # Red
+                'FN': '#FFD700'     # Gold
+            }
             
-            # Create scatter plot with cluster colors
-            for cluster in unique_clusters:
-                mask = pairgrid_data_with_clusters['cluster'] == cluster
+            # Create scatter plot with performance group colors
+            for group in unique_groups:
+                mask = pairgrid_data_with_clusters['performance_group'] == group
                 if mask.sum() > 0:
+                    color = performance_colors.get(group, '#808080')  # Default gray
                     ax.scatter(x[mask], y[mask], 
-                              c=[cluster_colors[cluster]], 
-                              label=f'Cluster {cluster}', 
+                              c=[color], 
                               alpha=0.7, s=50)
             
             # Add cluster centers if this is a 2D plot
@@ -1328,9 +1488,9 @@ def pair_clustering_analysis(results_df, df_wnv3_clean, n_clusters=2):
                     # Find the centers for this specific pair
                     col1_name = x.name
                     col2_name = y.name
-                    if col1_name in numeric_cols and col2_name in numeric_cols:
+                    if col1_name in available_labels and col2_name in available_labels:
                         # Get the centers for this specific pair
-                        pair_idx = [numeric_cols.index(col1_name), numeric_cols.index(col2_name)]
+                        pair_idx = [available_labels.index(col1_name), available_labels.index(col2_name)]
                         centers_2d = kmeans_all.cluster_centers_[:, pair_idx]
                         ax.scatter(centers_2d[:, 0], centers_2d[:, 1], 
                                  c='red', marker='x', s=200, linewidths=3, 
@@ -1339,38 +1499,46 @@ def pair_clustering_analysis(results_df, df_wnv3_clean, n_clusters=2):
                     pass
         
         def plot_lower_cluster(x, y, **kwargs):
-            """Plot lower triangle with cluster-colored scatter plots."""
+            """Plot lower triangle with performance group-colored scatter plots."""
             ax = kwargs.get('ax', plt.gca())
             
-            # Get unique clusters and colors
-            unique_clusters = pairgrid_data_with_clusters['cluster'].unique()
-            colors = plt.cm.Set1(np.linspace(0, 1, len(unique_clusters)))
-            cluster_colors = {cluster: colors[i] for i, cluster in enumerate(unique_clusters)}
+            # Get unique performance groups and colors
+            unique_groups = pairgrid_data_with_clusters['performance_group'].unique()
+            performance_colors = {
+                'TP': '#2E8B57',    # Green
+                'TN': '#4169E1',    # Blue  
+                'FP': '#FF6347',    # Red
+                'FN': '#FFD700'     # Gold
+            }
             
-            # Create scatter plot with cluster colors
-            for cluster in unique_clusters:
-                mask = pairgrid_data_with_clusters['cluster'] == cluster
+            # Create scatter plot with performance group colors
+            for group in unique_groups:
+                mask = pairgrid_data_with_clusters['performance_group'] == group
                 if mask.sum() > 0:
+                    color = performance_colors.get(group, '#808080')  # Default gray
                     ax.scatter(x[mask], y[mask], 
-                              c=[cluster_colors[cluster]], 
+                              c=[color], 
                               alpha=0.6, s=30)
         
         def plot_diag_cluster(x, **kwargs):
-            """Plot diagonal with histograms for each cluster."""
+            """Plot diagonal with histograms for each performance group."""
             ax = kwargs.get('ax', plt.gca())
             
-            # Get unique clusters and colors
-            unique_clusters = pairgrid_data_with_clusters['cluster'].unique()
-            colors = plt.cm.Set1(np.linspace(0, 1, len(unique_clusters)))
-            cluster_colors = {cluster: colors[i] for i, cluster in enumerate(unique_clusters)}
+            # Get unique performance groups and colors
+            unique_groups = pairgrid_data_with_clusters['performance_group'].unique()
+            performance_colors = {
+                'TP': '#2E8B57',    # Green
+                'TN': '#4169E1',    # Blue  
+                'FP': '#FF6347',    # Red
+                'FN': '#FFD700'     # Gold
+            }
             
-            for cluster in unique_clusters:
-                mask = pairgrid_data_with_clusters['cluster'] == cluster
+            for group in unique_groups:
+                mask = pairgrid_data_with_clusters['performance_group'] == group
                 if mask.sum() > 0:
-                    ax.hist(x[mask], alpha=0.6, color=cluster_colors[cluster], 
-                           label=f'Cluster {cluster}', bins=15, density=True)
-            
-            ax.legend(fontsize=8)
+                    color = performance_colors.get(group, '#808080')  # Default gray
+                    ax.hist(x[mask], alpha=0.6, color=color, 
+                           bins=15, density=True)
         
         # Apply the plotting functions
         g_cluster.map_upper(plot_upper_cluster)
@@ -1378,31 +1546,27 @@ def pair_clustering_analysis(results_df, df_wnv3_clean, n_clusters=2):
         g_cluster.map_diag(plot_diag_cluster)
         
         # Set title
-        g_cluster.fig.suptitle(f'Clustering Results - All Features\nN={len(pairgrid_data)}, Clusters={n_clusters}', 
+        g_cluster.fig.suptitle(f'Classifier Performance Groups - All Features\nN={len(pairgrid_data)}, Performance Groups: TP, TN, FP, FN', 
                               fontsize=16, y=1.02)
+        
+        # Add single master legend
+        from matplotlib.patches import Patch
+        legend_elements = [
+            Patch(facecolor='#2E8B57', label='TP (True Positive)'),
+            Patch(facecolor='#4169E1', label='TN (True Negative)'),
+            Patch(facecolor='#FF6347', label='FP (False Positive)'),
+            Patch(facecolor='#FFD700', label='FN (False Negative)')
+        ]
+        g_cluster.fig.legend(handles=legend_elements, loc='center', bbox_to_anchor=(0.5, 0.02), ncol=4, fontsize=10)
         
         plt.tight_layout()
         st.pyplot(g_cluster.fig)
         plt.close(g_cluster.fig)
         
-        # Show cluster vs group confusion matrix
-        st.subheader("Overall Clustering vs Group Confusion Matrix")
-        # Convert all labels to strings to avoid type mixing
-        group_labels_overall = pairgrid_data_with_clusters['Group'].astype(str)
-        cluster_labels_overall = pairgrid_data_with_clusters['cluster'].astype(str)
-        confusion_mat_overall = confusion_matrix(group_labels_overall, cluster_labels_overall)
-        
-        fig, ax = plt.subplots(figsize=(8, 6))
-        sns.heatmap(confusion_mat_overall, annot=True, fmt='d', cmap='Blues', 
-                   xticklabels=[f'Cluster {i}' for i in range(n_clusters)],
-                   yticklabels=sorted(group_labels_overall.unique()),
-                   ax=ax)
-        ax.set_title('Overall Clustering vs Group Confusion Matrix')
-        ax.set_xlabel('Predicted Cluster')
-        ax.set_ylabel('True Group')
-        plt.tight_layout()
-        st.pyplot(fig)
-        plt.close(fig)
+        # Show performance group summary
+        st.subheader("Performance Group Summary")
+        performance_summary = pairgrid_data_with_clusters['performance_group'].value_counts()
+        st.dataframe(performance_summary.to_frame('Count'))
     
     # Summary table
     if results_summary:
@@ -1418,14 +1582,255 @@ def pair_clustering_analysis(results_df, df_wnv3_clean, n_clusters=2):
         ax1.set_title('Classification Accuracy by Feature Pair')
         ax1.set_xlabel('Accuracy')
         
-        # Top feature importance
+        # Top clinical feature importance
         sns.barplot(data=summary_df, x='top_importance', y='pair', ax=ax2)
-        ax2.set_title('Top Feature Importance by Pair')
+        ax2.set_title('Top Clinical Feature Importance by Pair')
         ax2.set_xlabel('Importance')
         
         plt.tight_layout()
         st.pyplot(fig)
         plt.close(fig)
+
+
+def run_classifier_comparison_on_results(results_df, X_clinical):
+    """
+    Run all classifiers on scaled data from results_df and create comparison plots.
+    
+    Parameters:
+    -----------
+    results_df : pd.DataFrame
+        DataFrame with numeric features and Group column
+    X_clinical : pd.DataFrame
+        DataFrame with clinical features
+    """
+    import numpy as np
+    from sklearn.preprocessing import StandardScaler
+    
+    st.subheader("All Classifiers Performance Comparison")
+    
+    # Prepare data for classifier comparison
+    numeric_cols = results_df.select_dtypes(include=[np.number]).columns.tolist()
+    if 'cluster' in numeric_cols:
+        numeric_cols.remove('cluster')
+    
+    if len(numeric_cols) < 2:
+        st.warning("Not enough numeric features for classifier comparison")
+        return None
+    
+    # Use all numeric features for comparison
+    y_groups = results_df['cluster']
+    
+    # Scale the features
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X_clinical)
+    
+    # Run classifier comparison
+    return compare_all_classifiers_on_scaled_data(X_scaled, y_groups)
+
+def compare_all_classifiers_on_scaled_data(X_scaled, y_true, test_size=0.3):
+    """
+    Run all classifiers on X_scaled data and create a plot showing their accuracy.
+    
+    Parameters:
+    -----------
+    X_scaled : array-like
+        Scaled feature matrix
+    y_true : array-like
+        True labels
+    test_size : float
+        Proportion of data to use for testing (default: 0.3)
+    """
+    from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, StackingClassifier
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.neural_network import MLPClassifier
+    from xgboost import XGBClassifier
+    from lightgbm import LGBMClassifier
+    from sklearn.model_selection import train_test_split
+    from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+    import matplotlib.pyplot as plt
+    import pandas as pd
+    import numpy as np
+    
+    # Define all classifiers
+    classifiers = {
+        'Gradient Boosting': GradientBoostingClassifier(random_state=42),
+        'Random Forest': RandomForestClassifier(n_estimators=100, random_state=42),
+        'XGBoost': XGBClassifier(random_state=42),
+        'LightGBM': LGBMClassifier(random_state=42),
+        'MLP (Feedforward Neural Net)': MLPClassifier(random_state=42, max_iter=1000),
+        'Logistic Regression': LogisticRegression(random_state=42, max_iter=1000),
+        # 'Stacking Classifier': StackingClassifier(
+        #     estimators=[
+        #         ('rf', RandomForestClassifier(n_estimators=100, random_state=42)),
+        #         ('gb', GradientBoostingClassifier(random_state=42)),
+        #         ('xgb', XGBClassifier(random_state=42))
+        #     ],
+        #     final_estimator=LogisticRegression(random_state=42)
+        # ),
+    }
+    
+    # Split the data
+    X_train, X_test, y_train, y_test = train_test_split(
+        X_scaled, y_true, test_size=test_size, random_state=42, stratify=y_true
+    )
+    
+    # Store results
+    results = []
+    
+    st.subheader("Classifier Performance Comparison on Scaled Data")
+    st.write(f"Training on {len(X_train)} samples, testing on {len(X_test)} samples")
+    
+    # Run classifiers in parallel
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import threading
+    
+    def train_and_evaluate_classifier(name_classifier_tuple):
+        """Train and evaluate a single classifier"""
+        name, classifier = name_classifier_tuple
+        try:
+            # Train the classifier
+            classifier.fit(X_train, y_train)
+            
+            # Make predictions
+            y_pred = classifier.predict(X_test)
+            
+            # Calculate metrics
+            accuracy = accuracy_score(y_test, y_pred)
+            precision = precision_score(y_test, y_pred, average='weighted')
+            recall = recall_score(y_test, y_pred, average='weighted')
+            f1 = f1_score(y_test, y_pred, average='weighted')
+            
+            return {
+                'Classifier': name,
+                'Accuracy': accuracy,
+                'Precision': precision,
+                'Recall': recall,
+                'F1-Score': f1,
+                'status': 'success'
+            }
+            
+        except Exception as e:
+            return {
+                'Classifier': name,
+                'Accuracy': 0.0,
+                'Precision': 0.0,
+                'Recall': 0.0,
+                'F1-Score': 0.0,
+                'status': 'error',
+                'error': str(e)
+            }
+    
+    # Create progress bar
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    # Run classifiers in parallel
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        # Submit all tasks
+        future_to_name = {
+            executor.submit(train_and_evaluate_classifier, (name, classifier)): name 
+            for name, classifier in classifiers.items()
+        }
+        
+        # Process completed tasks
+        completed = 0
+        total = len(classifiers)
+        
+        for future in as_completed(future_to_name):
+            result = future.result()
+            results.append(result)
+            
+            # Update progress
+            completed += 1
+            progress_bar.progress(completed / total)
+            
+            # Show status
+            if result['status'] == 'success':
+                status_text.write(f"✅ {result['Classifier']}: Accuracy = {result['Accuracy']:.3f}")
+            else:
+                status_text.write(f"❌ {result['Classifier']}: Error - {result['error']}")
+    
+    # Clear progress indicators
+    progress_bar.empty()
+    status_text.empty()
+    
+    # Create results DataFrame (remove status fields for display)
+    display_results = []
+    for result in results:
+        display_results.append({
+            'Classifier': result['Classifier'],
+            'Accuracy': result['Accuracy'],
+            'Precision': result['Precision'],
+            'Recall': result['Recall'],
+            'F1-Score': result['F1-Score']
+        })
+    
+    results_df = pd.DataFrame(display_results)
+    
+    # Sort by accuracy
+    results_df = results_df.sort_values('Accuracy', ascending=True)
+    
+    # Create the plot
+    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 12))
+    
+    # Accuracy plot
+    bars1 = ax1.barh(results_df['Classifier'], results_df['Accuracy'], color='skyblue')
+    ax1.set_xlabel('Accuracy')
+    ax1.set_title('Classifier Accuracy Comparison')
+    ax1.set_xlim(0, 1)
+    
+    # Add value labels on bars
+    for i, bar in enumerate(bars1):
+        width = bar.get_width()
+        ax1.text(width + 0.01, bar.get_y() + bar.get_height()/2, 
+                f'{width:.3f}', ha='left', va='center', fontsize=9)
+    
+    # Precision plot
+    bars2 = ax2.barh(results_df['Classifier'], results_df['Precision'], color='lightgreen')
+    ax2.set_xlabel('Precision')
+    ax2.set_title('Classifier Precision Comparison')
+    ax2.set_xlim(0, 1)
+    
+    for i, bar in enumerate(bars2):
+        width = bar.get_width()
+        ax2.text(width + 0.01, bar.get_y() + bar.get_height()/2, 
+                f'{width:.3f}', ha='left', va='center', fontsize=9)
+    
+    # Recall plot
+    bars3 = ax3.barh(results_df['Classifier'], results_df['Recall'], color='lightcoral')
+    ax3.set_xlabel('Recall')
+    ax3.set_title('Classifier Recall Comparison')
+    ax3.set_xlim(0, 1)
+    
+    for i, bar in enumerate(bars3):
+        width = bar.get_width()
+        ax3.text(width + 0.01, bar.get_y() + bar.get_height()/2, 
+                f'{width:.3f}', ha='left', va='center', fontsize=9)
+    
+    # F1-Score plot
+    bars4 = ax4.barh(results_df['Classifier'], results_df['F1-Score'], color='lightyellow')
+    ax4.set_xlabel('F1-Score')
+    ax4.set_title('Classifier F1-Score Comparison')
+    ax4.set_xlim(0, 1)
+    
+    for i, bar in enumerate(bars4):
+        width = bar.get_width()
+        ax4.text(width + 0.01, bar.get_y() + bar.get_height()/2, 
+                f'{width:.3f}', ha='left', va='center', fontsize=9)
+    
+    plt.tight_layout()
+    st.pyplot(fig)
+    plt.close(fig)
+    
+    # Display results table
+    st.subheader("Detailed Results Table")
+    st.dataframe(results_df, use_container_width=True)
+    
+    # Find best classifier
+    best_classifier = results_df.loc[results_df['Accuracy'].idxmax()]
+    st.success(f"🏆 Best performing classifier: **{best_classifier['Classifier']}** with accuracy of {best_classifier['Accuracy']:.3f}")
+    
+    return results_df
 
 
 # Streamlit App
