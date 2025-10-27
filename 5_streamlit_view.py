@@ -1447,11 +1447,11 @@ def pair_clustering_analysis(results_df, df_wnv3_clean, n_clusters=2):
                 if true_cluster == 1 and pred_cluster == 1:
                     performance_groups.append('TP')
                 elif true_cluster == 0 and pred_cluster == 0:
-                    performance_groups.append('TN')
+                    performance_groups.append('FN')
                 elif true_cluster == 0 and pred_cluster == 1:
                     performance_groups.append('FP')
                 else:  # true_cluster == 1 and pred_cluster == 0
-                    performance_groups.append('FN')
+                    performance_groups.append('TN')
             pairgrid_data_with_clusters['classifier_pred'] = classifier_predictions
             pairgrid_data_with_clusters['performance_group'] =  performance_groups
         # remove column cluster and classifier_pred
