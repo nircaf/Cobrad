@@ -58,6 +58,172 @@ plt.rc('axes',  titlesize=12)  # Set title size to be the same as x and y labels
 montage = mne.channels.make_standard_montage('standard_1020')
 
 
+def plot_electrode_importance_topomap(electrode_importance_dict, title="Electrode Importance Topomap"):
+    """
+    Plot electrode importance values as an MNE topomap.
+    
+    Parameters:
+    -----------
+    electrode_importance_dict : dict
+        Dictionary mapping electrode names to importance values
+    title : str
+        Title for the plot
+    
+    Returns:
+    --------
+    fig : matplotlib.figure.Figure
+        The figure object, or None if insufficient channels
+    """
+    # Filter to only electrodes with non-zero importance and that exist in eeg_channels
+    available_channels = []
+    values = []
+    
+    for electrode, importance in electrode_importance_dict.items():
+        if electrode in eeg_channels and importance > 0:
+            available_channels.append(electrode)
+            values.append(importance)
+    
+    # Need at least 3 channels for a meaningful topomap
+    if len(available_channels) < 3:
+        return None
+    
+    try:
+        # Create MNE info object
+        info = mne.create_info(ch_names=available_channels, sfreq=256, ch_types='eeg')
+        info.set_montage(montage)
+        
+        # Create EvokedArray with importance values
+        values_array = np.array(values).reshape(-1, 1)
+        evoked = mne.EvokedArray(values_array, info)
+        
+        # Plot topomap
+        fig, ax = plt.subplots(figsize=(8, 6))
+        im, _ = mne.viz.plot_topomap(
+            evoked.data[:, 0], 
+            evoked.info, 
+            axes=ax, 
+            show=False,
+            cmap='Reds',
+            vlim=(0, max(values)) if values else None
+        )
+        fig.colorbar(im, ax=ax, label='Importance')
+        ax.set_title(title)
+        plt.tight_layout()
+        
+        return fig
+    except Exception as e:
+        # If there's an error (e.g., channel positions not found), return None
+        return None
+
+
+def plot_electrode_pvalue_topomap(electrode_importance_dict, title="Electrode P-Value Topomap"):
+    """
+    Plot p-values comparing each electrode's importance to all others as an MNE topomap.
+    
+    For each electrode, compares its importance value to all other electrodes' values
+    using a statistical test (Mann-Whitney U or one-sample test).
+    
+    Parameters:
+    -----------
+    electrode_importance_dict : dict
+        Dictionary mapping electrode names to importance values
+    title : str
+        Title for the plot
+    
+    Returns:
+    --------
+    fig : matplotlib.figure.Figure
+        The figure object, or None if insufficient channels
+    """
+    from scipy import stats
+    from statsmodels.stats.multitest import multipletests
+    
+    # Filter to only electrodes with non-zero importance and that exist in eeg_channels
+    available_channels = []
+    values = []
+    
+    for electrode, importance in electrode_importance_dict.items():
+        if electrode in eeg_channels and importance >= 0:  # Include zero for comparison
+            available_channels.append(electrode)
+            values.append(importance)
+    
+    # Need at least 3 channels for meaningful comparison
+    if len(available_channels) < 3:
+        return None
+    
+    # Calculate p-values: for each electrode, compare to all others
+    p_values = []
+    all_values = np.array(values)
+    
+    for i, electrode_val in enumerate(values):
+        # Get all other values
+        other_values = np.delete(all_values, i)
+        
+        if len(other_values) < 2:
+            p_values.append(1.0)
+            continue
+        
+        # Compare this electrode's value to all others
+        # Use Mann-Whitney U test (non-parametric)
+        try:
+            # Create two groups: [this electrode] vs [all others]
+            # For single value comparison, use a one-sample approach
+            # Compare this value to the distribution of others
+            if electrode_val == 0 and np.all(other_values == 0):
+                p_values.append(1.0)
+            else:
+                # Use a permutation-like approach: how many others are >= this value
+                # Or use a one-sample test comparing to the mean of others
+                from scipy.stats import mannwhitneyu
+                # Create a small sample for comparison (repeat the value a few times for valid test)
+                this_electrode_array = np.array([electrode_val] * min(3, len(other_values)))
+                stat, p = mannwhitneyu(this_electrode_array, other_values, alternative='two-sided')
+                p_values.append(p)
+        except Exception:
+            # Fallback: simple comparison based on rank
+            # How extreme is this value compared to others?
+            combined = np.concatenate([[electrode_val], other_values])
+            rank = np.sum(combined <= electrode_val)
+            p = 2 * min(rank / len(combined), 1 - rank / len(combined))
+            p_values.append(p)
+    
+    # Apply multiple comparison correction (FDR)
+    try:
+        _, p_corrected, _, _ = multipletests(p_values, method='fdr_bh', alpha=0.05)
+    except:
+        p_corrected = np.array(p_values)
+    
+    try:
+        # Create MNE info object
+        info = mne.create_info(ch_names=available_channels, sfreq=256, ch_types='eeg')
+        info.set_montage(montage)
+        
+        # Create EvokedArray with p-values
+        p_array = np.array(p_corrected).reshape(-1, 1)
+        evoked = mne.EvokedArray(p_array, info)
+        
+        # Plot topomap
+        fig, ax = plt.subplots(figsize=(8, 6))
+        # Use reversed colormap: lower p-values (more significant) shown in brighter colors
+        vlim_max = min(0.05, max(p_corrected)) if len(p_corrected) > 0 else 0.05
+        im, _ = mne.viz.plot_topomap(
+            evoked.data[:, 0], 
+            evoked.info, 
+            axes=ax, 
+            show=False,
+            cmap='Reds_r',  # Reversed: red = significant (low p-value)
+            vlim=(0, vlim_max)
+        )
+        fig.colorbar(im, ax=ax, label='P-value (FDR corrected)')
+        ax.set_title(title)
+        plt.tight_layout()
+        
+        return fig
+    except Exception as e:
+        # If there's an error, return None
+        return None
+
+
 def multiselect_pairplot(all_features):
     # groups are based on common split('_')[0] of all features
     feature_groups = [col.split('_')[0] for col in all_features]
@@ -911,12 +1077,12 @@ def HEP_plots(project_name, df_wnv3, controls, boxplot_columns, analysis_type, s
         # Ask user to select sleep stage
         sleep_stage = st.selectbox(
             "Select Sleep Stage",
-            options=['N1','All',  'N2', 'N3', 'R'],
-            index=1,  # Default to N1
+            options=['N1','All',  'N2', 'N3', 'R', 'W'],
+            index=1,  # Default to All
             key='sleep_stage_selection'
         )
         if sleep_stage == 'All':
-            st.subheader("Analyzing all sleep stages: EDF_N1, EDF_N2, EDF_N3, EDF_R")
+            st.subheader("Analyzing all sleep stages: EDF_N1, EDF_N2, EDF_N3, EDF_R, EDF_W")
         else:
             st.subheader(f"Analyzing: EDF_{sleep_stage}")
         # Define directory if single stage
@@ -1022,7 +1188,7 @@ def compare_sleep_stages_default_pairs(df_wnv3, power_bands, size_feature=None):
     from sklearn.preprocessing import StandardScaler
     from sklearn.ensemble import RandomForestClassifier
 
-    stages = ['N1', 'N2', 'N3', 'R']
+    stages = ['N1', 'N2', 'N3', 'R', 'W']
     default_pairs = [
         ('Vagal_SD1', 'Efficiency'),
         ('Vagal_SD1', 'Clustering'),
@@ -1096,6 +1262,288 @@ def compare_sleep_stages_default_pairs(df_wnv3, power_bands, size_feature=None):
 
             stage_results[stage] = results_df
             stage_clinical[stage] = df_wnv3_clean
+
+        # Plot HEP plots for all stages side by side
+        if any(stage in stage_results for stage in stages):
+            st.subheader(f"HEP Plots: All Sleep Stages Comparison (Band: {band_name})")
+            
+            # Get available stages
+            available_stages = [stage for stage in stages if stage in stage_results]
+            
+            if available_stages:
+                # Combine all stages into one DataFrame with stage label
+                labels = ['Vagal_SD1', 'Sympathetic_SD2', 'Efficiency', 'Clustering', 'Modularity', 'Assortativity']
+                
+                combined_dfs = []
+                for stage in available_stages:
+                    results_df_stage = stage_results[stage].copy()
+                    # Keep only the HEP metrics
+                    available_labels = [label for label in labels if label in results_df_stage.columns]
+                    if available_labels:
+                        stage_subset = results_df_stage[available_labels].copy()
+                        stage_subset['Stage'] = stage
+                        combined_dfs.append(stage_subset)
+                
+                if combined_dfs:
+                    # Combine all stages
+                    combined_df = pd.concat(combined_dfs, ignore_index=True)
+                    
+                    # Get common columns (HEP metrics)
+                    hep_columns = [col for col in labels if col in combined_df.columns]
+                    
+                    if len(hep_columns) >= 2:
+                        # Color palette for stages
+                        stage_colors = {'N1': 'blue', 'N2': 'green', 'N3': 'orange', 'R': 'red', 'W': 'purple'}
+                        
+                        # Create palette list matching available_stages order
+                        palette_list = [stage_colors.get(stage, 'gray') for stage in available_stages]
+                        
+                        # Create PairGrid with explicit palette
+                        g = sns.PairGrid(combined_df, vars=hep_columns, hue='Stage', 
+                                        diag_sharey=False, palette=palette_list, hue_order=available_stages)
+                        
+                        # LOWER: XY plot with 2 lines per pair (one for each variable) per stage
+                        def plot_lower(x, y, **kwargs):
+                            ax = kwargs.get('ax', plt.gca())
+                            
+                            # Get data for each stage
+                            # x and y are already subsets from PairGrid, so use their indices
+                            stage_data = {}
+                            for stage in available_stages:
+                                # Get stage mask for the current subset using indices
+                                indices = x.index
+                                stage_mask = combined_df.loc[indices, 'Stage'].values == stage
+                                if stage_mask.any():
+                                    # Get x and y values for this stage from the subset
+                                    x_vals = x.values[stage_mask]
+                                    y_vals = y.values[stage_mask]
+                                    mask = ~(np.isnan(x_vals) | np.isnan(y_vals))
+                                    x_clean = x_vals[mask]
+                                    y_clean = y_vals[mask]
+                                    if len(x_clean) > 1:
+                                        stage_data[stage] = {'x': x_clean, 'y': y_clean}
+                            
+                            # Create linspace for X axis
+                            all_x_vals = []
+                            all_y_vals = []
+                            for stage_data_item in stage_data.values():
+                                all_x_vals.extend(stage_data_item['x'])
+                                all_y_vals.extend(stage_data_item['y'])
+                            
+                            if all_x_vals and all_y_vals:
+                                # Plot scatter for each stage
+                                for stage in available_stages:
+                                    if stage in stage_data:
+                                        data = stage_data[stage]
+                                        x_clean = data['x']
+                                        y_clean = data['y']
+                                        
+                                        # Plot scatter plot
+                                        ax.scatter(x_clean, y_clean,
+                                                  color=stage_colors.get(stage, 'gray'),
+                                                  alpha=0.4,
+                                                  s=30,
+                                                  label=stage)
+                                
+                                ax.set_xlabel(x.name)
+                                ax.set_ylabel(y.name)
+                                ax.set_title(f'{x.name} vs {y.name}')
+                                ax.legend(loc='best', fontsize=8)
+                                ax.grid(True, alpha=0.3)
+                            else:
+                                ax.text(0.5, 0.5, 'No data available',
+                                       transform=ax.transAxes,
+                                       ha='center', va='center',
+                                       fontsize=10)
+                        
+                        # UPPER: Regplot with asterisks based on p-value
+                        def plot_upper(x, y, **kwargs):
+                            ax = kwargs.get('ax', plt.gca())
+                            
+                            # Get data and calculate p-values for each stage
+                            # x and y are already subsets from PairGrid, so use their indices
+                            stage_data = {}
+                            for stage in available_stages:
+                                # Get stage mask for the current subset using indices
+                                indices = x.index
+                                stage_mask = combined_df.loc[indices, 'Stage'].values == stage
+                                if stage_mask.any():
+                                    # Get x and y values for this stage from the subset
+                                    x_vals = x.values[stage_mask]
+                                    y_vals = y.values[stage_mask]
+                                    mask = ~(np.isnan(x_vals) | np.isnan(y_vals))
+                                    x_clean = x_vals[mask]
+                                    y_clean = y_vals[mask]
+                                    if len(x_clean) > 1:
+                                        stage_data[stage] = {'x': x_clean, 'y': y_clean}
+                                        
+                                        # Regplot for this stage
+                                        try:
+                                            sns.regplot(x=x_clean, y=y_clean, 
+                                                      ax=ax,
+                                                      color=stage_colors.get(stage, 'gray'),
+                                                      scatter=False,
+                                                      line_kws={'alpha': 0.8, 'linewidth': 2.5, 'label': stage},
+                                                      ci=95)
+                                        except:
+                                            # Fallback
+                                            from scipy import stats
+                                            slope, intercept, r_value, p_value, std_err = stats.linregress(x_clean, y_clean)
+                                            x_line = np.linspace(x_clean.min(), x_clean.max(), 100)
+                                            y_line = slope * x_line + intercept
+                                            ax.plot(x_line, y_line, 
+                                                   color=stage_colors.get(stage, 'gray'),
+                                                   linestyle='-', 
+                                                   alpha=0.8, 
+                                                   linewidth=2.5,
+                                                   label=stage)
+                            
+                            # Calculate p-values and add asterisks
+                            from scipy.stats import mannwhitneyu
+                            from itertools import combinations
+                            
+                            p_value_text = []
+                            for stage1, stage2 in combinations(available_stages, 2):
+                                if stage1 in stage_data and stage2 in stage_data:
+                                    data1 = stage_data[stage1]
+                                    data2 = stage_data[stage2]
+                                    try:
+                                        _, p_val = mannwhitneyu(data1['y'], data2['y'], alternative='two-sided')
+                                        sig = '***' if p_val < 0.001 else '**' if p_val < 0.01 else '*' if p_val < 0.05 else ''
+                                        p_value_text.append(f"{stage1} vs {stage2}: {p_val:.4f}{sig}")
+                                    except:
+                                        pass
+                            
+                            # Display p-values in upper corner
+                            if p_value_text:
+                                text = '\n'.join(p_value_text[:3])  # Show top 3
+                                ax.text(0.98, 0.02, text,
+                                       transform=ax.transAxes,
+                                       fontsize=7,
+                                       ha='right',
+                                       va='bottom',
+                                       family='monospace',
+                                       bbox=dict(boxstyle='round', facecolor='white', alpha=0.8, edgecolor='gray'))
+                            
+                            ax.legend(loc='best', fontsize=8)
+                            ax.grid(True, alpha=0.3)
+                        
+                        # Map function for diagonal (histograms)
+                        def plot_diag(x, **kwargs):
+                            ax = kwargs.get('ax', plt.gca())
+                            indices = x.index
+                            
+                            for stage in available_stages:
+                                stage_mask = combined_df.loc[indices, 'Stage'] == stage
+                                if stage_mask.any():
+                                    x_vals = x[stage_mask].values
+                                    x_clean = x_vals[~np.isnan(x_vals)]
+                                    if len(x_clean) > 0:
+                                        ax.hist(x_clean, alpha=0.5, 
+                                               label=stage, 
+                                               color=stage_colors.get(stage, 'gray'),
+                                               bins=20)
+                            ax.set_ylabel('Frequency')
+                        
+                        # Apply mapping functions
+                        g.map_lower(plot_lower)
+                        g.map_diag(plot_diag)
+                        g.map_upper(plot_upper)
+                        
+                        # Add legend with proper color mapping
+                        # Create custom legend handles with colors
+                        import matplotlib.patches as mpatches
+                        handles = [mpatches.Patch(color=stage_colors.get(stage, 'gray'), label=stage) 
+                                  for stage in available_stages]
+                        # Place legend on the figure, adjust layout to make room
+                        g.fig.legend(handles=handles, title='Sleep Stage', 
+                                   loc='upper right', bbox_to_anchor=(0.98, 0.98), fontsize=10, frameon=True)
+                        
+                        # Set title
+                        g.fig.suptitle(f'HEP Metrics PairGrid: All Sleep Stages Comparison (Band: {band_name})', 
+                                      fontsize=14, fontweight='bold', y=1.02)
+                        
+                        plt.tight_layout()
+                        st.pyplot(g.fig)
+                        plt.close(g.fig)
+                        
+                        # Create p-value table: rows are pairs, columns are stages
+                        st.subheader(f"P-Values Table: Pair Comparisons Across Stages (Band: {band_name})")
+                        
+                        from scipy.stats import mannwhitneyu
+                        from itertools import combinations
+                        
+                        # Get all pairs from hep_columns
+                        pair_list = []
+                        for i in range(len(hep_columns)):
+                            for j in range(i+1, len(hep_columns)):
+                                pair_list.append((hep_columns[i], hep_columns[j]))
+                        
+                        # Create DataFrame for p-values
+                        # Rows: pairs, Columns: stage comparisons
+                        pvalue_table_data = []
+                        for pair_x, pair_y in pair_list:
+                            row_data = {'Pair': f"{pair_x} vs {pair_y}"}
+                            
+                            # Get data for this pair across all stages
+                            pair_data = {}
+                            for stage in available_stages:
+                                stage_mask = combined_df['Stage'] == stage
+                                if stage_mask.any():
+                                    x_vals = combined_df.loc[stage_mask, pair_x].values
+                                    y_vals = combined_df.loc[stage_mask, pair_y].values
+                                    # Use y-values for comparison between stages
+                                    mask = ~(np.isnan(x_vals) | np.isnan(y_vals))
+                                    y_clean = y_vals[mask]
+                                    if len(y_clean) > 1:
+                                        pair_data[stage] = y_clean
+                            
+                            # Calculate p-values for each stage combination (columns)
+                            stage_combinations = list(combinations(available_stages, 2))
+                            for stage1, stage2 in stage_combinations:
+                                combo_name = f"{stage1} vs {stage2}"
+                                if stage1 in pair_data and stage2 in pair_data:
+                                    try:
+                                        _, p_val = mannwhitneyu(pair_data[stage1], pair_data[stage2], alternative='two-sided')
+                                        # Format with asterisks
+                                        sig = '***' if p_val < 0.001 else '**' if p_val < 0.01 else '*' if p_val < 0.05 else ''
+                                        row_data[combo_name] = f"{p_val:.4f}{sig}"
+                                    except:
+                                        row_data[combo_name] = "N/A"
+                                else:
+                                    row_data[combo_name] = "N/A"
+                            
+                            pvalue_table_data.append(row_data)
+                        
+                        # Create DataFrame and display
+                        if pvalue_table_data:
+                            pvalue_df = pd.DataFrame(pvalue_table_data)
+                            # Set Pair as index for better display
+                            pvalue_df = pvalue_df.set_index('Pair')
+                            st.dataframe(pvalue_df, use_container_width=True)
+                            
+                            # Add legend
+                            st.caption("*** p < 0.001, ** p < 0.01, * p < 0.05 | P-values compare y-variable distributions between stages for each pair")
+                
+                # Also call only_plots for each stage individually for detailed view
+                st.subheader(f"Detailed HEP Plots per Stage (Band: {band_name})")
+                for stage in available_stages:
+                    results_df_stage = stage_results[stage]
+                    hue_stage = results_df_stage.get('Group', None) if 'Group' in results_df_stage.columns else None
+                    
+                    st.write(f"**Stage: {stage}**")
+                    only_plots(
+                        results_df_stage,
+                        save_plot='',
+                        save_dir='',
+                        edf_pickle_name=f"plot_{stage}",
+                        band=band_name,
+                        step_sec=5,
+                        is_streamlit=True,
+                        hue=hue_stage,
+                        size_feature=size_feature
+                    )
+                    st.divider()
 
         # For each default pair, render per-stage comparisons
         for col1, col2 in default_pairs:
@@ -1187,8 +1635,289 @@ def compare_sleep_stages_default_pairs(df_wnv3, power_bands, size_feature=None):
                             plt.tight_layout()
                             st.pyplot(fig)
                             plt.close(fig)
+                            
+                            # Aggregate by electrode for this stage
+                            electrode_importance = {}
+                            for electrode in eeg_channels:
+                                electrode_importance[electrode] = 0.0
+                                for idx, feature in enumerate(importance_df['feature']):
+                                    if isinstance(feature, str) and electrode in feature:
+                                        electrode_importance[electrode] += importance_df.iloc[idx]['importance']
+                            
+                            electrode_df = pd.DataFrame({
+                                'electrode': list(electrode_importance.keys()),
+                                'total_importance': list(electrode_importance.values())
+                            }).sort_values('total_importance', ascending=False)
+                            
                         else:
                             st.info("Feature importance unavailable for this stage")
+
+            # Group-based electrode importance analysis
+            st.subheader("Group-Based Electrode Importance Analysis")
+            
+            # Get available clinical columns from the first stage that has data
+            available_clinical_cols = []
+            for stage in stages:
+                if stage in stage_clinical and not stage_clinical[stage].empty:
+                    numeric_cols = stage_clinical[stage].select_dtypes(include=[np.number]).columns.tolist()
+                    # Filter out metadata columns
+                    numeric_cols = [col for col in numeric_cols if col not in ['end_time', 'segment', 'start_time', 'duration_min', 'number_of_signals', 'ID']]
+                    available_clinical_cols = numeric_cols
+                    break
+            
+            if available_clinical_cols:
+                # Let user select a column (default to clinical_moca if available)
+                default_index = 0
+                if 'clinical_moca' in available_clinical_cols:
+                    default_index = available_clinical_cols.index('clinical_moca')
+                
+                selected_col = st.selectbox(
+                    "Select clinical column for group comparison:",
+                    options=available_clinical_cols,
+                    index=default_index,
+                    key=f'clinical_col_selection_{band_name}_{col1}_{col2}'
+                )
+                
+                if selected_col:
+                    # Determine threshold based on column type
+                    threshold = None
+                    group_name_high = "High"
+                    group_name_low = "Low"
+                    
+                    if selected_col in ['clinical_moca', 'clinical_mmse']:
+                        threshold = 18
+                        group_name_high = f"{selected_col} > 18"
+                        group_name_low = f"{selected_col} <= 18"
+                    else:
+                        # Check if binary (only 0 and 1)
+                        all_values = []
+                        for stage in stages:
+                            if stage in stage_clinical and not stage_clinical[stage].empty:
+                                col_values = stage_clinical[stage][selected_col].dropna().unique()
+                                all_values.extend(col_values)
+                        unique_vals = set([float(v) for v in all_values])
+                        
+                        if len(unique_vals) == 2 and unique_vals == {0.0, 1.0}:
+                            threshold = 0.5  # Binary threshold
+                            group_name_high = f"{selected_col} = 1"
+                            group_name_low = f"{selected_col} = 0"
+                        else:
+                            # Ask user for threshold
+                            threshold = st.number_input(
+                                f"Enter threshold for {selected_col}:",
+                                value=float(np.median([v for v in all_values if not pd.isna(v)])) if all_values else 0.0,
+                                key=f'threshold_{band_name}_{selected_col}_{col1}_{col2}'
+                            )
+                            group_name_high = f"{selected_col} > {threshold}"
+                            group_name_low = f"{selected_col} <= {threshold}"
+                    
+                    # Calculate electrode importance for each group across all stages
+                    group_importances = {group_name_high: {}, group_name_low: {}}
+                    group_counts = {group_name_high: 0, group_name_low: 0}  # Track sample sizes
+                    
+                    for stage in stages:
+                        if stage not in stage_results or stage not in stage_clinical:
+                            continue
+                        
+                        results_df = stage_results[stage]
+                        df_wnv3_clean = stage_clinical[stage]
+                        
+                        if selected_col not in df_wnv3_clean.columns:
+                            continue
+                        
+                        if col1 not in results_df.columns or col2 not in results_df.columns:
+                            continue
+                        
+                        pair_df = results_df[[col1, col2]].dropna()
+                        if pair_df.empty:
+                            continue
+                        
+                        # Clean outliers
+                        means = pair_df.mean()
+                        stds = pair_df.std(ddof=0).replace(0, np.nan)
+                        zscores = (pair_df - means) / stds
+                        mask_inliers = (zscores[col1].abs() <= 3) & (zscores[col2].abs() <= 3)
+                        pair_df_clean = pair_df[mask_inliers].dropna()
+                        if pair_df_clean.shape[0] < 2:
+                            continue
+                        
+                        # Get clinical features and align indices
+                        clinical = df_wnv3_clean.select_dtypes(include=[np.number])
+                        if clinical.empty:
+                            continue
+                        
+                        # Clean clinical data
+                        thresh = max(1, int(clinical.shape[0] / 2))
+                        clinical = clinical.dropna(axis=1, thresh=thresh)
+                        clinical = clinical.fillna(clinical.median())
+                        
+                        # Align clinical data with pair_df_clean by length (they may have different indices)
+                        # Use positional indexing since indices may not match
+                        min_len = min(len(pair_df_clean), len(clinical))
+                        if min_len < 2:
+                            continue
+                        
+                        # Get clinical column values aligned by position
+                        clinical_col_data = df_wnv3_clean[selected_col].dropna()
+                        min_len_col = min(min_len, len(clinical_col_data))
+                        if min_len_col < 2:
+                            continue
+                        
+                        # Get group masks based on clinical column values (using positional indexing)
+                        clinical_col_values = clinical_col_data.iloc[:min_len_col].values
+                        
+                        if threshold == 0.5:  # Binary case
+                            high_mask_bool = (clinical_col_values == 1) | (clinical_col_values == 1.0)
+                            low_mask_bool = (clinical_col_values == 0) | (clinical_col_values == 0.0)
+                        else:
+                            high_mask_bool = clinical_col_values > threshold
+                            low_mask_bool = clinical_col_values <= threshold
+                        
+                        # Process each group
+                        for group_name, mask_bool in [(group_name_high, high_mask_bool), (group_name_low, low_mask_bool)]:
+                            if mask_bool.sum() < 2:  # Need at least 2 samples
+                                continue
+                            
+                            # Use boolean mask on aligned data (using positional indexing)
+                            # Align all data to the same length
+                            align_len = min(len(mask_bool), min_len)
+                            mask_bool_aligned = mask_bool[:align_len]
+                            
+                            # Get aligned data slices
+                            clinical_aligned = clinical.iloc[:align_len]
+                            pair_df_aligned = pair_df_clean.iloc[:align_len]
+                            
+                            # Apply mask
+                            X_group = clinical_aligned[mask_bool_aligned]
+                            pair_df_group = pair_df_aligned[mask_bool_aligned]
+                            
+                            if len(pair_df_group) < 2 or len(X_group) < 2:
+                                continue
+                            
+                            # Track sample size for this group
+                            group_counts[group_name] += len(pair_df_group)
+                            
+                            # Cluster for this group
+                            scaler = StandardScaler()
+                            X_scaled = scaler.fit_transform(pair_df_group)
+                            kmeans = KMeans(n_clusters=2, random_state=42, n_init=10)
+                            clusters = kmeans.fit_predict(X_scaled)
+                            
+                            # Calculate feature importance
+                            try:
+                                rf = RandomForestClassifier(n_estimators=200, random_state=42)
+                                rf.fit(X_group, clusters)
+                                importance_df = pd.DataFrame({
+                                    'feature': X_group.columns,
+                                    'importance': rf.feature_importances_
+                                })
+                                
+                                # Aggregate by electrode
+                                for electrode in eeg_channels:
+                                    if electrode not in group_importances[group_name]:
+                                        group_importances[group_name][electrode] = 0.0
+                                    for idx, feature in enumerate(importance_df['feature']):
+                                        if isinstance(feature, str) and electrode in feature:
+                                            group_importances[group_name][electrode] += importance_df.iloc[idx]['importance']
+                            except Exception:
+                                continue
+                    
+                    # Display group comparisons
+                    if group_importances[group_name_high] or group_importances[group_name_low]:
+                        st.write(f"**Electrode Importance Comparison: {group_name_high} vs {group_name_low}**")
+                        
+                        # Create DataFrames for both groups
+                        all_electrodes = set()
+                        all_electrodes.update(group_importances[group_name_high].keys())
+                        all_electrodes.update(group_importances[group_name_low].keys())
+                        
+                        electrode_comparison_data = []
+                        for electrode in all_electrodes:
+                            high_imp = group_importances[group_name_high].get(electrode, 0.0)
+                            low_imp = group_importances[group_name_low].get(electrode, 0.0)
+                            electrode_comparison_data.append({
+                                'electrode': electrode,
+                                group_name_high: high_imp,
+                                group_name_low: low_imp
+                            })
+                        
+                        comparison_df = pd.DataFrame(electrode_comparison_data)
+                        comparison_df = comparison_df[(comparison_df[group_name_high] > 0) | (comparison_df[group_name_low] > 0)]
+                        comparison_df = comparison_df.sort_values(group_name_high, ascending=False)
+                        
+                        if not comparison_df.empty:
+                            # Bar plot comparison
+                            fig, ax = plt.subplots(figsize=(10, 6))
+                            x = np.arange(len(comparison_df.head(15)))
+                            width = 0.35
+                            ax.bar(x - width/2, comparison_df[group_name_high].head(15), width, label=group_name_high)
+                            ax.bar(x + width/2, comparison_df[group_name_low].head(15), width, label=group_name_low)
+                            ax.set_xlabel('Electrode')
+                            ax.set_ylabel('Total Importance')
+                            n_high = group_counts.get(group_name_high, 0)
+                            n_low = group_counts.get(group_name_low, 0)
+                            ax.set_title(f'Top 15 Electrodes: {group_name_high} (N={n_high}) vs {group_name_low} (N={n_low})')
+                            ax.set_xticks(x)
+                            ax.set_xticklabels(comparison_df['electrode'].head(15), rotation=45, ha='right')
+                            ax.legend()
+                            ax.grid(True, alpha=0.3)
+                            plt.tight_layout()
+                            st.pyplot(fig)
+                            plt.close(fig)
+                            
+                            # Topomaps for each group
+                            col_top1, col_top2 = st.columns(2)
+                            
+                            with col_top1:
+                                high_dict = dict(zip(comparison_df['electrode'], comparison_df[group_name_high]))
+                                topomap_high = plot_electrode_importance_topomap(
+                                    high_dict,
+                                    title=f'{group_name_high} Electrode Importance'
+                                )
+                                if topomap_high:
+                                    st.pyplot(topomap_high)
+                                    plt.close(topomap_high)
+                                else:
+                                    st.info("Topomap unavailable")
+                            
+                            with col_top2:
+                                low_dict = dict(zip(comparison_df['electrode'], comparison_df[group_name_low]))
+                                topomap_low = plot_electrode_importance_topomap(
+                                    low_dict,
+                                    title=f'{group_name_low} Electrode Importance'
+                                )
+                                if topomap_low:
+                                    st.pyplot(topomap_low)
+                                    plt.close(topomap_low)
+                                else:
+                                    st.info("Topomap unavailable")
+                            
+                            # P-value topomaps
+                            col_pval1, col_pval2 = st.columns(2)
+                            
+                            with col_pval1:
+                                pval_topomap_high = plot_electrode_pvalue_topomap(
+                                    high_dict,
+                                    title=f'{group_name_high} P-Value Topomap'
+                                )
+                                if pval_topomap_high:
+                                    st.pyplot(pval_topomap_high)
+                                    plt.close(pval_topomap_high)
+                                else:
+                                    st.info("P-value topomap unavailable")
+                            
+                            with col_pval2:
+                                pval_topomap_low = plot_electrode_pvalue_topomap(
+                                    low_dict,
+                                    title=f'{group_name_low} P-Value Topomap'
+                                )
+                                if pval_topomap_low:
+                                    st.pyplot(pval_topomap_low)
+                                    plt.close(pval_topomap_low)
+                                else:
+                                    st.info("P-value topomap unavailable")
+            else:
+                st.info("No clinical columns available for group comparison")
 
             # Averaged and ranked importance across stages
             if per_stage_importances:
@@ -1210,10 +1939,63 @@ def compare_sleep_stages_default_pairs(df_wnv3, power_bands, size_feature=None):
                 ax.set_ylabel('Feature')
                 st.pyplot(fig)
                 plt.close(fig)
-
-                # Ranked importance (by average)
-                st.markdown("**Ranked feature importance (by average across stages)**")
-                st.dataframe(avg_df.head(30))
+                
+                # Aggregate averaged importance by electrode
+                electrode_avg_importance = {}
+                for electrode in eeg_channels:
+                    electrode_avg_importance[electrode] = 0.0
+                    for idx, feature in enumerate(avg_df['feature']):
+                        if isinstance(feature, str) and electrode in feature:
+                            electrode_avg_importance[electrode] += avg_df.iloc[idx]['avg_importance']
+                
+                electrode_avg_df = pd.DataFrame({
+                    'electrode': list(electrode_avg_importance.keys()),
+                    'avg_total_importance': list(electrode_avg_importance.values())
+                }).sort_values('avg_total_importance', ascending=False)
+                
+                electrode_avg_df_nonzero = electrode_avg_df[electrode_avg_df['avg_total_importance'] > 0]
+                top_electrodes_avg = electrode_avg_df_nonzero.head(10)
+                
+                if not top_electrodes_avg.empty:
+                    st.markdown("**Top 10 EEG Electrodes by Average Importance Across All Stages**")
+                    
+                    # Create two columns: bar plot and topomap
+                    col_avg_bar, col_avg_topomap = st.columns(2)
+                    
+                    with col_avg_bar:
+                        fig, ax = plt.subplots(figsize=(7, 5))
+                        sns.barplot(data=top_electrodes_avg, x='avg_total_importance', y='electrode', ax=ax)
+                        ax.set_title('Top 10 EEG Electrodes (Averaged Across Stages)')
+                        ax.set_xlabel('Average Total Importance')
+                        ax.set_ylabel('EEG Electrode')
+                        plt.tight_layout()
+                        st.pyplot(fig)
+                        plt.close(fig)
+                    
+                    with col_avg_topomap:
+                        # Create topomap for averaged importance using all non-zero electrodes
+                        electrode_avg_dict = dict(zip(electrode_avg_df_nonzero['electrode'], electrode_avg_df_nonzero['avg_total_importance']))
+                        topomap_avg_fig = plot_electrode_importance_topomap(
+                            electrode_avg_dict,
+                            title='Average Electrode Importance Topomap\n(Across All Stages)'
+                        )
+                        if topomap_avg_fig:
+                            st.pyplot(topomap_avg_fig)
+                            plt.close(topomap_avg_fig)
+                        else:
+                            st.info("Topomap unavailable (insufficient channels or positioning data)")
+                    
+                    # P-value topomap for averaged importance: compare each electrode vs all others
+                    electrode_avg_dict = dict(zip(electrode_avg_df_nonzero['electrode'], electrode_avg_df_nonzero['avg_total_importance']))
+                    pvalue_topomap_avg_fig = plot_electrode_pvalue_topomap(
+                        electrode_avg_dict,
+                        title='Average Electrode P-Value Topomap (Each vs All Others)\n(Across All Stages)'
+                    )
+                    if pvalue_topomap_avg_fig:
+                        st.pyplot(pvalue_topomap_avg_fig)
+                        plt.close(pvalue_topomap_avg_fig)
+                    else:
+                        st.info("P-value topomap unavailable (insufficient channels or positioning data)")
 
 def pair_clustering_analysis(results_df, df_wnv3_clean, n_clusters=2, context_key=None):
     """
@@ -1507,6 +2289,74 @@ def pair_clustering_analysis(results_df, df_wnv3_clean, n_clusters=2, context_ke
                     # Display importance values
                     st.write("Top Clinical Features Predicting Clusters:")
                     st.dataframe(top_features)
+                    
+                    # Aggregate feature importance by EEG electrode
+                    electrode_importance = {}
+                    
+                    # For each electrode, find features that contain the electrode name and sum their importance
+                    for electrode in eeg_channels:
+                        electrode_importance[electrode] = 0.0
+                        # Check each feature to see if it contains this electrode name
+                        for idx, feature in enumerate(importance_df['feature']):
+                            if isinstance(feature, str) and electrode in feature:
+                                electrode_importance[electrode] += importance_df.iloc[idx]['importance']
+                    
+                    # Create DataFrame for electrode importance
+                    electrode_df = pd.DataFrame({
+                        'electrode': list(electrode_importance.keys()),
+                        'total_importance': list(electrode_importance.values())
+                    }).sort_values('total_importance', ascending=False)
+                    
+                    # Filter out electrodes with zero importance and show top 10
+                    electrode_df_nonzero = electrode_df[electrode_df['total_importance'] > 0]
+                    top_electrodes = electrode_df_nonzero.head(10)
+                    
+                    if not top_electrodes.empty:
+                        st.subheader("Top 10 EEG Electrodes by Overall Feature Importance")
+                        
+                        # Create two columns: bar plot and topomap
+                        col_bar, col_topomap = st.columns(2)
+                        
+                        with col_bar:
+                            fig, ax = plt.subplots(figsize=(8, 6))
+                            sns.barplot(data=top_electrodes, x='total_importance', y='electrode', ax=ax)
+                            ax.set_title(f'Top 10 EEG Electrodes Contributing to Cluster Prediction\nPair: {col1_name} vs {col2_name}')
+                            ax.set_xlabel('Total Importance (Sum across all features)')
+                            ax.set_ylabel('EEG Electrode')
+                            plt.tight_layout()
+                            st.pyplot(fig)
+                            plt.close(fig)
+                        
+                        with col_topomap:
+                            # Create topomap using all electrodes with non-zero importance (not just top 10)
+                            electrode_dict = dict(zip(electrode_df_nonzero['electrode'], electrode_df_nonzero['total_importance']))
+                            topomap_fig = plot_electrode_importance_topomap(
+                                electrode_dict,
+                                title=f'Electrode Importance Topomap\nPair: {col1_name} vs {col2_name}'
+                            )
+                            if topomap_fig:
+                                st.pyplot(topomap_fig)
+                                plt.close(topomap_fig)
+                            else:
+                                st.info("Topomap unavailable (insufficient channels or positioning data)")
+                        
+                        # P-value topomap: compare each electrode vs all others
+                        electrode_dict = dict(zip(electrode_df_nonzero['electrode'], electrode_df_nonzero['total_importance']))
+                        pvalue_topomap_fig = plot_electrode_pvalue_topomap(
+                            electrode_dict,
+                            title=f'Electrode P-Value Topomap (Each vs All Others)\nPair: {col1_name} vs {col2_name}'
+                        )
+                        if pvalue_topomap_fig:
+                            st.pyplot(pvalue_topomap_fig)
+                            plt.close(pvalue_topomap_fig)
+                        else:
+                            st.info("P-value topomap unavailable (insufficient channels or positioning data)")
+                        
+                        # Display electrode importance table
+                        st.write("Electrode Importance (aggregated across all features):")
+                        st.dataframe(top_electrodes)
+                    else:
+                        st.info("No EEG electrode features found in the clinical features.")
                     
                     # Classification report
                     y_pred = clf.predict(X_test)
@@ -2159,6 +3009,752 @@ def compare_all_classifiers_on_scaled_data(X_scaled, y_true, test_size=0.3):
     return results_df
 
 
+def rf_classifier_analysis(df_wnv2, selected_feature, eeg_features, key_suffix=""):
+    """
+    Perform Gradient Boosting classifier analysis for binary features.
+    If feature is not binary, ask user for threshold input.
+    
+    Parameters:
+    - df_wnv2: DataFrame with the data
+    - selected_feature: The feature to predict using EEG features
+    - eeg_features: List of EEG feature columns to use as predictors
+    - key_suffix: Unique suffix for streamlit keys
+    """
+    from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier, StackingClassifier
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.neural_network import MLPClassifier
+    from xgboost import XGBClassifier
+    from lightgbm import LGBMClassifier
+    from sklearn.model_selection import train_test_split
+    from sklearn.metrics import confusion_matrix, classification_report, accuracy_score, precision_score, recall_score, f1_score
+    
+    # Checkbox to show/hide the entire classifier analysis section
+    show_classifier = st.checkbox(
+        f"Show Classifier Analysis for {selected_feature}",
+        value=False,
+        key=f"show_classifier_{selected_feature}_{key_suffix}"
+    )
+    
+    if not show_classifier:
+        return
+    
+    # Prepare data
+    df_clean = df_wnv2[df_wnv2[selected_feature].notna()].copy()
+    
+    if df_clean.empty:
+        return
+    
+    # Convert feature to numeric if possible
+    feature_data = pd.to_numeric(df_clean[selected_feature], errors='coerce')
+    df_clean[selected_feature] = feature_data
+    
+    # Check if binary
+    unique_values = df_clean[selected_feature].dropna().unique()
+    n_unique = len(unique_values)
+    
+    # Determine threshold and create binary target
+    threshold = None
+    if n_unique == 2:
+        # Binary feature - use as is
+        unique_vals = sorted(unique_values)
+        y = df_clean[selected_feature].apply(lambda x: 1 if x == unique_vals[1] else 0)
+        group_name_0 = f"{selected_feature} = {unique_vals[0]}"
+        group_name_1 = f"{selected_feature} = {unique_vals[1]}"
+    else:
+        # Non-binary feature - ask for threshold
+        threshold = st.number_input(
+            f"Enter threshold for {selected_feature} to create binary classification:",
+            value=18.0,
+            key=f"threshold_{selected_feature}_rf_{key_suffix}",
+            help="Values above threshold will be class 1, below or equal will be class 0"
+        )
+        y = df_clean[selected_feature].apply(lambda x: 1 if x > threshold else 0)
+        group_name_0 = f"{selected_feature} <= {threshold}"
+        group_name_1 = f"{selected_feature} > {threshold}"
+    
+    # Check if we have enough samples in each class
+    if len(y[y == 0]) < 3 or len(y[y == 1]) < 3:
+        st.warning(f"Insufficient samples for binary classification (need at least 3 in each class)")
+        return
+    
+    # Get EEG features (only those that exist in df_clean)
+    available_eeg_features = [f for f in eeg_features if f in df_clean.columns]
+    
+    if not available_eeg_features:
+        st.warning(f"No EEG features available for {selected_feature}")
+        return
+    
+    # Prepare X (EEG features)
+    X = df_clean[available_eeg_features].copy()
+    
+    # Remove columns with too many NaN values (more than 50%)
+    X = X.dropna(axis=1, thresh=int(X.shape[0]/2))
+    
+    # Remove columns with constant values
+    X = X.loc[:, X.nunique() != 1]
+    
+    if X.empty:
+        st.warning(f"No valid EEG features after cleaning for {selected_feature}")
+        return
+    
+    # Align y with X (remove rows where X has NaN)
+    valid_idx = X.dropna().index
+    X = X.loc[valid_idx]
+    y = y.loc[valid_idx]
+    
+    # Fill remaining NaN with median
+    X = X.fillna(X.median())
+    
+    # Split data
+    if len(X) < 10:
+        st.warning(f"Insufficient samples for train/test split (need at least 10, have {len(X)})")
+        return
+    
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.3, random_state=42, stratify=y
+    )
+    
+    # Display sample counts for each group in training and testing
+    train_counts = y_train.value_counts().sort_index()
+    test_counts = y_test.value_counts().sort_index()
+    
+    st.write("**Sample Distribution:**")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.write("**Training Set:**")
+        for class_val, count in train_counts.items():
+            class_name = group_name_1 if class_val == 1 else group_name_0
+            st.write(f"- {class_name}: N = {count}")
+        st.write(f"**Total Training: N = {len(y_train)}**")
+    with col2:
+        st.write("**Testing Set:**")
+        for class_val, count in test_counts.items():
+            class_name = group_name_1 if class_val == 1 else group_name_0
+            st.write(f"- {class_name}: N = {count}")
+        st.write(f"**Total Testing: N = {len(y_test)}**")
+    
+    # Compare all classifiers first
+    st.subheader("Classifier Performance Comparison")
+    classifier_results = []
+    
+    # Define classifier factory functions to create fresh instances
+    classifier_factories = {
+        'Gradient Boosting': lambda: GradientBoostingClassifier(n_estimators=200, random_state=42, max_depth=10),
+        'Random Forest': lambda: RandomForestClassifier(n_estimators=200, random_state=42, max_depth=10),
+        'XGBoost': lambda: XGBClassifier(random_state=42),
+        'LightGBM': lambda: LGBMClassifier(random_state=42),
+        'MLP (Feedforward Neural Net)': lambda: MLPClassifier(random_state=42, max_iter=1000),
+        'Logistic Regression': lambda: LogisticRegression(random_state=42, max_iter=1000),
+        'Stacking Classifier': lambda: StackingClassifier(
+            estimators=[
+                ('rf', RandomForestClassifier(n_estimators=100, random_state=42)),
+                ('gb', GradientBoostingClassifier(random_state=42)),
+                ('xgb', XGBClassifier(random_state=42))
+            ],
+            final_estimator=LogisticRegression(random_state=42)
+        ),
+    }
+    
+    with st.spinner("Training and comparing all classifiers..."):
+        for name, factory in classifier_factories.items():
+            try:
+                clf = factory()  # Create fresh instance
+                clf.fit(X_train, y_train)
+                y_pred_temp = clf.predict(X_test)
+                acc = accuracy_score(y_test, y_pred_temp)
+                classifier_results.append({
+                    'Classifier': name,
+                    'Accuracy': acc
+                })
+            except Exception as e:
+                classifier_results.append({
+                    'Classifier': name,
+                    'Accuracy': 0.0
+                })
+                st.warning(f"Error training {name}: {str(e)}")
+    
+    # Create comparison plot
+    if classifier_results:
+        results_df = pd.DataFrame(classifier_results).sort_values('Accuracy', ascending=False)
+        
+        fig, ax = plt.subplots(figsize=(10, 6))
+        colors = ['#2ecc71' if i == 0 else '#3498db' for i in range(len(results_df))]
+        bars = ax.barh(results_df['Classifier'], results_df['Accuracy'], color=colors)
+        ax.set_xlabel('Accuracy')
+        ax.set_ylabel('Classifier')
+        ax.set_title('Classifier Accuracy Comparison')
+        ax.set_xlim(0, 1)
+        
+        # Add value labels on bars
+        for i, bar in enumerate(bars):
+            width = bar.get_width()
+            ax.text(width + 0.01, bar.get_y() + bar.get_height()/2, 
+                   f'{width:.3f}', ha='left', va='center', fontsize=10, fontweight='bold')
+        
+        plt.tight_layout()
+        st.pyplot(fig)
+        plt.close(fig)
+        
+        # Display results table
+        st.write("**Classifier Comparison Results:**")
+        st.dataframe(results_df, use_container_width=True)
+        
+        # Highlight best classifier
+        best_classifier = results_df.iloc[0]
+        st.success(f"🏆 Best performing classifier: **{best_classifier['Classifier']}** with accuracy of {best_classifier['Accuracy']:.3f}")
+    
+    # Let user select classifier
+    st.subheader("Select Classifier for Detailed Analysis")
+    # Get best classifier index for default selection
+    default_index = 0
+    if classifier_results:
+        results_df_temp = pd.DataFrame(classifier_results).sort_values('Accuracy', ascending=False)
+        best_name = results_df_temp.iloc[0]['Classifier']
+        classifier_names = list(classifier_factories.keys())
+        if best_name in classifier_names:
+            default_index = classifier_names.index(best_name)
+    
+    selected_classifier_name = st.selectbox(
+        "Choose classifier for detailed analysis:",
+        list(classifier_factories.keys()),
+        index=default_index,
+        key=f"classifier_select_{selected_feature}_{key_suffix}"
+    )
+    
+    # Create fresh instance for selected classifier
+    selected_classifier = classifier_factories[selected_classifier_name]()
+    
+    # Train selected classifier
+    try:
+        selected_classifier.fit(X_train, y_train)
+        
+        # Predictions
+        y_pred = selected_classifier.predict(X_test)
+        y_pred_proba = selected_classifier.predict_proba(X_test)[:, 1]
+        
+        # Display results
+        st.subheader(f"{selected_classifier_name} Classifier Results: Predicting {selected_feature}")
+        
+        # Classification report
+        st.write("**Classification Report:**")
+        report = classification_report(y_test, y_pred, target_names=[group_name_0, group_name_1], output_dict=True)
+        st.text(classification_report(y_test, y_pred, target_names=[group_name_0, group_name_1]))
+        
+        # Metrics
+        accuracy = accuracy_score(y_test, y_pred)
+        precision = precision_score(y_test, y_pred, average='weighted')
+        recall = recall_score(y_test, y_pred, average='weighted')
+        f1 = f1_score(y_test, y_pred, average='weighted')
+        
+        # Display metrics
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Accuracy", f"{accuracy:.3f}")
+        col2.metric("Precision", f"{precision:.3f}")
+        col3.metric("Recall", f"{recall:.3f}")
+        col4.metric("F1-Score", f"{f1:.3f}")
+        
+        # Confusion Matrix
+        st.subheader("Confusion Matrix")
+        # Show class descriptions as info
+        st.info(f"Class 0: {group_name_0} | Class 1: {group_name_1}")
+        cm = confusion_matrix(y_test, y_pred)
+        cm_percent = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis] * 100
+        
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+        
+        # Raw counts - use simple 0/1 labels
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax1,
+                   xticklabels=['0', '1'],
+                   yticklabels=['0', '1'])
+        ax1.set_title('Confusion Matrix (Counts)')
+        ax1.set_xlabel('Predicted')
+        ax1.set_ylabel('True')
+        
+        # Percentages - use simple 0/1 labels
+        sns.heatmap(cm_percent, annot=True, fmt='.1f', cmap='viridis', ax=ax2,
+                   xticklabels=['0', '1'],
+                   yticklabels=['0', '1'])
+        ax2.set_title('Confusion Matrix (Percentages)')
+        ax2.set_xlabel('Predicted')
+        ax2.set_ylabel('True')
+        
+        plt.tight_layout()
+        st.pyplot(fig)
+        plt.close(fig)
+        
+        # Feature Importance
+        st.subheader("Feature Importance")
+        # Check if classifier has feature_importances_ attribute
+        if hasattr(selected_classifier, 'feature_importances_'):
+            importances = selected_classifier.feature_importances_
+        elif hasattr(selected_classifier, 'coef_'):
+            # For linear models like Logistic Regression, use coefficient absolute values
+            importances = np.abs(selected_classifier.coef_[0])
+        else:
+            st.info("Feature importance not available for this classifier type.")
+            importances = None
+        
+        if importances is not None:
+            importance_df = pd.DataFrame({
+                'feature': X.columns,
+                'importance': importances
+            }).sort_values('importance', ascending=False)
+        
+            # Plot top 20 features
+            top_n = min(20, len(importance_df))
+            top_importance = importance_df.head(top_n)
+            
+            fig, ax = plt.subplots(figsize=(10, max(6, top_n * 0.3)))
+            sns.barplot(data=top_importance, x='importance', y='feature', ax=ax, palette='viridis')
+            ax.set_title(f'Top {top_n} Feature Importances ({selected_classifier_name})')
+            ax.set_xlabel('Importance')
+            ax.set_ylabel('Feature')
+            plt.tight_layout()
+            st.pyplot(fig)
+            plt.close(fig)
+            
+            # Display feature importance table
+            st.write(f"**Top {top_n} Most Important Features:**")
+            st.dataframe(top_importance, use_container_width=True)
+        
+        # Aggregate feature importance by EEG electrode (only if feature importance is available)
+        if importances is not None:
+            st.subheader("Feature Importance by Electrode")
+            electrode_importance = {}
+            
+            # For each electrode, find features that contain the electrode name and sum their importance
+            for electrode in eeg_channels:
+                electrode_importance[electrode] = 0.0
+                # Check each feature to see if it contains this electrode name
+                for idx, feature in enumerate(importance_df['feature']):
+                    if isinstance(feature, str) and electrode in feature:
+                        electrode_importance[electrode] += importance_df.iloc[idx]['importance']
+            
+            # Create DataFrame for electrode importance
+            electrode_df = pd.DataFrame({
+                'electrode': list(electrode_importance.keys()),
+                'total_importance': list(electrode_importance.values())
+            }).sort_values('total_importance', ascending=False)
+            
+            # Filter out electrodes with zero importance
+            electrode_df_nonzero = electrode_df[electrode_df['total_importance'] > 0]
+            
+            if not electrode_df_nonzero.empty:
+                # Plot electrode importance
+                fig, ax = plt.subplots(figsize=(10, max(6, len(electrode_df_nonzero) * 0.3)))
+                sns.barplot(data=electrode_df_nonzero, x='total_importance', y='electrode', ax=ax, palette='viridis')
+                ax.set_title(f'Feature Importance by Electrode ({selected_classifier_name})')
+                ax.set_xlabel('Total Importance (Sum across all features)')
+                ax.set_ylabel('EEG Electrode')
+                plt.tight_layout()
+                st.pyplot(fig)
+                plt.close(fig)
+                
+                # Display electrode importance table
+                st.write(f"**Feature Importance by Electrode:**")
+                st.dataframe(electrode_df_nonzero, use_container_width=True)
+                
+                # Try to create topomap if available
+                try:
+                    electrode_dict = dict(zip(electrode_df_nonzero['electrode'], electrode_df_nonzero['total_importance']))
+                    topomap_fig = plot_electrode_importance_topomap(
+                        electrode_dict,
+                        title=f'Electrode Importance Topomap: Predicting {selected_feature}'
+                    )
+                    if topomap_fig:
+                        st.subheader("Electrode Importance Topomap")
+                        st.pyplot(topomap_fig)
+                        plt.close(topomap_fig)
+                except Exception as e:
+                    st.info(f"Topomap unavailable: {str(e)}")
+            else:
+                st.info("No electrode importance found (no features matched electrode names)")
+        
+    except Exception as e:
+        st.error(f"Error in RF classifier analysis: {str(e)}")
+
+
+def rf_regressor_analysis(df_wnv2, selected_feature, eeg_features, key_suffix=""):
+    """
+    Perform regression analysis for numerical features using various regressors.
+    
+    Parameters:
+    - df_wnv2: DataFrame with the data
+    - selected_feature: The numerical feature to predict using EEG features
+    - eeg_features: List of EEG feature columns to use as predictors
+    - key_suffix: Unique suffix for streamlit keys
+    """
+    from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor, StackingRegressor
+    from sklearn.linear_model import LinearRegression, Ridge, Lasso
+    from sklearn.neural_network import MLPRegressor
+    from xgboost import XGBRegressor
+    from lightgbm import LGBMRegressor
+    from sklearn.model_selection import train_test_split
+    from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+    from sklearn.preprocessing import StandardScaler
+    
+    # Checkbox to show/hide the entire regressor analysis section
+    show_regressor = st.checkbox(
+        f"Show Regressor Analysis for {selected_feature}",
+        value=False,
+        key=f"show_regressor_{selected_feature}_{key_suffix}"
+    )
+    
+    if not show_regressor:
+        return
+    
+    # Prepare data
+    df_clean = df_wnv2[df_wnv2[selected_feature].notna()].copy()
+    
+    if df_clean.empty:
+        return
+    
+    # Convert feature to numeric if possible
+    feature_data = pd.to_numeric(df_clean[selected_feature], errors='coerce')
+    df_clean[selected_feature] = feature_data
+    
+    # Remove any remaining NaN values in target
+    df_clean = df_clean[df_clean[selected_feature].notna()].copy()
+    
+    if df_clean.empty:
+        st.warning(f"No valid numerical data for {selected_feature}")
+        return
+    
+    # Get EEG features (only those that exist in df_clean)
+    available_eeg_features = [f for f in eeg_features if f in df_clean.columns]
+    
+    if not available_eeg_features:
+        st.warning(f"No EEG features available for {selected_feature}")
+        return
+    
+    # Prepare X (EEG features)
+    X = df_clean[available_eeg_features].copy()
+    y = df_clean[selected_feature].copy()
+    
+    # Remove columns with too many NaN values (more than 50%)
+    X = X.dropna(axis=1, thresh=int(X.shape[0]/2))
+    
+    # Remove columns with constant values
+    X = X.loc[:, X.nunique() != 1]
+    
+    if X.empty:
+        st.warning(f"No valid EEG features after cleaning for {selected_feature}")
+        return
+    
+    # Align y with X (remove rows where X has NaN)
+    valid_idx = X.dropna().index
+    X = X.loc[valid_idx]
+    y = y.loc[valid_idx]
+    
+    # Fill remaining NaN with median
+    X = X.fillna(X.median())
+    
+    # Split data
+    if len(X) < 10:
+        st.warning(f"Insufficient samples for train/test split (need at least 10, have {len(X)})")
+        return
+    
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.3, random_state=42
+    )
+    
+    # Display sample counts
+    st.write("**Sample Distribution:**")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.write(f"**Training Set: N = {len(y_train)}**")
+        st.write(f"Target range: [{y_train.min():.2f}, {y_train.max():.2f}]")
+        st.write(f"Target mean: {y_train.mean():.2f} ± {y_train.std():.2f}")
+    with col2:
+        st.write(f"**Testing Set: N = {len(y_test)}**")
+        st.write(f"Target range: [{y_test.min():.2f}, {y_test.max():.2f}]")
+        st.write(f"Target mean: {y_test.mean():.2f} ± {y_test.std():.2f}")
+    
+    # Compare all regressors first
+    st.subheader("Regressor Performance Comparison")
+    regressor_results = []
+    
+    # Define regressor factory functions to create fresh instances
+    regressor_factories = {
+        'Gradient Boosting': lambda: GradientBoostingRegressor(n_estimators=200, random_state=42, max_depth=10),
+        'Random Forest': lambda: RandomForestRegressor(n_estimators=200, random_state=42, max_depth=10),
+        'XGBoost': lambda: XGBRegressor(random_state=42),
+        'LightGBM': lambda: LGBMRegressor(random_state=42),
+        'MLP (Feedforward Neural Net)': lambda: MLPRegressor(random_state=42, max_iter=1000),
+        'Linear Regression': lambda: LinearRegression(),
+        'Ridge Regression': lambda: Ridge(random_state=42),
+        'Lasso Regression': lambda: Lasso(random_state=42, max_iter=1000),
+        'Stacking Regressor': lambda: StackingRegressor(
+            estimators=[
+                ('rf', RandomForestRegressor(n_estimators=100, random_state=42)),
+                ('gb', GradientBoostingRegressor(random_state=42)),
+                ('xgb', XGBRegressor(random_state=42))
+            ],
+            final_estimator=LinearRegression()
+        ),
+    }
+    
+    with st.spinner("Training and comparing all regressors..."):
+        for name, factory in regressor_factories.items():
+            try:
+                reg = factory()  # Create fresh instance
+                reg.fit(X_train, y_train)
+                y_pred_temp = reg.predict(X_test)
+                r2 = r2_score(y_test, y_pred_temp)
+                rmse = np.sqrt(mean_squared_error(y_test, y_pred_temp))
+                mae = mean_absolute_error(y_test, y_pred_temp)
+                regressor_results.append({
+                    'Regressor': name,
+                    'R² Score': r2,
+                    'RMSE': rmse,
+                    'MAE': mae
+                })
+            except Exception as e:
+                regressor_results.append({
+                    'Regressor': name,
+                    'R² Score': -np.inf,
+                    'RMSE': np.inf,
+                    'MAE': np.inf
+                })
+                st.warning(f"Error training {name}: {str(e)}")
+    
+    # Create comparison plot
+    if regressor_results:
+        results_df = pd.DataFrame(regressor_results).sort_values('R² Score', ascending=False)
+        
+        # Plot R² scores
+        fig, ax = plt.subplots(figsize=(10, 6))
+        colors = ['#2ecc71' if i == 0 else '#3498db' for i in range(len(results_df))]
+        bars = ax.barh(results_df['Regressor'], results_df['R² Score'], color=colors)
+        ax.set_xlabel('R² Score')
+        ax.set_ylabel('Regressor')
+        ax.set_title('Regressor R² Score Comparison')
+        ax.axvline(x=0, color='red', linestyle='--', alpha=0.5)
+        
+        # Add value labels on bars
+        for i, bar in enumerate(bars):
+            width = bar.get_width()
+            ax.text(width + 0.01 if width >= 0 else width - 0.01, bar.get_y() + bar.get_height()/2, 
+                   f'{width:.3f}', ha='left' if width >= 0 else 'right', va='center', fontsize=10, fontweight='bold')
+        
+        plt.tight_layout()
+        st.pyplot(fig)
+        plt.close(fig)
+        
+        # Display results table
+        st.write("**Regressor Comparison Results:**")
+        st.dataframe(results_df, use_container_width=True)
+        
+        # Highlight best regressor
+        best_regressor = results_df.iloc[0]
+        st.success(f"🏆 Best performing regressor: **{best_regressor['Regressor']}** with R² score of {best_regressor['R² Score']:.3f}")
+    
+    # Let user select regressor
+    st.subheader("Select Regressor for Detailed Analysis")
+    # Get best regressor index for default selection
+    default_index = 0
+    if regressor_results:
+        results_df_temp = pd.DataFrame(regressor_results).sort_values('R² Score', ascending=False)
+        best_name = results_df_temp.iloc[0]['Regressor']
+        regressor_names = list(regressor_factories.keys())
+        if best_name in regressor_names:
+            default_index = regressor_names.index(best_name)
+    
+    selected_regressor_name = st.selectbox(
+        "Choose regressor for detailed analysis:",
+        list(regressor_factories.keys()),
+        index=default_index,
+        key=f"regressor_select_{selected_feature}_{key_suffix}"
+    )
+    
+    # Create fresh instance for selected regressor
+    selected_regressor = regressor_factories[selected_regressor_name]()
+    
+    # Train selected regressor
+    try:
+        selected_regressor.fit(X_train, y_train)
+        
+        # Predictions
+        y_pred = selected_regressor.predict(X_test)
+        y_pred_train = selected_regressor.predict(X_train)
+        
+        # Display results
+        st.subheader(f"{selected_regressor_name} Regressor Results: Predicting {selected_feature}")
+        
+        # Metrics
+        r2 = r2_score(y_test, y_pred)
+        rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+        mae = mean_absolute_error(y_test, y_pred)
+        r2_train = r2_score(y_train, y_pred_train)
+        
+        # Display metrics
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("R² Score (Test)", f"{r2:.3f}")
+        col2.metric("RMSE (Test)", f"{rmse:.3f}")
+        col3.metric("MAE (Test)", f"{mae:.3f}")
+        col4.metric("R² Score (Train)", f"{r2_train:.3f}")
+        
+        # Prediction vs Actual plots
+        st.subheader("Prediction vs Actual")
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        
+        # Test set
+        axes[0].scatter(y_test, y_pred, alpha=0.6, s=50)
+        min_val = min(y_test.min(), y_pred.min())
+        max_val = max(y_test.max(), y_pred.max())
+        axes[0].plot([min_val, max_val], [min_val, max_val], 'r--', lw=2, label='Perfect Prediction')
+        axes[0].set_xlabel('Actual Values')
+        axes[0].set_ylabel('Predicted Values')
+        axes[0].set_title(f'Test Set (R² = {r2:.3f})')
+        axes[0].legend()
+        axes[0].grid(True, alpha=0.3)
+        
+        # Train set
+        axes[1].scatter(y_train, y_pred_train, alpha=0.6, s=50, color='green')
+        min_val = min(y_train.min(), y_pred_train.min())
+        max_val = max(y_train.max(), y_pred_train.max())
+        axes[1].plot([min_val, max_val], [min_val, max_val], 'r--', lw=2, label='Perfect Prediction')
+        axes[1].set_xlabel('Actual Values')
+        axes[1].set_ylabel('Predicted Values')
+        axes[1].set_title(f'Train Set (R² = {r2_train:.3f})')
+        axes[1].legend()
+        axes[1].grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        st.pyplot(fig)
+        plt.close(fig)
+        
+        # Residuals plot
+        st.subheader("Residuals Analysis")
+        residuals = y_test - y_pred
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        
+        # Residuals vs Predicted
+        axes[0].scatter(y_pred, residuals, alpha=0.6, s=50)
+        axes[0].axhline(y=0, color='r', linestyle='--', lw=2)
+        axes[0].set_xlabel('Predicted Values')
+        axes[0].set_ylabel('Residuals')
+        axes[0].set_title('Residuals vs Predicted')
+        axes[0].grid(True, alpha=0.3)
+        
+        # Residuals distribution
+        axes[1].hist(residuals, bins=20, edgecolor='black', alpha=0.7)
+        axes[1].axvline(x=0, color='r', linestyle='--', lw=2)
+        axes[1].set_xlabel('Residuals')
+        axes[1].set_ylabel('Frequency')
+        axes[1].set_title('Residuals Distribution')
+        axes[1].grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        st.pyplot(fig)
+        plt.close(fig)
+        
+        # Feature Importance
+        st.subheader("Feature Importance")
+        # Check if regressor has feature_importances_ attribute
+        if hasattr(selected_regressor, 'feature_importances_'):
+            importances = selected_regressor.feature_importances_
+        elif hasattr(selected_regressor, 'coef_'):
+            # For linear models, use coefficient absolute values
+            importances = np.abs(selected_regressor.coef_)
+        else:
+            st.info("Feature importance not available for this regressor type.")
+            importances = None
+        
+        if importances is not None:
+            importance_df = pd.DataFrame({
+                'feature': X.columns,
+                'importance': importances
+            }).sort_values('importance', ascending=False)
+        
+            # Plot top 20 features
+            top_n = min(20, len(importance_df))
+            top_importance = importance_df.head(top_n)
+            
+            fig, ax = plt.subplots(figsize=(10, max(6, top_n * 0.3)))
+            sns.barplot(data=top_importance, x='importance', y='feature', ax=ax, palette='viridis')
+            ax.set_title(f'Top {top_n} Feature Importances ({selected_regressor_name})')
+            ax.set_xlabel('Importance')
+            ax.set_ylabel('Feature')
+            plt.tight_layout()
+            st.pyplot(fig)
+            plt.close(fig)
+            
+            # Display feature importance table
+            st.write(f"**Top {top_n} Most Important Features:**")
+            st.dataframe(top_importance, use_container_width=True)
+        
+            # Aggregate feature importance by EEG electrode (only if feature importance is available)
+            st.subheader("Feature Importance by Electrode")
+            electrode_importance = {}
+            
+            # Get eeg_channels if available (try to import or use a default list)
+            try:
+                from utils.eeg_utils import eeg_channels
+            except:
+                # If not available, try to extract from feature names
+                eeg_channels = set()
+                for feature in X.columns:
+                    if isinstance(feature, str):
+                        # Try to extract electrode names (this is a fallback)
+                        for channel in ['Fp1', 'Fp2', 'F3', 'F4', 'C3', 'C4', 'P3', 'P4', 'O1', 'O2', 
+                                       'F7', 'F8', 'T3', 'T4', 'T5', 'T6', 'Fz', 'Cz', 'Pz']:
+                            if channel in feature:
+                                eeg_channels.add(channel)
+                eeg_channels = list(eeg_channels) if eeg_channels else []
+            
+            # For each electrode, find features that contain the electrode name and sum their importance
+            for electrode in eeg_channels:
+                electrode_importance[electrode] = 0.0
+                # Check each feature to see if it contains this electrode name
+                for idx, feature in enumerate(importance_df['feature']):
+                    if isinstance(feature, str) and electrode in feature:
+                        electrode_importance[electrode] += importance_df.iloc[idx]['importance']
+            
+            # Create DataFrame for electrode importance
+            electrode_df = pd.DataFrame({
+                'electrode': list(electrode_importance.keys()),
+                'total_importance': list(electrode_importance.values())
+            }).sort_values('total_importance', ascending=False)
+            
+            # Filter out electrodes with zero importance
+            electrode_df_nonzero = electrode_df[electrode_df['total_importance'] > 0]
+            
+            if not electrode_df_nonzero.empty:
+                # Plot electrode importance
+                fig, ax = plt.subplots(figsize=(10, max(6, len(electrode_df_nonzero) * 0.3)))
+                sns.barplot(data=electrode_df_nonzero, x='total_importance', y='electrode', ax=ax, palette='viridis')
+                ax.set_title(f'Feature Importance by Electrode ({selected_regressor_name})')
+                ax.set_xlabel('Total Importance (Sum across all features)')
+                ax.set_ylabel('EEG Electrode')
+                plt.tight_layout()
+                st.pyplot(fig)
+                plt.close(fig)
+                
+                # Display electrode importance table
+                st.write(f"**Feature Importance by Electrode:**")
+                st.dataframe(electrode_df_nonzero, use_container_width=True)
+                
+                # Try to create topomap if available
+                try:
+                    electrode_dict = dict(zip(electrode_df_nonzero['electrode'], electrode_df_nonzero['total_importance']))
+                    topomap_fig = plot_electrode_importance_topomap(
+                        electrode_dict,
+                        title=f'Electrode Importance Topomap: Predicting {selected_feature}'
+                    )
+                    if topomap_fig:
+                        st.subheader("Electrode Importance Topomap")
+                        st.pyplot(topomap_fig)
+                        plt.close(topomap_fig)
+                except Exception as e:
+                    st.info(f"Topomap unavailable: {str(e)}")
+            else:
+                st.info("No electrode importance found (no features matched electrode names)")
+        
+    except Exception as e:
+        st.error(f"Error in RF regressor analysis: {str(e)}")
+
+
 # Streamlit App
 def main():
     # options to choose from folders in pickles
@@ -2219,8 +3815,8 @@ def main():
     clinical_features_numeric = [col for col in clinical_features if pd.api.types.is_numeric_dtype(df_wnv2[col])]
     # Sidebar for feature selection
     st.sidebar.header("Feature Selection")
-    feature_types = ( 'HEP','All',  'Clinical Feature', "EEG Feature", "ml_plots", "vs_Controls", "Pair Plot",'Raw','Spectrogram') # 'Longitudinal',
-    feature_type = st.sidebar.selectbox("Select feature type to plot against the other type:", feature_types)
+    feature_types = ('systole_diastole_comparison', 'ECG_Analysis', 'HEP','All',  'Clinical Feature', "EEG Feature", "ml_plots", "vs_Controls", "Pair Plot",'Raw','Spectrogram', ) # 'Longitudinal',
+    feature_type = st.sidebar.selectbox("Select feature type to plot against the other type:", feature_types, index=0)
     
     # Sidebar for scatterplot size feature selection
     st.sidebar.header("Scatterplot Size Control")
@@ -2284,10 +3880,45 @@ def main():
         elif current_feature_type == "Raw":
             st.title("Raw Data")
             raw_run(cases_group_name)
+        elif current_feature_type == "systole_diastole_comparison":
+            # Sleep stage selection
+            sleep_stage_options = ["N1","None (Full Recording)",  "N2", "N3", "R", "W"]
+            selected_stage_display = st.sidebar.selectbox(
+                "Select Sleep Stage to Extract:",
+                sleep_stage_options,
+                index=0,
+                key="systole_diastole_stage"
+            )
+            sleep_stage = None if selected_stage_display == "None (Full Recording)" else selected_stage_display
+            min_duration_min = st.sidebar.number_input(
+                "Minimum Duration (minutes):",
+                min_value=1,
+                max_value=60,
+                value=1,
+                help="Minimum duration of the sleep stage segment. For W stage, 10 minutes is used.",
+                key="systole_diastole_duration"
+            )
+            systole_diastole_comparison_run(cases_group_name, sleep_stage=sleep_stage, min_duration_min=min_duration_min)
+        elif current_feature_type == "ECG_Analysis":
+            # Sleep stage selection
+            sleep_stage_options = ["N1","None (Full Recording)",  "N2", "N3", "R", "W"]
+            selected_stage_display = st.sidebar.selectbox(
+                "Select Sleep Stage to Extract:",
+                sleep_stage_options,
+                index=0
+            )
+            sleep_stage = None if selected_stage_display == "None (Full Recording)" else selected_stage_display
+            min_duration_min = st.sidebar.number_input(
+                "Minimum Duration (minutes):",
+                min_value=1,
+                max_value=60,
+                value=1,
+                help="Minimum duration of the sleep stage segment. For W stage, 10 minutes is used."
+            )
+            ecg_analysis_run(cases_group_name, sleep_stage=sleep_stage, min_duration_min=min_duration_min)
         elif current_feature_type == "Longitudinal":
             longitudinal_analysis(project_name)
         elif current_feature_type == "EEG Feature":
-            forest_plot_eeg = st.sidebar.checkbox("Show Forest Plot vs All Clinical Features", value=False)
             eeg_feature_options =  eeg_features+ ["All Features"] 
             selected_feature = st.sidebar.selectbox("Select an EEG feature:", eeg_feature_options)
             if selected_feature == "All Features" or feature_type == "All":
@@ -2295,6 +3926,9 @@ def main():
                 selected_feature = eeg_features[0]
             plot_title = f"Plots of {selected_feature} vs All Clinical Features"
             boxplot_columns = clinical_features_numeric
+            
+            # Checkbox for forest plot next to HEP checkbox position
+            forest_plot_eeg = st.checkbox("Show Forest Plot vs All Clinical Features", value=False, key=f"forest_plot_eeg_{selected_feature}")
             
             # Add forest plot if requested
             if forest_plot_eeg:
@@ -2304,7 +3938,11 @@ def main():
             clinical_features_correlation = st.sidebar.checkbox("Show Clinical Features Correlation", value=False)
             forest_plot_clinical = st.sidebar.checkbox("Show Forest Plot vs All EEG Features", value=False)
             marked_clinical_features_w_all = clinical_features + ["All Features"]
-            selected_feature = st.sidebar.selectbox("Select a Clinical feature:", marked_clinical_features_w_all)
+            # Set default index to 'clinical_moca' if available, otherwise 0
+            default_index = 0
+            if 'clinical_moca' in marked_clinical_features_w_all:
+                default_index = marked_clinical_features_w_all.index('clinical_moca')
+            selected_feature = st.sidebar.selectbox("Select a Clinical feature:", marked_clinical_features_w_all, index=default_index)
             if selected_feature == "All Features" or feature_type == "All":
                 all_feat_list = clinical_features
                 selected_feature = clinical_features[0]
@@ -2415,6 +4053,10 @@ def main():
                     clinical_features, boxplot_columns = get_clinical_and_boxplot_cols(df_wnv2=df_wnv2)
                     selected_feature = feature
                     st.write(f"## Analyzing Feature: {selected_feature}")
+                    # Add RF classifier analysis for binary features (or non-binary with threshold)
+                    rf_classifier_analysis(df_wnv2, selected_feature, eeg_features, key_suffix=f"all_{feature}")
+                    # Add RF regressor analysis for numerical features
+                    rf_regressor_analysis(df_wnv2, selected_feature, eeg_features, key_suffix=f"all_{feature}")
                     run_selected_feature(boxplot_columns, hep_checkbox)
                     # Add forest plot if requested
                     if forest_plot_clinical:
@@ -2422,6 +4064,10 @@ def main():
                         forest_plot_all_features(df_wnv2, selected_feature, eeg_features, analysis_type)
                     st.divider()
             else:
+                # Add RF classifier analysis for binary features (or non-binary with threshold)
+                rf_classifier_analysis(df_wnv2, selected_feature, eeg_features, key_suffix="single")
+                # Add RF regressor analysis for numerical features
+                rf_regressor_analysis(df_wnv2, selected_feature, eeg_features, key_suffix="single")
                 run_selected_feature(boxplot_columns)
                 # Add forest plot if requested
                 if forest_plot_clinical:
@@ -2434,81 +4080,2010 @@ def main():
     download_pptx_button()
 
 
+def extract_sleep_stage_segment(raw, stage='N1', min_duration_min=1):
+    """
+    Extract a specific sleep stage segment from raw MNE data using YASA sleep staging.
+    
+    Parameters:
+    -----------
+    raw : mne.io.Raw
+        MNE Raw object with EEG/ECG data
+    stage : str
+        Sleep stage to extract (N1, N2, N3, R, or W) (default: N1)
+    min_duration_min : int
+        Minimum duration of stage segment in minutes (default: 1)
+        For W stage, this is ignored and 10 minutes is used
+    
+    Returns:
+    --------
+    mne.io.Raw or None
+        Cropped raw object containing only the selected stage segment, or None if not found
+    """
+    import yasa
+    import numpy as np
+    
+    try:
+        # Check if file has ECG channel (optional but preferred)
+        ch_lower = [ch.lower() for ch in raw.ch_names]
+        ecg_indices = [i for i, ch in enumerate(ch_lower) if 'ecg' in ch or 'ekg' in ch]
+        
+        # Find the best channels for sleep staging
+        available_eeg_channels = [ch for ch in raw.ch_names if ch in eeg_channels]
+        if not available_eeg_channels:
+            return None
+        
+        # Select optimal EEG channel (prefer central electrodes like C3, C4, Cz)
+        central_eeg_channels = ['Cz', 'C3', 'C4']
+        eeg_name = None
+        for ch in central_eeg_channels:
+            if ch in available_eeg_channels:
+                eeg_name = ch
+                break
+        
+        # If no central electrode, use the first available EEG channel
+        if eeg_name is None:
+            eeg_name = available_eeg_channels[0]
+        
+        # Find EOG channel
+        eog_name = None
+        if 'EOG+' in raw.ch_names:
+            eog_name = 'EOG+'
+        elif 'EOG' in raw.ch_names:
+            eog_name = 'EOG'
+        
+        # Find EMG channel (prefer EMG1+ over EMG2+)
+        emg_name = None
+        if 'EMG1+' in raw.ch_names:
+            emg_name = 'EMG1+'
+        elif 'EMG2+' in raw.ch_names:
+            emg_name = 'EMG2+'
+        elif 'EMG' in raw.ch_names:
+            emg_name = 'EMG'
+        
+        # Run YASA sleep staging
+        ss = yasa.SleepStaging(raw, eeg_name=eeg_name, eog_name=eog_name, emg_name=emg_name)
+        predicted_stages = ss.predict()
+        
+        # Special handling for W: select 10 min of Wake right after the last adequate non-W run
+        if stage == 'W':
+            # YASA uses 30-second epochs by default
+            epoch_duration_sec = 30
+            # Require at least 5 minutes of any non-W stage before the Wake segment
+            min_non_w_epochs = int(np.ceil(5 * 60 / epoch_duration_sec))
+            min_w_epochs = int(np.ceil(10 * 60 / epoch_duration_sec))  # 10 minutes of W
+
+            # Build runs of identical stages: (label, start_idx, length)
+            runs = []
+            if len(predicted_stages) > 0:
+                cur_label = predicted_stages[0]
+                cur_start = 0
+                cur_len = 1
+                for i in range(1, len(predicted_stages)):
+                    if predicted_stages[i] == cur_label:
+                        cur_len += 1
+                    else:
+                        runs.append((cur_label, cur_start, cur_len))
+                        cur_label = predicted_stages[i]
+                        cur_start = i
+                        cur_len = 1
+                runs.append((cur_label, cur_start, cur_len))
+
+            # Find the last non-W run (>= min_non_w_epochs) that is immediately followed by a W run (>= 10 min)
+            selected_w_start_epoch = None
+            for idx in range(len(runs) - 1, -1, -1):
+                label, start_idx, length = runs[idx]
+                if label == 'W' or length < min_non_w_epochs:
+                    continue
+                # Check next run exists and is Wake
+                if idx + 1 < len(runs):
+                    next_label, next_start, next_length = runs[idx + 1]
+                    if next_label == 'W' and next_length >= min_w_epochs:
+                        selected_w_start_epoch = next_start
+                        break
+
+            if selected_w_start_epoch is None:
+                return None
+
+            # Define the 10-minute Wake segment
+            segment_start_sec = selected_w_start_epoch * epoch_duration_sec
+            segment_end_sec = (selected_w_start_epoch + min_w_epochs) * epoch_duration_sec
+            
+            # Crop the raw data to the stage segment
+            raw_stage = raw.copy().crop(tmin=segment_start_sec, tmax=segment_end_sec)
+            return raw_stage
+
+        else:
+            # Find specified sleep stage epochs (N1, N2, N3, R)
+            stage_epochs = np.where(predicted_stages == stage)[0]
+
+            if len(stage_epochs) == 0:
+                return None
+            
+            # Find the longest continuous streak of stage epochs (allowing gaps of up to 3 epochs)
+            def find_longest_stage_streak(stage_epochs, max_gap=3):
+                """Find the longest continuous streak of stage epochs, allowing gaps of up to max_gap epochs."""
+                if len(stage_epochs) == 0:
+                    return None, 0
+                
+                longest_start = None
+                longest_length = 0
+                current_start = stage_epochs[0]
+                current_length = 1
+                current_end = stage_epochs[0]
+                
+                for i in range(1, len(stage_epochs)):
+                    gap = stage_epochs[i] - current_end
+                    
+                    if gap <= max_gap + 1:  # Allow gap of up to max_gap epochs
+                        # Still part of the same streak
+                        current_length += 1
+                        current_end = stage_epochs[i]
+                    else:
+                        # Gap too large, check if this is the longest streak
+                        if current_length > longest_length:
+                            longest_start = current_start
+                            longest_length = current_length
+                        
+                        # Start new streak
+                        current_start = stage_epochs[i]
+                        current_length = 1
+                        current_end = stage_epochs[i]
+                
+                # Check the last streak
+                if current_length > longest_length:
+                    longest_start = current_start
+                    longest_length = current_length
+                
+                return longest_start, longest_length
+            
+            # Find the longest stage streak
+            longest_start, longest_length = find_longest_stage_streak(stage_epochs)
+            
+            if longest_start is None or longest_length == 0:
+                return None
+            
+            # YASA uses 30-second epochs by default
+            epoch_duration_sec = 30
+            min_stage_epochs = int(min_duration_min * 60 / epoch_duration_sec)
+            
+            # Check if the longest streak meets the minimum duration requirement
+            if longest_length >= min_stage_epochs:
+                segment_start_sec = longest_start * epoch_duration_sec
+                segment_end_sec = (longest_start + longest_length) * epoch_duration_sec
+                
+                # Crop the raw data to the stage segment
+                raw_stage = raw.copy().crop(tmin=segment_start_sec, tmax=segment_end_sec)
+                return raw_stage
+            else:
+                return None
+                
+    except Exception as e:
+        return None
+
+
+def compute_all_network_features(raw, patient_id):
+    """
+    Compute all EEG and HRV network features from raw MNE data.
+    
+    Parameters:
+    -----------
+    raw : mne.io.Raw
+        MNE Raw object with EEG/ECG data
+    patient_id : str
+        Patient identifier
+    
+    Returns:
+    --------
+    dict : Dictionary with all computed features
+    """
+    features = {}
+    
+    try:
+        # Get data and sampling frequency
+        data = raw.get_data()
+        sfreq = raw.info['sfreq']
+        ch_names = raw.ch_names
+        
+        if data.size == 0 or data.shape[0] < 2:
+            return features
+        
+        # Separate EEG and ECG channels
+        eeg_ch_idx = [i for i, ch in enumerate(ch_names) if 'eeg' in ch.lower() or any(elec in ch.upper() for elec in ['FP', 'F', 'C', 'P', 'O', 'T', 'A'])]
+        ecg_ch_idx = [i for i, ch in enumerate(ch_names) if 'ecg' in ch.lower() or 'ekg' in ch.lower()]
+        
+        eeg_data = data[eeg_ch_idx, :] if eeg_ch_idx else data
+        ecg_data = data[ecg_ch_idx, :] if ecg_ch_idx else None
+        
+        # Require EEG data, but ECG is optional
+        if eeg_data is None or eeg_data.size == 0:
+            return features
+
+        n_eeg_channels = eeg_data.shape[0]
+        
+        if n_eeg_channels < 2:
+            return features
+        
+        # Import required libraries
+        from mne_connectivity import SpectralConnectivity as spectral_connectivity
+        from scipy.signal import coherence, hilbert, welch
+        from scipy.stats import pearsonr
+        import networkx as nx
+        from itertools import combinations
+        import pandas as pd
+        import mne.time_frequency
+        
+        # ========== EEG FEATURES (Overall and Per-Electrode) ==========
+        
+        # Define power bands
+        power_bands = {
+            "delta": [0.5, 4],
+            "theta": [4, 8],
+            "alpha": [8, 12],
+            "beta": [12, 30],
+            "gamma": [30, 100]
+        }
+        
+        try:
+            # Compute PSD and FFT for each channel
+            window_size_sec = 5
+            window_size = int(window_size_sec * sfreq)
+            psd_list = []
+            fft_list = []
+            mpf_list = []
+            df_list = []
+            
+            for i, channel_data in enumerate(eeg_data):
+                ch_psd = []
+                ch_fft = []
+                ch_mpf = []
+                ch_df = []
+                
+                # Slide windows
+                for start in range(0, len(channel_data) - window_size + 1, window_size):
+                    win = channel_data[start:start + window_size]
+                    
+                    # PSD
+                    psd_vals, freqs = mne.time_frequency.psd_array_welch(
+                        win, sfreq, fmin=1, fmax=40, n_fft=int(sfreq)
+                    )
+                    psd_vals = psd_vals.squeeze()
+                    
+                    # FFT
+                    fft_vals = np.fft.fft(win)
+                    
+                    # MPF (Mean Power Frequency) and Dominant Frequency
+                    mpf = np.sum(psd_vals * freqs) / np.sum(psd_vals) if np.sum(psd_vals) > 0 else 0.0
+                    dfreq = freqs[np.argmax(psd_vals)] if len(psd_vals) > 0 else 0.0
+                    
+                    ch_psd.append(psd_vals)
+                    ch_fft.append(fft_vals)
+                    ch_mpf.append(mpf)
+                    ch_df.append(dfreq)
+                
+                psd_list.append(ch_psd)
+                fft_list.append(ch_fft)
+                mpf_list.append(ch_mpf)
+                df_list.append(ch_df)
+            
+            # Convert to arrays - handle lists of arrays
+            # mpf_arr and df_arr are lists of lists, need to flatten for overall stats
+            mpf_all = []
+            df_all = []
+            for ch_mpf in mpf_list:
+                mpf_all.extend(ch_mpf)
+            for ch_df in df_list:
+                df_all.extend(ch_df)
+            mpf_arr = np.array(mpf_all) if mpf_all else np.array([0.0])
+            df_arr = np.array(df_all) if df_all else np.array([0.0])
+            dfv_arr = np.array([np.std(ch_df) if len(ch_df) > 0 else 0.0 for ch_df in df_list])
+            
+            # Keep per-channel lists for per-channel stats
+            mpf_list_per_ch = mpf_list
+            df_list_per_ch = df_list
+            
+            # Compute mean PSD and FFT for each channel (from list of arrays)
+            psd_means = []
+            psd_stds = []
+            fft_means = []
+            fft_stds = []
+            for ch_psd_list in psd_list:
+                if len(ch_psd_list) > 0:
+                    ch_psd_concat = np.concatenate(ch_psd_list)
+                    psd_means.append(np.mean(ch_psd_concat))
+                    psd_stds.append(np.std(ch_psd_concat))
+                else:
+                    psd_means.append(0.0)
+                    psd_stds.append(0.0)
+            
+            for ch_fft_list in fft_list:
+                if len(ch_fft_list) > 0:
+                    ch_fft_concat = np.concatenate(ch_fft_list)
+                    fft_means.append(np.mean(np.abs(ch_fft_concat)))
+                    fft_stds.append(np.std(np.abs(ch_fft_concat)))
+                else:
+                    fft_means.append(0.0)
+                    fft_stds.append(0.0)
+            
+            psd_means_arr = np.array(psd_means)
+            psd_stds_arr = np.array(psd_stds)
+            fft_means_arr = np.array(fft_means)
+            fft_stds_arr = np.array(fft_stds)
+            
+            # Bandpower computation
+            def bandpower(data, sf, band, window_sec=None, relative=False):
+                low, high = band
+                nperseg = int((window_sec or (2/low)) * sf)
+                freqs, psd = welch(data, sf, nperseg=nperseg)
+                idx = np.logical_and(freqs >= low, freqs <= high)
+                bp = np.trapz(psd[:, idx], freqs[idx], axis=1)
+                if relative:
+                    bp /= np.trapz(psd, freqs, axis=1)
+                return bp
+            
+            band_powers = {name: bandpower(eeg_data, sfreq, rng, window_sec=window_size_sec) 
+                          for name, rng in power_bands.items()}
+            
+            # Time-domain stats (skewness and kurtosis)
+            skew = np.apply_along_axis(lambda x: pd.Series(x).skew(), 1, eeg_data)
+            kurt = np.apply_along_axis(lambda x: pd.Series(x).kurt(), 1, eeg_data)
+            
+            # Overall features
+            features['overall_min'] = float(eeg_data.min())
+            features['overall_max'] = float(eeg_data.max())
+            features['overall_mean'] = float(eeg_data.mean())
+            features['overall_median'] = float(np.median(eeg_data))
+            features['overall_std'] = float(eeg_data.std())
+            features['overall_psd_mean'] = float(psd_means_arr.mean())
+            features['overall_psd_std'] = float(psd_stds_arr.mean())
+            features['overall_fft_mean'] = float(fft_means_arr.mean())
+            features['overall_fft_std'] = float(fft_stds_arr.mean())
+            features['overall_delta_power'] = float(band_powers['delta'].mean())
+            features['overall_theta_power'] = float(band_powers['theta'].mean())
+            features['overall_alpha_power'] = float(band_powers['alpha'].mean())
+            features['overall_beta_power'] = float(band_powers['beta'].mean())
+            features['overall_gamma_power'] = float(band_powers['gamma'].mean())
+            features['overall_skewness'] = float(skew.mean())
+            features['overall_kurtosis'] = float(kurt.mean())
+            features['overall_mpf_mean'] = float(mpf_arr.mean())
+            features['overall_mpf_median'] = float(np.median(mpf_arr))
+            features['overall_df_mean'] = float(df_arr.mean())
+            features['overall_dfv_std'] = float(dfv_arr.mean())
+            
+            # Channel-specific features
+            eeg_ch_names = [ch_names[i] for i in eeg_ch_idx] if eeg_ch_idx else ch_names[:n_eeg_channels]
+            for i, ch in enumerate(eeg_ch_names):
+                features[f'min_EEG {ch}'] = float(eeg_data[i].min())
+                features[f'max_EEG {ch}'] = float(eeg_data[i].max())
+                features[f'mean_EEG {ch}'] = float(eeg_data[i].mean())
+                features[f'median_EEG {ch}'] = float(np.median(eeg_data[i]))
+                features[f'std_EEG {ch}'] = float(eeg_data[i].std())
+                features[f'psd_mean_EEG {ch}'] = float(psd_means_arr[i])
+                features[f'psd_std_EEG {ch}'] = float(psd_stds_arr[i])
+                features[f'fft_mean_EEG {ch}'] = float(fft_means_arr[i])
+                features[f'fft_std_EEG {ch}'] = float(fft_stds_arr[i])
+                features[f'delta_power_EEG {ch}'] = float(band_powers['delta'][i])
+                features[f'theta_power_EEG {ch}'] = float(band_powers['theta'][i])
+                features[f'alpha_power_EEG {ch}'] = float(band_powers['alpha'][i])
+                features[f'beta_power_EEG {ch}'] = float(band_powers['beta'][i])
+                features[f'gamma_power_EEG {ch}'] = float(band_powers['gamma'][i])
+                features[f'skewness_EEG {ch}'] = float(skew[i])
+                features[f'kurtosis_EEG {ch}'] = float(kurt[i])
+                features[f'mean_mpf_EEG {ch}'] = float(np.mean(mpf_list_per_ch[i])) if len(mpf_list_per_ch[i]) > 0 else 0.0
+                features[f'median_mpf_EEG {ch}'] = float(np.median(mpf_list_per_ch[i])) if len(mpf_list_per_ch[i]) > 0 else 0.0
+                features[f'dfv_mean_EEG {ch}'] = float(np.mean(df_list_per_ch[i])) if len(df_list_per_ch[i]) > 0 else 0.0
+                features[f'dfv_std_EEG {ch}'] = float(dfv_arr[i])
+        except Exception as e:
+            # If EEG feature computation fails, continue with network features
+            pass
+        
+        # ========== EEG NETWORK FEATURES ==========
+        
+        # 1. Coherence Matrix
+        try:
+            data_for_conn = eeg_data[np.newaxis, :, :]
+            conn_res = spectral_connectivity(
+                data_for_conn,
+                method='coh',
+                sfreq=sfreq,
+                fmin=1.0,
+                fmax=40.0,
+                faverage=True,
+                verbose=False,
+            )
+            conn = conn_res[0]
+            if conn.ndim == 3:
+                coherence_matrix = np.mean(conn, axis=2)
+            elif conn.ndim == 2:
+                n_ch = eeg_data.shape[0]
+                conn_mean = np.mean(conn, axis=1)
+                coherence_matrix = np.zeros((n_ch, n_ch))
+                triu_idx = np.triu_indices(n_ch, k=1)
+                coherence_matrix[triu_idx] = conn_mean
+                coherence_matrix[(triu_idx[1], triu_idx[0])] = conn_mean
+            else:
+                coherence_matrix = np.corrcoef(eeg_data)
+                coherence_matrix = np.nan_to_num(coherence_matrix, nan=0.0, posinf=0.0, neginf=0.0)
+            np.fill_diagonal(coherence_matrix, 1.0)
+            features['coherence_matrix'] = coherence_matrix
+        except:
+            coherence_matrix = np.corrcoef(eeg_data)
+            coherence_matrix = np.nan_to_num(coherence_matrix, nan=0.0, posinf=0.0, neginf=0.0)
+            np.fill_diagonal(coherence_matrix, 1.0)
+            features['coherence_matrix'] = coherence_matrix
+        
+        # 2. Imaginary Coherence
+        try:
+            conn_res = spectral_connectivity(
+                data_for_conn,
+                method='imcoh',
+                sfreq=sfreq,
+                fmin=1.0,
+                fmax=40.0,
+                faverage=True,
+                verbose=False,
+            )
+            conn = conn_res[0]
+            if conn.ndim == 3:
+                imaginary_coherence = np.mean(np.abs(conn), axis=2)
+            elif conn.ndim == 2:
+                n_ch = eeg_data.shape[0]
+                conn_mean = np.mean(np.abs(conn), axis=1)
+                imaginary_coherence = np.zeros((n_ch, n_ch))
+                triu_idx = np.triu_indices(n_ch, k=1)
+                imaginary_coherence[triu_idx] = conn_mean
+                imaginary_coherence[(triu_idx[1], triu_idx[0])] = conn_mean
+            else:
+                imaginary_coherence = np.abs(np.imag(np.fft.fft(eeg_data)))
+            np.fill_diagonal(imaginary_coherence, 0.0)
+            features['imaginary_coherence'] = imaginary_coherence
+        except:
+            features['imaginary_coherence'] = np.zeros((n_eeg_channels, n_eeg_channels))
+        
+        # 3. wPLI (Weighted Phase Lag Index)
+        try:
+            conn_res = spectral_connectivity(
+                data_for_conn,
+                method='wpli',
+                sfreq=sfreq,
+                fmin=1.0,
+                fmax=40.0,
+                faverage=True,
+                verbose=False,
+            )
+            conn = conn_res[0]
+            if conn.ndim == 3:
+                wPLI_matrix = np.mean(conn, axis=2)
+            elif conn.ndim == 2:
+                n_ch = eeg_data.shape[0]
+                conn_mean = np.mean(conn, axis=1)
+                wPLI_matrix = np.zeros((n_ch, n_ch))
+                triu_idx = np.triu_indices(n_ch, k=1)
+                wPLI_matrix[triu_idx] = conn_mean
+                wPLI_matrix[(triu_idx[1], triu_idx[0])] = conn_mean
+            else:
+                wPLI_matrix = np.zeros((n_eeg_channels, n_eeg_channels))
+            np.fill_diagonal(wPLI_matrix, 0.0)
+            features['wPLI_matrix'] = wPLI_matrix
+        except:
+            features['wPLI_matrix'] = np.zeros((n_eeg_channels, n_eeg_channels))
+        
+        # 4. PLI (Phase Lag Index)
+        try:
+            conn_res = spectral_connectivity(
+                data_for_conn,
+                method='pli',
+                sfreq=sfreq,
+                fmin=1.0,
+                fmax=40.0,
+                faverage=True,
+                verbose=False,
+            )
+            conn = conn_res[0]
+            if conn.ndim == 3:
+                PLI_matrix = np.mean(conn, axis=2)
+            elif conn.ndim == 2:
+                n_ch = eeg_data.shape[0]
+                conn_mean = np.mean(conn, axis=1)
+                PLI_matrix = np.zeros((n_ch, n_ch))
+                triu_idx = np.triu_indices(n_ch, k=1)
+                PLI_matrix[triu_idx] = conn_mean
+                PLI_matrix[(triu_idx[1], triu_idx[0])] = conn_mean
+            else:
+                PLI_matrix = np.zeros((n_eeg_channels, n_eeg_channels))
+            np.fill_diagonal(PLI_matrix, 0.0)
+            features['PLI_matrix'] = PLI_matrix
+        except:
+            features['PLI_matrix'] = np.zeros((n_eeg_channels, n_eeg_channels))
+        
+        # 5. Amplitude Envelope Correlation (AEC)
+        try:
+            # Compute Hilbert transform for amplitude envelope
+            analytic_signal = hilbert(eeg_data, axis=1)
+            amplitude_envelope = np.abs(analytic_signal)
+            amplitude_envelope_corr = np.corrcoef(amplitude_envelope)
+            amplitude_envelope_corr = np.nan_to_num(amplitude_envelope_corr, nan=0.0, posinf=0.0, neginf=0.0)
+            np.fill_diagonal(amplitude_envelope_corr, 1.0)
+            features['amplitude_envelope_corr'] = amplitude_envelope_corr
+        except:
+            amplitude_envelope_corr = np.corrcoef(eeg_data)
+            amplitude_envelope_corr = np.nan_to_num(amplitude_envelope_corr, nan=0.0, posinf=0.0, neginf=0.0)
+            np.fill_diagonal(amplitude_envelope_corr, 1.0)
+            features['amplitude_envelope_corr'] = amplitude_envelope_corr
+        
+        # 6. Phase Locking Value (PLV)
+        try:
+            analytic_signal = hilbert(eeg_data, axis=1)
+            phase = np.angle(analytic_signal)
+            phase_locking_value = np.zeros((n_eeg_channels, n_eeg_channels))
+            for i, j in combinations(range(n_eeg_channels), 2):
+                phase_diff = phase[i] - phase[j]
+                plv = np.abs(np.mean(np.exp(1j * phase_diff)))
+                phase_locking_value[i, j] = phase_locking_value[j, i] = plv
+            np.fill_diagonal(phase_locking_value, 1.0)
+            features['phase_locking_value'] = phase_locking_value
+        except:
+            features['phase_locking_value'] = np.zeros((n_eeg_channels, n_eeg_channels))
+        
+        # Use coherence_matrix as base for graph metrics
+        if 'coherence_matrix' in features:
+            conn_matrix = features['coherence_matrix']
+        else:
+            conn_matrix = np.corrcoef(eeg_data)
+        
+        # Threshold connectivity matrix (keep top 20% connections)
+        threshold = np.percentile(conn_matrix[np.triu_indices_from(conn_matrix, k=1)], 80)
+        binarized = (conn_matrix >= threshold).astype(float)
+        np.fill_diagonal(binarized, 0)
+        
+        # Build network graph
+        G = nx.from_numpy_array(binarized)
+        
+        # 7. Graph Degree
+        try:
+            degrees = dict(G.degree())
+            graph_degree = np.array([degrees.get(i, 0) for i in range(n_eeg_channels)])
+            features['graph_degree'] = graph_degree
+        except:
+            features['graph_degree'] = np.zeros(n_eeg_channels)
+        
+        # 8. Graph Strength (weighted degree)
+        try:
+            strengths = dict(G.degree(weight='weight'))
+            graph_strength = np.array([strengths.get(i, 0) for i in range(n_eeg_channels)])
+            features['graph_strength'] = graph_strength
+        except:
+            features['graph_strength'] = np.sum(conn_matrix, axis=1) - np.diag(conn_matrix)
+        
+        # 9. Clustering Coefficient
+        try:
+            clustering_coeff = nx.clustering(G)
+            clustering_coefficient = np.array([clustering_coeff.get(i, 0) for i in range(n_eeg_channels)])
+            features['clustering_coefficient'] = clustering_coefficient
+        except:
+            features['clustering_coefficient'] = np.zeros(n_eeg_channels)
+        
+        # 10. Global Efficiency
+        try:
+            global_efficiency = nx.global_efficiency(G)
+            features['global_efficiency'] = global_efficiency if np.isfinite(global_efficiency) else 0.0
+        except:
+            features['global_efficiency'] = 0.0
+        
+        # 11. Characteristic Path Length
+        try:
+            if nx.is_connected(G):
+                path_length = nx.average_shortest_path_length(G)
+                features['characteristic_path_length'] = path_length if np.isfinite(path_length) else np.inf
+            else:
+                # For disconnected graphs, compute for each component
+                components = list(nx.connected_components(G))
+                path_lengths = []
+                for comp in components:
+                    subgraph = G.subgraph(comp)
+                    if len(comp) > 1:
+                        path_lengths.append(nx.average_shortest_path_length(subgraph))
+                features['characteristic_path_length'] = np.mean(path_lengths) if path_lengths else np.inf
+        except:
+            features['characteristic_path_length'] = np.inf
+        
+        # 12. Modularity
+        try:
+            communities = nx.community.greedy_modularity_communities(G)
+            modularity = nx.community.modularity(G, communities)
+            features['modularity'] = modularity if np.isfinite(modularity) else 0.0
+        except:
+            features['modularity'] = 0.0
+        
+        # 13. Betweenness Centrality
+        try:
+            betweenness = nx.betweenness_centrality(G)
+            betweenness_centrality = np.array([betweenness.get(i, 0) for i in range(n_eeg_channels)])
+            features['betweenness_centrality'] = betweenness_centrality
+        except:
+            features['betweenness_centrality'] = np.zeros(n_eeg_channels)
+        
+        # 14. Eigenvector Centrality
+        try:
+            eigenvector = nx.eigenvector_centrality(G, max_iter=100)
+            eigenvector_centrality = np.array([eigenvector.get(i, 0) for i in range(n_eeg_channels)])
+            features['eigenvector_centrality'] = eigenvector_centrality
+        except:
+            features['eigenvector_centrality'] = np.zeros(n_eeg_channels)
+        
+        # 15. Participation Coefficient
+        try:
+            communities = nx.community.greedy_modularity_communities(G)
+            community_dict = {}
+            for idx, comm in enumerate(communities):
+                for node in comm:
+                    community_dict[node] = idx
+            
+            participation_coefficient = np.zeros(n_eeg_channels)
+            for i in range(n_eeg_channels):
+                ki = G.degree(i)
+                if ki > 0:
+                    kis = {}
+                    for neighbor in G.neighbors(i):
+                        comm = community_dict.get(neighbor, -1)
+                        kis[comm] = kis.get(comm, 0) + 1
+                    M = len(communities)
+                    part_coef = 1 - sum((kis.get(m, 0) / ki) ** 2 for m in range(M))
+                    participation_coefficient[i] = part_coef
+            features['participation_coefficient'] = participation_coefficient
+        except:
+            features['participation_coefficient'] = np.zeros(n_eeg_channels)
+        
+        # 16. Small Worldness
+        try:
+            if nx.is_connected(G):
+                C_rand = 2 * G.number_of_edges() / (G.number_of_nodes() * (G.number_of_nodes() - 1))
+                L_rand = np.log(G.number_of_nodes()) / np.log(np.mean([G.degree(n) for n in G.nodes()]))
+                C = nx.transitivity(G)
+                L = nx.average_shortest_path_length(G)
+                small_worldness = (C / C_rand) / (L / L_rand) if L_rand > 0 and C_rand > 0 else 0.0
+                features['small_worldness'] = small_worldness if np.isfinite(small_worldness) else 0.0
+            else:
+                features['small_worldness'] = 0.0
+        except:
+            features['small_worldness'] = 0.0
+        
+        # 17. Assortativity
+        try:
+            assortativity = nx.degree_pearson_correlation_coefficient(G)
+            features['assortativity'] = assortativity if np.isfinite(assortativity) else 0.0
+        except:
+            features['assortativity'] = 0.0
+        
+        # 18. Network Entropy
+        try:
+            degrees = [G.degree(n) for n in G.nodes()]
+            if sum(degrees) > 0:
+                degree_dist = np.array(degrees) / sum(degrees)
+                network_entropy = -np.sum(degree_dist * np.log2(degree_dist + 1e-10))
+            else:
+                network_entropy = 0.0
+            features['network_entropy'] = network_entropy if np.isfinite(network_entropy) else 0.0
+        except:
+            features['network_entropy'] = 0.0
+        
+        # 19. Dynamic Connectivity Entropy (simplified - variance of connectivity over time)
+        try:
+            # Compute connectivity in sliding windows
+            window_size = int(sfreq * 5)  # 5 second windows
+            n_windows = max(1, eeg_data.shape[1] // window_size)
+            conn_variance = []
+            for w in range(n_windows):
+                start = w * window_size
+                end = min(start + window_size, eeg_data.shape[1])
+                window_data = eeg_data[:, start:end]
+                if window_data.shape[1] > 10:
+                    try:
+                        # Check for constant or near-constant channels before correlation
+                        # Remove channels with insufficient variance
+                        valid_channels = []
+                        for ch_idx in range(window_data.shape[0]):
+                            ch_data = window_data[ch_idx, :]
+                            if np.std(ch_data) > 1e-10 and not np.allclose(ch_data, ch_data[0], atol=1e-10):
+                                valid_channels.append(ch_idx)
+                        
+                        if len(valid_channels) >= 2:
+                            window_data_clean = window_data[valid_channels, :]
+                            window_conn = np.corrcoef(window_data_clean)
+                            # Replace NaN and Inf values with 0
+                            window_conn = np.nan_to_num(window_conn, nan=0.0, posinf=0.0, neginf=0.0)
+                            var_val = np.var(window_conn)
+                            if np.isfinite(var_val) and not np.isnan(var_val):
+                                conn_variance.append(var_val)
+                    except:
+                        continue
+            dynamic_connectivity_entropy = np.std(conn_variance) if conn_variance else 0.0
+            if not np.isfinite(dynamic_connectivity_entropy):
+                dynamic_connectivity_entropy = 0.0
+            features['dynamic_connectivity_entropy'] = dynamic_connectivity_entropy
+        except:
+            features['dynamic_connectivity_entropy'] = 0.0
+        
+        # 20. Functional Connectivity Density
+        try:
+            functional_connectivity_density = np.mean(conn_matrix)
+            features['functional_connectivity_density'] = functional_connectivity_density
+        except:
+            features['functional_connectivity_density'] = 0.0
+        
+        # 21. PCA Components (explaining 95% variance)
+        try:
+            from sklearn.decomposition import PCA
+            from sklearn.preprocessing import StandardScaler
+            
+            # Standardize the data
+            scaler = StandardScaler()
+            eeg_data_scaled = scaler.fit_transform(eeg_data.T).T  # Scale across time for each channel
+            
+            # Reshape for PCA: (n_samples, n_features) where samples are time points, features are channels
+            eeg_data_for_pca = eeg_data_scaled.T  # Shape: (n_timepoints, n_channels)
+            
+            # Find number of components for 95% variance
+            pca_full = PCA()
+            pca_full.fit(eeg_data_for_pca)
+            cumsum_variance = np.cumsum(pca_full.explained_variance_ratio_)
+            n_components_95 = np.argmax(cumsum_variance >= 0.95) + 1
+            n_components_95 = min(n_components_95, eeg_data_for_pca.shape[1])
+            
+            # Apply PCA with 95% variance components
+            pca = PCA(n_components=n_components_95)
+            pca_components = pca.fit_transform(eeg_data_for_pca)
+            
+            # Store PCA components (transpose back to match original shape concept)
+            features['pca_components_95'] = pca_components.T  # Shape: (n_components, n_timepoints)
+            features['pca_explained_variance_ratio'] = pca.explained_variance_ratio_
+            features['pca_n_components_95'] = n_components_95
+            features['pca_total_variance_explained'] = np.sum(pca.explained_variance_ratio_)
+        except Exception as e:
+            features['pca_components_95'] = np.zeros((1, eeg_data.shape[1]))
+            features['pca_explained_variance_ratio'] = np.array([0.0])
+            features['pca_n_components_95'] = 0
+            features['pca_total_variance_explained'] = 0.0
+        
+        # 22. Autoencoder Features (explaining 95% variance)
+        try:
+            # Use a simple autoencoder approach
+            # For simplicity, we'll use PCA as a linear autoencoder baseline
+            # A full autoencoder would require neural network libraries
+            
+            # Option 1: Use PCA as linear autoencoder (fast, always available)
+            from sklearn.decomposition import PCA
+            from sklearn.preprocessing import StandardScaler
+            
+            scaler = StandardScaler()
+            eeg_data_scaled = scaler.fit_transform(eeg_data.T).T
+            eeg_data_for_ae = eeg_data_scaled.T
+            
+            # Find components for 95% variance
+            pca_ae = PCA()
+            pca_ae.fit(eeg_data_for_ae)
+            cumsum_variance = np.cumsum(pca_ae.explained_variance_ratio_)
+            n_components_95_ae = np.argmax(cumsum_variance >= 0.95) + 1
+            n_components_95_ae = min(n_components_95_ae, eeg_data_for_ae.shape[1])
+            
+            # Encode and decode
+            pca_encoder = PCA(n_components=n_components_95_ae)
+            encoded = pca_encoder.fit_transform(eeg_data_for_ae)
+            decoded = pca_encoder.inverse_transform(encoded)
+            
+            # Calculate reconstruction error
+            reconstruction_error = np.mean((eeg_data_for_ae - decoded) ** 2)
+            variance_explained = np.sum(pca_encoder.explained_variance_ratio_)
+            
+            # Store autoencoder features (encoded representation)
+            features['autoencoder_features_95'] = encoded.T  # Shape: (n_components, n_timepoints)
+            features['autoencoder_n_components_95'] = n_components_95_ae
+            features['autoencoder_variance_explained'] = variance_explained
+            features['autoencoder_reconstruction_error'] = reconstruction_error
+            
+            # Option 2: Try to use a neural network autoencoder if available
+            try:
+                import tensorflow as tf
+                from tensorflow import keras
+                from tensorflow.keras import layers
+                
+                # Build a simple autoencoder
+                input_dim = eeg_data_for_ae.shape[1]
+                encoding_dim = n_components_95_ae
+                
+                # Create encoder
+                input_layer = keras.Input(shape=(input_dim,))
+                encoded = layers.Dense(encoding_dim * 2, activation='relu')(input_layer)
+                encoded = layers.Dense(encoding_dim, activation='relu')(encoded)
+                
+                # Create decoder
+                decoded = layers.Dense(encoding_dim * 2, activation='relu')(encoded)
+                decoded = layers.Dense(input_dim, activation='linear')(decoded)
+                
+                # Create autoencoder
+                autoencoder = keras.Model(input_layer, decoded)
+                encoder = keras.Model(input_layer, encoded)
+                
+                # Compile and train (quick training for feature extraction)
+                autoencoder.compile(optimizer='adam', loss='mse')
+                
+                # Train on a subset if data is too large
+                max_samples = min(10000, eeg_data_for_ae.shape[0])
+                train_data = eeg_data_for_ae[:max_samples]
+                
+                # Quick training (few epochs for speed)
+                autoencoder.fit(train_data, train_data, epochs=5, batch_size=32, verbose=0)
+                
+                # Get encoded features for all data
+                encoded_nn = encoder.predict(eeg_data_for_ae, verbose=0)
+                
+                # Calculate variance explained
+                decoded_nn = autoencoder.predict(eeg_data_for_ae, verbose=0)
+                reconstruction_error_nn = np.mean((eeg_data_for_ae - decoded_nn) ** 2)
+                
+                # Calculate variance explained by comparing to original variance
+                original_var = np.var(eeg_data_for_ae, axis=0).sum()
+                residual_var = np.var(eeg_data_for_ae - decoded_nn, axis=0).sum()
+                variance_explained_nn = 1 - (residual_var / original_var) if original_var > 0 else 0.0
+                
+                # Store neural network autoencoder features
+                features['autoencoder_features_95_nn'] = encoded_nn.T
+                features['autoencoder_variance_explained_nn'] = variance_explained_nn
+                features['autoencoder_reconstruction_error_nn'] = reconstruction_error_nn
+                
+            except ImportError:
+                # TensorFlow not available, use PCA-based autoencoder only
+                pass
+            except Exception as e:
+                # Neural network training failed, use PCA-based autoencoder only
+                pass
+                
+        except Exception as e:
+            features['autoencoder_features_95'] = np.zeros((1, eeg_data.shape[1]))
+            features['autoencoder_n_components_95'] = 0
+            features['autoencoder_variance_explained'] = 0.0
+            features['autoencoder_reconstruction_error'] = np.inf
+        
+        # ========== HRV NETWORK / COUPLED FEATURES ==========
+        
+        if ecg_data is not None and ecg_data.shape[0] > 0:
+            ecg_signal = ecg_data[0, :]  # Use first ECG channel
+            
+            # 21. Time Domain Matrix (HRV metrics covariance)
+            try:
+                # Compute HRV time-domain metrics in windows
+                window_size = int(sfreq * 30)  # 30 second windows
+                n_windows = max(1, len(ecg_signal) // window_size)
+                hrv_metrics = []
+                for w in range(n_windows):
+                    start = w * window_size
+                    end = min(start + window_size, len(ecg_signal))
+                    window_ecg = ecg_signal[start:end]
+                    if len(window_ecg) > 10:
+                        # Simple HRV metrics
+                        rr_intervals = np.diff(np.where(np.diff(window_ecg) > np.std(window_ecg))[0])
+                        if len(rr_intervals) > 1:
+                            hrv_metrics.append([
+                                np.mean(rr_intervals),
+                                np.std(rr_intervals),
+                                np.var(rr_intervals)
+                            ])
+                if len(hrv_metrics) > 1:
+                    time_domain_matrix = np.cov(np.array(hrv_metrics).T)
+                else:
+                    time_domain_matrix = np.zeros((3, 3))
+                features['time_domain_matrix'] = time_domain_matrix
+            except:
+                features['time_domain_matrix'] = np.zeros((3, 3))
+            
+            # Heart-Brain Coherence
+            try:
+                eeg_power = np.mean(np.abs(np.fft.fft(eeg_data, axis=1)), axis=0)
+                ecg_power = np.abs(np.fft.fft(ecg_signal))
+                min_len = min(len(eeg_power), len(ecg_power))
+                heart_brain_coherence = np.corrcoef(eeg_power[:min_len], ecg_power[:min_len])[0, 1]
+                features['heart_brain_coherence'] = heart_brain_coherence if np.isfinite(heart_brain_coherence) else 0.0
+            except:
+                features['heart_brain_coherence'] = 0.0
+            
+            features['phase_amplitude_coupling'] = np.zeros(n_eeg_channels)
+            features['mutual_information_matrix'] = np.zeros((n_eeg_channels, n_eeg_channels))
+            features['graph_efficiency_heart_brain'] = 0.0
+            features['network_synchrony_index'] = 0.0
+        else:
+            # No ECG data available
+            for hrv_feat in ['time_domain_matrix', 'frequency_coupling_matrix', 'transfer_entropy_matrix',
+                           'granger_causality_values', 'cross_correlation_matrix', 'heart_brain_coherence',
+                           'phase_amplitude_coupling', 'mutual_information_matrix', 'graph_efficiency_heart_brain',
+                           'network_synchrony_index']:
+                features[hrv_feat] = np.zeros((1, 1)) if 'matrix' in hrv_feat else 0.0
+        
+    except Exception as e:
+        st.warning(f"Error computing network features for {patient_id}: {str(e)}")
+    
+    return features
+
+
+def get_cache_key(project_name, patient_id, pickle_file, sleep_stage, min_duration_min):
+    """
+    Generate a cache key based on parameters that affect the results.
+    
+    Parameters:
+    -----------
+    project_name : str
+        Name of the project
+    patient_id : str
+        Patient identifier
+    pickle_file : str
+        Name of the pickle file
+    sleep_stage : str or None
+        Sleep stage to extract
+    min_duration_min : int
+        Minimum duration in minutes
+    
+    Returns:
+    --------
+    str : Cache key string
+    """
+    import hashlib
+    
+    # Create a unique key based on all parameters
+    cache_params = {
+        'project_name': project_name,
+        'patient_id': patient_id,
+        'pickle_file': pickle_file,
+        'sleep_stage': sleep_stage if sleep_stage else 'full',
+        'min_duration_min': min_duration_min,
+        'cache_version': '1.0'  # Increment if feature computation changes
+    }
+    
+    # Create hash from sorted parameters
+    param_string = '_'.join([f"{k}:{v}" for k, v in sorted(cache_params.items())])
+    cache_key = hashlib.md5(param_string.encode()).hexdigest()
+    return cache_key
+
+
+def get_cache_path(project_name, cache_key):
+    """
+    Get the cache file path for a given cache key.
+    
+    Parameters:
+    -----------
+    project_name : str
+        Name of the project
+    cache_key : str
+        Cache key
+    
+    Returns:
+    --------
+    str : Path to cache file
+    """
+    cache_dir = os.path.join('cache', project_name)
+    os.makedirs(cache_dir, exist_ok=True)
+    return os.path.join(cache_dir, f"{cache_key}.pkl")
+
+
+def load_from_cache(cache_path):
+    """
+    Load cached results if they exist.
+    
+    Parameters:
+    -----------
+    cache_path : str
+        Path to cache file
+    
+    Returns:
+    --------
+    dict or None : Cached results or None if not found
+    """
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, 'rb') as f:
+                return pickle.load(f)
+        except Exception as e:
+            # If cache is corrupted, return None
+            return None
+    return None
+
+
+def save_to_cache(cache_path, data):
+    """
+    Save results to cache.
+    
+    Parameters:
+    -----------
+    cache_path : str
+        Path to cache file
+    data : dict
+        Data to cache (should contain 'patient_features' and 'feature_data_entries')
+    """
+    try:
+        with open(cache_path, 'wb') as f:
+            pickle.dump(data, f)
+    except Exception as e:
+        # If caching fails, just continue without cache
+        pass
+
+
+def extract_systole_diastole_segments(raw, sfreq):
+    """
+    Extract systole (RST) and diastole (PQR) segments from ECG data.
+    
+    Parameters:
+    -----------
+    raw : mne.io.Raw
+        MNE Raw object with EEG/ECG data
+    sfreq : float
+        Sampling frequency
+    
+    Returns:
+    --------
+    dict : Dictionary with 'systole' and 'diastole' keys, each containing:
+        - 'eeg_data': EEG data during that phase (n_channels, n_samples)
+        - 'ecg_data': ECG data during that phase (n_samples,)
+        - 'indices': Sample indices for the segments
+    """
+    import neurokit2 as nk
+    import numpy as np
+    
+    # Get channel names and data
+    ch_names = raw.ch_names
+    data = raw.get_data()
+    
+    # Find ECG channel
+    ch_lower = [ch.lower() for ch in ch_names]
+    ecg_indices = [i for i, ch in enumerate(ch_lower) if 'ecg' in ch or 'ekg' in ch]
+    
+    if not ecg_indices:
+        return None
+    
+    ecg_ch_idx = ecg_indices[0]
+    ecg_signal = data[ecg_ch_idx, :]
+    
+    # Clean ECG signal
+    try:
+        ecg_clean = nk.ecg_clean(ecg_signal, sampling_rate=sfreq)
+    except:
+        ecg_clean = ecg_signal
+    
+    # Detect R-peaks
+    try:
+        _, rpk = nk.ecg_peaks(ecg_clean, sampling_rate=sfreq)
+        rpeaks = rpk['ECG_R_Peaks']
+    except:
+        # Fallback: simple peak detection
+        from scipy.signal import find_peaks
+        peaks, _ = find_peaks(ecg_clean, distance=int(sfreq * 0.3))
+        rpeaks = peaks
+    
+    if len(rpeaks) < 2:
+        return None
+    
+    # Find EEG channels
+    eeg_ch_idx = [i for i, ch in enumerate(ch_names) 
+                  if 'eeg' in ch.lower() or any(elec in ch.upper() for elec in ['FP', 'F', 'C', 'P', 'O', 'T', 'A'])]
+    
+    if not eeg_ch_idx:
+        return None
+    
+    eeg_data = data[eeg_ch_idx, :]
+    
+    # Extract segments
+    systole_segments_eeg = []
+    systole_segments_ecg = []
+    systole_indices = []
+    
+    diastole_segments_eeg = []
+    diastole_segments_ecg = []
+    diastole_indices = []
+    
+    # For each R-R interval
+    for i in range(len(rpeaks) - 1):
+        r_start = rpeaks[i]
+        r_end = rpeaks[i + 1]
+        rr_length = r_end - r_start
+        
+        if rr_length < 10:  # Skip very short intervals
+            continue
+        
+        # Systole: R to T (RST) - approximately first 40% of R-R interval (R peak to T wave)
+        systole_end = r_start + int(0.4 * rr_length)
+        if systole_end > r_start and systole_end < len(ecg_signal):
+            systole_segments_eeg.append(eeg_data[:, r_start:systole_end])
+            systole_segments_ecg.append(ecg_signal[r_start:systole_end])
+            systole_indices.append((r_start, systole_end))
+        
+        # Diastole: P to R (PQR) - approximately last 30% of previous R-R interval (P wave to R peak)
+        # For the first R peak, we need to look at the previous interval
+        if i > 0:
+            prev_r_start = rpeaks[i - 1]
+            prev_rr_length = r_start - prev_r_start
+            # P wave typically starts around 70-80% into the previous R-R interval
+            diastole_start = prev_r_start + int(0.7 * prev_rr_length)
+            diastole_end = r_start
+            if diastole_start < diastole_end and diastole_end < len(ecg_signal) and diastole_start >= 0:
+                diastole_segments_eeg.append(eeg_data[:, diastole_start:diastole_end])
+                diastole_segments_ecg.append(ecg_signal[diastole_start:diastole_end])
+                diastole_indices.append((diastole_start, diastole_end))
+    
+    # Concatenate all segments
+    if systole_segments_eeg and diastole_segments_eeg:
+        # Pad segments to same length for concatenation
+        max_systole_len = max(seg.shape[1] for seg in systole_segments_eeg) if systole_segments_eeg else 0
+        max_diastole_len = max(seg.shape[1] for seg in diastole_segments_eeg) if diastole_segments_eeg else 0
+        
+        # For feature extraction, we'll use all segments separately
+        return {
+            'systole': {
+                'eeg_segments': systole_segments_eeg,
+                'ecg_segments': systole_segments_ecg,
+                'indices': systole_indices
+            },
+            'diastole': {
+                'eeg_segments': diastole_segments_eeg,
+                'ecg_segments': diastole_segments_ecg,
+                'indices': diastole_indices
+            }
+        }
+    
+    return None
+
+
+def compute_autoencoder_features(data, feature_name_prefix="", variance_threshold=0.95):
+    """
+    Compute autoencoder features from data using PCA-based autoencoder.
+    
+    Parameters:
+    -----------
+    data : np.ndarray
+        Data array. For EEG: (n_channels, n_timepoints) or list of segments
+        For ECG: (n_timepoints,) or list of segments
+    feature_name_prefix : str
+        Prefix for feature names (e.g., "eeg", "ecg")
+    variance_threshold : float
+        Variance threshold for PCA (default: 0.95)
+    
+    Returns:
+    --------
+    dict : Dictionary with autoencoder features
+    """
+    from sklearn.decomposition import PCA
+    from sklearn.preprocessing import StandardScaler
+    import numpy as np
+    
+    features = {}
+    
+    try:
+        # Handle list of segments - concatenate them
+        if isinstance(data, list):
+            if len(data) == 0:
+                return features
+            # Concatenate segments
+            if isinstance(data[0], np.ndarray):
+                if data[0].ndim == 1:  # ECG segments
+                    data_concatenated = np.concatenate(data)
+                    data_for_ae = data_concatenated.reshape(-1, 1).T  # Shape: (1, n_samples)
+                else:  # EEG segments (n_channels, n_samples)
+                    # Concatenate along time axis
+                    data_concatenated = np.concatenate(data, axis=1)  # Shape: (n_channels, total_samples)
+                    data_for_ae = data_concatenated.T  # Shape: (total_samples, n_channels)
+            else:
+                return features
+        else:
+            # Single array
+            if data.ndim == 1:  # ECG
+                data_for_ae = data.reshape(-1, 1).T  # Shape: (1, n_samples)
+            else:  # EEG (n_channels, n_samples)
+                data_for_ae = data.T  # Shape: (n_samples, n_channels)
+        
+        if data_for_ae.size == 0:
+            return features
+        
+        # Standardize
+        scaler = StandardScaler()
+        data_scaled = scaler.fit_transform(data_for_ae)
+        
+        # Find components for variance threshold
+        pca_ae = PCA()
+        pca_ae.fit(data_scaled)
+        cumsum_variance = np.cumsum(pca_ae.explained_variance_ratio_)
+        n_components = np.argmax(cumsum_variance >= variance_threshold) + 1
+        n_components = min(n_components, data_scaled.shape[1], data_scaled.shape[0])
+        
+        if n_components == 0:
+            n_components = 1
+        
+        # Encode
+        pca_encoder = PCA(n_components=n_components)
+        encoded = pca_encoder.fit_transform(data_scaled)
+        
+        # Calculate metrics
+        decoded = pca_encoder.inverse_transform(encoded)
+        reconstruction_error = np.mean((data_scaled - decoded) ** 2)
+        variance_explained = np.sum(pca_encoder.explained_variance_ratio_)
+        
+        # Store features
+        # For feature matrix, we'll use mean of encoded features across time
+        features[f'{feature_name_prefix}_autoencoder_features_mean'] = np.mean(encoded, axis=0)
+        features[f'{feature_name_prefix}_autoencoder_features_std'] = np.std(encoded, axis=0)
+        features[f'{feature_name_prefix}_autoencoder_n_components'] = n_components
+        features[f'{feature_name_prefix}_autoencoder_variance_explained'] = variance_explained
+        features[f'{feature_name_prefix}_autoencoder_reconstruction_error'] = reconstruction_error
+        
+        # Also store the full encoded features (flattened) for more detailed analysis
+        features[f'{feature_name_prefix}_autoencoder_features_full'] = encoded.flatten()
+        
+    except Exception as e:
+        # Return empty features on error
+        pass
+    
+    return features
+
+
+def systole_diastole_comparison_run(project_name, sleep_stage=None, min_duration_min=1):
+    """
+    Extract systole and diastole segments from ECG and compute autoencoder features
+    for EEG and ECG data in both phases.
+    
+    Parameters:
+    -----------
+    project_name : str
+        Name of the project (used to locate pickle files)
+    sleep_stage : str, optional
+        Sleep stage to extract (N1, N2, N3, R, or W). If None, uses full recording (default: None)
+    min_duration_min : int
+        Minimum duration of stage segment in minutes (default: 1)
+        For W stage, this is ignored and 10 minutes is used
+    """
+    import sys
+    sys.modules['mne.io.array.array'] = mne.io.array
+    
+    st.title("Systole/Diastole Comparison: Autoencoder Features")
+    
+    # Get pickle directory
+    pickles_dir = f'pickles/{project_name}'
+    
+    if not os.path.exists(pickles_dir):
+        st.error(f"Directory not found: {pickles_dir}")
+        return
+    
+    # Get all pickle files
+    pickle_files = [f for f in os.listdir(pickles_dir) if f.endswith('.pkl')]
+    
+    if not pickle_files:
+        st.warning(f"No pickle files found in {pickles_dir}")
+        return
+    
+    st.info(f"Found {len(pickle_files)} pickle files in {pickles_dir}")
+    
+    # Group files by patient ID
+    patient_files = {}
+    for pickle_file in pickle_files:
+        if '.edf' in pickle_file:
+            patient_id = pickle_file.split('.edf')[0]
+        else:
+            patient_id = pickle_file.replace('.pkl', '').split('_')[0] if '_' in pickle_file else pickle_file.replace('.pkl', '')
+        
+        if patient_id not in patient_files:
+            patient_files[patient_id] = []
+        patient_files[patient_id].append(pickle_file)
+    
+    # Sort files for each patient
+    for patient_id in patient_files:
+        patient_files[patient_id].sort()
+    
+    # Select files to load: if patient has multiple files, use the second one (index 1)
+    files_to_load = []
+    for patient_id, files in patient_files.items():
+        if len(files) > 1:
+            files_to_load.append((patient_id, files[1]))
+        else:
+            files_to_load.append((patient_id, files[0]))
+    
+    st.info(f"Loading {len(files_to_load)} files (one per patient)")
+    
+    # Progress bar
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    # Store feature matrices
+    all_features = []
+    patient_ids_list = []
+    
+    for idx, (patient_id, pickle_file) in enumerate(files_to_load):
+        progress_bar.progress((idx + 1) / len(files_to_load))
+        status_text.text(f"Processing {pickle_file} (Patient: {patient_id})...")
+        
+        try:
+            file_path = os.path.join(pickles_dir, pickle_file)
+            with open(file_path, 'rb') as f:
+                raw = pickle.load(f)
+            
+            # Extract sleep stage segment if specified
+            if sleep_stage is not None:
+                raw_stage = extract_sleep_stage_segment(raw, stage=sleep_stage, min_duration_min=min_duration_min)
+                if raw_stage is not None:
+                    raw = raw_stage
+                else:
+                    st.warning(f"No {sleep_stage} stage segment found for {patient_id}. Skipping.")
+                    continue
+            
+            sfreq = raw.info['sfreq']
+            
+            # Extract systole and diastole segments
+            segments = extract_systole_diastole_segments(raw, sfreq)
+            
+            if segments is None:
+                st.warning(f"Could not extract systole/diastole segments for {patient_id}. Skipping.")
+                continue
+            
+            # Compute autoencoder features for systole
+            systole_features = {}
+            
+            # EEG features in systole
+            if segments['systole']['eeg_segments']:
+                eeg_systole_features = compute_autoencoder_features(
+                    segments['systole']['eeg_segments'],
+                    feature_name_prefix="eeg_systole"
+                )
+                systole_features.update(eeg_systole_features)
+            
+            # ECG features in systole
+            if segments['systole']['ecg_segments']:
+                ecg_systole_features = compute_autoencoder_features(
+                    segments['systole']['ecg_segments'],
+                    feature_name_prefix="ecg_systole"
+                )
+                systole_features.update(ecg_systole_features)
+            
+            # Compute autoencoder features for diastole
+            diastole_features = {}
+            
+            # EEG features in diastole
+            if segments['diastole']['eeg_segments']:
+                eeg_diastole_features = compute_autoencoder_features(
+                    segments['diastole']['eeg_segments'],
+                    feature_name_prefix="eeg_diastole"
+                )
+                diastole_features.update(eeg_diastole_features)
+            
+            # ECG features in diastole
+            if segments['diastole']['ecg_segments']:
+                ecg_diastole_features = compute_autoencoder_features(
+                    segments['diastole']['ecg_segments'],
+                    feature_name_prefix="ecg_diastole"
+                )
+                diastole_features.update(ecg_diastole_features)
+            
+            # Combine features into a single row
+            patient_feature_dict = {
+                'patient_id': patient_id,
+                'phase': 'systole'
+            }
+            patient_feature_dict.update(systole_features)
+            
+            # Flatten array features
+            flattened_features = {}
+            for key, value in patient_feature_dict.items():
+                if isinstance(value, np.ndarray):
+                    if value.ndim == 1:
+                        # Create separate columns for each element
+                        for i, v in enumerate(value):
+                            flattened_features[f'{key}_{i}'] = v
+                    else:
+                        # Flatten multi-dimensional arrays
+                        flat = value.flatten()
+                        for i, v in enumerate(flat):
+                            flattened_features[f'{key}_{i}'] = v
+                else:
+                    flattened_features[key] = value
+            
+            all_features.append(flattened_features)
+            patient_ids_list.append(f"{patient_id}_systole")
+            
+            # Add diastole features
+            patient_feature_dict_diastole = {
+                'patient_id': patient_id,
+                'phase': 'diastole'
+            }
+            patient_feature_dict_diastole.update(diastole_features)
+            
+            flattened_features_diastole = {}
+            for key, value in patient_feature_dict_diastole.items():
+                if isinstance(value, np.ndarray):
+                    if value.ndim == 1:
+                        for i, v in enumerate(value):
+                            flattened_features_diastole[f'{key}_{i}'] = v
+                    else:
+                        flat = value.flatten()
+                        for i, v in enumerate(flat):
+                            flattened_features_diastole[f'{key}_{i}'] = v
+                else:
+                    flattened_features_diastole[key] = value
+            
+            all_features.append(flattened_features_diastole)
+            patient_ids_list.append(f"{patient_id}_diastole")
+            
+        except Exception as e:
+            st.warning(f"Error processing {pickle_file}: {str(e)}")
+            import traceback
+            st.error(traceback.format_exc())
+            continue
+    
+    progress_bar.empty()
+    status_text.empty()
+    
+    if not all_features:
+        st.error("No features could be extracted from any files")
+        return
+    
+    st.success(f"Successfully processed {len(patient_ids_list) // 2} patients")
+    
+    # Create DataFrame
+    try:
+        # Get all unique keys
+        all_keys = set()
+        for feat_dict in all_features:
+            all_keys.update(feat_dict.keys())
+        
+        # Create DataFrame with all keys
+        feature_matrix = []
+        for feat_dict in all_features:
+            row = {key: feat_dict.get(key, np.nan) for key in all_keys}
+            feature_matrix.append(row)
+        
+        df_features = pd.DataFrame(feature_matrix)
+        
+        st.subheader("Feature Matrix")
+        st.dataframe(df_features, use_container_width=True)
+        
+        # Display summary statistics
+        st.subheader("Summary Statistics")
+        st.dataframe(df_features.describe(), use_container_width=True)
+        
+        # Display feature comparison between systole and diastole
+        st.subheader("Systole vs Diastole Comparison")
+        
+        # Separate by phase
+        df_systole = df_features[df_features['phase'] == 'systole']
+        df_diastole = df_features[df_features['phase'] == 'diastole']
+        
+        if not df_systole.empty and not df_diastole.empty:
+            # Compare mean values
+            numeric_cols = df_features.select_dtypes(include=[np.number]).columns
+            numeric_cols = [col for col in numeric_cols if col != 'phase']
+            
+            comparison_data = []
+            for col in numeric_cols:
+                if col in df_systole.columns and col in df_diastole.columns:
+                    systole_mean = df_systole[col].mean()
+                    diastole_mean = df_diastole[col].mean()
+                    comparison_data.append({
+                        'feature': col,
+                        'systole_mean': systole_mean,
+                        'diastole_mean': diastole_mean,
+                        'difference': systole_mean - diastole_mean,
+                        'percent_change': ((systole_mean - diastole_mean) / abs(diastole_mean) * 100) if diastole_mean != 0 else np.nan
+                    })
+            
+            if comparison_data:
+                df_comparison = pd.DataFrame(comparison_data)
+                st.dataframe(df_comparison, use_container_width=True)
+        
+    except Exception as e:
+        st.error(f"Error creating feature matrix: {str(e)}")
+        import traceback
+        st.error(traceback.format_exc())
+
+
+def ecg_analysis_run(project_name, sleep_stage=None, min_duration_min=1):
+    """
+    Read all pickle files from pickles/{project_name} folder and plot 
+    ECG/EEG network measurements and their correlations.
+    
+    Parameters:
+    -----------
+    project_name : str
+        Name of the project (used to locate pickle files)
+    sleep_stage : str, optional
+        Sleep stage to extract (N1, N2, N3, R, or W). If None, uses full recording (default: None)
+    min_duration_min : int
+        Minimum duration of stage segment in minutes (default: 1)
+        For W stage, this is ignored and 10 minutes is used
+    """
+    import sys
+    sys.modules['mne.io.array.array'] = mne.io.array
+    
+    st.title("ECG Analysis: Network Features and Correlations")
+    
+    # Define feature categories
+    eeg_network_features = [
+        "coherence_matrix",
+        # "wPLI_matrix",
+        # "PLI_matrix",
+        # "imaginary_coherence",
+        "amplitude_envelope_corr",
+        "phase_locking_value",
+        "graph_degree",
+        "graph_strength",
+        "clustering_coefficient",
+        "global_efficiency",
+        "characteristic_path_length",
+        "modularity",
+        "betweenness_centrality",
+        "eigenvector_centrality",
+        "participation_coefficient",
+        "small_worldness",
+        "assortativity",
+        "network_entropy",
+        "dynamic_connectivity_entropy",
+        "functional_connectivity_density",
+        "pca_components_95",
+        "pca_explained_variance_ratio",
+        "pca_n_components_95",
+        "pca_total_variance_explained",
+        "autoencoder_features_95",
+        "autoencoder_n_components_95",
+        "autoencoder_variance_explained",
+        "autoencoder_reconstruction_error"
+    ]
+    
+    hrv_network_features = [
+        "time_domain_matrix",
+        "frequency_coupling_matrix",
+        "transfer_entropy_matrix",
+        "granger_causality_values",
+        "cross_correlation_matrix",
+        "heart_brain_coherence",
+        "phase_amplitude_coupling",
+        "mutual_information_matrix",
+        "graph_efficiency_heart_brain",
+        "network_synchrony_index"
+    ]
+    
+    all_features = eeg_network_features + hrv_network_features
+    
+    # Get pickle directory
+    pickles_dir = f'pickles/{project_name}'
+    
+    if not os.path.exists(pickles_dir):
+        st.error(f"Directory not found: {pickles_dir}")
+        return
+    
+    # Get all pickle files
+    pickle_files = [f for f in os.listdir(pickles_dir) if f.endswith('.pkl')]
+    
+    if not pickle_files:
+        st.warning(f"No pickle files found in {pickles_dir}")
+        return
+    
+    st.info(f"Found {len(pickle_files)} pickle files in {pickles_dir}")
+    
+    # Group files by patient ID (extract part before .edf)
+    patient_files = {}
+    for pickle_file in pickle_files:
+        # Extract patient ID - everything before .edf
+        if '.edf' in pickle_file:
+            patient_id = pickle_file.split('.edf')[0]
+        else:
+            # Fallback: use part before first underscore
+            patient_id = pickle_file.replace('.pkl', '').split('_')[0] if '_' in pickle_file else pickle_file.replace('.pkl', '')
+        
+        if patient_id not in patient_files:
+            patient_files[patient_id] = []
+        patient_files[patient_id].append(pickle_file)
+    
+    # Sort files for each patient (by filename to ensure consistent ordering)
+    for patient_id in patient_files:
+        patient_files[patient_id].sort()
+    
+    # Select files to load: if patient has multiple files, use the second one (index 1)
+    # If patient has only one file, use that one
+    files_to_load = []
+    for patient_id, files in patient_files.items():
+        if len(files) > 1:
+            # Multiple files - use the second one (index 1)
+            files_to_load.append((patient_id, files[1]))
+        else:
+            # Single file - use it
+            files_to_load.append((patient_id, files[0]))
+    
+    st.info(f"Loading {len(files_to_load)} files (one per patient)")
+    
+    # Progress bar
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    # Load data from pickle files
+    all_data = {}
+    feature_data = {feature: [] for feature in all_features}
+    patient_ids = []
+    
+    # Track cache statistics
+    cache_hits = 0
+    cache_misses = 0
+    
+    for idx, (patient_id, pickle_file) in enumerate(files_to_load):
+        progress_bar.progress((idx + 1) / len(files_to_load))
+        status_text.text(f"Loading {pickle_file} (Patient: {patient_id})...")
+        
+        try:
+            # Generate cache key
+            cache_key = get_cache_key(project_name, patient_id, pickle_file, sleep_stage, min_duration_min)
+            cache_path = get_cache_path(project_name, cache_key)
+            
+            # Try to load from cache
+            cached_data = load_from_cache(cache_path)
+            
+            if cached_data is not None:
+                # Load from cache
+                cache_hits += 1
+                status_text.text(f"Loading from cache: {pickle_file} (Patient: {patient_id})...")
+                patient_features = cached_data.get('patient_features')
+                feature_data_entries = cached_data.get('feature_data_entries', {})
+                raw = cached_data.get('raw')
+                
+                # Restore feature_data entries
+                for feature, entries in feature_data_entries.items():
+                    if feature in feature_data:
+                        feature_data[feature].extend(entries)
+                
+                patient_ids.append(patient_id)
+                all_data[patient_id] = {
+                    'raw': raw,
+                    'features': patient_features
+                }
+                continue
+            
+            # Cache miss - compute features
+            cache_misses += 1
+            status_text.text(f"Computing features: {pickle_file} (Patient: {patient_id})...")
+            
+            file_path = os.path.join(pickles_dir, pickle_file)
+            with open(file_path, 'rb') as f:
+                raw = pickle.load(f)
+            
+            # Extract sleep stage segment if specified
+            if sleep_stage is not None:
+                raw_stage = extract_sleep_stage_segment(raw, stage=sleep_stage, min_duration_min=min_duration_min)
+                if raw_stage is not None:
+                    raw = raw_stage
+                else:
+                    st.warning(f"No {sleep_stage} stage segment found for {patient_id}. Skipping.")
+                    continue
+            
+            patient_ids.append(patient_id)
+            
+            # Compute all network features from raw data
+            patient_features = compute_all_network_features(raw, patient_id)
+            if patient_features is None:
+                st.warning(f"Error computing network features for {patient_id}")
+                continue
+            
+            # Process computed features and extract summary statistics
+            feature_data_entries = {}
+            for feature in all_features:
+                if feature in patient_features:
+                    value = patient_features[feature]
+                    entry = None
+                    # Handle matrix/array features - extract summary statistics
+                    if isinstance(value, np.ndarray):
+                        if value.ndim == 2:  # Matrix
+                            # Extract mean, std, max, min of matrix
+                            entry = {
+                                'patient_id': patient_id,
+                                'mean': np.mean(value),
+                                'std': np.std(value),
+                                'max': np.max(value),
+                                'min': np.min(value),
+                                'median': np.median(value)
+                            }
+                        elif value.ndim == 1:  # 1D array
+                            entry = {
+                                'patient_id': patient_id,
+                                'mean': np.mean(value),
+                                'std': np.std(value),
+                                'max': np.max(value),
+                                'min': np.min(value),
+                                'median': np.median(value)
+                            }
+                        else:
+                            # Multi-dimensional array - flatten and compute stats
+                            flat_value = value.flatten()
+                            entry = {
+                                'patient_id': patient_id,
+                                'mean': np.mean(flat_value),
+                                'std': np.std(flat_value),
+                                'max': np.max(flat_value),
+                                'min': np.min(flat_value),
+                                'median': np.median(flat_value)
+                            }
+                    elif isinstance(value, (int, float, np.number)):
+                        entry = {
+                            'patient_id': patient_id,
+                            'value': float(value)
+                        }
+                    
+                    if entry is not None:
+                        feature_data[feature].append(entry)
+                        if feature not in feature_data_entries:
+                            feature_data_entries[feature] = []
+                        feature_data_entries[feature].append(entry)
+            
+            all_data[patient_id] = {
+                'raw': raw,
+                'features': patient_features
+            }
+            
+            # Save to cache
+            cache_data = {
+                'patient_features': patient_features,
+                'feature_data_entries': feature_data_entries,
+                'raw': raw
+            }
+            save_to_cache(cache_path, cache_data)
+            
+        except Exception as e:
+            st.warning(f"Error loading {pickle_file}: {str(e)}")
+            continue
+    
+    # Display cache statistics
+    if cache_hits > 0 or cache_misses > 0:
+        total = cache_hits + cache_misses
+        cache_hit_rate = (cache_hits / total * 100) if total > 0 else 0
+        st.info(f"Cache: {cache_hits} hits, {cache_misses} misses ({cache_hit_rate:.1f}% hit rate)")
+    
+    progress_bar.empty()
+    status_text.empty()
+    
+    if not all_data:
+        st.error("No data could be loaded from pickle files")
+        return
+    
+    st.success(f"Successfully loaded data from {len(all_data)} files")
+    
+    # Create DataFrames for each feature type
+    st.subheader("Feature Measurements")
+    
+    # Process feature data into DataFrames
+    feature_dfs = {}
+    for feature in all_features:
+        if feature_data[feature]:
+            # Convert list of dicts to DataFrame
+            df = pd.DataFrame(feature_data[feature])
+            if not df.empty:
+                feature_dfs[feature] = df
+    
+    if not feature_dfs:
+        st.warning("No feature data could be extracted. The pickle files may not contain the expected network features.")
+        st.info("Note: This function expects pickle files to contain MNE Raw objects with network features stored in the info dictionary.")
+        return
+    
+    # Display feature selection
+    st.sidebar.header("ECG Analysis Options")
+    feature_category = st.sidebar.selectbox(
+        "Select feature category:",
+        ["EEG Network Features", "HRV Network Features", "All Features"]
+    )
+    
+    if feature_category == "EEG Network Features":
+        available_features = [f for f in eeg_network_features if f in feature_dfs]
+    elif feature_category == "HRV Network Features":
+        available_features = [f for f in hrv_network_features if f in feature_dfs]
+    else:
+        available_features = list(feature_dfs.keys())
+    
+    if not available_features:
+        st.warning(f"No {feature_category} found in the data")
+        return
+    
+    # Plot 1: Summary statistics for selected features
+    st.subheader("Feature Summary Statistics")
+    
+    # Create a combined DataFrame for correlation analysis
+    correlation_data = {}
+    
+    for feature in available_features[:10]:  # Limit to first 10 for performance
+        df = feature_dfs[feature]
+        # Get numeric columns (excluding patient_id)
+        numeric_cols = [col for col in df.columns if col != 'patient_id' and pd.api.types.is_numeric_dtype(df[col])]
+        
+        if numeric_cols:
+            # Use mean if available, otherwise use value
+            if 'mean' in numeric_cols:
+                correlation_data[feature] = df.set_index('patient_id')['mean']
+            elif 'value' in numeric_cols:
+                correlation_data[feature] = df.set_index('patient_id')['value']
+    
+    if correlation_data:
+        # Create correlation matrix
+        correlation_df = pd.DataFrame(correlation_data)
+        correlation_df = correlation_df.dropna()
+        
+        if not correlation_df.empty and len(correlation_df.columns) > 1:
+            # Plot correlation heatmap
+            st.subheader("Feature Correlation Matrix")
+            fig, ax = plt.subplots(figsize=(12, 10))
+            corr_matrix = correlation_df.corr()
+            sns.heatmap(corr_matrix, annot=True, fmt='.2f', cmap='coolwarm', center=0,
+                       square=True, linewidths=0.5, cbar_kws={"shrink": 0.8}, ax=ax)
+            ax.set_title("Correlation Matrix of Network Features")
+            plt.tight_layout()
+            st.pyplot(fig)
+            plt.close(fig)
+            
+            # Display correlation table
+            st.dataframe(corr_matrix, use_container_width=True)
+        
+        # Plot individual feature distributions
+        st.subheader("Feature Distributions")
+        
+        n_features = min(len(available_features), 6)  # Show up to 6 features
+        cols = st.columns(2)
+        
+        for idx, feature in enumerate(available_features[:n_features]):
+            df = feature_dfs[feature]
+            numeric_cols = [col for col in df.columns if col != 'patient_id' and pd.api.types.is_numeric_dtype(df[col])]
+            
+            if numeric_cols:
+                col_idx = idx % 2
+                with cols[col_idx]:
+                    # Plot distribution
+                    fig, ax = plt.subplots(figsize=(8, 5))
+                    
+                    # Use mean if available
+                    if 'mean' in numeric_cols:
+                        data_to_plot = df['mean'].dropna()
+                        ax.hist(data_to_plot, bins=20, edgecolor='black', alpha=0.7)
+                        ax.set_xlabel('Mean Value')
+                        ax.set_ylabel('Frequency')
+                        ax.set_title(f'{feature}\n(n={len(data_to_plot)})')
+                    elif 'value' in numeric_cols:
+                        data_to_plot = df['value'].dropna()
+                        ax.hist(data_to_plot, bins=20, edgecolor='black', alpha=0.7)
+                        ax.set_xlabel('Value')
+                        ax.set_ylabel('Frequency')
+                        ax.set_title(f'{feature}\n(n={len(data_to_plot)})')
+                    
+                    ax.grid(True, alpha=0.3)
+                    plt.tight_layout()
+                    st.pyplot(fig)
+                    plt.close(fig)
+        
+        # Pairwise scatter plots for top correlated features
+        if len(correlation_df.columns) >= 2:
+            st.subheader("Top Correlated Feature Pairs")
+            
+            # Get top correlations
+            corr_pairs = []
+            for i, col1 in enumerate(correlation_df.columns):
+                for j, col2 in enumerate(correlation_df.columns):
+                    if i < j:
+                        corr_val = correlation_df[col1].corr(correlation_df[col2])
+                        if not np.isnan(corr_val):
+                            corr_pairs.append((col1, col2, abs(corr_val)))
+            
+            corr_pairs.sort(key=lambda x: x[2], reverse=True)
+            top_pairs = corr_pairs[:4]  # Show top 4 pairs
+            
+            if top_pairs:
+                cols = st.columns(2)
+                for idx, (col1, col2, corr_val) in enumerate(top_pairs):
+                    col_idx = idx % 2
+                    with cols[col_idx]:
+                        fig, ax = plt.subplots(figsize=(8, 6))
+                        ax.scatter(correlation_df[col1], correlation_df[col2], alpha=0.6, s=50)
+                        ax.set_xlabel(col1)
+                        ax.set_ylabel(col2)
+                        ax.set_title(f'{col1} vs {col2}\n(r={corr_val:.3f})')
+                        ax.grid(True, alpha=0.3)
+                        plt.tight_layout()
+                        st.pyplot(fig)
+                        plt.close(fig)
+    
+    # Display raw feature data tables
+    st.subheader("Feature Data Tables")
+    
+    selected_feature_display = st.selectbox(
+        "Select a feature to view detailed data:",
+        available_features
+    )
+    
+    if selected_feature_display in feature_dfs:
+        st.dataframe(feature_dfs[selected_feature_display], use_container_width=True)
+        
+        # Show statistics
+        df = feature_dfs[selected_feature_display]
+        numeric_cols = [col for col in df.columns if col != 'patient_id' and pd.api.types.is_numeric_dtype(df[col])]
+        
+        if numeric_cols:
+            st.write("**Summary Statistics:**")
+            st.dataframe(df[numeric_cols].describe(), use_container_width=True)
+
+
 def forest_plot_all_features(df_wnv3, selected_feature, target_features, analysis_type="Full"):
     """
-    Create a forest plot showing effect sizes (Cohen's d) for the selected feature
-    against all target features (either all EEG or all Clinical features).
+    Create a forest plot with 2 columns (one for each group) showing median, std, and p-values
+    for each target feature (EEG features) grouped by the selected feature.
     
     Parameters:
     - df_wnv3: DataFrame with the data
-    - selected_feature: The feature being analyzed
-    - target_features: List of features to compare against
+    - selected_feature: The feature being analyzed (used for grouping)
+    - target_features: List of EEG features to compare
     - analysis_type: "Full" or "Significant" to filter results
     """
     from scipy.stats import mannwhitneyu, ttest_ind
-    from statsmodels.stats.multitest import multipletests
-    import matplotlib.patches as patches
     
     # Prepare data for analysis
     df_clean = df_wnv3[df_wnv3[selected_feature].notna()].copy()
     
-    # Convert selected feature to binary if it's not already
-    if df_clean[selected_feature].nunique() == 2:
-        # Already binary
-        unique_vals = sorted(df_clean[selected_feature].unique())
-        df_clean['Group'] = df_clean[selected_feature].apply(lambda x: f"{selected_feature}+" if x == unique_vals[1] else f"{selected_feature}-")
-    else:
-        # Convert to binary using median split
-        median_val = df_clean[selected_feature].median()
-        df_clean['Group'] = df_clean[selected_feature].apply(lambda x: f"{selected_feature}+" if x >= median_val else f"{selected_feature}-")
+    # Determine if binary and get threshold
+    n_unique = df_clean[selected_feature].nunique()
+    unique_vals = sorted(df_clean[selected_feature].dropna().unique())
     
-    # Calculate effect sizes for each target feature
+    threshold = None
+    if n_unique == 2:
+        # Binary - use 0 and 1 groups
+        threshold = 0.5  # For binary comparison
+        df_clean['Group'] = df_clean[selected_feature].apply(lambda x: 1 if x == unique_vals[1] else 0)
+        group_name_0 = f"{selected_feature} = {unique_vals[0]}"
+        group_name_1 = f"{selected_feature} = {unique_vals[1]}"
+    else:
+        # Ask user for threshold
+        median_val = float(df_clean[selected_feature].median())
+        threshold = st.number_input(
+            f"Enter threshold for {selected_feature} to split into groups:",
+            value=median_val,
+            key=f"threshold_{selected_feature}_forest"
+        )
+        df_clean['Group'] = df_clean[selected_feature].apply(lambda x: 1 if x > threshold else 0)
+        group_name_0 = f"{selected_feature} <= {threshold}"
+        group_name_1 = f"{selected_feature} > {threshold}"
+    
+    # Calculate statistics for each target feature
     results = []
     for feature in target_features:
         if feature not in df_clean.columns:
             continue
-            
+        
         # Get data for both groups
-        group1_data = df_clean[df_clean['Group'] == f"{selected_feature}+"][feature].dropna()
-        group2_data = df_clean[df_clean['Group'] == f"{selected_feature}-"][feature].dropna()
+        group0_data = df_clean[df_clean['Group'] == 0][feature].dropna()
+        group1_data = df_clean[df_clean['Group'] == 1][feature].dropna()
         
-        if len(group1_data) < 2 or len(group2_data) < 2:
+        if len(group0_data) < 2 or len(group1_data) < 2:
             continue
-            
-        # Calculate effect size (Cohen's d)
-        n1, n2 = len(group1_data), len(group2_data)
-        mean1, mean2 = group1_data.mean(), group2_data.mean()
-        std1, std2 = group1_data.std(), group2_data.std()
         
-        # Pooled standard deviation
-        pooled_std = np.sqrt(((n1 - 1) * std1**2 + (n2 - 1) * std2**2) / (n1 + n2 - 2))
-        cohens_d = (mean1 - mean2) / pooled_std if pooled_std > 0 else 0
+        # Calculate median and std for each group
+        median0 = group0_data.median()
+        std0 = group0_data.std()
+        median1 = group1_data.median()
+        std1 = group1_data.std()
         
         # Statistical test
         try:
             # Normality test
+            _, normal_p0 = stats.normaltest(group0_data)
             _, normal_p1 = stats.normaltest(group1_data)
-            _, normal_p2 = stats.normaltest(group2_data)
             
-            if normal_p1 < 0.05 or normal_p2 < 0.05:  # Non-parametric
-                stat, p_value = mannwhitneyu(group1_data, group2_data, alternative='two-sided')
+            if normal_p0 < 0.05 or normal_p1 < 0.05:  # Non-parametric
+                stat, p_value = mannwhitneyu(group0_data, group1_data, alternative='two-sided')
                 test_used = "Mann-Whitney U"
             else:  # Parametric
-                stat, p_value = ttest_ind(group1_data, group2_data)
+                stat, p_value = ttest_ind(group0_data, group1_data)
                 test_used = "T-test"
-        except:
+        except Exception:
             p_value = np.nan
             test_used = "Failed"
         
         results.append({
             'Feature': feature,
-            'Cohen_d': cohens_d,
+            'Group0_Median': median0,
+            'Group0_Std': std0,
+            'Group1_Median': median1,
+            'Group1_Std': std1,
             'P_value': p_value,
             'Test': test_used,
-            'N1': n1,
-            'N2': n2,
-            'Mean1': mean1,
-            'Mean2': mean2
+            'N0': len(group0_data),
+            'N1': len(group1_data)
         })
     
     if not results:
@@ -2518,86 +6093,114 @@ def forest_plot_all_features(df_wnv3, selected_feature, target_features, analysi
     # Convert to DataFrame
     results_df = pd.DataFrame(results)
     
-    # Multiple comparison correction
-    valid_pvals = results_df['P_value'].dropna()
-    if len(valid_pvals) > 1:
-        _, pvals_corrected, _, _ = multipletests(valid_pvals, method='fdr_bh')
-        results_df.loc[valid_pvals.index, 'P_corrected'] = pvals_corrected
-    else:
-        results_df['P_corrected'] = results_df['P_value']
-    
     # Filter by significance if requested
     if analysis_type == "Significant":
-        results_df = results_df[results_df['P_corrected'] < 0.05]
+        results_df = results_df[results_df['P_value'] < 0.05]
     
     if results_df.empty:
         st.warning("No significant results found.")
         return
     
-    # Sort by effect size
-    results_df = results_df.sort_values('Cohen_d', key=abs, ascending=False)
+    # Sort by p-value (most significant first)
+    results_df = results_df.sort_values('P_value', ascending=True)
     
-    # Create forest plot
-    fig, ax = plt.subplots(figsize=(12, max(6, len(results_df) * 0.4)))
+    # Create forest plot with 2 columns
+    fig, (ax0, ax1) = plt.subplots(1, 2, figsize=(14, max(8, len(results_df) * 0.5)), sharey=True)
     
-    # Colors based on significance
-    colors = ['red' if p < 0.05 else 'blue' for p in results_df['P_corrected']]
-    
-    # Plot effect sizes
     y_pos = np.arange(len(results_df))
-    bars = ax.barh(y_pos, results_df['Cohen_d'], color=colors, alpha=0.7)
     
-    # Add vertical line at 0
-    ax.axvline(x=0, color='black', linestyle='-', alpha=0.3)
+    # Calculate common x-axis range for both plots
+    all_medians = np.concatenate([results_df['Group0_Median'].values, results_df['Group1_Median'].values])
+    all_stds = np.concatenate([results_df['Group0_Std'].values, results_df['Group1_Std'].values])
+    # Calculate range including error bars (median ± std)
+    all_min = np.nanmin(all_medians - all_stds)
+    all_max = np.nanmax(all_medians + all_stds)
+    range_val = all_max - all_min
+    x_min = all_min - range_val * 0.1
+    x_max = all_max + range_val * 0.1
+    # Ensure range is valid
+    if x_min == x_max or np.isnan(x_min) or np.isnan(x_max):
+        x_min, x_max = None, None  # Let matplotlib auto-scale
     
-    # Add confidence intervals (simplified)
-    for i, (idx, row) in enumerate(results_df.iterrows()):
-        # Simple 95% CI approximation
-        se = 1 / np.sqrt(row['N1'] + row['N2'] - 2)  # Simplified standard error
-        ci_lower = row['Cohen_d'] - 1.96 * se
-        ci_upper = row['Cohen_d'] + 1.96 * se
-        
-        ax.plot([ci_lower, ci_upper], [i, i], 'k-', linewidth=2)
-        ax.plot([ci_lower, ci_lower], [i-0.1, i+0.1], 'k-', linewidth=2)
-        ax.plot([ci_upper, ci_upper], [i-0.1, i+0.1], 'k-', linewidth=2)
+    # Column 0: Group 0
+    medians0 = results_df['Group0_Median'].values
+    stds0 = results_df['Group0_Std'].values
     
-    # Customize plot
-    ax.set_yticks(y_pos)
-    ax.set_yticklabels(results_df['Feature'], fontsize=10)
-    ax.set_xlabel("Cohen's d (Effect Size)", fontsize=12)
-    ax.set_title(f"Forest Plot: {selected_feature} vs All {len(target_features)} Features\n"
-                f"Effect Sizes (Cohen's d) with 95% Confidence Intervals", fontsize=14)
+    # Plot median points
+    ax0.scatter(medians0, y_pos, s=100, color='blue', alpha=0.7, label='Median', zorder=3)
     
-    # Add legend
-    red_patch = patches.Patch(color='red', alpha=0.7, label='Significant (p < 0.05)')
-    blue_patch = patches.Patch(color='blue', alpha=0.7, label='Non-significant')
-    ax.legend(handles=[red_patch, blue_patch], loc='upper right')
+    # Plot error bars (std)
+    for i, (median, std) in enumerate(zip(medians0, stds0)):
+        ax0.plot([median - std, median + std], [i, i], 'b-', linewidth=2, alpha=0.7)
+        ax0.plot([median - std, median - std], [i-0.1, i+0.1], 'b-', linewidth=2, alpha=0.7)
+        ax0.plot([median + std, median + std], [i-0.1, i+0.1], 'b-', linewidth=2, alpha=0.7)
+        # Add median value text
+        ax0.text(median, i, f' {median:.2f}', va='center', fontsize=9)
+        # Add std text
+        ax0.text(median + std + (ax0.get_xlim()[1] - ax0.get_xlim()[0]) * 0.05, i, f'σ={std:.2f}', va='center', fontsize=8, alpha=0.7)
     
-    # Add effect size interpretation
-    ax.text(0.02, 0.98, "Effect Size Interpretation:\n"
-                        "|d| < 0.2: Small\n"
-                        "0.2 ≤ |d| < 0.5: Medium\n"
-                        "0.5 ≤ |d| < 0.8: Large\n"
-                        "|d| ≥ 0.8: Very Large",
-            transform=ax.transAxes, fontsize=9, verticalalignment='top',
-            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+    ax0.set_yticks(y_pos)
+    ax0.set_yticklabels(results_df['Feature'], fontsize=10)
+    ax0.set_xlabel(f'{group_name_0}\nMedian ± Std', fontsize=12)
+    ax0.set_title(f'Group 0: {group_name_0}\n(N={results_df["N0"].sum()})', fontsize=12, fontweight='bold')
+    if x_min is not None and x_max is not None:
+        ax0.set_xlim(x_min, x_max)
+    ax0.grid(True, alpha=0.3, axis='x')
+    ax0.invert_yaxis()  # Top to bottom
+    
+    # Column 1: Group 1
+    medians1 = results_df['Group1_Median'].values
+    stds1 = results_df['Group1_Std'].values
+    
+    # Plot median points
+    ax1.scatter(medians1, y_pos, s=100, color='red', alpha=0.7, label='Median', zorder=3)
+    
+    # Plot error bars (std)
+    for i, (median, std) in enumerate(zip(medians1, stds1)):
+        ax1.plot([median - std, median + std], [i, i], 'r-', linewidth=2, alpha=0.7)
+        ax1.plot([median - std, median - std], [i-0.1, i+0.1], 'r-', linewidth=2, alpha=0.7)
+        ax1.plot([median + std, median + std], [i-0.1, i+0.1], 'r-', linewidth=2, alpha=0.7)
+        # Add median value text
+        ax1.text(median, i, f' {median:.2f}', va='center', fontsize=9)
+        # Add std text
+        ax1.text(median + std + (ax1.get_xlim()[1] - ax1.get_xlim()[0]) * 0.05, i, f'σ={std:.2f}', va='center', fontsize=8, alpha=0.7)
+        # Add p-value text
+        p_val = results_df.iloc[i]['P_value']
+        p_color = 'red' if p_val < 0.05 else 'gray'
+        p_text = f'p={p_val:.3f}' if not np.isnan(p_val) else 'p=NaN'
+        ax1.text(ax1.get_xlim()[1] * 0.98, i, p_text, va='center', ha='right', fontsize=9, 
+                color=p_color, fontweight='bold' if p_val < 0.05 else 'normal')
+    
+    ax1.set_yticks(y_pos)
+    ax1.set_yticklabels(results_df['Feature'], fontsize=10)
+    ax1.set_xlabel(f'{group_name_1}\nMedian ± Std', fontsize=12)
+    ax1.set_title(f'Group 1: {group_name_1}\n(N={results_df["N1"].sum()})', fontsize=12, fontweight='bold')
+    if x_min is not None and x_max is not None:
+        ax1.set_xlim(x_min, x_max)
+    ax1.grid(True, alpha=0.3, axis='x')
+    ax1.invert_yaxis()  # Top to bottom
+    
+    # Overall title
+    fig.suptitle(f'Forest Plot: {selected_feature} vs All EEG Features\n'
+                 f'Median ± Std (Group 0 vs Group 1)', fontsize=14, fontweight='bold')
     
     plt.tight_layout()
     
     # Display in Streamlit
-    st.subheader(f"Forest Plot: {selected_feature} vs All Features")
-    st_pyplot_func(fig, filename=f'forest_plot_{selected_feature}_vs_all.png')
+    st.pyplot(fig)
+    plt.close(fig)
     
     # Display summary statistics table
     st.subheader("Summary Statistics")
-    display_df = results_df[['Feature', 'Cohen_d', 'P_value', 'P_corrected', 'Test', 'N1', 'N2']].copy()
-    display_df['Cohen_d'] = display_df['Cohen_d'].round(3)
-    display_df['P_value'] = display_df['P_value'].apply(lambda x: f"{x:.3e}" if not pd.isna(x) else "N/A")
-    display_df['P_corrected'] = display_df['P_corrected'].apply(lambda x: f"{x:.3e}" if not pd.isna(x) else "N/A")
-    display_df.columns = ['Feature', "Cohen's d", 'P-value', 'P-corrected', 'Test', 'N+', 'N-']
+    display_df = results_df[['Feature', 'Group0_Median', 'Group0_Std', 'Group1_Median', 'Group1_Std', 'P_value', 'Test', 'N0', 'N1']].copy()
+    display_df['Group0_Median'] = display_df['Group0_Median'].round(3)
+    display_df['Group0_Std'] = display_df['Group0_Std'].round(3)
+    display_df['Group1_Median'] = display_df['Group1_Median'].round(3)
+    display_df['Group1_Std'] = display_df['Group1_Std'].round(3)
+    display_df['P_value'] = display_df['P_value'].apply(lambda x: f"{x:.4f}" if not pd.isna(x) else "N/A")
+    display_df.columns = ['Feature', f'{group_name_0} Median', f'{group_name_0} Std', 
+                          f'{group_name_1} Median', f'{group_name_1} Std', 'P-value', 'Test', 'N0', 'N1']
     st.dataframe(display_df, use_container_width=True)
-    
-    plt.close(fig)
 
 def longitudinal_analysis(project_name):
     """

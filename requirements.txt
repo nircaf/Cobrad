@@ -29,4 +29,8 @@ edfio
 
 plotly
 pathlib
-python-pptx 
+python-pptx
+xgboost
+lightgbm
+torch
+tensorflow

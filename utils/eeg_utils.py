@@ -386,6 +386,66 @@ def mean_of_resized_arrays(arrays):
     # Compute the mean
     return np.mean(resized_arrays, axis=0)
 
+def rename_channels(raw):
+    try:
+        # remove channels that don't have EEG, ECG, or EOG in their name from raw
+        # raw.drop_channels([channel for channel in raw.ch_names if 'EEG' not in channel])
+        # remove EEG from channel name
+        raw.rename_channels({channel: channel.replace('EEG', '').strip() for channel in raw.ch_names})
+        # all channels that have EEG, their split(' ')[-1] needs to be uppercase first letter, all rest lower case
+        raw.rename_channels({channel: ' '.join([part.capitalize() if i == len(channel.split(' ')) - 1 else part for i, part in enumerate(channel.split(' '))]) if 'EEG' in channel else channel for channel in raw.ch_names})
+        # rename channels based on eeg_utils.eeg_dict_convertion
+        valid_channels = set(raw.info['ch_names'])
+        valid_rename_dict = {k: v for k, v in eeg_dict_convertion.items() if k in valid_channels}
+        # if valid_rename_dict == {}, use the first .split('-')[0] as the channel name if it already exists, use .split('-')[1]
+        if len(valid_rename_dict) == 0:
+            channels_to_remove = []
+            for channel in raw.ch_names:
+                if '-' in channel:
+                    split_0 = channel.split('-')[0]
+                    split_1 = channel.split('-')[1]
+                    existing_values = valid_rename_dict.values()
+                    
+                    # If both exist, remove the channel
+                    if split_0 in existing_values and split_1 in existing_values:
+                        channels_to_remove.append(channel)
+                    # If split[0] exists, use split[1]
+                    elif split_0 in existing_values:
+                        valid_rename_dict[channel] = split_1
+                    # Default: use split[0]
+                    else:
+                        valid_rename_dict[channel] = split_0
+            # Remove channels where both splits already exist
+            if channels_to_remove:
+                raw.drop_channels(channels_to_remove)
+        raw.rename_channels(valid_rename_dict)
+    except:
+        pass
+    for channel in raw.ch_names:
+        if channel.lower() in [ch.lower() for ch in eeg_channels]:
+            raw.set_channel_types({channel: 'eeg'})
+            channel_name = channel
+            if channel.lower().startswith('fp'):
+                # if channel starts with fp (ignore case) capitalize it
+                channel_name = channel_name.capitalize()
+                raw.rename_channels({channel: channel_name})
+            # if channel ends with z (ignore case) lowercase it
+            if channel_name.lower().endswith('z'):
+                # lower the last letter
+                raw.rename_channels({channel_name: channel_name[:-1] + channel_name[-1].lower()})
+        elif channel.lower() in ('eog', 'ecg', 'emg'):
+            if channel.lower() == 'eog':
+                ch_type = 'eog'
+            elif channel.lower() == 'ecg':
+                ch_type = 'ecg'
+            else:
+                ch_type = 'emg'
+            print(f'Setting channel type to {ch_type} for {channel}')
+            raw.set_channel_types({channel: ch_type})
+        else:
+            raw.set_channel_types({channel: 'misc'})
+    return raw
+
 def stat_text_get(group_data, col=None):
     lower_bound = -1e-30
     upper_bound = 1e30
@@ -818,10 +878,178 @@ def annotate_pvals_with_jitter(ax, pval_lines, cleaned_df, col, unique_groups):
 
 from pptx import Presentation
 from pptx.util import Inches
+from pptx.enum.text import PP_ALIGN
 
 # initialize session state pptx only once
 if "pptx" not in st.session_state:
     st.session_state.pptx = Presentation()
+    st.session_state.pptx_sections = []  # Track sections for TOC
+    st.session_state.current_section = None  # Track current section
+
+def _add_title_slide(pptx):
+    """Add a title slide to the presentation."""
+    title_slide_layout = pptx.slide_layouts[0]  # Title slide layout
+    slide = pptx.slides.add_slide(title_slide_layout)
+    title = slide.shapes.title
+    subtitle = slide.placeholders[1]
+    
+    title.text = "EEG Analysis Report"
+    subtitle.text = "Statistical Analysis and Visualization\n" + \
+                   "Generated from Cobrad Pipeline"
+
+def _add_toc_slide(pptx, sections):
+    """Add a table of contents slide."""
+    blank_slide_layout = pptx.slide_layouts[6]  # Blank layout
+    slide = pptx.slides.add_slide(blank_slide_layout)
+    
+    # Add title
+    left = Inches(1)
+    top = Inches(0.5)
+    width = Inches(8)
+    height = Inches(0.8)
+    title_box = slide.shapes.add_textbox(left, top, width, height)
+    title_frame = title_box.text_frame
+    title_frame.text = "Table of Contents"
+    title_para = title_frame.paragraphs[0]
+    title_para.font.size = Inches(0.4)
+    title_para.font.bold = True
+    
+    # Add section list
+    toc_top = Inches(1.5)
+    toc_left = Inches(1)
+    toc_width = Inches(8)
+    
+    for i, section in enumerate(sections, 1):
+        text_box = slide.shapes.add_textbox(toc_left, toc_top + (i-1) * Inches(0.4), toc_width, Inches(0.35))
+        text_frame = text_box.text_frame
+        text_frame.text = f"{i}. {section}"
+        para = text_frame.paragraphs[0]
+        para.font.size = Inches(0.25)
+
+def _get_section_name_from_filename(filename):
+    """Determine section name from filename."""
+    filename_lower = filename.lower()
+    if 'pairplot' in filename_lower:
+        return 'Pair Plot Analysis'
+    elif 'scatterplot' in filename_lower or 'regression' in filename_lower:
+        return 'Scatter Plot with Regression Analysis'
+    elif 'tsne' in filename_lower:
+        return 't-SNE Dimensionality Reduction'
+    elif 'dabest' in filename_lower or 'boxplot' in filename_lower:
+        return 'DABEST Boxplot Comparison'
+    elif 'topomap' in filename_lower:
+        return 'Topographic Map (Topomap) Analysis'
+    elif 'forest_plot' in filename_lower:
+        return 'Forest Plot Meta-Analysis'
+    elif 'average_trajectory' in filename_lower:
+        return 'Average Trajectory Analysis'
+    elif 'longitudinal' in filename_lower:
+        return 'Longitudinal Analysis'
+    elif any(x in filename_lower for x in ['eeg', 'raw', 'channel', 'delta']):
+        return 'EEG Raw Data Visualization'
+    elif 'spectrogram' in filename_lower:
+        return 'Spectrogram Analysis'
+    else:
+        return 'General Analysis'
+
+def _get_section_explanation(section_name):
+    """Get explanation text for each section."""
+    explanations = {
+        'Pair Plot Analysis': 
+            "Pair plots display pairwise relationships between multiple variables. "
+            "Each plot shows scatterplots (lower triangle), histograms (diagonal), "
+            "and optionally correlation coefficients. This helps identify relationships, "
+            "distributions, and potential correlations between clinical and EEG features.",
+        
+        'Scatter Plot with Regression Analysis':
+            "Scatter plots show the relationship between two continuous variables with a regression line. "
+            "R² (R-squared) indicates the proportion of variance explained (0-1, higher is better). "
+            "P-value indicates statistical significance of the relationship. "
+            "Regression lines show the trend: positive slope indicates positive correlation, negative slope indicates negative correlation.",
+        
+        't-SNE Dimensionality Reduction':
+            "t-SNE (t-Distributed Stochastic Neighbor Embedding) reduces high-dimensional data to 2D for visualization. "
+            "Points closer together in the 2D plot are more similar in the original high-dimensional space. "
+            "This helps identify clusters and patterns in complex EEG data. "
+            "Different colors represent different groups for comparison.",
+        
+        'DABEST Boxplot Comparison':
+            "DABEST (Data Analysis with Bootstrap ESTimation) plots show effect sizes between groups using bootstrap confidence intervals. "
+            "Boxplots display median (line), quartiles (box), and outliers. "
+            "The estimation plot shows mean difference with 95% confidence intervals. "
+            "P-values indicate statistical significance (*** p<0.001, ** p<0.01, * p<0.05, ns=not significant). "
+            "Cohen's d effect size: |d|<0.2 (negligible), 0.2-0.5 (small), 0.5-0.8 (medium), >0.8 (large).",
+        
+        'Topographic Map (Topomap) Analysis':
+            "Topomaps show spatial distribution of EEG measures across the scalp. "
+            "Color intensity represents the magnitude of the measure (e.g., power, p-values). "
+            "P-value topomaps show statistical significance: darker colors indicate lower p-values (more significant). "
+            "This visualizes which brain regions show significant differences between groups.",
+        
+        'Forest Plot Meta-Analysis':
+            "Forest plots summarize effect sizes (e.g., Cohen's d) across multiple features. "
+            "Each horizontal line represents a feature's effect size with confidence interval. "
+            "Diamonds show overall effect. Features on the right favor one group, on the left favor the other. "
+            "P-values and corrected p-values (accounting for multiple comparisons) are provided.",
+        
+        'Average Trajectory Analysis':
+            "Shows the average progression of a measure over time across groups. "
+            "Lines represent mean values with confidence intervals. "
+            "R² indicates how well time explains the variance. "
+            "P-values test whether slopes differ significantly between groups.",
+        
+        'Longitudinal Analysis':
+            "Longitudinal plots show individual trajectories over time. "
+            "Each line represents a subject's progression. "
+            "This helps identify individual patterns, variability, and group differences in temporal trends.",
+        
+        'EEG Raw Data Visualization':
+            "Raw EEG data displays show time-series electrical activity from different brain regions (channels). "
+            "Amplitude (y-axis) represents voltage in microvolts, time (x-axis) in seconds. "
+            "Delta power analysis identifies channels/regions with highest/lowest slow-wave activity (0.5-4 Hz), "
+            "which is important for detecting brain states like sleep or pathological slowing.",
+        
+        'Spectrogram Analysis':
+            "Spectrograms show frequency content over time using color intensity. "
+            "X-axis: time, Y-axis: frequency, Color: power/intensity. "
+            "This reveals temporal changes in brain rhythms (delta, theta, alpha, beta, gamma bands).",
+        
+        'General Analysis':
+            "General statistical analyses and visualizations from the EEG processing pipeline."
+    }
+    return explanations.get(section_name, explanations['General Analysis'])
+
+def _add_section_explanation_slide(pptx, section_name):
+    """Add an explanation slide for a section."""
+    blank_slide_layout = pptx.slide_layouts[6]  # Blank layout
+    slide = pptx.slides.add_slide(blank_slide_layout)
+    
+    # Add section title
+    left = Inches(1)
+    top = Inches(0.5)
+    width = Inches(8)
+    height = Inches(0.8)
+    title_box = slide.shapes.add_textbox(left, top, width, height)
+    title_frame = title_box.text_frame
+    title_frame.text = section_name
+    title_para = title_frame.paragraphs[0]
+    title_para.font.size = Inches(0.4)
+    title_para.font.bold = True
+    
+    # Add explanation text
+    explanation_top = Inches(1.5)
+    explanation_left = Inches(1)
+    explanation_width = Inches(8)
+    explanation_height = Inches(5)
+    text_box = slide.shapes.add_textbox(explanation_left, explanation_top, explanation_width, explanation_height)
+    text_frame = text_box.text_frame
+    text_frame.word_wrap = True
+    text_frame.text = _get_section_explanation(section_name)
+    
+    # Format paragraphs
+    for para in text_frame.paragraphs:
+        para.font.size = Inches(0.2)
+        para.space_after = Inches(0.1)
 
 def st_pyplot_func(fig, filename="plot",pval_df=None):
     """Show matplotlib figure in Streamlit, add SVG download,
@@ -845,6 +1073,18 @@ def st_pyplot_func(fig, filename="plot",pval_df=None):
     # --- Initialize pptx in session_state if it doesn't exist ---
     if "pptx" not in st.session_state:
         st.session_state.pptx = Presentation()
+        st.session_state.pptx_sections = []
+        st.session_state.current_section = None
+
+    # --- Detect section change and add explanation slide if needed ---
+    section_name = _get_section_name_from_filename(filename)
+    if section_name != st.session_state.current_section:
+        # New section detected
+        if section_name not in st.session_state.pptx_sections:
+            st.session_state.pptx_sections.append(section_name)
+        # Add explanation slide before the plot
+        _add_section_explanation_slide(st.session_state.pptx, section_name)
+        st.session_state.current_section = section_name
 
     # --- Append PNG to pptx in session_state ---
     png_buffer = io.BytesIO()
@@ -854,13 +1094,28 @@ def st_pyplot_func(fig, filename="plot",pval_df=None):
     slide = st.session_state.pptx.slides.add_slide(
         st.session_state.pptx.slide_layouts[6]  # blank layout
     )
-    slide.shapes.add_picture(png_buffer, Inches(1), Inches(1), height=Inches(5))
+    
+    # Add section label at top of slide
+    left_label = Inches(0.5)
+    top_label = Inches(0.2)
+    width_label = Inches(9)
+    height_label = Inches(0.3)
+    label_box = slide.shapes.add_textbox(left_label, top_label, width_label, height_label)
+    label_frame = label_box.text_frame
+    label_frame.text = section_name
+    label_para = label_frame.paragraphs[0]
+    label_para.font.size = Inches(0.18)
+    label_para.font.italic = True
+    # Use theme default color by not explicitly setting RGB
+    
+    # Add the plot image (adjusted position to account for label)
+    slide.shapes.add_picture(png_buffer, Inches(1), Inches(0.6), height=Inches(5))
     
     # --- Add pval_df as table to the same slide ---
     if pval_df is not None and not pval_df.empty:
         # Position the table below the figure
         table_left = Inches(1)
-        table_top = Inches(6.5)  # Below the figure
+        table_top = Inches(6.3)  # Adjusted for label
         table_width = Inches(8)
         table_height = Inches(1.5)
         
@@ -884,10 +1139,98 @@ def st_pyplot_func(fig, filename="plot",pval_df=None):
                     table.cell(i, j).text_frame.paragraphs[0].font.bold = True
 
 
+def _copy_slide_shapes(source_slide, target_slide):
+    """Copy all shapes from source slide to target slide."""
+    try:
+        from pptx.shapes.picture import Picture
+        PictureClass = Picture
+    except ImportError:
+        PictureClass = None
+    
+    for shape in source_slide.shapes:
+        try:
+            # Check if it's a picture shape
+            is_picture = (PictureClass and isinstance(shape, PictureClass)) or \
+                        (hasattr(shape, 'image') and hasattr(shape.image, 'blob'))
+            if is_picture:
+                # Copy image
+                img_stream = io.BytesIO(shape.image.blob)
+                left = shape.left
+                top = shape.top
+                width = shape.width
+                height = shape.height
+                target_slide.shapes.add_picture(img_stream, left, top, width, height)
+            elif hasattr(shape, 'table'):
+                # Copy table
+                left = shape.left
+                top = shape.top
+                width = shape.width
+                height = shape.height
+                table_data = []
+                for row in shape.table.rows:
+                    row_data = []
+                    for cell in row.cells:
+                        row_data.append(cell.text)
+                    table_data.append(row_data)
+                if table_data:
+                    new_table = target_slide.shapes.add_table(
+                        len(table_data), len(table_data[0]),
+                        left, top, width, height
+                    ).table
+                    for i, row_data in enumerate(table_data):
+                        for j, cell_text in enumerate(row_data):
+                            new_table.cell(i, j).text = str(cell_text)
+                            if i == 0:
+                                new_table.cell(i, j).text_frame.paragraphs[0].font.bold = True
+            elif hasattr(shape, 'text_frame'):
+                # Copy text box
+                left = shape.left
+                top = shape.top
+                width = shape.width
+                height = shape.height
+                text_box = target_slide.shapes.add_textbox(left, top, width, height)
+                text_frame = text_box.text_frame
+                text_frame.text = shape.text_frame.text
+                # Copy formatting for first paragraph
+                if shape.text_frame.paragraphs:
+                    source_para = shape.text_frame.paragraphs[0]
+                    if text_frame.paragraphs:
+                        text_frame.paragraphs[0].font.size = source_para.font.size
+                        text_frame.paragraphs[0].font.bold = source_para.font.bold
+                        text_frame.paragraphs[0].font.italic = source_para.font.italic
+        except Exception:
+            # Skip shapes that can't be copied
+            continue
+
 def download_pptx_button(label="Download all plots as PPTX"):
     """Provide a Streamlit button to download the aggregated PPTX."""
+    # Ensure pptx and sections are initialized
+    if "pptx" not in st.session_state:
+        st.session_state.pptx = Presentation()
+        st.session_state.pptx_sections = []
+    
+    # Create a new presentation with title, TOC, and then all existing slides
+    final_pptx = Presentation()
+    
+    # Add title slide
+    _add_title_slide(final_pptx)
+    
+    # Add TOC slide if we have sections
+    if st.session_state.pptx_sections:
+        _add_toc_slide(final_pptx, st.session_state.pptx_sections)
+    
+    # Copy all slides from original presentation
+    for source_slide in st.session_state.pptx.slides:
+        # Create blank slide in target presentation
+        blank_slide_layout = final_pptx.slide_layouts[6]  # Blank layout
+        target_slide = final_pptx.slides.add_slide(blank_slide_layout)
+        
+        # Copy all shapes from source to target
+        _copy_slide_shapes(source_slide, target_slide)
+    
+    # Save to buffer
     pptx_buffer = io.BytesIO()
-    st.session_state.pptx.save(pptx_buffer)
+    final_pptx.save(pptx_buffer)
     pptx_buffer.seek(0)
 
     st.sidebar.download_button(
@@ -1166,21 +1509,195 @@ def find_consecutive_sequences(events, min_duration_sec=5):
     return sequences
 
 def read_edf_mne(file_path):
-    raw = mne.io.read_raw_edf(file_path, preload=True, encoding='latin1')
-    metadata = {
-        'file_name': os.path.basename(file_path),
-        'start_date': raw.info['meas_date'],
-        'duration_sec': raw.times[-1],
-        'duration_min': raw.times[-1] / 60,
-        'number_of_signals': len(raw.ch_names),
-        'signal_labels': raw.ch_names,
-        'sampling_frequency': raw.info['sfreq'],
-        'highpass': raw.info['highpass'],
-        'lowpass': raw.info['lowpass'],
-        'annotations': raw.annotations if raw.annotations else None,
-        'n_samples': raw.n_times,
-        'bad_channels': raw.info['bads']
-    }
+    """
+    Read EDF file using MNE with error handling for malformed files.
+    Tries multiple approaches if the default fails.
+    """
+    # Try different approaches to read the EDF file
+    read_attempts = [
+        # Attempt 1: Default with latin1 encoding
+        {'preload': True, 'encoding': 'latin1', 'verbose': False},
+        # Attempt 2: Without preload first, then load
+        {'preload': False, 'encoding': 'latin1', 'verbose': False},
+        # Attempt 3: Try without encoding specification
+        {'preload': True, 'verbose': False},
+        # Attempt 4: Try with preload=False and no encoding
+        {'preload': False, 'verbose': False},
+        # Attempt 5: Try with exclude parameter to skip problematic channels
+        {'preload': True, 'encoding': 'latin1', 'exclude': [], 'verbose': False},
+        # Attempt 6: Try with stim_channel=None (for EDF files without stim channels)
+        {'preload': True, 'encoding': 'latin1', 'stim_channel': None, 'verbose': False},
+        # Attempt 7: Try with exclude and stim_channel=None
+        {'preload': True, 'encoding': 'latin1', 'exclude': [], 'stim_channel': None, 'verbose': False},
+    ]
+    
+    raw = None
+    last_error = None
+    int_conversion_error = False
+    
+    for i, params in enumerate(read_attempts):
+        try:
+            raw = mne.io.read_raw_edf(file_path, **params)
+            # If preload was False, load the data now
+            if not params.get('preload', True):
+                raw.load_data()
+            # Success - break out of loop
+            break
+        except Exception as e:
+            last_error = e
+            error_str = str(e)
+            error_repr = repr(e)
+            error_type = type(e).__name__
+            # Check for the specific empty string to int error in multiple ways
+            is_int_error = (
+                "invalid literal for int()" in error_str or 
+                "base 10" in error_str or 
+                "''" in error_str or
+                "invalid literal for int()" in error_repr or
+                "base 10" in error_repr or
+                "''" in error_repr or
+                (isinstance(e, ValueError) and ("int()" in error_str or "base 10" in error_str))
+            )
+            
+            if is_int_error:
+                int_conversion_error = True
+                print(f"Warning: MNE attempt {i+1} failed with int conversion error for {os.path.basename(file_path)}: {error_str}")
+                print(f"  Trying pyedflib as alternative reading method...")
+                # Try using pyedflib as fallback immediately when we detect this error
+                try:
+                    import pyedflib
+                    # Read with pyedflib and convert to MNE format
+                    edf = pyedflib.EdfReader(file_path)
+                    n_channels = edf.signals_in_file
+                    ch_names = [edf.getSignalLabel(i) for i in range(n_channels)]
+                    sfreqs = [edf.getSampleFrequency(i) for i in range(n_channels)]
+                    # Use the most common sampling frequency, or first one if all same
+                    sfreq = sfreqs[0] if sfreqs else 256
+                    if len(set(sfreqs)) > 1:
+                        # If different sampling rates, use the most common one
+                        from collections import Counter
+                        sfreq = Counter(sfreqs).most_common(1)[0][0]
+                    
+                    # Get data
+                    data = np.array([edf.readSignal(i) for i in range(n_channels)])
+                    # Create MNE info - use 'misc' for unknown channel types
+                    ch_types = ['misc'] * n_channels
+                    info = mne.create_info(ch_names=ch_names, sfreq=sfreq, ch_types=ch_types)
+                    # Create Raw object
+                    raw = mne.io.RawArray(data, info)
+                    edf.close()
+                    print(f"Successfully read file using pyedflib fallback")
+                    break
+                except ImportError:
+                    print("pyedflib not available for fallback reading")
+                    # Continue with next MNE attempt if pyedflib not available
+                    if i < len(read_attempts) - 1:
+                        continue
+                except Exception as fallback_error:
+                    print(f"pyedflib fallback also failed: {fallback_error}")
+                    # Continue with next MNE attempt if pyedflib fails
+                    if i < len(read_attempts) - 1:
+                        continue
+            else:
+                # For non-int errors, continue with next attempt or re-raise on last attempt
+                if i < len(read_attempts) - 1:
+                    print(f"Warning: Attempt {i+1} failed for {os.path.basename(file_path)}: {error_str}")
+                    continue
+                else:
+                    # Last attempt failed, try pyedflib as final fallback
+                    print(f"Warning: All MNE attempts failed. Trying pyedflib as final fallback...")
+                    try:
+                        import pyedflib
+                        # Read with pyedflib and convert to MNE format
+                        edf = pyedflib.EdfReader(file_path)
+                        n_channels = edf.signals_in_file
+                        ch_names = [edf.getSignalLabel(i) for i in range(n_channels)]
+                        sfreqs = [edf.getSampleFrequency(i) for i in range(n_channels)]
+                        # Use the most common sampling frequency, or first one if all same
+                        sfreq = sfreqs[0] if sfreqs else 256
+                        if len(set(sfreqs)) > 1:
+                            # If different sampling rates, use the most common one
+                            from collections import Counter
+                            sfreq = Counter(sfreqs).most_common(1)[0][0]
+                        
+                        # Get data
+                        data = np.array([edf.readSignal(i) for i in range(n_channels)])
+                        # Create MNE info - use 'misc' for unknown channel types
+                        ch_types = ['misc'] * n_channels
+                        info = mne.create_info(ch_names=ch_names, sfreq=sfreq, ch_types=ch_types)
+                        # Create Raw object
+                        raw = mne.io.RawArray(data, info)
+                        edf.close()
+                        print(f"Successfully read file using pyedflib fallback")
+                        break
+                    except ImportError:
+                        print("pyedflib not available for fallback reading")
+                    except Exception as fallback_error:
+                        print(f"pyedflib fallback also failed: {fallback_error}")
+                    # Re-raise the original error if pyedflib also fails
+                    raise
+    
+    # If all attempts failed, raise the last error with context
+    if raw is None:
+        error_msg = f"Failed to read EDF file {file_path} after multiple attempts."
+        if last_error:
+            error_msg += f" Last error: {last_error}"
+        raise ValueError(error_msg)
+    
+    # Try to create metadata from raw object
+    try:
+        metadata = {
+            'file_name': os.path.basename(file_path),
+            'start_date': raw.info['meas_date'],
+            'duration_sec': raw.times[-1],
+            'duration_min': raw.times[-1] / 60,
+            'number_of_signals': len(raw.ch_names),
+            'signal_labels': raw.ch_names,
+            'sampling_frequency': raw.info['sfreq'],
+            'highpass': raw.info['highpass'],
+            'lowpass': raw.info['lowpass'],
+            'annotations': raw.annotations if raw.annotations else None,
+            'n_samples': raw.n_times,
+            'bad_channels': raw.info['bads']
+        }
+    except Exception as e:
+        # If metadata creation fails, create minimal metadata and warn
+        print(f"Warning: Could not extract full metadata from {os.path.basename(file_path)}: {e}")
+        print(f"  Creating minimal metadata...")
+        try:
+            metadata = {
+                'file_name': os.path.basename(file_path),
+                'number_of_signals': len(raw.ch_names) if hasattr(raw, 'ch_names') else 0,
+                'signal_labels': raw.ch_names if hasattr(raw, 'ch_names') else [],
+                'sampling_frequency': raw.info['sfreq'] if hasattr(raw, 'info') and 'sfreq' in raw.info else None,
+                'n_samples': raw.n_times if hasattr(raw, 'n_times') else None,
+            }
+            # Try to get other fields with defaults
+            if hasattr(raw, 'times') and len(raw.times) > 0:
+                metadata['duration_sec'] = raw.times[-1]
+                metadata['duration_min'] = raw.times[-1] / 60
+            else:
+                metadata['duration_sec'] = None
+                metadata['duration_min'] = None
+            
+            if hasattr(raw, 'info'):
+                metadata['start_date'] = raw.info.get('meas_date', None)
+                metadata['highpass'] = raw.info.get('highpass', None)
+                metadata['lowpass'] = raw.info.get('lowpass', None)
+                metadata['bad_channels'] = raw.info.get('bads', [])
+            else:
+                metadata['start_date'] = None
+                metadata['highpass'] = None
+                metadata['lowpass'] = None
+                metadata['bad_channels'] = []
+            
+            metadata['annotations'] = raw.annotations if hasattr(raw, 'annotations') and raw.annotations else None
+        except Exception as e2:
+            # If even minimal metadata fails, raise an error
+            error_msg = f"Failed to extract metadata from EDF file {file_path} after reading."
+            error_msg += f" Reading succeeded but metadata extraction failed: {e2}"
+            raise ValueError(error_msg) from e2
+    
     return metadata, raw
 
 def eeg_data_to_features(raw, window_size_sec=5, min_duration_sec=5):
@@ -1275,6 +1792,11 @@ def eeg_data_to_features(raw, window_size_sec=5, min_duration_sec=5):
         else:
             durations = []
             events_per_minute = {}
+            pswe_stats.append({
+                'pswe_percentage': 0,
+                'pswe_events_per_minute': 0,
+                'pswe_avg_length': 0,
+            })
             continue
 
         pswe_total = sum(durations)
@@ -1395,12 +1917,15 @@ def eeg_data_to_features(raw, window_size_sec=5, min_duration_sec=5):
             f'kurtosis_EEG {ch}': kurt[i],
             f'mean_mpf_EEG {ch}': mpf_arr[i].mean(),
             f'median_mpf_EEG {ch}': np.median(mpf_arr[i]),
-            f'pswe_percentage_EEG {ch}': pswe_stats[i]['pswe_percentage'],
-            f'pswe_events_per_minute_EEG {ch}': pswe_stats[i]['pswe_events_per_minute'],
-            f'pswe_avg_length_EEG {ch}': pswe_stats[i]['pswe_avg_length'],
             f'dfv_mean_EEG {ch}': df_arr[i].mean(),
             f'dfv_std_EEG {ch}': dfv_arr[i]
         })
+        if pswe_stats:
+            meta.update({
+                f'pswe_percentage_EEG {ch}': pswe_stats[i]['pswe_percentage'],
+                f'pswe_events_per_minute_EEG {ch}': pswe_stats[i]['pswe_events_per_minute'],
+                f'pswe_avg_length_EEG {ch}': pswe_stats[i]['pswe_avg_length'],
+            })
     return meta, conn_df
 
 def process_file_2(file, pickles_location, sample_window_size):
@@ -1761,8 +2286,15 @@ def generic_get_files(project_name: str):
                 if matched_rows:
                     df_merged = pd.concat([clinical_df.reset_index(drop=True), df_parquet.loc[matched_rows].reset_index(drop=True)], axis=1, ignore_index=False)
 
+    if project_name == "reading_epilepsy_cut":
+        pre_df, post_df, pairing_info = load_pre_post_data(project_name)
+        df_wnv2 = pd.concat([post_df], ignore_index=True)
+    # Controls: generic loader doesn't have controls; return empty DataFrame
+    controls = get_cobrad_controls()
+    cases_group_name = project_name
     # assess if df_merged is empty
     if df_merged.empty:
+        return df_parquet, patients_folder, controls, df_wnv2, cases_group_name
         raise ValueError(f"No matching IDs found between clinical and parquet data")
     df_wnv2 = aggregate_dataframe(df_merged, weighted_avg)
     # Create grouped/aggregated df (df_wnv2) similar to other loaders
@@ -1779,12 +2311,218 @@ def generic_get_files(project_name: str):
                 df_wnv2[col] = pd.to_numeric(df_wnv2[col])
             except Exception:
                 pass
-    
-    # Controls: generic loader doesn't have controls; return empty DataFrame
-    controls = get_cobrad_controls()
-    cases_group_name = project_name
     return df_parquet, patients_folder, controls, df_wnv2, cases_group_name
     df_merged.columns.unique().tolist()
+
+def get_patient_groups(dataset="reading_epilepsy_cut"):
+    """Get patient group assignments from EDF_Format folder structure."""
+    patient_groups = {}
+    
+    if dataset == "reading_epilepsy_cut":
+        edf_dir = "EDF_Format/reading_epilepsy_cut"
+        if os.path.exists(edf_dir):
+            # Walk through patient folders
+            for root, dirs, files in os.walk(edf_dir):
+                # Get patient group name from folder
+                if root != edf_dir:  # Skip the root directory
+                    patient_group = os.path.basename(root)
+                    
+                    # Process EDF files in this patient group
+                    for file in files:
+                        if file.endswith('.edf'):
+                            # Extract patient ID from filename (before first underscore)
+                            patient_id = file.split('_')[0]
+                            patient_groups[patient_id] = patient_group
+    
+    return patient_groups
+
+def load_pre_post_data(dataset="VNS_PRE_POST_25", analysis_level="Per Patient (averaged)"):
+    """Load pre and post data from parquet files and determine group membership from EDF directory structure."""
+    
+    # Load all parquet files
+    parquet_dir = f"parquet_results/{dataset}"
+    parquet_files = glob.glob(os.path.join(parquet_dir, "*.parquet"))
+    
+    pre_data = []
+    post_data = []
+    
+    if dataset == "reading_epilepsy_cut":
+        # Get patient group assignments from EDF_Format folder structure
+        patient_groups = get_patient_groups(dataset)
+        print(f"Patient groups: {patient_groups}")
+        
+        # Special handling for reading_epilepsy_cut dataset
+        for parquet_file in parquet_files:
+            try:
+                # Extract filename without extension
+                filename = os.path.basename(parquet_file).replace('.edf.parquet', '')
+                
+                # Load parquet data
+                df = pd.read_parquet(parquet_file)
+                
+                # Determine group and subject from filename
+                # Format: BA0012UZ_reading.edf.parquet or BA0012UZ_non_reading.edf.parquet
+                if '_non_reading' in filename:
+                    group = "PRE"   # non_reading = pre (before reading)
+                    subject_id = filename.replace('_non_reading', '')
+                elif '_reading' in filename:
+                    group = "POST"  # reading = post (after reading)
+                    subject_id = filename.replace('_reading', '')
+                else:
+                    continue  # Skip files that don't match the pattern
+                
+                # Extract patient ID and get patient group
+                patient_id = subject_id.split('_')[0]
+                patient_group = patient_groups.get(patient_id, 'Unknown')
+                
+                # Add group label and patient information
+                df['Group'] = group
+                df['Subject_ID'] = subject_id
+                df['Patient_ID'] = patient_id
+                df['Patient_Group'] = patient_group
+                
+                if group == "POST":
+                    post_data.append(df)
+                else:
+                    pre_data.append(df)
+                    
+            except Exception as e:
+                st.warning(f"Could not load {parquet_file}: {e}")
+                continue
+    else:
+        # Original logic for VNS_PRE_POST_25 dataset
+        file_map = {}
+        # EDF directory structure for determining pre/post
+        edf_base_dir = f"EDF_Format/{dataset}"
+        
+        for parquet_file in parquet_files:
+            try:
+                # Extract filename without extension
+                filename = os.path.basename(parquet_file).replace('.edf.parquet', '')
+                
+                # Load parquet data
+                df = pd.read_parquet(parquet_file)
+                
+                # Determine if this is pre or post based on EDF directory structure
+                # Build a mapping from filename to (group, Subject_ID) for all files in edf_base_dir
+                    
+                for root, dirs, files in os.walk(edf_base_dir):
+                    for file in files:
+                        if filename in file:
+                            key = file.split('.')[0]  # Remove extension for matching
+                            group = root.split(os.sep)[-1].upper()
+                            subject_id = root.split(os.sep)[-2]
+                            file_map[key] = (group, subject_id)
+                            print(f"Mapping file {key} to group {group}, subject {subject_id}. Filename: {filename}, file: {file}")
+                            break
+                    # if key in file_map:
+                    if filename in file_map:
+                        break
+                load_pre_post_data._file_map = file_map
+
+                # Try to match filename in the file_map
+                group_subject = file_map.get(filename, (False, None))
+                is_post, Subject_ID = group_subject
+                
+                # Add group label
+                df['Group'] = is_post
+                df['Subject_ID'] = Subject_ID
+                
+                if is_post == "POST":
+                    post_data.append(df)
+                else:
+                    pre_data.append(df)
+                # print how many in pre and post
+            except Exception as e:
+                st.warning(f"Could not load {parquet_file}: {e}")
+                continue
+    print(f"Loaded {len(pre_data)} PRE and {len(post_data)} POST files so far.")
+    if not pre_data and not post_data:
+        st.error("No data found!")
+        return None, None, None
+    
+    pre_df = pd.concat(pre_data, ignore_index=True) if pre_data else pd.DataFrame()
+    post_df = pd.concat(post_data, ignore_index=True) if post_data else pd.DataFrame()
+    
+    # Apply averaging based on analysis level
+    if analysis_level == "Per Patient (averaged)" and dataset == "reading_epilepsy_cut":
+        # For per-patient analysis, average by Patient_Group instead of Subject_ID
+        if len(pre_df) > 0:
+            numeric_cols = pre_df.select_dtypes(include=np.number).columns.tolist()
+            non_numeric_cols = [col for col in pre_df.columns if col not in numeric_cols and col not in ['Subject_ID', 'Patient_ID', 'Patient_Group']]
+            pre_df = pre_df.groupby('Patient_Group').agg({**{col: 'mean' for col in numeric_cols}, **{col: 'first' for col in non_numeric_cols}}).reset_index()
+            # Use Patient_Group as Subject_ID for consistency
+            pre_df['Subject_ID'] = pre_df['Patient_Group']
+            
+        if len(post_df) > 0:
+            numeric_cols = post_df.select_dtypes(include=np.number).columns.tolist()
+            non_numeric_cols = [col for col in post_df.columns if col not in numeric_cols and col not in ['Subject_ID', 'Patient_ID', 'Patient_Group']]
+            post_df = post_df.groupby('Patient_Group').agg({**{col: 'mean' for col in numeric_cols}, **{col: 'first' for col in non_numeric_cols}}).reset_index()
+            # Use Patient_Group as Subject_ID for consistency
+            post_df['Subject_ID'] = post_df['Patient_Group']
+    elif analysis_level == "All Samples (mixed paired/non-paired)":
+        # For mixed analysis, average by Subject_ID but keep all samples
+        # Multiple scans per patient will be averaged per Subject_ID
+        if len(pre_df) > 0:
+            numeric_cols = pre_df.select_dtypes(include=np.number).columns.tolist()
+            non_numeric_cols = [col for col in pre_df.columns if col not in numeric_cols and col != 'Subject_ID']
+            pre_df = pre_df.groupby('Subject_ID').agg({**{col: 'mean' for col in numeric_cols}, **{col: 'first' for col in non_numeric_cols}}).reset_index()
+        if len(post_df) > 0:
+            numeric_cols = post_df.select_dtypes(include=np.number).columns.tolist()
+            non_numeric_cols = [col for col in post_df.columns if col not in numeric_cols and col != 'Subject_ID']
+            post_df = post_df.groupby('Subject_ID').agg({**{col: 'mean' for col in numeric_cols}, **{col: 'first' for col in non_numeric_cols}}).reset_index()
+    else:
+        # Original logic: mean over Subject_ID for numeric columns, first for non-numeric columns
+        if len(pre_df) > 0:
+            numeric_cols = pre_df.select_dtypes(include=np.number).columns.tolist()
+            non_numeric_cols = [col for col in pre_df.columns if col not in numeric_cols and col != 'Subject_ID']
+            pre_df = pre_df.groupby('Subject_ID').agg({**{col: 'mean' for col in numeric_cols}, **{col: 'first' for col in non_numeric_cols}}).reset_index()
+        if len(post_df) > 0:
+            numeric_cols = post_df.select_dtypes(include=np.number).columns.tolist()
+            non_numeric_cols = [col for col in post_df.columns if col not in numeric_cols and col != 'Subject_ID']
+            post_df = post_df.groupby('Subject_ID').agg({**{col: 'mean' for col in numeric_cols}, **{col: 'first' for col in non_numeric_cols}}).reset_index()
+    # Find patients with both PRE and POST data
+    pre_subjects = set(pre_df['Subject_ID'].unique()) if len(pre_df) > 0 else set()
+    post_subjects = set(post_df['Subject_ID'].unique()) if len(post_df) > 0 else set()
+    paired_subjects = pre_subjects.intersection(post_subjects)
+    unpaired_pre_subjects = pre_subjects - post_subjects
+    unpaired_post_subjects = post_subjects - pre_subjects
+    
+    # Handle different analysis levels
+    if analysis_level == "All Samples (mixed paired/non-paired)":
+        # Return all data: paired and unpaired
+        # Sort by Subject_ID for consistency
+        pre_df = pre_df.sort_values('Subject_ID').reset_index(drop=True)
+        post_df = post_df.sort_values('Subject_ID').reset_index(drop=True)
+        
+        # Create a combined info dict to track paired/unpaired status
+        pairing_info = {
+            'paired': paired_subjects,
+            'unpaired_pre': unpaired_pre_subjects,
+            'unpaired_post': unpaired_post_subjects,
+            'total_pre': len(pre_df),
+            'total_post': len(post_df),
+            'paired_count': len(paired_subjects),
+            'unpaired_pre_count': len(unpaired_pre_subjects),
+            'unpaired_post_count': len(unpaired_post_subjects)
+        }
+        
+        print(f'Mixed analysis - Paired: {len(paired_subjects)}, Unpaired PRE: {len(unpaired_pre_subjects)}, Unpaired POST: {len(unpaired_post_subjects)}')
+        return pre_df, post_df, pairing_info
+    else:
+        # Original behavior: filter to only include paired subjects
+        if len(paired_subjects) > 0:
+            pre_paired = pre_df[pre_df['Subject_ID'].isin(paired_subjects)].copy()
+            post_paired = post_df[post_df['Subject_ID'].isin(paired_subjects)].copy()
+            
+            # Sort by Subject_ID to ensure proper pairing
+            pre_paired = pre_paired.sort_values('Subject_ID').reset_index(drop=True)
+            post_paired = post_paired.sort_values('Subject_ID').reset_index(drop=True)
+            print(f'len pre_paired: {len(pre_paired)}, len post_paired: {len(post_paired)}')
+            return pre_paired, post_paired, paired_subjects
+        else:
+            st.warning("No patients found with both PRE and POST data!")
+            return None, None, None
 
 def aggregate_dataframe(df_merged, weighted_avg):
     """
@@ -3564,12 +4302,28 @@ def hep_run(temp_dir='temps_EDF_HEP', bands=None, step_sec=5, save_plot=False, s
             step_sec=step_sec,
             is_streamlit=is_streamlit
         )
+        
+def raise_error(error, context=""):
+    """
+    Helper function to raise errors with optional context information.
+    
+    Parameters
+    ----------
+    error : Exception
+        The exception to raise
+    context : str
+        Additional context information for debugging
+    """
+    if context:
+        print(f"Error context: {context}")
+    raise error
 
 # if name == main
 if __name__ == '__main__':
     # Example usage
+    pass
     # tga_get_files()
-    get_controls_ages_genders('temps_Controls_EDF')
+    # get_controls_ages_genders('temps_Controls_EDF')
     # detect_sleep('EDF', save_sleep_only=True)
     # read_pkl_files('pickles/wake_EDF')
 

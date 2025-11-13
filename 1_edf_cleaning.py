@@ -2,7 +2,10 @@ import os
 from collections import defaultdict
 import pandas as pd
 import sys
-import pyedflib
+try:
+    import pyedflib
+except ImportError:
+    pyedflib = None  # Optional dependency
 import numpy as np
 import warnings
 import mne
@@ -56,16 +59,7 @@ getcwd = os.getcwd()
 
 #%% INITIALIZATION
 # Parse command line arguments
-
-parser = argparse.ArgumentParser(description='EDF Cleaning Script')
-parser.add_argument('-c', '--cases_project_name', type=str, default=None,
-                    help='Name of the cases project, e.g., Seeg')
-args = parser.parse_args()
-
-# Get cases_project_name from CLI or use default
-cases_project_name = args.cases_project_name
-if not cases_project_name:
-    cases_project_name = 'sleep_controls' # 'Controls' #'Seeg' #'CAP_Sleep_Database/CAP_Sleep_Database'
+cases_project_name = 'Pre-Post_XCOPRI' # 'Controls' #'Seeg' #'CAP_Sleep_Database/CAP_Sleep_Database'
 
 edf_dir = 'EDF_Format'
 # Where to load the data from 
@@ -295,33 +289,90 @@ def plot_not_prod(raw,is_prod,filename):
         fig.savefig(f'figures/data_cleaning/{filename}.png')
         plt.close(fig)
 
-def analyze_eeg_data(raw,is_prod,filename):
-    raw_copy = raw.copy()
-    # raw = raw_copy.copy()
-    # Step 1: Preprocessing with PyPrep
+
+
+def manual_epoch_rejection(epochs, filename):
+    """
+    Manual epoch rejection when AutoReject fails.
+    
+    Parameters
+    ----------
+    epochs : mne.Epochs
+        Epochs to clean
+    filename : str
+        Filename for debugging
+        
+    Returns
+    -------
+    mne.Epochs
+        Cleaned epochs
+    """
+    print(f'[{filename}] Applying manual epoch rejection...')
+    
+    # Get epoch data
+    epochs_data = epochs.get_data()  # Shape: (n_epochs, n_channels, n_times)
+    n_epochs, n_channels, n_times = epochs_data.shape
+    
+    # Calculate rejection criteria using standard deviations
+    # 1. Amplitude-based rejection (channels with extreme values)
+    max_amplitudes = np.max(np.abs(epochs_data), axis=2)  # Max amplitude per epoch per channel
+    amp_mean = np.mean(max_amplitudes)
+    amp_std = np.std(max_amplitudes)
+    amplitude_threshold = amp_mean + 3 * amp_std  # 3 SD above mean
+    
+    # 2. Variance-based rejection (channels with very low or very high variance)
+    epoch_variances = np.var(epochs_data, axis=2)  # Variance per epoch per channel
+    var_mean = np.mean(epoch_variances)
+    var_std = np.std(epoch_variances)
+    var_low_threshold = var_mean - 3 * var_std  # 3 SD below mean
+    var_high_threshold = var_mean + 3 * var_std  # 3 SD above mean
+    
+    # 3. Gradient-based rejection (channels with sudden jumps)
+    gradients = np.diff(epochs_data, axis=2)  # Time derivative
+    max_gradients = np.max(np.abs(gradients), axis=2)  # Max gradient per epoch per channel
+    grad_mean = np.mean(max_gradients)
+    grad_std = np.std(max_gradients)
+    gradient_threshold = grad_mean + 3 * grad_std  # 3 SD above mean
+    
+    # Find bad epochs
+    bad_epochs = []
+    for epoch_idx in range(n_epochs):
+        epoch_bad = False
+        
+        # Check amplitude
+        if np.any(max_amplitudes[epoch_idx] > amplitude_threshold):
+            epoch_bad = True
+            
+        # Check variance
+        if np.any(epoch_variances[epoch_idx] < var_low_threshold) or \
+           np.any(epoch_variances[epoch_idx] > var_high_threshold):
+            epoch_bad = True
+            
+        # Check gradient
+        if np.any(max_gradients[epoch_idx] > gradient_threshold):
+            epoch_bad = True
+            
+        if epoch_bad:
+            bad_epochs.append(epoch_idx)
+    
+    print(f'[{filename}] Rejecting {len(bad_epochs)}/{n_epochs} epochs ({len(bad_epochs)/n_epochs*100:.1f}%)')
+    
+    # Create good epochs mask
+    good_epochs_mask = np.ones(n_epochs, dtype=bool)
+    good_epochs_mask[bad_epochs] = False
+    
+    # Return cleaned epochs
+    if np.sum(good_epochs_mask) == 0:
+        print(f'[{filename}] Warning: All epochs rejected! Using original epochs.')
+        return epochs
+    else:
+        return epochs[good_epochs_mask]
+
+
+
+def clean_mne_raw(raw,filename):
     channels = raw.ch_names
-    try:
-        # remove channels that don't have EEG, ECG, or EOG in their name from raw
-        # raw.drop_channels([channel for channel in raw.ch_names if 'EEG' not in channel])
-        # remove EEG from channel name
-        raw.rename_channels({channel: channel.replace('EEG', '').strip() for channel in raw.ch_names})
-        # all channels that have EEG, their split(' ')[-1] needs to be uppercase first letter, all rest lower case
-        raw.rename_channels({channel: ' '.join([part.capitalize() if i == len(channel.split(' ')) - 1 else part for i, part in enumerate(channel.split(' '))]) if 'EEG' in channel else channel for channel in raw.ch_names})
-        # rename channels based on eeg_utils.eeg_dict_convertion
-        valid_channels = set(raw.info['ch_names'])
-        valid_rename_dict = {k: v for k, v in eeg_utils.eeg_dict_convertion.items() if k in valid_channels}
-        raw.rename_channels(valid_rename_dict)
-    except:
-        pass
-    for channel in raw.ch_names:
-        if channel in eeg_utils.eeg_channels:
-            raw.set_channel_types({channel: 'eeg'})
-        elif channel == 'eog':
-            raw.set_channel_types({channel: 'eog'})
-        elif channel == 'ecg':
-            raw.set_channel_types({channel: 'ecg'})
-        else:
-            raw.set_channel_types({channel: 'misc'})
+    raw = rename_channels(raw)
     plot_not_prod(raw,is_prod,'pre_clean1')
     # Clean data
     # Filter the data
@@ -330,38 +381,106 @@ def analyze_eeg_data(raw,is_prod,filename):
     picks = mne.pick_types(raw.info, eeg=True, exclude='bads')
     if len(picks) == 0:
         print('No EEG channels found after picking. Skipping this file.')
-        return {},{}
+        raise
     raw.filter(l_freq=.5, h_freq=nyquist_freq - 0.1, picks=picks)
     raw.notch_filter(np.arange(50, nyquist_freq, 50), filter_length='auto', phase='zero', picks=picks)
     plot_not_prod(raw,is_prod,'filter2')
     # picks = mne.pick_types(raw.info, meg=False, eeg=True, stim=False, eog=False)
     # raw.pick(picks)
-    # Initialize the PrepPipeline
+    # Initialize the PrepPipeline with fallback
     prep_params = {
         "ref_chs": "eeg",
         "reref_chs": "eeg",
         "line_freqs": np.arange(50, nyquist_freq, 50),
     }
-    prep = PrepPipeline(raw, prep_params, montage="standard_1020",ransac=False)
+    
     try:
-        with suppress_stdout():
-            prep.fit()  # Run the pipeline without writing to console
+        prep = PrepPipeline(raw, prep_params, montage="standard_1020", ransac=False)
+        prep.fit()  # Run the pipeline without writing to console
+        plot_not_prod(prep.raw, is_prod, 'PrepPipeline4')
+        raw = prep.raw  # Get cleaned data
+        
+        # Interpolate bad channels (only if digitization info is available)
+        try:
+            raw.interpolate_bads()
+        except RuntimeError as e:
+            if "digitization" in str(e).lower() or "headshape" in str(e).lower():
+                print(f'Cannot interpolate bad channels (no digitization info): {e}')
+                print('Dropping bad channels instead...')
+                # Drop bad channels instead of interpolating
+                if len(raw.info['bads']) > 0:
+                    raw.drop_channels(raw.info['bads'])
+            else:
+                raise_error(e, f"Unexpected interpolation error for {filename}")
     except Exception as e:
-        print(f'Error in PrepPipeline: {e}')
-        return {},{}
-    plot_not_prod(prep.raw,is_prod,'PrepPipeline4')
-    raw = prep.raw  # Get cleaned data
-    raw.interpolate_bads()
-    # raw.preload
+        print(f'--------------------------------------------------')
+        print(f'Error in PrepPipeline: {e} for file: {filename}')
+        print(f'Falling back to manual preprocessing...')
+        print(f'--------------------------------------------------')
+        
+        
+        # Fallback: Manual bad channel detection and standard referencing
+        data = raw.get_data()
+        ch_names = raw.ch_names
+        
+        # Define threshold factors
+        var_thresh_factor = 0.01  # Channels with variance < 10% of median are bad
+        corr_thresh_factor = 0.3  # Channels with correlation < 30% of median are bad
+        
+        # --- 1. Variance-based detection ---
+        variances = np.var(data, axis=1)
+        median_var = np.median(variances)
+        variance_threshold = var_thresh_factor * median_var
+        bad_var = [ch_names[i] for i, v in enumerate(variances) if v < variance_threshold]
+
+        # --- 2. Correlation-based detection ---
+        corr_matrix = np.corrcoef(data)
+        mean_corr = np.mean(np.abs(corr_matrix), axis=1)  # abs avoids sign issues
+        median_corr = np.median(mean_corr)
+        corr_threshold = corr_thresh_factor * median_corr
+        bad_corr = [ch_names[i] for i, c in enumerate(mean_corr) if c < corr_threshold]
+        
+        # Combine both methods
+        bad_channels = list(set(bad_var + bad_corr))
+        
+        # Mark bad channels
+        raw.info['bads'] = bad_channels
+        print(f'Detected {len(bad_channels)} bad channels: {bad_channels}')
+        
+        # Standard average reference (instead of robust reference)
+        raw.set_eeg_reference('average', projection=True)
+        raw.apply_proj()
+        
+        # Interpolate bad channels (only if digitization info is available)
+        if len(bad_channels) > 0:
+            try:
+                raw.interpolate_bads()
+            except RuntimeError as e:
+                if "digitization" in str(e).lower() or "headshape" in str(e).lower():
+                    print(f'Cannot interpolate bad channels (no digitization info): {e}')
+                    print('Dropping bad channels instead...')
+                    # Drop bad channels instead of interpolating
+                    raw.drop_channels(bad_channels)
+                else:
+                    raise_error(e, f"Unexpected interpolation error in fallback for {filename}")
+            # raw.preload
     # Remove bad windows using autoreject
     # raw.load_data()
-    ar = AutoReject()
-    epochs = mne.make_fixed_length_epochs(raw, duration=2, overlap=0.5,preload=True)
+    epochs = mne.make_fixed_length_epochs(raw, duration=2, overlap=0.5, preload=True)
+    
+    # Try AutoReject first
     try:
+        ar = AutoReject()
         epochs_clean, reject_log = ar.fit_transform(epochs, return_log=True)
+        print(f'[{filename}] AutoReject successfully applied')
     except Exception as e:
-        print(f'Error in AutoReject: {e}')
-        return {},{}
+        print(f'--------------------------------------------------')
+        print(f'Error in AutoReject: {e} for file: {filename}')
+        print(f'Falling back to manual epoch rejection...')
+        print(f'--------------------------------------------------')
+        
+        # Fallback: Manual epoch rejection using variance and amplitude criteria
+        epochs_clean = manual_epoch_rejection(epochs, filename)
     # Assuming epochs_clean is an instance of mne.Epochs
     epochs_data = epochs_clean.get_data()  # Shape: (n_epochs, n_channels, n_times)
     
@@ -371,6 +490,10 @@ def analyze_eeg_data(raw,is_prod,filename):
     # Create a new RawArray object
     info = epochs_clean.info  # Use the info from the epochs
     raw = mne.io.RawArray(reshaped_data, info)
+    return raw
+
+def analyze_eeg_data(raw,is_prod,filename):
+    raw = clean_mne_raw(raw,filename)
     plot_not_prod(raw,is_prod,'AutoReject5')
     # save spec_data to pickle in pickles/project_name/filename
     with open(f'pickles/{project_name}/{filename}.pkl', 'wb') as f:
@@ -385,6 +508,8 @@ def process_file(row,filename,is_prod):
     file_name = row['file_name']
     # read file
     metadata, raw = read_edf_mne(row['file_path'])
+    if raw is None or metadata is None:
+        return None
     metadata.update(row)
     # make folder if not exist
     os.makedirs(temp_dir, exist_ok=True)
@@ -396,9 +521,9 @@ def process_file(row,filename,is_prod):
         channels = raw.ch_names
         # Check the duration of the recording
         duration_s = raw.times[-1]  # Convert duration to milliseconds
-        duration_skip = 9 * 60  # Skip recordings less than 10 minutes
-        if duration_s < duration_skip:
-            return
+        # duration_skip = 3 * 60  # Skip recordings less than 10 minutes
+        # if duration_s < duration_skip:
+        #     return
         # Split the data into segments
         max_duration_s = 60 * 60  # 60 minutes in seconds
         

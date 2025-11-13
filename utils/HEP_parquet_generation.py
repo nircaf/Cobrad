@@ -844,17 +844,53 @@ def process_patients_n1_stage_hep(edf_root="EDF_Format/EDF", step_sec=5, n1_dura
 
     # patient_to_files flip order
     patient_to_files = dict(sorted(patient_to_files.items(), key=lambda x: x[0], reverse=True))
+    
+    # Diagnostic tracking
+    patient_stats = {
+        'total': len(patient_to_files),
+        'processed': 0,
+        'skipped_no_segments': 0,
+        'skipped_already_processed': 0,
+        'patient_filter_reasons': {
+            'no_ecg': 0,  # All files failed: no ECG
+            'no_eeg': 0,  # All files failed: no EEG
+            'no_stage': 0,  # All files failed: no N3 stages detected
+            'no_continuous': 0,  # All files failed: no continuous N3 epochs
+            'too_short': 0,  # All files failed: N3 streak too short
+            'processing_error': 0,  # All files failed: processing errors
+            'mixed': 0  # Multiple different reasons across files
+        },
+        'file_level_stats': {
+            'no_ecg': 0,
+            'no_eeg': 0,
+            'no_stage': 0,
+            'no_continuous': 0,
+            'too_short': 0,
+            'processing_error': 0
+        }
+    }
+    
     for patient_id, files in patient_to_files.items():
         print(f"Patient {patient_id}: {len(files)} EDF files found.")
         
         # Check if patient was already processed
         if is_patient_processed(patient_id, temps_dir=TEMPS_DIR):
             print(f"Patient {patient_id}: already processed (parquet files exist). Skipping.")
+            patient_stats['skipped_already_processed'] += 1
             continue
         
         # Process each file to find stage segments
         # flip order of files
         stage_segments = []
+        patient_file_stats = {
+            'no_ecg': 0,
+            'no_eeg': 0,
+            'no_stage': 0,
+            'no_continuous': 0,
+            'too_short': 0,
+            'processing_error': 0,
+            'successful': 0
+        }
         for file_path in files:
             print(f"Processing {file_path} for {stage} sleep stages...")
             
@@ -874,6 +910,8 @@ def process_patients_n1_stage_hep(edf_root="EDF_Format/EDF", step_sec=5, n1_dura
                 ecg_indices = [i for i, ch in enumerate(ch_lower) if 'ecg' in ch or 'ekg' in ch]
                 if not ecg_indices:
                     print(f"No ECG channel found in {file_path}. Skipping.")
+                    patient_file_stats['no_ecg'] += 1
+                    patient_stats['file_level_stats']['no_ecg'] += 1
                     continue
                 
                 # Use YASA for sleep staging
@@ -881,6 +919,8 @@ def process_patients_n1_stage_hep(edf_root="EDF_Format/EDF", step_sec=5, n1_dura
                 available_eeg_channels = [ch for ch in raw.ch_names if ch in eeg_channels]
                 if not available_eeg_channels:
                     print(f"No suitable EEG channels found in {file_path}. Skipping.")
+                    patient_file_stats['no_eeg'] += 1
+                    patient_stats['file_level_stats']['no_eeg'] += 1
                     continue
                 
                 # Select optimal EEG channel (prefer central electrodes like C3, C4, Cz)
@@ -921,12 +961,62 @@ def process_patients_n1_stage_hep(edf_root="EDF_Format/EDF", step_sec=5, n1_dura
                 ss = yasa.SleepStaging(raw, eeg_name=eeg_name, eog_name=eog_name, emg_name=emg_name)
                 predicted_stages = ss.predict()
                 
-                # Find specified sleep stage epochs (N1, N2, N3, R, or W)
-                stage_epochs = np.where(predicted_stages == stage)[0]
+                # Special handling for W: select 10 min of Wake right after the last adequate non-W run
+                if stage == 'W':
+                    # YASA uses 30-second epochs by default
+                    epoch_duration_sec = 30
+                    # Require at least 5 minutes of any non-W stage before the Wake segment
+                    min_non_w_epochs = int(np.ceil(5 * 60 / epoch_duration_sec))
+                    min_w_epochs = int(np.ceil(10 * 60 / epoch_duration_sec))  # 10 minutes of W
 
-                if len(stage_epochs) == 0:
-                    print(f"No {stage} sleep stages found in {file_path}. Skipping.")
-                    continue
+                    # Build runs of identical stages: (label, start_idx, length)
+                    runs = []
+                    if len(predicted_stages) > 0:
+                        cur_label = predicted_stages[0]
+                        cur_start = 0
+                        cur_len = 1
+                        for i in range(1, len(predicted_stages)):
+                            if predicted_stages[i] == cur_label:
+                                cur_len += 1
+                            else:
+                                runs.append((cur_label, cur_start, cur_len))
+                                cur_label = predicted_stages[i]
+                                cur_start = i
+                                cur_len = 1
+                        runs.append((cur_label, cur_start, cur_len))
+
+                    # Find the last non-W run (>= min_non_w_epochs) that is immediately followed by a W run (>= 10 min)
+                    selected_w_start_epoch = None
+                    for idx in range(len(runs) - 1, -1, -1):
+                        label, start_idx, length = runs[idx]
+                        if label == 'W' or length < min_non_w_epochs:
+                            continue
+                        # Check next run exists and is Wake
+                        if idx + 1 < len(runs):
+                            next_label, next_start, next_length = runs[idx + 1]
+                            if next_label == 'W' and next_length >= min_w_epochs:
+                                selected_w_start_epoch = next_start
+                                break
+
+                    if selected_w_start_epoch is None:
+                        print(f"No qualifying non-W->W transition (>= 5 min any non-W then >= 10 min W) in {file_path}. Skipping.")
+                        continue
+
+                    # Define the 10-minute Wake segment right after the N1 run
+                    segment_start_sec = selected_w_start_epoch * epoch_duration_sec
+                    segment_end_sec = (selected_w_start_epoch + min_w_epochs) * epoch_duration_sec
+                    stage_segments_in_file = [(segment_start_sec, segment_end_sec)]
+                    print(f"Selected 10 min W segment after last adequate non-W in {file_path}: {segment_start_sec:.1f}s - {segment_end_sec:.1f}s")
+
+                else:
+                    # Find specified sleep stage epochs (N1, N2, N3, R)
+                    stage_epochs = np.where(predicted_stages == stage)[0]
+
+                    if len(stage_epochs) == 0:
+                        print(f"No {stage} sleep stages found in {file_path}. Skipping.")
+                        patient_file_stats['no_stage'] += 1
+                        patient_stats['file_level_stats']['no_stage'] += 1
+                        continue
                 
                 # Find the longest continuous streak of stage epochs (allowing gaps of up to 3 epochs)
                 def find_longest_stage_streak(stage_epochs, max_gap=3):
@@ -965,26 +1055,31 @@ def process_patients_n1_stage_hep(edf_root="EDF_Format/EDF", step_sec=5, n1_dura
                     
                     return longest_start, longest_length
                 
-                # Find the longest stage streak
-                longest_start, longest_length = find_longest_stage_streak(stage_epochs)
-                
-                if longest_start is None or longest_length == 0:
-                    print(f"No continuous {stage} epochs found in {file_path}. Skipping.")
-                    continue
-                
-                # YASA uses 30-second epochs by default
-                epoch_duration_sec = 30
-                min_stage_epochs = int(n1_duration_min * 60 / epoch_duration_sec)
-                
-                # Check if the longest streak meets the minimum duration requirement
-                if longest_length >= min_stage_epochs:
-                    segment_start_sec = longest_start * epoch_duration_sec
-                    segment_end_sec = (longest_start + longest_length) * epoch_duration_sec
-                    stage_segments_in_file = [(segment_start_sec, segment_end_sec)]
-                    print(f"Found longest {stage} streak: {longest_length} epochs ({longest_length * epoch_duration_sec / 60:.1f} minutes) in {file_path}")
-                else:
-                    print(f"Longest {stage} streak ({longest_length} epochs, {longest_length * epoch_duration_sec / 60:.1f} minutes) is shorter than required {n1_duration_min} minutes in {file_path}. Skipping.")
-                    continue
+                if stage != 'W':
+                    # Find the longest stage streak
+                    longest_start, longest_length = find_longest_stage_streak(stage_epochs)
+                    
+                    if longest_start is None or longest_length == 0:
+                        print(f"No continuous {stage} epochs found in {file_path}. Skipping.")
+                        patient_file_stats['no_continuous'] += 1
+                        patient_stats['file_level_stats']['no_continuous'] += 1
+                        continue
+                    
+                    # YASA uses 30-second epochs by default
+                    epoch_duration_sec = 30
+                    min_stage_epochs = int(n1_duration_min * 60 / epoch_duration_sec)
+                    
+                    # Check if the longest streak meets the minimum duration requirement
+                    if longest_length >= min_stage_epochs:
+                        segment_start_sec = longest_start * epoch_duration_sec
+                        segment_end_sec = (longest_start + longest_length) * epoch_duration_sec
+                        stage_segments_in_file = [(segment_start_sec, segment_end_sec)]
+                        print(f"Found longest {stage} streak: {longest_length} epochs ({longest_length * epoch_duration_sec / 60:.1f} minutes) in {file_path}")
+                    else:
+                        print(f"Longest {stage} streak ({longest_length} epochs, {longest_length * epoch_duration_sec / 60:.1f} minutes) is shorter than required {n1_duration_min} minutes in {file_path}. Skipping.")
+                        patient_file_stats['too_short'] += 1
+                        patient_stats['file_level_stats']['too_short'] += 1
+                        continue
                 
                 # Crop the raw data to stage segments, clean them, and add to list
                 for start_sec, end_sec in stage_segments_in_file:
@@ -996,21 +1091,98 @@ def process_patients_n1_stage_hep(edf_root="EDF_Format/EDF", step_sec=5, n1_dura
                         print(f"Cleaning {stage} segment: {start_sec:.1f}s - {end_sec:.1f}s ({end_sec-start_sec:.1f}s duration)")
                         raw_stage_cleaned = clean_mne_raw(raw_stage,file_path)
                         
+                        # Save the cleaned MNE raw object to pickle
+                        duration = int(end_sec - start_sec)
+                        pickle_dir = os.path.join("pickles_sleep_stage", project_name,stage)
+                        os.makedirs(pickle_dir, exist_ok=True)
+                        pickle_filename = f"{patient_id}_{stage}_{duration}_{step_sec}.pkl"
+                        pickle_path = os.path.join(pickle_dir, pickle_filename)
+                        with open(pickle_path, 'wb') as f:
+                            pickle.dump(raw_stage_cleaned, f)
+                        print(f"Saved cleaned MNE raw to {pickle_path}")
+                        
                         stage_segments.append(raw_stage_cleaned)
+                        patient_file_stats['successful'] += 1
                         print(f"Added cleaned {stage} segment: {start_sec:.1f}s - {end_sec:.1f}s ({end_sec-start_sec:.1f}s duration)")
                     except Exception as e:
                         print(f"Error processing {stage} segment {start_sec}-{end_sec}s: {e}")
+                        patient_file_stats['processing_error'] += 1
+                        patient_stats['file_level_stats']['processing_error'] += 1
                         continue
                         
             except Exception as e:
                 print(f"Error processing {file_path}: {e}")
+                patient_file_stats['processing_error'] += 1
+                patient_stats['file_level_stats']['processing_error'] += 1
                 continue
         
         if len(stage_segments) == 0:
             print(f"Patient {patient_id}: no {stage} segments found. Skipping.")
+            print(f"  Patient {patient_id} file statistics: {patient_file_stats}")
+            patient_stats['skipped_no_segments'] += 1
+            
+            # Determine the primary reason why this patient was filtered
+            total_failed_files = sum([
+                patient_file_stats['no_ecg'],
+                patient_file_stats['no_eeg'],
+                patient_file_stats['no_stage'],
+                patient_file_stats['no_continuous'],
+                patient_file_stats['too_short'],
+                patient_file_stats['processing_error']
+            ])
+            
+            if total_failed_files == 0:
+                # All files failed at exception level (before reaching specific filters)
+                patient_stats['patient_filter_reasons']['processing_error'] += 1
+            else:
+                # Find the primary reason (the one that affected all or most files)
+                # Check if one reason accounts for all failures
+                if patient_file_stats['no_ecg'] == total_failed_files and total_failed_files > 0:
+                    patient_stats['patient_filter_reasons']['no_ecg'] += 1
+                elif patient_file_stats['no_eeg'] == total_failed_files and total_failed_files > 0:
+                    patient_stats['patient_filter_reasons']['no_eeg'] += 1
+                elif patient_file_stats['no_stage'] == total_failed_files and total_failed_files > 0:
+                    patient_stats['patient_filter_reasons']['no_stage'] += 1
+                elif patient_file_stats['no_continuous'] == total_failed_files and total_failed_files > 0:
+                    patient_stats['patient_filter_reasons']['no_continuous'] += 1
+                elif patient_file_stats['too_short'] == total_failed_files and total_failed_files > 0:
+                    patient_stats['patient_filter_reasons']['too_short'] += 1
+                elif patient_file_stats['processing_error'] == total_failed_files and total_failed_files > 0:
+                    patient_stats['patient_filter_reasons']['processing_error'] += 1
+                else:
+                    # Multiple different reasons - count as mixed if no single reason accounts for all failures
+                    # Count how many different reasons have non-zero counts
+                    non_zero_reasons = sum([
+                        1 if patient_file_stats['no_ecg'] > 0 else 0,
+                        1 if patient_file_stats['no_eeg'] > 0 else 0,
+                        1 if patient_file_stats['no_stage'] > 0 else 0,
+                        1 if patient_file_stats['no_continuous'] > 0 else 0,
+                        1 if patient_file_stats['too_short'] > 0 else 0,
+                        1 if patient_file_stats['processing_error'] > 0 else 0
+                    ])
+                    if non_zero_reasons > 1:
+                        # Multiple different reasons
+                        patient_stats['patient_filter_reasons']['mixed'] += 1
+                    else:
+                        # Shouldn't happen, but assign to the single reason
+                        reasons = {
+                            'no_ecg': patient_file_stats['no_ecg'],
+                            'no_eeg': patient_file_stats['no_eeg'],
+                            'no_stage': patient_file_stats['no_stage'],
+                            'no_continuous': patient_file_stats['no_continuous'],
+                            'too_short': patient_file_stats['too_short'],
+                            'processing_error': patient_file_stats['processing_error']
+                        }
+                        primary_reason = max(reasons, key=reasons.get)
+                        if reasons[primary_reason] > 0:
+                            patient_stats['patient_filter_reasons'][primary_reason] += 1
+                        else:
+                            patient_stats['patient_filter_reasons']['mixed'] += 1
+            
             continue
         
         print(f"Patient {patient_id}: found {len(stage_segments)} {stage} segments for processing.")
+        patient_stats['processed'] += 1
         
         # Run brain-heart coupling analysis on stage segments
         results_df_dict = compute_brain_heart_coupling(
@@ -1031,6 +1203,36 @@ def process_patients_n1_stage_hep(edf_root="EDF_Format/EDF", step_sec=5, n1_dura
 
     # Aggregate across all patients
     plot_all_patients_band_means(bands=power_bands.keys(), step_sec=step_sec, temps_dir=TEMPS_DIR, save_dir=SAVE_DIR)
+    
+    # Print diagnostic summary
+    print(f"\n{'='*80}")
+    print(f"DIAGNOSTIC SUMMARY for {stage} stage processing:")
+    print(f"{'='*80}")
+    print(f"Total patients found: {patient_stats['total']}")
+    print(f"Patients successfully processed: {patient_stats['processed']}")
+    print(f"Patients skipped (already processed): {patient_stats['skipped_already_processed']}")
+    print(f"Patients skipped (no {stage} segments found): {patient_stats['skipped_no_segments']}")
+    print(f"\n{'='*80}")
+    print(f"PATIENT-LEVEL FILTER BREAKDOWN (why patients were filtered):")
+    print(f"{'='*80}")
+    print(f"  Patients filtered - No ECG channel (all files): {patient_stats['patient_filter_reasons']['no_ecg']}")
+    print(f"  Patients filtered - No suitable EEG channels (all files): {patient_stats['patient_filter_reasons']['no_eeg']}")
+    print(f"  Patients filtered - No {stage} stages detected (all files): {patient_stats['patient_filter_reasons']['no_stage']}")
+    print(f"  Patients filtered - No continuous {stage} epochs (all files): {patient_stats['patient_filter_reasons']['no_continuous']}")
+    print(f"  Patients filtered - {stage} streak too short (all files, < {n1_duration_min} min): {patient_stats['patient_filter_reasons']['too_short']}")
+    print(f"  Patients filtered - Processing errors (all files): {patient_stats['patient_filter_reasons']['processing_error']}")
+    print(f"  Patients filtered - Mixed reasons (multiple different failures): {patient_stats['patient_filter_reasons']['mixed']}")
+    print(f"\n{'='*80}")
+    print(f"FILE-LEVEL FILTERING STATISTICS (across all patients):")
+    print(f"{'='*80}")
+    print(f"  Files skipped - No ECG channel: {patient_stats['file_level_stats']['no_ecg']}")
+    print(f"  Files skipped - No suitable EEG channels: {patient_stats['file_level_stats']['no_eeg']}")
+    print(f"  Files skipped - No {stage} stages detected: {patient_stats['file_level_stats']['no_stage']}")
+    print(f"  Files skipped - No continuous {stage} epochs: {patient_stats['file_level_stats']['no_continuous']}")
+    print(f"  Files skipped - {stage} streak too short (< {n1_duration_min} min): {patient_stats['file_level_stats']['too_short']}")
+    print(f"  Files skipped - Processing errors: {patient_stats['file_level_stats']['processing_error']}")
+    print(f"{'='*80}\n")
+    
     print(f"All {stage} stage processing and plotting complete.")
 
 # ------------------------------------------------------------------------------
@@ -1050,7 +1252,7 @@ if __name__ == "__main__":
     # Controls for N1 mode
     parser.add_argument('--n1_duration_min', type=int, default=1,
                         help='Duration of stage segments to extract in minutes (default: 1)')
-    parser.add_argument('--stage', type=str, choices=['N1', 'N2', 'N3', 'R', 'W'], default='N2',
+    parser.add_argument('--stage', type=str, choices=['N1', 'N2', 'N3', 'R', 'W'], default='N1',
                         help='Sleep stage to extract (N1, N2, N3, R, or W) (default: N2)')
     # Common controls
     parser.add_argument('-s', '--step_sec', type=int, default=5,
