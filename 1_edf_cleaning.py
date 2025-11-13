@@ -381,7 +381,7 @@ def clean_mne_raw(raw,filename):
     picks = mne.pick_types(raw.info, eeg=True, exclude='bads')
     if len(picks) == 0:
         print('No EEG channels found after picking. Skipping this file.')
-        raise
+        return None
     raw.filter(l_freq=.5, h_freq=nyquist_freq - 0.1, picks=picks)
     raw.notch_filter(np.arange(50, nyquist_freq, 50), filter_length='auto', phase='zero', picks=picks)
     plot_not_prod(raw,is_prod,'filter2')
@@ -494,6 +494,8 @@ def clean_mne_raw(raw,filename):
 
 def analyze_eeg_data(raw,is_prod,filename):
     raw = clean_mne_raw(raw,filename)
+    if raw is None:
+        return None, None
     plot_not_prod(raw,is_prod,'AutoReject5')
     # save spec_data to pickle in pickles/project_name/filename
     with open(f'pickles/{project_name}/{filename}.pkl', 'wb') as f:
@@ -596,10 +598,11 @@ def process_file(row,filename,is_prod):
             except:
                 pass
             eeg_metadata, conn_df = analyze_eeg_data(raw,is_prod,row["file_name"])
-            if eeg_metadata == {}:
+            if eeg_metadata is None:
                 # save empty parquet file
                 # pd.DataFrame().to_parquet(f'{temp_dir}/{row["file_name"]}.parquet', index=False)
                 print(f'Error processing {row["file_name"]}')
+                return None
             else:
                 metadata.update(eeg_metadata)
                 # metadata annotation to str
