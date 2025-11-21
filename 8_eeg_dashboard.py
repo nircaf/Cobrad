@@ -513,6 +513,120 @@ def create_multi_histogram_plot(df, columns, color_by_binary=None):
     
     return fig
 
+def create_binary_intersection_table(df, binary_columns):
+    """Create a table showing intersections and counts for binary/categorical variables"""
+    if len(binary_columns) < 2:
+        return None
+    
+    # Get unique values for each binary column
+    binary_data = {}
+    for col in binary_columns:
+        data = df[col].dropna()
+        unique_vals = sorted(data.unique())
+        if len(unique_vals) == 2:
+            binary_data[col] = {
+                'val1': unique_vals[0],
+                'val2': unique_vals[1],
+                'data': data
+            }
+        else:
+            # Not binary, skip
+            continue
+    
+    if len(binary_data) < 2:
+        return None
+    
+    # Get aligned data (drop rows with NaN in any of the binary columns)
+    cols = list(binary_data.keys())
+    aligned_df = df[cols].dropna()
+    
+    n = len(binary_data)
+    
+    if n == 2:
+        # 2 variables
+        col1, col2 = cols[0], cols[1]
+        val1_1, val1_2 = binary_data[col1]['val1'], binary_data[col1]['val2']
+        val2_1, val2_2 = binary_data[col2]['val1'], binary_data[col2]['val2']
+        
+        # Calculate all combinations
+        table_data = []
+        for v1 in [val1_1, val1_2]:
+            for v2 in [val2_1, val2_2]:
+                count = len(aligned_df[(aligned_df[col1] == v1) & (aligned_df[col2] == v2)])
+                percentage = (count / len(aligned_df) * 100) if len(aligned_df) > 0 else 0
+                table_data.append({
+                    col1: v1,
+                    col2: v2,
+                    'Count': count,
+                    'Percentage (%)': round(percentage, 2)
+                })
+        
+        result_df = pd.DataFrame(table_data)
+        
+    elif n == 3:
+        # 3 variables
+        col1, col2, col3 = cols[0], cols[1], cols[2]
+        val1_1, val1_2 = binary_data[col1]['val1'], binary_data[col1]['val2']
+        val2_1, val2_2 = binary_data[col2]['val1'], binary_data[col2]['val2']
+        val3_1, val3_2 = binary_data[col3]['val1'], binary_data[col3]['val2']
+        
+        # Calculate all combinations
+        table_data = []
+        for v1 in [val1_1, val1_2]:
+            for v2 in [val2_1, val2_2]:
+                for v3 in [val3_1, val3_2]:
+                    count = len(aligned_df[(aligned_df[col1] == v1) & (aligned_df[col2] == v2) & (aligned_df[col3] == v3)])
+                    percentage = (count / len(aligned_df) * 100) if len(aligned_df) > 0 else 0
+                    table_data.append({
+                        col1: v1,
+                        col2: v2,
+                        col3: v3,
+                        'Count': count,
+                        'Percentage (%)': round(percentage, 2)
+                    })
+        
+        result_df = pd.DataFrame(table_data)
+        
+    else:
+        # More than 3 variables - show first 3
+        st.warning(f"Showing intersections for first 3 variables. You have {len(binary_columns)} binary variables.")
+        # Process first 3 variables
+        cols = cols[:3]
+        aligned_df = df[cols].dropna()  # Recalculate for first 3 columns only
+        col1, col2, col3 = cols[0], cols[1], cols[2]
+        val1_1, val1_2 = binary_data[col1]['val1'], binary_data[col1]['val2']
+        val2_1, val2_2 = binary_data[col2]['val1'], binary_data[col2]['val2']
+        val3_1, val3_2 = binary_data[col3]['val1'], binary_data[col3]['val2']
+        
+        # Calculate all combinations
+        table_data = []
+        for v1 in [val1_1, val1_2]:
+            for v2 in [val2_1, val2_2]:
+                for v3 in [val3_1, val3_2]:
+                    count = len(aligned_df[(aligned_df[col1] == v1) & (aligned_df[col2] == v2) & (aligned_df[col3] == v3)])
+                    percentage = (count / len(aligned_df) * 100) if len(aligned_df) > 0 else 0
+                    table_data.append({
+                        col1: v1,
+                        col2: v2,
+                        col3: v3,
+                        'Count': count,
+                        'Percentage (%)': round(percentage, 2)
+                    })
+        
+        result_df = pd.DataFrame(table_data)
+    
+    # Add total row
+    total_count = result_df['Count'].sum()
+    total_row = {col: 'Total' if col == cols[0] else '' for col in result_df.columns}
+    total_row['Count'] = total_count
+    total_row['Percentage (%)'] = 100.0 if len(aligned_df) > 0 else 0.0
+    
+    # Verify total matches
+    if total_count != len(aligned_df):
+        st.warning(f"Total count mismatch: {total_count} vs {len(aligned_df)} rows in aligned data")
+    
+    return result_df
+
 def main():
     # Header
     st.markdown('<h1 class="main-header">🧠 EEG Data Analysis Dashboard</h1>', unsafe_allow_html=True)
@@ -617,6 +731,22 @@ def main():
         fig = create_multi_histogram_plot(patients_df, selected_columns, color_by_binary)
         if fig is not None:
             st.plotly_chart(fig, use_container_width=True)
+        
+        # Identify binary/categorical variables from selected columns
+        binary_columns_in_selected = []
+        for col in selected_columns:
+            if col in patients_df.columns:
+                data = patients_df[col].dropna()
+                if len(data) > 0 and data.nunique() == 2:
+                    binary_columns_in_selected.append(col)
+        
+        # Show intersection table for binary/categorical variables
+        if len(binary_columns_in_selected) >= 2:
+            st.markdown("### Binary/Categorical Variables: Intersection Table")
+            intersection_table = create_binary_intersection_table(patients_df, binary_columns_in_selected)
+            if intersection_table is not None:
+                st.dataframe(intersection_table, use_container_width=True)
+                st.caption(f"Total rows: {len(intersection_table)} combinations")
         
         # Show summary statistics for selected columns
         st.markdown("### Summary Statistics for Selected Columns")

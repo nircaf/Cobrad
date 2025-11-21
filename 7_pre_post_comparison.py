@@ -2,17 +2,20 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
 import seaborn as sns
 import os
 import glob
 import re
 from utils.eeg_utils import *
 import mne
-from scipy import stats
+from scipy import stats, signal
 from statsmodels.stats.multitest import multipletests
 import dabest
 from statsmodels.stats.power import TTestIndPower
 import warnings
+import io
+from datetime import datetime
 warnings.filterwarnings('ignore')
 
 # Set plotting styles
@@ -186,7 +189,7 @@ def extract_channel_values_for_feature(df, feature_name):
     
     return channel_values
 
-def create_topomap_comparison(pre_data, post_data, feature, montage):
+def create_topomap_comparison(pre_data, post_data, feature, montage, p_value=None):
     """Create topomap comparison for pre vs post groups."""
     
     # For overall features, try to extract channel-specific data
@@ -240,6 +243,14 @@ def create_topomap_comparison(pre_data, post_data, feature, montage):
     all_vals = pre_vals + post_vals
     vmin, vmax = np.min(all_vals), np.max(all_vals)
     
+    # Create title with p-value if available
+    if p_value is not None:
+        title_suffix = f'\np = {p_value:.3e}'
+        if p_value < 0.05:
+            title_suffix += ' *'
+    else:
+        title_suffix = ''
+    
     # PRE topomap
     im1, _ = mne.viz.plot_topomap(pre_evoked.data[:, 0], pre_evoked.info, 
                                   axes=axes[0], show=False, vlim=(vmin, vmax))
@@ -255,6 +266,9 @@ def create_topomap_comparison(pre_data, post_data, feature, montage):
                                   axes=axes[2], show=False)
     axes[2].set_title('POST - PRE')
     
+    # Add overall title with p-value
+    fig.suptitle(f'{feature}{title_suffix}', fontsize=14, fontweight='bold', y=1.02)
+    
     # Add colorbars
     plt.colorbar(im1, ax=axes[0])
     plt.colorbar(im2, ax=axes[1])
@@ -264,9 +278,11 @@ def create_topomap_comparison(pre_data, post_data, feature, montage):
     
     return fig, pre_evoked, post_evoked
 
-def create_topomaps_for_all_features(pre_df, post_df, eeg_features, montage, pre_label, post_label):
+def create_topomaps_for_all_features(pre_df, post_df, eeg_features, montage, pre_label, post_label, 
+                                     pairing_info=None, is_mixed=False, significant_only=True):
     """
     Create topomaps for all EEG features that have channel-specific data.
+    Optionally filter to only significant features.
     
     Parameters
     ----------
@@ -282,10 +298,16 @@ def create_topomaps_for_all_features(pre_df, post_df, eeg_features, montage, pre
         Label for PRE group
     post_label : str
         Label for POST group
+    pairing_info : dict or set, optional
+        Pairing information for statistical tests
+    is_mixed : bool
+        Whether analysis is mixed paired/unpaired
+    significant_only : bool
+        If True, only show significant features (p < 0.05)
     
     Returns
     -------
-    dict : Dictionary mapping feature names to figure objects
+    dict : Dictionary mapping feature names to (figure, p_value) tuples
     """
     topomap_figs = {}
     
@@ -300,10 +322,34 @@ def create_topomaps_for_all_features(pre_df, post_df, eeg_features, montage, pre
         post_vals = extract_channel_values_for_feature(post_df, feature_type)
         
         if len(pre_vals) >= 3 or len(post_vals) >= 3:
+            # Calculate p-value for this feature
+            # First, try to find a matching column that contains this feature type
+            p_value = None
+            if pairing_info is not None:
+                # Look for a column that matches this feature type
+                matching_col = None
+                for col in pre_df.columns:
+                    if feature_type.lower() in col.lower() and col in post_df.columns:
+                        matching_col = col
+                        break
+                
+                if matching_col:
+                    try:
+                        result = calculate_effect_size_and_power(pre_df, post_df, matching_col, pairing_info)
+                        if result[0] is not None:
+                            p_value = result[0]
+                    except (KeyError, Exception):
+                        # If calculation fails, continue without p-value
+                        pass
+            
+            # Filter for significant features if requested
+            if significant_only and (p_value is None or p_value >= 0.05):
+                continue
+            
             # Create topomap for this feature
-            fig, _, _ = create_topomap_comparison(pre_df, post_df, feature_type, montage)
+            fig, _, _ = create_topomap_comparison(pre_df, post_df, feature_type, montage, p_value=p_value)
             if fig is not None:
-                topomap_figs[feature_type] = fig
+                topomap_figs[feature_type] = (fig, p_value)
     
     # Also process individual features from eeg_features list
     for feature in eeg_features:
@@ -316,11 +362,567 @@ def create_topomaps_for_all_features(pre_df, post_df, eeg_features, montage, pre
         post_vals = extract_channel_values_for_feature(post_df, feature)
         
         if len(pre_vals) >= 3 or len(post_vals) >= 3:
-            fig, _, _ = create_topomap_comparison(pre_df, post_df, feature, montage)
+            # Calculate p-value for this feature
+            p_value = None
+            if pairing_info is not None:
+                result = calculate_effect_size_and_power(pre_df, post_df, feature, pairing_info)
+                if result[0] is not None:
+                    p_value = result[0]
+            
+            # Filter for significant features if requested
+            if significant_only and (p_value is None or p_value >= 0.05):
+                continue
+            
+            fig, _, _ = create_topomap_comparison(pre_df, post_df, feature, montage, p_value=p_value)
             if fig is not None:
-                topomap_figs[feature] = fig
+                topomap_figs[feature] = (fig, p_value)
     
     return topomap_figs
+
+def create_spectrograms(pre_df, post_df, dataset_name, pre_label, post_label):
+    """
+    Create spectrograms (Hz vs time) for PRE and POST groups.
+    For Pre-Post_XCOPRI dataset, averages spectrograms across all patients with both PRE and POST files,
+    grouped by brain regions (Frontal, Temporal, Central, Occipital).
+    For other datasets, loads representative EDF files and creates spectrograms.
+    
+    Parameters
+    ----------
+    pre_df : pd.DataFrame
+        PRE group data
+    post_df : pd.DataFrame
+        POST group data
+    dataset_name : str
+        Name of the dataset
+    pre_label : str
+        Label for PRE group
+    post_label : str
+        Label for POST group
+    
+    Returns
+    -------
+    fig : matplotlib.figure.Figure or None
+        Figure with averaged spectrograms by region (4 rows × 2 columns: regions × PRE/POST) 
+        for Pre-Post_XCOPRI, or two spectrograms side by side for other datasets
+    """
+    try:
+        # Find EDF files for PRE and POST
+        edf_dir = f"EDF_Format/{dataset_name}"
+        if not os.path.exists(edf_dir):
+            # Try alternative path
+            edf_dir = dataset_name
+            if not os.path.exists(edf_dir):
+                return None
+        
+        # Special handling for Pre-Post_XCOPRI: find all patients with both PRE and POST pickle files
+        if dataset_name == "Pre-Post_XCOPRI":
+            # Find all pickle files
+            pickle_dir = "pickles/Pre-Post_XCOPRI"
+            if not os.path.exists(pickle_dir):
+                return None
+            
+            # Parse pickle files to find patients with both PRE and POST
+            pickle_files = [f for f in os.listdir(pickle_dir) if f.endswith('.pkl')]
+            
+            # Group by patient ID and PRE/POST status
+            patient_files = {}  # {patient_id: {'PRE': file, 'POST': file}}
+            
+            for pickle_file in pickle_files:
+                # Parse filename: e.g., "01_PRE_FA0014CD.edf.pkl" or "01_POST_FA0014Q2.edf.pkl"
+                parts = pickle_file.replace('.edf.pkl', '').split('_')
+                if len(parts) >= 2:
+                    patient_id = parts[0]
+                    status = parts[1].upper()  # PRE or POST
+                    
+                    if patient_id not in patient_files:
+                        patient_files[patient_id] = {}
+                    
+                    if status in ['PRE', 'POST']:
+                        patient_files[patient_id][status] = pickle_file
+            
+            # Only keep patients with both PRE and POST
+            patient_dirs = []
+            for patient_id, files in patient_files.items():
+                if 'PRE' in files and 'POST' in files:
+                    patient_dirs.append({
+                        'patient_id': patient_id,
+                        'pre_file': os.path.join(pickle_dir, files['PRE']),
+                        'post_file': os.path.join(pickle_dir, files['POST'])
+                    })
+            
+            if len(patient_dirs) == 0:
+                return None
+            
+            # Define brain regions
+            brain_regions = {
+                'F': ['Fp1', 'Fp2', 'F3', 'F4', 'F7', 'F8', 'Fz'],  # Frontal
+                'T': ['T3', 'T4', 'T5', 'T6', 'T1', 'T2'],  # Temporal
+                'C': ['C3', 'C4', 'Cz'],  # Central
+                'O': ['O1', 'O2', 'P3', 'P4', 'Pz']  # Occipital
+            }
+            
+            # Initialize progress bar
+            total_patients = len(patient_dirs)
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            # FIRST PASS: Load all raw files and collect data for global z-score calculation
+            status_text.text('Loading all files to calculate global statistics...')
+            pre_data_by_region = {region: [] for region in brain_regions.keys()}
+            post_data_by_region = {region: [] for region in brain_regions.keys()}
+            
+            # Fix for MNE pickle loading
+            import sys
+            import pickle
+            sys.modules['mne.io.array.array'] = mne.io.array
+            
+            for patient_idx, patient_info in enumerate(patient_dirs):
+                patient_id = patient_info['patient_id']
+                pre_file = patient_info['pre_file']
+                post_file = patient_info['post_file']
+                
+                # Update progress bar
+                progress = (patient_idx + 1) / (total_patients * 2)  # Two passes
+                progress_bar.progress(progress)
+                status_text.text(f'Loading patient {patient_id} ({patient_idx + 1}/{total_patients})...')
+                
+                # Load PRE pickle file
+                try:
+                    with open(pre_file, 'rb') as f:
+                        pre_raw = pickle.load(f)
+                    
+                    pre_raw = rename_channels(pre_raw)
+                    ch_names = pre_raw.ch_names
+                    
+                    # Process each region
+                    for region, region_chs in brain_regions.items():
+                        available_chs = [ch for ch in ch_names if ch in region_chs]
+                        if len(available_chs) == 0:
+                            continue
+                        
+                        try:
+                            pre_raw_region = pre_raw.copy().pick_channels(available_chs)
+                            total_duration = pre_raw_region.times[-1]
+                            segment_duration = min(300, total_duration)
+                            if total_duration > segment_duration:
+                                start_time = (total_duration - segment_duration) / 2
+                                end_time = start_time + segment_duration
+                                pre_raw_crop = pre_raw_region.copy().crop(tmin=start_time, tmax=end_time)
+                            else:
+                                pre_raw_crop = pre_raw_region.copy()
+                            
+                            data = pre_raw_crop.get_data()
+                            data_avg = np.mean(data, axis=0)  # Average across channels
+                            pre_data_by_region[region].append(data_avg)
+                        except Exception as e:
+                            continue
+                except Exception as e:
+                    continue
+                
+                # Load POST pickle file
+                try:
+                    with open(post_file, 'rb') as f:
+                        post_raw = pickle.load(f)
+                    
+                    post_raw = rename_channels(post_raw)
+                    ch_names = post_raw.ch_names
+                    
+                    # Process each region
+                    for region, region_chs in brain_regions.items():
+                        available_chs = [ch for ch in ch_names if ch in region_chs]
+                        if len(available_chs) == 0:
+                            continue
+                        
+                        try:
+                            post_raw_region = post_raw.copy().pick_channels(available_chs)
+                            total_duration = post_raw_region.times[-1]
+                            segment_duration = min(300, total_duration)
+                            if total_duration > segment_duration:
+                                start_time = (total_duration - segment_duration) / 2
+                                end_time = start_time + segment_duration
+                                post_raw_crop = post_raw_region.copy().crop(tmin=start_time, tmax=end_time)
+                            else:
+                                post_raw_crop = post_raw_region.copy()
+                            
+                            data = post_raw_crop.get_data()
+                            data_avg = np.mean(data, axis=0)  # Average across channels
+                            post_data_by_region[region].append(data_avg)
+                        except Exception as e:
+                            continue
+                except Exception as e:
+                    continue
+            
+            # Calculate global mean and std for each region (combining PRE and POST)
+            global_stats_by_region = {}
+            for region in brain_regions.keys():
+                all_data = pre_data_by_region[region] + post_data_by_region[region]
+                if len(all_data) > 0:
+                    # Concatenate all data for this region
+                    all_data_concat = np.concatenate(all_data)
+                    global_mean = np.nanmean(all_data_concat)
+                    global_std = np.nanstd(all_data_concat)
+                    global_stats_by_region[region] = {'mean': global_mean, 'std': global_std}
+            
+            # SECOND PASS: Process each patient with z-scoring
+            status_text.text('Computing spectrograms with z-scoring...')
+            pre_spectrograms_by_region = {region: [] for region in brain_regions.keys()}
+            post_spectrograms_by_region = {region: [] for region in brain_regions.keys()}
+            common_freqs = None
+            common_times = None
+            
+            for patient_idx, patient_info in enumerate(patient_dirs):
+                patient_id = patient_info['patient_id']
+                pre_file = patient_info['pre_file']
+                post_file = patient_info['post_file']
+                
+                # Update progress bar
+                progress = (total_patients + patient_idx + 1) / (total_patients * 2)
+                progress_bar.progress(progress)
+                status_text.text(f'Processing patient {patient_id} ({patient_idx + 1}/{total_patients})...')
+                
+                # Load and process PRE pickle file with z-scoring
+                try:
+                    with open(pre_file, 'rb') as f:
+                        pre_raw = pickle.load(f)
+                    
+                    pre_raw = rename_channels(pre_raw)
+                    ch_names = pre_raw.ch_names
+                    
+                    # Process each region
+                    for region, region_chs in brain_regions.items():
+                        if region not in global_stats_by_region:
+                            continue
+                        
+                        available_chs = [ch for ch in ch_names if ch in region_chs]
+                        if len(available_chs) == 0:
+                            continue
+                        
+                        try:
+                            pre_raw_region = pre_raw.copy().pick_channels(available_chs)
+                            total_duration = pre_raw_region.times[-1]
+                            segment_duration = min(300, total_duration)
+                            if total_duration > segment_duration:
+                                start_time = (total_duration - segment_duration) / 2
+                                end_time = start_time + segment_duration
+                                pre_raw_crop = pre_raw_region.copy().crop(tmin=start_time, tmax=end_time)
+                            else:
+                                pre_raw_crop = pre_raw_region.copy()
+                            
+                            # Get data and z-score using global statistics
+                            data = pre_raw_crop.get_data()
+                            data_avg = np.mean(data, axis=0)  # Average across channels
+                            # Z-score using global statistics
+                            global_mean = global_stats_by_region[region]['mean']
+                            global_std = global_stats_by_region[region]['std']
+                            if global_std > 0:
+                                data_avg_z = (data_avg - global_mean) / global_std
+                            else:
+                                data_avg_z = data_avg
+                            
+                            sfreq = pre_raw_crop.info['sfreq']
+                            
+                            nperseg = int(2 * sfreq)
+                            noverlap = int(nperseg * 0.5)
+                            freqs, times, Sxx = signal.spectrogram(
+                                data_avg_z, sfreq, nperseg=nperseg, noverlap=noverlap, window='hann'
+                            )
+                            
+                            freq_mask = (freqs >= 1) & (freqs <= 50)
+                            freqs_filtered = freqs[freq_mask]
+                            Sxx_filtered = Sxx[freq_mask, :]
+                            
+                            if common_freqs is None:
+                                common_freqs = freqs_filtered
+                                common_times = times
+                                pre_spectrograms_by_region[region].append(Sxx_filtered)
+                            else:
+                                if len(times) != len(common_times) or not np.allclose(freqs_filtered, common_freqs):
+                                    from scipy.interpolate import RectBivariateSpline
+                                    f_interp = RectBivariateSpline(freqs_filtered, times, Sxx_filtered, kx=1, ky=1)
+                                    Sxx_interp = f_interp(common_freqs, common_times)
+                                    pre_spectrograms_by_region[region].append(Sxx_interp)
+                                else:
+                                    pre_spectrograms_by_region[region].append(Sxx_filtered)
+                        except Exception as e:
+                            continue
+                except Exception as e:
+                    continue
+                
+                # Load and process POST pickle file with z-scoring
+                try:
+                    with open(post_file, 'rb') as f:
+                        post_raw = pickle.load(f)
+                    
+                    post_raw = rename_channels(post_raw)
+                    ch_names = post_raw.ch_names
+                    
+                    # Process each region
+                    for region, region_chs in brain_regions.items():
+                        if region not in global_stats_by_region:
+                            continue
+                        
+                        available_chs = [ch for ch in ch_names if ch in region_chs]
+                        if len(available_chs) == 0:
+                            continue
+                        
+                        try:
+                            post_raw_region = post_raw.copy().pick_channels(available_chs)
+                            total_duration = post_raw_region.times[-1]
+                            segment_duration = min(300, total_duration)
+                            if total_duration > segment_duration:
+                                start_time = (total_duration - segment_duration) / 2
+                                end_time = start_time + segment_duration
+                                post_raw_crop = post_raw_region.copy().crop(tmin=start_time, tmax=end_time)
+                            else:
+                                post_raw_crop = post_raw_region.copy()
+                            
+                            # Get data and z-score using global statistics
+                            data = post_raw_crop.get_data()
+                            data_avg = np.mean(data, axis=0)  # Average across channels
+                            # Z-score using global statistics
+                            global_mean = global_stats_by_region[region]['mean']
+                            global_std = global_stats_by_region[region]['std']
+                            if global_std > 0:
+                                data_avg_z = (data_avg - global_mean) / global_std
+                            else:
+                                data_avg_z = data_avg
+                            
+                            sfreq = post_raw_crop.info['sfreq']
+                            
+                            nperseg = int(2 * sfreq)
+                            noverlap = int(nperseg * 0.5)
+                            freqs, times, Sxx = signal.spectrogram(
+                                data_avg_z, sfreq, nperseg=nperseg, noverlap=noverlap, window='hann'
+                            )
+                            
+                            freq_mask = (freqs >= 1) & (freqs <= 50)
+                            freqs_filtered = freqs[freq_mask]
+                            Sxx_filtered = Sxx[freq_mask, :]
+                            
+                            if len(times) != len(common_times) or not np.allclose(freqs_filtered, common_freqs):
+                                from scipy.interpolate import RectBivariateSpline
+                                f_interp = RectBivariateSpline(freqs_filtered, times, Sxx_filtered, kx=1, ky=1)
+                                Sxx_interp = f_interp(common_freqs, common_times)
+                                post_spectrograms_by_region[region].append(Sxx_interp)
+                            else:
+                                post_spectrograms_by_region[region].append(Sxx_filtered)
+                        except Exception as e:
+                            continue
+                except Exception as e:
+                    continue
+            
+            # Clear progress bar
+            progress_bar.empty()
+            status_text.empty()
+            
+            # Average spectrograms across all patients for each region
+            pre_avg_by_region = {}
+            post_avg_by_region = {}
+            region_labels = {'F': 'Frontal', 'T': 'Temporal', 'C': 'Central', 'O': 'Occipital'}
+            
+            for region in brain_regions.keys():
+                if len(pre_spectrograms_by_region[region]) > 0:
+                    pre_avg_by_region[region] = np.nanmean(np.stack(pre_spectrograms_by_region[region], axis=0), axis=0)
+                if len(post_spectrograms_by_region[region]) > 0:
+                    post_avg_by_region[region] = np.nanmean(np.stack(post_spectrograms_by_region[region], axis=0), axis=0)
+            
+            if len(pre_avg_by_region) == 0 or len(post_avg_by_region) == 0:
+                return None
+            
+            # Create figure with grid: 4 rows (regions) × 2 columns (PRE, POST)
+            fig, axes = plt.subplots(4, 2, figsize=(16, 12))
+            
+            # Plot spectrograms for each region
+            for idx, region in enumerate(['F', 'T', 'C', 'O']):
+                if region in pre_avg_by_region and region in post_avg_by_region:
+                    # PRE spectrogram
+                    im1 = axes[idx, 0].pcolormesh(common_times, common_freqs, 
+                                                  10 * np.log10(pre_avg_by_region[region] + 1e-10), 
+                                                  cmap='jet', shading='gouraud')
+                    axes[idx, 0].set_xlabel('Time (s)', fontsize=10)
+                    axes[idx, 0].set_ylabel('Frequency (Hz)', fontsize=10)
+                    axes[idx, 0].set_title(f'{pre_label} - {region_labels[region]} (N={len(pre_spectrograms_by_region[region])})', 
+                                          fontsize=12, fontweight='bold')
+                    axes[idx, 0].set_ylim([1, 50])
+                    plt.colorbar(im1, ax=axes[idx, 0], label='Power (dB)')
+                    
+                    # POST spectrogram
+                    im2 = axes[idx, 1].pcolormesh(common_times, common_freqs, 
+                                                  10 * np.log10(post_avg_by_region[region] + 1e-10), 
+                                                  cmap='jet', shading='gouraud')
+                    axes[idx, 1].set_xlabel('Time (s)', fontsize=10)
+                    axes[idx, 1].set_ylabel('Frequency (Hz)', fontsize=10)
+                    axes[idx, 1].set_title(f'{post_label} - {region_labels[region]} (N={len(post_spectrograms_by_region[region])})', 
+                                          fontsize=12, fontweight='bold')
+                    axes[idx, 1].set_ylim([1, 50])
+                    plt.colorbar(im2, ax=axes[idx, 1], label='Power (dB)')
+                else:
+                    # If region data not available, show message
+                    axes[idx, 0].text(0.5, 0.5, 'No data', ha='center', va='center', transform=axes[idx, 0].transAxes)
+                    axes[idx, 0].set_title(f'{pre_label} - {region_labels[region]} - No data', fontsize=12)
+                    axes[idx, 1].text(0.5, 0.5, 'No data', ha='center', va='center', transform=axes[idx, 1].transAxes)
+                    axes[idx, 1].set_title(f'{post_label} - {region_labels[region]} - No data', fontsize=12)
+            
+            plt.tight_layout()
+            return fig
+        
+        # Original logic for other datasets: use representative files
+        # Get a representative subject from each group
+        pre_subjects = pre_df['Subject_ID'].unique() if len(pre_df) > 0 else []
+        post_subjects = post_df['Subject_ID'].unique() if len(post_df) > 0 else []
+        
+        if len(pre_subjects) == 0 or len(post_subjects) == 0:
+            return None
+        
+        # Find EDF files
+        pre_edf_file = None
+        post_edf_file = None
+        
+        # Search for EDF files matching subject IDs
+        for root, dirs, files in os.walk(edf_dir):
+            for file in files:
+                if file.lower().endswith('.edf'):
+                    file_lower = file.lower()
+                    # Check if file matches a PRE subject
+                    if pre_edf_file is None:
+                        for subject in pre_subjects[:5]:  # Check first 5 subjects
+                            if subject.lower().replace('_', '') in file_lower.replace('_', '').replace('-', ''):
+                                pre_edf_file = os.path.join(root, file)
+                                break
+                    # Check if file matches a POST subject
+                    if post_edf_file is None:
+                        for subject in post_subjects[:5]:  # Check first 5 subjects
+                            if subject.lower().replace('_', '') in file_lower.replace('_', '').replace('-', ''):
+                                post_edf_file = os.path.join(root, file)
+                                break
+                    if pre_edf_file and post_edf_file:
+                        break
+            if pre_edf_file and post_edf_file:
+                break
+        
+        if pre_edf_file is None or post_edf_file is None:
+            return None
+        
+        # Load EDF files using MNE
+        try:
+            pre_raw = mne.io.read_raw_edf(pre_edf_file, preload=True, verbose=False)
+            post_raw = mne.io.read_raw_edf(post_edf_file, preload=True, verbose=False)
+        except Exception as e:
+            # Try using the utility function
+            try:
+                pre_raw = read_edf_mne(pre_edf_file)
+                post_raw = read_edf_mne(post_edf_file)
+                if pre_raw is None or post_raw is None:
+                    return None
+            except:
+                return None
+        
+        # Pick a representative EEG channel (prefer central channels)
+        eeg_chs = [ch for ch in pre_raw.ch_names if 'EEG' in ch.upper() or 'eeg' in ch.lower()]
+        if len(eeg_chs) == 0:
+            return None
+        
+        # Prefer central channels (Cz, C3, C4, Fz, Pz)
+        preferred_chs = ['Cz', 'C3', 'C4', 'Fz', 'Pz']
+        selected_ch = None
+        for pref in preferred_chs:
+            for ch in eeg_chs:
+                if pref.upper() in ch.upper():
+                    selected_ch = ch
+                    break
+            if selected_ch:
+                break
+        
+        if selected_ch is None:
+            selected_ch = eeg_chs[0]
+        
+        # Create figure with two subplots
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+        
+        # Compute and plot spectrogram for PRE
+        try:
+            pre_raw.pick_channels([selected_ch])
+            # Use shorter duration for faster computation (first 60 seconds or full duration)
+            duration = min(60, pre_raw.times[-1])
+            pre_raw_crop = pre_raw.copy().crop(tmax=duration)
+            
+            # Get data
+            data = pre_raw_crop.get_data()[0]
+            sfreq = pre_raw_crop.info['sfreq']
+            
+            # Compute spectrogram using scipy
+            nperseg = int(2 * sfreq)  # 2 second windows
+            noverlap = int(nperseg * 0.5)  # 50% overlap
+            freqs, times, Sxx = signal.spectrogram(
+                data, 
+                sfreq, 
+                nperseg=nperseg, 
+                noverlap=noverlap,
+                window='hann'
+            )
+            
+            # Filter frequencies (1-50 Hz)
+            freq_mask = (freqs >= 1) & (freqs <= 50)
+            freqs_filtered = freqs[freq_mask]
+            Sxx_filtered = Sxx[freq_mask, :]
+            
+            # Plot spectrogram
+            im1 = ax1.pcolormesh(times, freqs_filtered, 10 * np.log10(Sxx_filtered + 1e-10), 
+                                 cmap='jet', shading='gouraud')
+            ax1.set_xlabel('Time (s)', fontsize=12)
+            ax1.set_ylabel('Frequency (Hz)', fontsize=12)
+            ax1.set_title(f'{pre_label} - {selected_ch}', fontsize=14, fontweight='bold')
+            ax1.set_ylim([1, 50])
+            plt.colorbar(im1, ax=ax1, label='Power (dB)')
+        except Exception as e:
+            ax1.text(0.5, 0.5, f'Error: {str(e)}', ha='center', va='center', transform=ax1.transAxes)
+            ax1.set_title(f'{pre_label} - Error', fontsize=14)
+        
+        # Compute and plot spectrogram for POST
+        try:
+            post_raw.pick_channels([selected_ch])
+            # Use shorter duration for faster computation
+            duration = min(60, post_raw.times[-1])
+            post_raw_crop = post_raw.copy().crop(tmax=duration)
+            
+            # Get data
+            data = post_raw_crop.get_data()[0]
+            sfreq = post_raw_crop.info['sfreq']
+            
+            # Compute spectrogram using scipy
+            nperseg = int(2 * sfreq)  # 2 second windows
+            noverlap = int(nperseg * 0.5)  # 50% overlap
+            freqs, times, Sxx = signal.spectrogram(
+                data, 
+                sfreq, 
+                nperseg=nperseg, 
+                noverlap=noverlap,
+                window='hann'
+            )
+            
+            # Filter frequencies (1-50 Hz)
+            freq_mask = (freqs >= 1) & (freqs <= 50)
+            freqs_filtered = freqs[freq_mask]
+            Sxx_filtered = Sxx[freq_mask, :]
+            
+            # Plot spectrogram
+            im2 = ax2.pcolormesh(times, freqs_filtered, 10 * np.log10(Sxx_filtered + 1e-10), 
+                                cmap='jet', shading='gouraud')
+            ax2.set_xlabel('Time (s)', fontsize=12)
+            ax2.set_ylabel('Frequency (Hz)', fontsize=12)
+            ax2.set_title(f'{post_label} - {selected_ch}', fontsize=14, fontweight='bold')
+            ax2.set_ylim([1, 50])
+            plt.colorbar(im2, ax=ax2, label='Power (dB)')
+        except Exception as e:
+            ax2.text(0.5, 0.5, f'Error: {str(e)}', ha='center', va='center', transform=ax2.transAxes)
+            ax2.set_title(f'{post_label} - Error', fontsize=14)
+        
+        plt.tight_layout()
+        return fig
+        
+    except Exception as e:
+        # Return None if anything fails
+        return None
 
 def create_simple_comparison_plot(pre_data, post_data, feature):
     """Create a simple comparison plot for overall features."""
@@ -361,9 +963,259 @@ def create_simple_comparison_plot(pre_data, post_data, feature):
     plt.tight_layout()
     return fig
 
-def create_median_std_forest_plot(pre_df, post_df, eeg_features, pre_label, post_label, is_mixed, pairing_info):
+def create_individual_change_plot(pre_df, post_df, feature, pre_label, post_label, pairing_info=None):
     """
-    Create a forest plot showing median ± STD for all EEG features.
+    Create a plot showing individual PRE/POST changes with connecting lines for each subject.
+    
+    Parameters
+    ----------
+    pre_df : pd.DataFrame
+        PRE group data
+    post_df : pd.DataFrame
+        POST group data
+    feature : str
+        Feature name
+    pre_label : str
+        Label for PRE group
+    post_label : str
+        Label for POST group
+    pairing_info : dict or set, optional
+        Pairing information
+    
+    Returns
+    -------
+    fig : matplotlib.figure.Figure or None
+        Figure object if successful, None otherwise
+    """
+    # Get paired data
+    pre_subjects = set(pre_df['Subject_ID'].unique()) if len(pre_df) > 0 else set()
+    post_subjects = set(post_df['Subject_ID'].unique()) if len(post_df) > 0 else set()
+    common_subjects = pre_subjects.intersection(post_subjects)
+    
+    if len(common_subjects) < 1:
+        return None
+    
+    # Prepare paired data
+    paired_data = []
+    for subject in common_subjects:
+        pre_val = pre_df[pre_df['Subject_ID'] == subject][feature].iloc[0] if len(pre_df[pre_df['Subject_ID'] == subject]) > 0 else np.nan
+        post_val = post_df[post_df['Subject_ID'] == subject][feature].iloc[0] if len(post_df[post_df['Subject_ID'] == subject]) > 0 else np.nan
+        
+        if not np.isnan(pre_val) and not np.isnan(post_val):
+            paired_data.append({
+                'subject': subject,
+                'pre': pre_val,
+                'post': post_val,
+                'change': post_val - pre_val
+            })
+    
+    if len(paired_data) == 0:
+        return None
+    
+    # Sort by change magnitude for better visualization
+    paired_data.sort(key=lambda x: x['change'])
+    
+    fig, ax = plt.subplots(figsize=(12, 8))
+    
+    # X positions for PRE and POST
+    x_pre = 0
+    x_post = 1
+    
+    # Determine alpha and line width based on number of subjects
+    n_subjects = len(paired_data)
+    if n_subjects > 50:
+        line_alpha = 0.3
+        point_alpha = 0.5
+        linewidth = 1.0
+        point_size = 40
+    elif n_subjects > 20:
+        line_alpha = 0.4
+        point_alpha = 0.6
+        linewidth = 1.2
+        point_size = 60
+    else:
+        line_alpha = 0.6
+        point_alpha = 0.8
+        linewidth = 1.5
+        point_size = 80
+    
+    # Plot individual lines and points
+    for i, data in enumerate(paired_data):
+        # Color based on direction of change
+        if data['change'] > 0:
+            color = 'red'
+        else:
+            color = 'blue'
+        
+        # Draw connecting line
+        ax.plot([x_pre, x_post], [data['pre'], data['post']], 
+               color=color, linewidth=linewidth, alpha=line_alpha, zorder=1)
+        
+        # Plot PRE point
+        ax.scatter(x_pre, data['pre'], color='blue', s=point_size, 
+                  alpha=point_alpha, zorder=3, edgecolors='darkblue', linewidths=1)
+        
+        # Plot POST point
+        ax.scatter(x_post, data['post'], color='red', s=point_size, 
+                  alpha=point_alpha, zorder=3, edgecolors='darkred', linewidths=1)
+    
+    # Add mean lines
+    pre_mean = np.mean([d['pre'] for d in paired_data])
+    post_mean = np.mean([d['post'] for d in paired_data])
+    
+    ax.axhline(y=pre_mean, xmin=0, xmax=0.5, color='blue', linestyle='--', 
+              linewidth=2, alpha=0.7, label=f'{pre_label} Mean')
+    ax.axhline(y=post_mean, xmin=0.5, xmax=1, color='red', linestyle='--', 
+              linewidth=2, alpha=0.7, label=f'{post_label} Mean')
+    
+    # Customize plot
+    ax.set_xticks([x_pre, x_post])
+    ax.set_xticklabels([pre_label, post_label], fontsize=12, fontweight='bold')
+    ax.set_ylabel(feature, fontsize=12, fontweight='bold')
+    ax.set_title(f'Individual Changes: {feature}\n(N={len(paired_data)} paired subjects)', 
+                fontsize=14, fontweight='bold', pad=15)
+    ax.grid(True, alpha=0.3, axis='y', linestyle='--')
+    ax.legend(loc='best', fontsize=10, framealpha=0.9)
+    
+    # Add summary statistics text
+    mean_change = np.mean([d['change'] for d in paired_data])
+    std_change = np.std([d['change'] for d in paired_data], ddof=1)
+    ax.text(0.02, 0.98, f'Mean Change: {mean_change:.3f} ± {std_change:.3f}', 
+           transform=ax.transAxes, fontsize=10, verticalalignment='top',
+           bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.7))
+    
+    plt.tight_layout()
+    return fig
+
+def create_single_feature_forest_plot(pre_vals, post_vals, feature, pre_label, post_label, p_value=None, is_mixed=False):
+    """
+    Create a forest plot for a single feature showing pre vs post with significance line.
+    Values are z-scored before plotting.
+    
+    Parameters
+    ----------
+    pre_vals : list
+        PRE group values
+    post_vals : list
+        POST group values
+    feature : str
+        Feature name
+    pre_label : str
+        Label for PRE group
+    post_label : str
+        Label for POST group
+    p_value : float, optional
+        P-value for significance indication
+    is_mixed : bool
+        Whether analysis is mixed paired/unpaired
+    
+    Returns
+    -------
+    fig : matplotlib.figure.Figure or None
+        Figure object if successful, None otherwise
+    """
+    if len(pre_vals) == 0 or len(post_vals) == 0:
+        return None
+    
+    # Z-score the values using combined distribution
+    all_vals = np.array(pre_vals + post_vals)
+    combined_mean = np.mean(all_vals)
+    combined_std = np.std(all_vals, ddof=1)
+    
+    if combined_std == 0:
+        # If std is 0, all values are the same, skip z-scoring
+        pre_vals_z = np.array(pre_vals)
+        post_vals_z = np.array(post_vals)
+    else:
+        # Z-score both groups using combined mean and std
+        pre_vals_z = (np.array(pre_vals) - combined_mean) / combined_std
+        post_vals_z = (np.array(post_vals) - combined_mean) / combined_std
+    
+    fig, ax = plt.subplots(figsize=(6, 4))
+    
+    # Calculate statistics on z-scored values
+    pre_mean = np.mean(pre_vals_z)
+    pre_std = np.std(pre_vals_z, ddof=1)
+    pre_se = pre_std / np.sqrt(len(pre_vals_z))
+    pre_ci_lower = pre_mean - 1.96 * pre_se
+    pre_ci_upper = pre_mean + 1.96 * pre_se
+    
+    post_mean = np.mean(post_vals_z)
+    post_std = np.std(post_vals_z, ddof=1)
+    post_se = post_std / np.sqrt(len(post_vals_z))
+    post_ci_lower = post_mean - 1.96 * post_se
+    post_ci_upper = post_mean + 1.96 * post_se
+    
+    # Calculate difference on z-scored values
+    mean_diff = post_mean - pre_mean
+    if is_mixed:
+        # Unpaired: use pooled standard error
+        pooled_se = np.sqrt((pre_std**2 / len(pre_vals_z)) + (post_std**2 / len(post_vals_z)))
+    else:
+        # Paired: use difference scores on z-scored values
+        differences = post_vals_z - pre_vals_z
+        diff_std = np.std(differences, ddof=1)
+        pooled_se = diff_std / np.sqrt(len(differences))
+    
+    diff_ci_lower = mean_diff - 1.96 * pooled_se
+    diff_ci_upper = mean_diff + 1.96 * pooled_se
+    
+    # Determine significance color
+    is_significant = p_value is not None and p_value < 0.05
+    color = 'red' if is_significant else 'gray'
+    marker_style = '*' if is_significant else 'o'
+    
+    # Y positions for PRE, POST, and Difference
+    y_positions = [0, 1, 2]
+    labels = [pre_label, post_label, f'{post_label} - {pre_label}']
+    
+    # Plot PRE
+    ax.plot([pre_ci_lower, pre_ci_upper], [y_positions[0], y_positions[0]], 
+           color='blue', linewidth=2.5, alpha=0.7)
+    ax.scatter(pre_mean, y_positions[0], color='blue', s=100, 
+              marker='o', alpha=0.8, zorder=5, edgecolors='darkblue', linewidths=1.5)
+    
+    # Plot POST
+    ax.plot([post_ci_lower, post_ci_upper], [y_positions[1], y_positions[1]], 
+           color='red', linewidth=2.5, alpha=0.7)
+    ax.scatter(post_mean, y_positions[1], color='red', s=100, 
+              marker='s', alpha=0.8, zorder=5, edgecolors='darkred', linewidths=1.5)
+    
+    # Plot Difference with significance indication
+    ax.plot([diff_ci_lower, diff_ci_upper], [y_positions[2], y_positions[2]], 
+           color=color, linewidth=2.5, alpha=0.7)
+    ax.scatter(mean_diff, y_positions[2], color=color, s=120, 
+              marker=marker_style, alpha=0.8, zorder=5, edgecolors='black', linewidths=1.5)
+    
+    # Add vertical line at 0 (no difference)
+    ax.axvline(x=0, color='black', linestyle='--', alpha=0.5, linewidth=1.5, label='No difference')
+    
+    # Add significance line if significant
+    if is_significant:
+        # Add a vertical line at the mean difference to highlight significance
+        ax.axvline(x=mean_diff, color=color, linestyle=':', alpha=0.3, linewidth=1)
+    
+    # Customize plot
+    ax.set_yticks(y_positions)
+    ax.set_yticklabels(labels)
+    ax.set_xlabel('Z-scored Value (Mean ± 95% CI)', fontsize=10, fontweight='bold')
+    ax.set_title(f'{feature}\n{"* p < 0.05" if is_significant else "ns"}', 
+                fontsize=11, fontweight='bold')
+    ax.grid(True, alpha=0.3, axis='x', linestyle='--')
+    
+    # Add text annotation for p-value if available
+    if p_value is not None:
+        ax.text(0.98, 0.02, f'p = {p_value:.3e}', transform=ax.transAxes,
+               ha='right', va='bottom', fontsize=9, 
+               bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    
+    plt.tight_layout()
+    return fig
+
+def create_median_std_forest_plot(pre_df, post_df, eeg_features, pre_label, post_label, is_mixed, pairing_info, significant_only=True):
+    """
+    Create a forest plot showing median ± STD for EEG features.
+    Optionally filter to only significant features.
     
     Parameters
     ----------
@@ -381,6 +1233,8 @@ def create_median_std_forest_plot(pre_df, post_df, eeg_features, pre_label, post
         Whether analysis is mixed paired/unpaired
     pairing_info : dict or set
         Pairing information
+    significant_only : bool
+        If True, only show significant features (p < 0.05)
     
     Returns
     -------
@@ -410,6 +1264,22 @@ def create_median_std_forest_plot(pre_df, post_df, eeg_features, pre_label, post
                 if not np.isnan(pre_val) and not np.isnan(post_val):
                     pre_vals.append(pre_val)
                     post_vals.append(post_val)
+        
+        # Calculate p-value if filtering for significant features
+        if significant_only and pairing_info is not None:
+            try:
+                result = calculate_effect_size_and_power(pre_df, post_df, feature, pairing_info)
+                if result[0] is not None:
+                    p_value = result[0]
+                    # Skip if not significant
+                    if p_value >= 0.05:
+                        continue
+                else:
+                    # Skip if p-value cannot be calculated
+                    continue
+            except (KeyError, Exception):
+                # Skip if calculation fails
+                continue
         
         # Calculate median and STD for each group
         if len(pre_vals) > 0:
@@ -481,7 +1351,10 @@ def create_median_std_forest_plot(pre_df, post_df, eeg_features, pre_label, post
     ax.set_yticks(y_positions)
     ax.set_yticklabels([data['feature'] for data in plot_data])
     ax.set_xlabel('Value (Median ± STD)', fontsize=12, fontweight='bold')
-    ax.set_title('Forest Plot: All EEG Features (Median ± STD)', fontsize=14, fontweight='bold', pad=20)
+    if significant_only:
+        ax.set_title('Forest Plot: Significant EEG Features (Median ± STD, p < 0.05)', fontsize=14, fontweight='bold', pad=20)
+    else:
+        ax.set_title('Forest Plot: All EEG Features (Median ± STD)', fontsize=14, fontweight='bold', pad=20)
     ax.grid(True, alpha=0.3, axis='x', linestyle='--')
     ax.legend(loc='upper right', fontsize=10, framealpha=0.9)
     
@@ -668,6 +1541,168 @@ def calculate_effect_size_and_power(pre_data, post_data, feature, pairing_info=N
     
     return p_value, cohen_d, effect_size_desc, power, test_type
 
+def generate_excel_data(pre_df, post_df, eeg_features, pairing_info, is_mixed, pre_label, post_label):
+    """
+    Generate Excel data with Subject_ID, PRE and POST values for each feature.
+    
+    Parameters
+    ----------
+    pre_df : pd.DataFrame
+        PRE group data
+    post_df : pd.DataFrame
+        POST group data
+    eeg_features : list
+        List of EEG feature names
+    pairing_info : dict or set
+        Pairing information
+    is_mixed : bool
+        Whether analysis is mixed paired/unpaired
+    pre_label : str
+        Label for PRE group
+    post_label : str
+        Label for POST group
+    
+    Returns
+    -------
+    bytes : Excel file as bytes
+    """
+    # Get all unique subjects from both datasets
+    pre_subjects = set(pre_df['Subject_ID'].unique()) if len(pre_df) > 0 else set()
+    post_subjects = set(post_df['Subject_ID'].unique()) if len(post_df) > 0 else set()
+    all_subjects = sorted(list(pre_subjects | post_subjects))
+    
+    if len(all_subjects) == 0:
+        return None
+    
+    # Create a dictionary to store the data
+    excel_data = {'Subject_ID': all_subjects}
+    
+    # For each feature, add PRE and POST columns
+    for feature in eeg_features:
+        pre_col_name = f"{feature}_{pre_label}"
+        post_col_name = f"{feature}_{post_label}"
+        
+        pre_values = []
+        post_values = []
+        
+        for subject in all_subjects:
+            # Get PRE value
+            pre_subject_data = pre_df[pre_df['Subject_ID'] == subject]
+            if len(pre_subject_data) > 0 and feature in pre_subject_data.columns:
+                pre_val = pre_subject_data[feature].iloc[0] if not pre_subject_data[feature].isna().all() else np.nan
+            else:
+                pre_val = np.nan
+            pre_values.append(pre_val)
+            
+            # Get POST value
+            post_subject_data = post_df[post_df['Subject_ID'] == subject]
+            if len(post_subject_data) > 0 and feature in post_subject_data.columns:
+                post_val = post_subject_data[feature].iloc[0] if not post_subject_data[feature].isna().all() else np.nan
+            else:
+                post_val = np.nan
+            post_values.append(post_val)
+        
+        excel_data[pre_col_name] = pre_values
+        excel_data[post_col_name] = post_values
+    
+    # Create DataFrame
+    excel_df = pd.DataFrame(excel_data)
+    
+    # Create Excel file in memory
+    excel_buffer = io.BytesIO()
+    try:
+        with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
+            excel_df.to_excel(writer, index=False, sheet_name='Analysis Data')
+        excel_buffer.seek(0)
+        return excel_buffer.getvalue()
+    except ImportError:
+        raise ImportError("openpyxl is required for Excel export. Please install it with: pip install openpyxl")
+    except Exception as e:
+        raise Exception(f"Error creating Excel file: {str(e)}")
+
+def generate_pdf_report(pre_df, post_df, eeg_features, pairing_info, is_mixed, pre_label, post_label, 
+                        montage, selected_feature, show_significant_only):
+    """
+    Generate a PDF report with all plots and results.
+    
+    Returns
+    -------
+    bytes : PDF file as bytes
+    """
+    pdf_buffer = io.BytesIO()
+    
+    with PdfPages(pdf_buffer) as pdf:
+        # Title page
+        fig = plt.figure(figsize=(8.5, 11))
+        fig.text(0.5, 0.9, 'VNS Pre/Post EEG Comparison Report', 
+                ha='center', va='top', fontsize=20, fontweight='bold')
+        fig.text(0.5, 0.8, f'Generated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}', 
+                ha='center', va='top', fontsize=12)
+        fig.text(0.5, 0.7, f'Analysis: {selected_feature}', 
+                ha='center', va='top', fontsize=14)
+        fig.text(0.5, 0.6, f'{pre_label} vs {post_label}', 
+                ha='center', va='top', fontsize=14)
+        if is_mixed:
+            fig.text(0.5, 0.5, 'Mixed paired/unpaired analysis', 
+                    ha='center', va='top', fontsize=12)
+        else:
+            fig.text(0.5, 0.5, 'Paired analysis', 
+                    ha='center', va='top', fontsize=12)
+        pdf.savefig(fig, bbox_inches='tight')
+        plt.close(fig)
+        
+        # Collect all forest plots for significant features
+        if selected_feature == "All Features":
+            for feature in eeg_features:
+                # Get data for this feature
+                if is_mixed:
+                    pre_vals = pre_df[feature].dropna().tolist()
+                    post_vals = post_df[feature].dropna().tolist()
+                else:
+                    pre_subjects = set(pre_df['Subject_ID'].unique()) if len(pre_df) > 0 else set()
+                    post_subjects = set(post_df['Subject_ID'].unique()) if len(post_df) > 0 else set()
+                    common_subjects = pre_subjects.intersection(post_subjects)
+                    
+                    pre_vals = []
+                    post_vals = []
+                    for subject in common_subjects:
+                        pre_val = pre_df[pre_df['Subject_ID'] == subject][feature].iloc[0] if len(pre_df[pre_df['Subject_ID'] == subject]) > 0 else np.nan
+                        post_val = post_df[post_df['Subject_ID'] == subject][feature].iloc[0] if len(post_df[post_df['Subject_ID'] == subject]) > 0 else np.nan
+                        
+                        if not np.isnan(pre_val) and not np.isnan(post_val):
+                            pre_vals.append(pre_val)
+                            post_vals.append(post_val)
+                
+                if len(pre_vals) > 0 and len(post_vals) > 0:
+                    result = calculate_effect_size_and_power(pre_df, post_df, feature, pairing_info)
+                    if result[0] is not None:
+                        p_value = result[0]
+                    else:
+                        p_value = None
+                    
+                    # Only include significant features if filtering is enabled
+                    if not show_significant_only or (p_value is not None and p_value < 0.05):
+                        fig = create_single_feature_forest_plot(
+                            pre_vals, post_vals, feature, pre_label, post_label, 
+                            p_value=p_value, is_mixed=is_mixed
+                        )
+                        if fig is not None:
+                            pdf.savefig(fig, bbox_inches='tight')
+                            plt.close(fig)
+            
+            # Add topomaps for significant features
+            topomap_figs = create_topomaps_for_all_features(
+                pre_df, post_df, eeg_features, montage, pre_label, post_label,
+                pairing_info=pairing_info, is_mixed=is_mixed, significant_only=True
+            )
+            
+            for feature_name, (fig, p_val) in topomap_figs.items():
+                pdf.savefig(fig, bbox_inches='tight')
+                plt.close(fig)
+    
+    pdf_buffer.seek(0)
+    return pdf_buffer.getvalue()
+
 def main():
     st.set_page_config(page_title="VNS Pre/Post EEG Comparison", layout="wide")
     
@@ -709,7 +1744,7 @@ def main():
     st.markdown("### Results Display")
     show_significant_only = st.checkbox(
         "Show only significant results (p < 0.05)",
-        value=False,
+        value=True,
         help="When checked, only displays plots and statistics for measurements with p < 0.05. When unchecked, shows all results."
     )
     
@@ -786,7 +1821,7 @@ def main():
     
     # Get EEG features
     eeg_features = get_eeg_features(pre_df)
-    
+    eeg_features_forest = [feature for feature in eeg_features if 'overall_' in feature]
     if not eeg_features:
         st.error("No EEG features found in the data.")
         return
@@ -801,6 +1836,77 @@ def main():
     show_topomaps = st.sidebar.checkbox("Show Topomaps", value=True)
     show_statistics = st.sidebar.checkbox("Show Detailed Statistics", value=True)
     
+    # PDF Export - Generate automatically
+    st.sidebar.markdown("---")
+    st.sidebar.header("Export")
+    
+    # Create a unique key for this session based on data and settings
+    session_key = f"pdf_{selected_feature}_{pre_label}_{post_label}_{is_mixed}_{show_significant_only}"
+    
+    # Check if PDF is already generated in session state
+    if session_key not in st.session_state:
+        st.sidebar.info("Generating PDF report...")
+        try:
+            pdf_bytes = generate_pdf_report(
+                pre_df, post_df, eeg_features, pairing_info, is_mixed, 
+                pre_label, post_label, montage, selected_feature, show_significant_only
+            )
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"eeg_comparison_report_{timestamp}.pdf"
+            
+            # Store in session state
+            st.session_state[session_key] = pdf_bytes
+            st.session_state[f"{session_key}_filename"] = filename
+        except Exception as e:
+            st.sidebar.error(f"Error generating PDF: {str(e)}")
+            st.session_state[session_key] = None
+    
+    # Show download button if PDF is available
+    if session_key in st.session_state and st.session_state[session_key] is not None:
+        st.sidebar.success("PDF ready!")
+        st.sidebar.download_button(
+            label="📥 Download PDF",
+            data=st.session_state[session_key],
+            file_name=st.session_state.get(f"{session_key}_filename", "eeg_comparison_report.pdf"),
+            mime="application/pdf",
+            help="Download the complete analysis report as PDF"
+        )
+    
+    # Excel Export
+    excel_session_key = f"excel_{pre_label}_{post_label}_{is_mixed}"
+    
+    # Check if Excel is already generated in session state
+    if excel_session_key not in st.session_state:
+        st.sidebar.info("Generating Excel data...")
+        try:
+            excel_bytes = generate_excel_data(
+                pre_df, post_df, eeg_features, pairing_info, is_mixed, 
+                pre_label, post_label
+            )
+            if excel_bytes is not None:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = f"eeg_analysis_data_{timestamp}.xlsx"
+                
+                # Store in session state
+                st.session_state[excel_session_key] = excel_bytes
+                st.session_state[f"{excel_session_key}_filename"] = filename
+            else:
+                st.session_state[excel_session_key] = None
+        except Exception as e:
+            st.sidebar.error(f"Error generating Excel: {str(e)}")
+            st.session_state[excel_session_key] = None
+    
+    # Show download button if Excel is available
+    if excel_session_key in st.session_state and st.session_state[excel_session_key] is not None:
+        st.sidebar.success("Excel ready!")
+        st.sidebar.download_button(
+            label="📊 Download Excel",
+            data=st.session_state[excel_session_key],
+            file_name=st.session_state.get(f"{excel_session_key}_filename", "eeg_analysis_data.xlsx"),
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            help="Download analysis data as Excel file (Subject_ID, PRE and POST values for each feature)"
+        )
+    
     # Check if "All Features" is selected
     if selected_feature == "All Features":
         st.markdown("## Analysis of: All EEG Features")
@@ -810,152 +1916,26 @@ def main():
         cols_per_row = 3  # Number of columns per row
         num_rows = (num_features + cols_per_row - 1) // cols_per_row
         
-        for row in range(num_rows):
-            start_idx = row * cols_per_row
-            end_idx = min(start_idx + cols_per_row, num_features)
-            current_features = eeg_features[start_idx:end_idx]
-            
-            # Create columns for this row
-            cols = st.columns(len(current_features))
-            
-            for i, feature in enumerate(current_features):
-                with cols[i]:
-                    st.markdown(f"### {feature}")
-                    
-                    # Get data for this feature
-                    if is_mixed:
-                        # For mixed analysis, get all data
-                        pre_vals = pre_df[feature].dropna().tolist()
-                        post_vals = post_df[feature].dropna().tolist()
-                    else:
-                        # For paired analysis, get only paired data
-                        pre_subjects = set(pre_df['Subject_ID'].unique()) if len(pre_df) > 0 else set()
-                        post_subjects = set(post_df['Subject_ID'].unique()) if len(post_df) > 0 else set()
-                        common_subjects = pre_subjects.intersection(post_subjects)
-                        
-                        pre_vals = []
-                        post_vals = []
-                        for subject in common_subjects:
-                            pre_val = pre_df[pre_df['Subject_ID'] == subject][feature].iloc[0] if len(pre_df[pre_df['Subject_ID'] == subject]) > 0 else np.nan
-                            post_val = post_df[post_df['Subject_ID'] == subject][feature].iloc[0] if len(post_df[post_df['Subject_ID'] == subject]) > 0 else np.nan
-                            
-                            if not np.isnan(pre_val) and not np.isnan(post_val):
-                                pre_vals.append(pre_val)
-                                post_vals.append(post_val)
-                    
-                    # Show basic statistics
-                    if len(pre_vals) > 0 and len(post_vals) > 0:
-                        # Calculate difference/change based on analysis type
-                        if is_mixed:
-                            mean_diff = np.mean(post_vals) - np.mean(pre_vals)
-                            differences_for_display = [mean_diff]  # Just for consistency
-                        else:
-                            differences = np.array(post_vals) - np.array(pre_vals)
-                            differences_for_display = differences
-                        
-                        # Statistical analysis
-                        result = calculate_effect_size_and_power(pre_df, post_df, feature, pairing_info)
-                        if result[0] is not None:
-                            p_value, cohen_d, effect_size_desc, power, test_type = result
-                        else:
-                            p_value, cohen_d, effect_size_desc, power, test_type = None, None, None, None, None
-                        
-                        # Show results based on user selection
-                        if show_significant_only:
-                            # Only show significant results
-                            if p_value is not None and p_value < 0.05:
-                                st.write(f"**N ({pre_label}):** {len(pre_vals)}")
-                                st.write(f"**N ({post_label}):** {len(post_vals)}")
-                                st.write(f"**{pre_label}:** {np.mean(pre_vals):.3f} ± {np.std(pre_vals):.3f}")
-                                st.write(f"**{post_label}:** {np.mean(post_vals):.3f} ± {np.std(post_vals):.3f}")
-                                if is_mixed:
-                                    st.write(f"**Mean Diff:** {np.mean(post_vals) - np.mean(pre_vals):.3f}")
-                                else:
-                                    st.write(f"**Change:** {np.mean(differences_for_display):.3f} ± {np.std(differences_for_display):.3f}")
-                                st.write(f"**p:** {p_value:.3e} *")
-                                st.write(f"**d:** {cohen_d:.3f}")
-                                
-                                # Create a small comparison plot
-                                fig, ax = plt.subplots(figsize=(4, 3))
-                                
-                                data_for_box = [pre_vals, post_vals]
-                                labels = [pre_label, post_label]
-                                
-                                ax.boxplot(data_for_box, labels=labels)
-                                ax.set_ylabel(feature)
-                                ax.set_title(f'{feature}')
-                                ax.grid(True, alpha=0.3)
-                                
-                                st.pyplot(fig)
-                                plt.close(fig)
-                            else:
-                                st.write("**p ≥ 0.05** - Not significant")
-                        else:
-                            # Show all results
-                            st.write(f"**N ({pre_label}):** {len(pre_vals)}")
-                            st.write(f"**N ({post_label}):** {len(post_vals)}")
-                            st.write(f"**{pre_label}:** {np.mean(pre_vals):.3f} ± {np.std(pre_vals):.3f}")
-                            st.write(f"**{post_label}:** {np.mean(post_vals):.3f} ± {np.std(post_vals):.3f}")
-                            if is_mixed:
-                                st.write(f"**Mean Diff:** {np.mean(post_vals) - np.mean(pre_vals):.3f}")
-                            else:
-                                st.write(f"**Change:** {np.mean(differences_for_display):.3f} ± {np.std(differences_for_display):.3f}")
-                            
-                            if p_value is not None:
-                                if p_value < 0.05:
-                                    st.write(f"**p:** {p_value:.3e} *")
-                                else:
-                                    st.write(f"**p:** {p_value:.3e}")
-                                st.write(f"**d:** {cohen_d:.3f}")
-                            else:
-                                st.write("**Insufficient data**")
-                            
-                            # Create a small comparison plot
-                            fig, ax = plt.subplots(figsize=(4, 3))
-                            
-                            data_for_box = [pre_vals, post_vals]
-                            labels = [pre_label, post_label]
-                            
-                            ax.boxplot(data_for_box, labels=labels)
-                            ax.set_ylabel(feature)
-                            ax.set_title(f'{feature}')
-                            ax.grid(True, alpha=0.3)
-                            
-                            st.pyplot(fig)
-                            plt.close(fig)
-                    else:
-                        st.write("**No paired data**")
+
         
         # Forest plot for measurements
         if show_significant_only:
-            st.markdown("## 🌲 Forest Plot - Significant Measurements (p < 0.05)")
+            st.markdown("## 🌲 Forest Plot - Significant Overall Measurements (p < 0.05)")
         else:
-            st.markdown("## 🌲 Forest Plot - All Measurements")
+            st.markdown("## 🌲 Forest Plot - All Overall Measurements")
         
         # Collect results based on user selection
         plot_results = []
-        for feature in eeg_features:
-            # For mixed analysis, get all data; for paired-only, get only paired
-            if is_mixed:
-                # Get all PRE and POST values (paired + unpaired)
-                pre_vals = pre_df[feature].dropna().tolist()
-                post_vals = post_df[feature].dropna().tolist()
-            else:
-                # Get only paired data
-                pre_subjects = set(pre_df['Subject_ID'].unique()) if len(pre_df) > 0 else set()
-                post_subjects = set(post_df['Subject_ID'].unique()) if len(post_df) > 0 else set()
-                common_subjects = pre_subjects.intersection(post_subjects)
-                
-                pre_vals = []
-                post_vals = []
-                for subject in common_subjects:
-                    pre_val = pre_df[pre_df['Subject_ID'] == subject][feature].iloc[0] if len(pre_df[pre_df['Subject_ID'] == subject]) > 0 else np.nan
-                    post_val = post_df[post_df['Subject_ID'] == subject][feature].iloc[0] if len(post_df[post_df['Subject_ID'] == subject]) > 0 else np.nan
-                    
-                    if not np.isnan(pre_val) and not np.isnan(post_val):
-                        pre_vals.append(pre_val)
-                        post_vals.append(post_val)
-            
+        for feature in eeg_features_forest:
+            # get all values of pre and post in single list
+            all_values = pre_df[feature].dropna().tolist() + post_df[feature].dropna().tolist()
+            all_values_zscore = (np.array(all_values) - np.mean(all_values)) / np.std(all_values)
+            pre_df_non_na_indices = pre_df[feature].dropna().index
+            post_df_non_na_indices = post_df[feature].dropna().index
+            pre_df.loc[pre_df_non_na_indices, feature] = all_values_zscore[:len(pre_df_non_na_indices)]
+            post_df.loc[post_df_non_na_indices, feature] = all_values_zscore[len(pre_df_non_na_indices):]
+            pre_vals = pre_df[feature].dropna().tolist()
+            post_vals = post_df[feature].dropna().tolist()
             if len(pre_vals) > 0 and len(post_vals) > 0:
                 result = calculate_effect_size_and_power(pre_df, post_df, feature, pairing_info)
                 if result[0] is not None:
@@ -1049,7 +2029,10 @@ def main():
             ax.set_yticks(y_positions)
             ax.set_yticklabels(feature_names)
             ax.set_xlabel('Mean Difference (95% CI)')
-            ax.set_title('Forest Plot: Significant EEG Measurements (p < 0.05)')
+            if show_significant_only:
+                ax.set_title('Forest Plot: Significant Overall EEG Measurements (p < 0.05)')
+            else:
+                ax.set_title('Forest Plot: All Overall EEG Measurements')
             ax.grid(True, alpha=0.3, axis='x')
             
             # Add legend
@@ -1112,35 +2095,38 @@ def main():
             else:
                 st.info("No measurements found")
         
-        # Forest plot with median ± STD for all features
-        st.markdown("## 🌳 Forest Plot - All EEG Features (Median ± STD)")
-        median_std_fig = create_median_std_forest_plot(pre_df, post_df, eeg_features, pre_label, post_label, is_mixed, pairing_info)
+        # Forest plot with median ± STD for significant features only
+        st.markdown("## 🌳 Forest Plot - Significant EEG Features (Median ± STD, p < 0.05)")
+        median_std_fig = create_median_std_forest_plot(pre_df, post_df, eeg_features_forest, pre_label, post_label, is_mixed, pairing_info, significant_only=True)
         if median_std_fig is not None:
             st.pyplot(median_std_fig)
             plt.close(median_std_fig)
             
-            # Create summary table for median ± STD
-            st.markdown("### Summary Table: Median ± STD")
+            # Create summary table for median ± STD (significant features only)
+            st.markdown("### Summary Table: Median ± STD (Significant Features, p < 0.05)")
             summary_median_data = []
-            for feature in eeg_features:
-                # Get data for this feature
-                if is_mixed:
-                    pre_vals = pre_df[feature].dropna().tolist()
-                    post_vals = post_df[feature].dropna().tolist()
-                else:
-                    pre_subjects = set(pre_df['Subject_ID'].unique()) if len(pre_df) > 0 else set()
-                    post_subjects = set(post_df['Subject_ID'].unique()) if len(post_df) > 0 else set()
-                    common_subjects = pre_subjects.intersection(post_subjects)
-                    
-                    pre_vals = []
-                    post_vals = []
-                    for subject in common_subjects:
-                        pre_val = pre_df[pre_df['Subject_ID'] == subject][feature].iloc[0] if len(pre_df[pre_df['Subject_ID'] == subject]) > 0 else np.nan
-                        post_val = post_df[post_df['Subject_ID'] == subject][feature].iloc[0] if len(post_df[post_df['Subject_ID'] == subject]) > 0 else np.nan
-                        
-                        if not np.isnan(pre_val) and not np.isnan(post_val):
-                            pre_vals.append(pre_val)
-                            post_vals.append(post_val)
+            pre_vals = pre_df[feature].dropna().tolist()
+            post_vals = post_df[feature].dropna().tolist()
+            # Check if feature is significant
+            is_significant_feature = True
+            if pairing_info is not None:
+                try:
+                    result = calculate_effect_size_and_power(pre_df, post_df, feature, pairing_info)
+                    if result[0] is not None:
+                        p_value = result[0]
+                        # Mark as not significant if p >= 0.05
+                        if p_value >= 0.05:
+                            is_significant_feature = False
+                    else:
+                        # Mark as not significant if p-value cannot be calculated
+                        is_significant_feature = False
+                except (KeyError, Exception):
+                    # Mark as not significant if calculation fails
+                    is_significant_feature = False
+
+            if not is_significant_feature:
+                pass  # do not add to summary_median_data
+            else:
                 
                 if len(pre_vals) > 0 or len(post_vals) > 0:
                     pre_median = np.median(pre_vals) if len(pre_vals) > 0 else np.nan
@@ -1166,12 +2152,15 @@ def main():
         else:
             st.warning("Insufficient data to create median ± STD forest plot")
         
-        # Topomaps for all EEG features
-        st.markdown("## 🧠 Topographic Maps - All EEG Features")
-        st.markdown("Topomaps showing spatial distribution of EEG features across channels for PRE and POST groups.")
+        # Topomaps for all EEG features (significant only)
+        st.markdown("## 🧠 Topographic Maps - Significant EEG Features (p < 0.05)")
+        st.markdown("Topomaps showing spatial distribution of significant EEG features across channels for PRE and POST groups.")
         
-        with st.spinner("Generating topomaps for all EEG features..."):
-            topomap_figs = create_topomaps_for_all_features(pre_df, post_df, eeg_features, montage, pre_label, post_label)
+        with st.spinner("Generating topomaps for significant EEG features..."):
+            topomap_figs = create_topomaps_for_all_features(
+                pre_df, post_df, eeg_features, montage, pre_label, post_label,
+                pairing_info=pairing_info, is_mixed=is_mixed, significant_only=True
+            )
         
         if topomap_figs:
             # Group features by type for better organization
@@ -1183,20 +2172,35 @@ def main():
             for feature_type in feature_type_order:
                 if feature_type in topomap_figs:
                     displayed_features.add(feature_type)
+                    fig, p_val = topomap_figs[feature_type]
                     st.markdown(f"### {feature_type.replace('_', ' ').title()}")
-                    st.pyplot(topomap_figs[feature_type])
-                    plt.close(topomap_figs[feature_type])
+                    st.pyplot(fig)
+                    plt.close(fig)
             
             # Display remaining features
             remaining_features = [f for f in topomap_figs.keys() if f not in displayed_features]
             if remaining_features:
                 st.markdown("### Other Features")
                 for feature in remaining_features:
+                    fig, p_val = topomap_figs[feature]
                     st.markdown(f"#### {feature}")
-                    st.pyplot(topomap_figs[feature])
-                    plt.close(topomap_figs[feature])
+                    st.pyplot(fig)
+                    plt.close(fig)
         else:
-            st.info("No channel-specific topomaps available. Feature data may not contain channel-specific measurements.")
+            st.info("No significant channel-specific topomaps available (p < 0.05).")
+        
+        # Spectrograms
+        st.markdown("## 📊 Spectrograms - Frequency vs Time")
+        st.markdown("Spectrograms showing frequency content over time for representative PRE and POST recordings.")
+        
+        with st.spinner("Generating spectrograms..."):
+            spectrogram_fig = create_spectrograms(pre_df, post_df, selected_dataset, pre_label, post_label)
+        
+        if spectrogram_fig is not None:
+            st.pyplot(spectrogram_fig)
+            plt.close(spectrogram_fig)
+        else:
+            st.info("Spectrograms could not be generated. EDF files may not be available or accessible.")
     else:
         st.markdown(f"## Analysis of: {selected_feature}")
         
@@ -1334,6 +2338,10 @@ def main():
         # Topomaps or Simple Comparison Plots
         if show_topomaps:
             with st.expander("🧠 Topographic Maps", expanded=True):
+                # Calculate p-value for topomap title
+                result = calculate_effect_size_and_power(pre_df, post_df, selected_feature, pairing_info)
+                topomap_p_value = result[0] if result[0] is not None else None
+                
                 if 'overall_' in selected_feature:
                     # For overall features, show simple comparison plots
                     fig = create_simple_comparison_plot(pre_df, post_df, selected_feature)
@@ -1344,7 +2352,9 @@ def main():
                         st.warning("Insufficient data for comparison plot")
                 else:
                     # For channel-specific features, show topomaps
-                    fig, pre_evoked, post_evoked = create_topomap_comparison(pre_df, post_df, selected_feature, montage)
+                    fig, pre_evoked, post_evoked = create_topomap_comparison(
+                        pre_df, post_df, selected_feature, montage, p_value=topomap_p_value
+                    )
                     if fig is not None:
                         st.pyplot(fig)
                         plt.close(fig)
@@ -1385,6 +2395,17 @@ def main():
             st.pyplot(fig)
             plt.close(fig)
         
+        # Individual change plot with connecting lines
+        with st.expander("📊 Individual Changes (PRE → POST)", expanded=True):
+            individual_fig = create_individual_change_plot(
+                pre_df, post_df, selected_feature, pre_label, post_label, pairing_info
+            )
+            if individual_fig is not None:
+                st.pyplot(individual_fig)
+                plt.close(individual_fig)
+            else:
+                st.warning("Insufficient paired data for individual change plot")
+        
         # Box plots
         with st.expander("📦 Box Plot Comparison (Paired)", expanded=True):
             fig, ax = plt.subplots(figsize=(8, 6))
@@ -1416,7 +2437,30 @@ def main():
                 labels.append('POST (Paired)')
             
             if data_for_box:
-                ax.boxplot(data_for_box, labels=labels)
+                # Create box plot
+                bp = ax.boxplot(data_for_box, labels=labels, patch_artist=True)
+                
+                # Color the boxes
+                colors = ['lightblue', 'lightcoral']
+                for patch, color in zip(bp['boxes'], colors):
+                    patch.set_facecolor(color)
+                    patch.set_alpha(0.7)
+                
+                # Add individual data points with connecting lines
+                if len(pre_vals) == len(post_vals) and len(pre_vals) > 0:
+                    # Boxplot positions are 1-indexed
+                    x_pre = 1
+                    x_post = 2
+                    for i in range(len(pre_vals)):
+                        # Draw connecting line
+                        ax.plot([x_pre, x_post], [pre_vals[i], post_vals[i]], 
+                               color='gray', linewidth=0.8, alpha=0.3, zorder=1)
+                        # Add individual points
+                        ax.scatter(x_pre, pre_vals[i], color='blue', s=25, 
+                                  alpha=0.6, zorder=2, edgecolors='darkblue', linewidths=0.5)
+                        ax.scatter(x_post, post_vals[i], color='red', s=25, 
+                                  alpha=0.6, zorder=2, edgecolors='darkred', linewidths=0.5)
+                
                 ax.set_ylabel(selected_feature)
                 ax.set_title(f'Box Plot Comparison: {selected_feature} (Paired Data)')
                 ax.grid(True, alpha=0.3)
