@@ -34,3 +34,7 @@ xgboost
 lightgbm
 torch
 tensorflow
+jupyter
+jupyterlab
+ipykernel
+jupyter-client

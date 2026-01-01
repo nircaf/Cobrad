@@ -22,6 +22,7 @@ import statsmodels.stats.multitest as smm
 from scipy.signal import spectrogram
 import statsmodels.api as sm
 from collections import Counter
+import time
 
 # Set plotting styles as specified
 sns.set_context('talk')
@@ -349,17 +350,24 @@ def pairplot_columns(df, clinical_features, eeg_features, hue=None, output_dir=N
             plt.close()
 
 from scipy.stats import mannwhitneyu
-def vs_controls_run(project_name,df_wnv2,controls,boxplot_columns,analysis_type):
+
+def vs_controls_general_groups(project_name, df_wnv2, controls, boxplot_columns, analysis_type):
+    """
+    Run general groups vs controls analysis: demographics and boxplot columns.
+    """
     df_wnv2['Group'] = project_name
     controls['Group'] = 'Controls'
-    combined_df = pd.concat([df_wnv2, controls], ignore_index=True,axis=0)
+    combined_df = pd.concat([df_wnv2, controls], ignore_index=True, axis=0)
     controls_dir = f'temps_Controls_EDF'
     try:
         st.header('Controls Demographics')
         # get controls demographic from get_controls_ages_genders(controls_dir)
         controls_demographics_df = get_controls_ages_genders(controls_dir)
-        cobrad_ages = df_wnv2['clinical_age_at_visit']
-        cobrad_sexes = df_wnv2['clinical_sex, 1=male']
+        # Use renamed columns if available, otherwise use original names
+        age_col = 'age' if 'age' in df_wnv2.columns else 'clinical_age_at_visit'
+        gender_col = 'gender' if 'gender' in df_wnv2.columns else 'clinical_sex, 1=male'
+        cobrad_ages = df_wnv2[age_col]
+        cobrad_sexes = df_wnv2[gender_col]
         cobrad_sexes -= 1
         st.write(f"Controls Demographics: N= {controls_demographics_df.shape[0]}, mean age {controls_demographics_df['Age'].mean():.2f} ± {controls_demographics_df['Age'].std():.2f}")
         # Display mean gender (assuming 1=male, 0=female or similar coding)
@@ -379,7 +387,282 @@ def vs_controls_run(project_name,df_wnv2,controls,boxplot_columns,analysis_type)
         if num_groups < 2:
             continue
         results_df = analyze_and_correct(curr_data, [col], groups=curr_data['Group'].unique())
-        boxplot_plot_dabest(results_df,curr_data, col, 'vs_controls',is_streamlit=True,analysis_type=analysis_type)
+        boxplot_plot_dabest(results_df, curr_data, col, 'vs_controls', is_streamlit=True, analysis_type=analysis_type)
+
+def vs_controls_all_features(df_wnv2, controls, boxplot_columns, analysis_type):
+    """
+    Run analysis over all features vs controls: iterate through all clinical columns and create plots.
+    """
+    # Add section to go over columns of df_wnv2 and show features vs controls
+    st.divider()
+    st.header('Features vs Controls Analysis')
+
+    # Get clinical features
+    clinical_features, _ = get_clinical_and_boxplot_cols(df_wnv2=df_wnv2)
+    
+    # Get columns to iterate over (exclude metadata columns)
+    cols_to_skip = ['ID', 'annotations', 'bad_channels', 'Group', 'patient_number', 'size', 'n_samples', 
+                    'lowpass', 'highpass', 'duration_sec', 'parquet_file_name']
+    # Add age and gender columns to skip (check both old and new names)
+    age_cols_to_skip = [col for col in df_wnv2.columns if 'age' in col.lower()]
+    gender_cols_to_skip = [col for col in df_wnv2.columns if 'gender' in col.lower() or ('sex' in col.lower() and 'age' not in col.lower())]
+    cols_to_skip.extend(age_cols_to_skip)
+    cols_to_skip.extend(gender_cols_to_skip)
+    
+    # Filter to only clinical features that are numeric and not in cols_to_skip
+    feature_columns = [col for col in clinical_features if col not in cols_to_skip]
+    numeric_columns = df_wnv2.select_dtypes(include=[np.number]).columns
+    feature_columns = [col for col in feature_columns if col in numeric_columns]
+    controls['Group'] = 'Controls'
+
+    for idx, selected_feature in enumerate(feature_columns):
+            # keep only rows that can be safely converted to float
+            feature_data = (
+                df_wnv2[selected_feature]
+                .apply(pd.to_numeric, errors='coerce')  # turn invalids into NaN
+                .dropna()
+                .astype(float)
+            )
+            if feature_data.empty:
+                reason = f"Skipping {selected_feature}: No valid numeric data after conversion"
+                print(reason)
+                st.write(f"⏭️ {reason}")
+                continue  # Skip to next feature
+            
+            # Display selected feature header
+            st.subheader(f"Feature: {selected_feature}")
+            
+            # Create df_wnv3 with the selected feature
+            df_wnv3 = df_wnv2[df_wnv2[selected_feature].notna()].copy()
+            
+            # Clean ID column: remove .edf, .eeg, and other file extensions
+            if 'ID' in df_wnv3.columns:
+                df_wnv3['ID'] = df_wnv3['ID'].astype(str).str.replace('.edf', '', regex=False, case=False)
+                df_wnv3['ID'] = df_wnv3['ID'].str.replace('.eeg', '', regex=False, case=False)
+                df_wnv3['ID'] = df_wnv3['ID'].str.replace('.EDF', '', regex=False, case=False)
+                df_wnv3['ID'] = df_wnv3['ID'].str.replace('.EEG', '', regex=False, case=False)
+                # Remove any trailing dots
+                df_wnv3['ID'] = df_wnv3['ID'].str.rstrip('.')
+            
+            unique_values = df_wnv3[selected_feature].unique()
+            
+            # Only process binary features (exactly 2 unique values)
+            if df_wnv3.shape[0] < 3 :
+                if df_wnv3.shape[0] < 3:
+                    reason = f"Skipping {selected_feature}: Not enough rows ({df_wnv3.shape[0]} < 3)"
+                else:
+                    reason = f"Skipping {selected_feature}: Not binary feature (has {len(unique_values)} unique values, need exactly 2)"
+                print(reason)
+                st.write(f"⏭️ {reason}")
+                continue
+            
+            # Convert to numeric and ensure binary (0 and 1)
+            df_wnv3[selected_feature] = pd.to_numeric(df_wnv3[selected_feature], errors='coerce')
+            df_wnv3 = df_wnv3[df_wnv3[selected_feature].notna()]
+            unique_values = df_wnv3[selected_feature].unique()
+            
+            
+            # Normalize to 0 and 1 if needed
+            min_val = df_wnv3[selected_feature].min()
+            max_val = df_wnv3[selected_feature].max()
+            if min_val != 0 or max_val != 1:
+                # Map to 0 and 1
+                df_wnv3[selected_feature] = df_wnv3[selected_feature].apply(lambda x: 1 if x == max_val else 0)
+            
+            # Check that there are at least 3 in each group (0,1)
+            group_0_count = len(df_wnv3[df_wnv3[selected_feature] == 0])
+            group_1_count = len(df_wnv3[df_wnv3[selected_feature] == 1])
+            if group_0_count < 3 or group_1_count < 3:
+                reason = f"Skipping {selected_feature}: Not enough samples in each group (Group 0: {group_0_count}, Group 1: {group_1_count}, need at least 3 each)"
+                print(reason)
+                st.write(f"⏭️ {reason}")
+                continue
+            
+            # Get group 1's age and gender for matching controls
+            group_1_data = df_wnv3[df_wnv3[selected_feature] == 1].copy()
+            # Use renamed columns if available, otherwise use original names
+            age_col = 'age' if 'age' in group_1_data.columns else 'clinical_age_at_visit'
+            gender_col = 'gender' if 'gender' in group_1_data.columns else 'clinical_sex, 1=male'
+            group_1_ages = group_1_data[age_col].dropna()
+            group_1_sexes = group_1_data[gender_col].dropna()
+            
+            if group_1_ages.empty or group_1_sexes.empty:
+                if group_1_ages.empty:
+                    reason = f"Skipping {selected_feature}: Missing age data for group 1"
+                else:
+                    reason = f"Skipping {selected_feature}: Missing gender data for group 1"
+                print(reason)
+                st.write(f"⏭️ {reason}")
+                continue
+            
+            # Match controls by age and gender from group 1
+            # Convert group 1 gender format to match controls (if needed)
+            if gender_col == 'clinical_sex, 1=male':
+                # Convert: 1=male, 2=female -> 0=female, 1=male (to match controls format)
+                group_1_sexes_normalized = group_1_sexes - 1
+            else:
+                # Assume already in correct format (0=female, 1=male)
+                group_1_sexes_normalized = group_1_sexes.copy()
+            
+            # Check if controls have age and gender columns
+            if 'age' not in controls.columns or 'gender' not in controls.columns:
+                reason = f"Skipping {selected_feature}: Controls dataframe missing 'age' or 'gender' column"
+                print(reason)
+                st.write(f"⏭️ {reason}")
+                continue
+            
+            # Match controls: find controls with matching age range and gender
+            matched_controls_indices = []
+            for age, sex in zip(group_1_ages, group_1_sexes_normalized):
+                # Find controls with similar age (within 2 years) and same gender
+                age_mask = (controls['age'] >= age - 2) & (controls['age'] <= age + 2)
+                gender_mask = (controls['gender'] == sex)
+                matched = controls[age_mask & gender_mask]
+                if not matched.empty:
+                    # Get matched indices that don't already exist
+                    matched_indices = [idx for idx in matched.index.tolist() if idx not in matched_controls_indices]
+                    # Take first 3 that don't already exist
+                    matched_controls_indices.extend(matched_indices[:3])
+            
+            if not matched_controls_indices:
+                reason = f"Skipping {selected_feature}: No matched controls found for group 1's age and gender distribution"
+                print(reason)
+                st.write(f"⏭️ {reason}")
+                continue
+            
+            # Remove duplicates and get matched controls
+            matched_controls_indices = list(set(matched_controls_indices))
+            controls_matched = controls.loc[matched_controls_indices].copy()
+            
+            if controls_matched.empty:
+                reason = f"Skipping {selected_feature}: No matched controls data found after filtering"
+                print(reason)
+                st.write(f"⏭️ {reason}")
+                continue
+            
+            # Create groups: group 0, group 1, and controls
+            org_selected_feature_for_plot = org_selected_feature(selected_feature) if selected_feature != 'sex' and 'sex' not in selected_feature.lower() else ''
+            
+            # Assign group labels
+            df_wnv3.loc[df_wnv3[selected_feature] == 0, 'Group'] = f'{org_selected_feature_for_plot} 0' if org_selected_feature_for_plot else 'Group 0'
+            df_wnv3.loc[df_wnv3[selected_feature] == 1, 'Group'] = f'{org_selected_feature_for_plot} 1' if org_selected_feature_for_plot else 'Group 1'
+            
+            # Concatenate only matched controls (they already have 'Group' = 'Controls' from earlier)
+            df_wnv3 = pd.concat([df_wnv3, controls_matched], ignore_index=True)
+            # Verify we have 3 unique groups
+            unique_groups = df_wnv3['Group'].unique()
+            if len(unique_groups) != 3:
+                reason = f"Skipping {selected_feature}: Expected 3 unique groups but found {len(unique_groups)} groups: {unique_groups}"
+                print(reason)
+                st.write(f"⏭️ {reason}")
+                continue
+            
+            # Create statistics table for age, gender, and selected_feature
+            # Get age and gender columns
+            age_col = 'age' if 'age' in df_wnv3.columns else 'clinical_age_at_visit'
+            gender_col = 'gender' if 'gender' in df_wnv3.columns else 'clinical_sex, 1=male'
+            
+            # Prepare data for table
+            table_data = []
+            
+            # Get group 0 and group 1 labels
+            group_0_label = df_wnv3.loc[df_wnv3[selected_feature] == 0, 'Group'].iloc[0] if len(df_wnv3[df_wnv3[selected_feature] == 0]) > 0 else None
+            group_1_label = df_wnv3.loc[df_wnv3[selected_feature] == 1, 'Group'].iloc[0] if len(df_wnv3[df_wnv3[selected_feature] == 1]) > 0 else None
+            group_0_data = df_wnv3[df_wnv3['Group'] == group_0_label].copy() if group_0_label is not None else pd.DataFrame()
+            group_1_data = df_wnv3[df_wnv3['Group'] == group_1_label].copy() if group_1_label is not None else pd.DataFrame()
+            
+            # Function to calculate p-value between two groups
+            def calc_pvalue(group1_data, group2_data, col_name):
+                try:
+                    g1 = group1_data[col_name].dropna()
+                    g2 = group2_data[col_name].dropna()
+                    if len(g1) < 2 or len(g2) < 2:
+                        return None
+                    stat, pval = mannwhitneyu(g1, g2, alternative='two-sided')
+                    return pval
+                except:
+                    return None
+            
+            # Age statistics
+            if age_col in df_wnv3.columns:
+                controls_age = controls_matched[age_col].dropna()
+                group_0_age = group_0_data[age_col].dropna() if not group_0_data.empty else pd.Series()
+                group_1_age = group_1_data[age_col].dropna() if not group_1_data.empty else pd.Series()
+                
+                table_data.append({
+                    'Variable': 'Age',
+                    'Controls': f"{controls_age.mean():.2f} ± {controls_age.std():.2f} (n={len(controls_age)})",
+                    'Group 0': f"{group_0_age.mean():.2f} ± {group_0_age.std():.2f} (n={len(group_0_age)})" if len(group_0_age) > 0 else "N/A",
+                    'Group 1': f"{group_1_age.mean():.2f} ± {group_1_age.std():.2f} (n={len(group_1_age)})" if len(group_1_age) > 0 else "N/A",
+                    'p-value (Controls vs Group 0)': f"{calc_pvalue(controls_matched, group_0_data, age_col):.3e}" if calc_pvalue(controls_matched, group_0_data, age_col) is not None else "N/A",
+                    'p-value (Controls vs Group 1)': f"{calc_pvalue(controls_matched, group_1_data, age_col):.3e}" if calc_pvalue(controls_matched, group_1_data, age_col) is not None else "N/A",
+                    'p-value (Group 0 vs Group 1)': f"{calc_pvalue(group_0_data, group_1_data, age_col):.3e}" if calc_pvalue(group_0_data, group_1_data, age_col) is not None else "N/A"
+                })
+            
+            # Gender statistics
+            if gender_col in df_wnv3.columns:
+                controls_gender = controls_matched[gender_col].dropna()
+                group_0_gender = group_0_data[gender_col].dropna() if not group_0_data.empty else pd.Series()
+                group_1_gender = group_1_data[gender_col].dropna() if not group_1_data.empty else pd.Series()
+                
+                table_data.append({
+                    'Variable': 'Gender',
+                    'Controls': f"{controls_gender.mean():.2f} ± {controls_gender.std():.2f} (n={len(controls_gender)})",
+                    'Group 0': f"{group_0_gender.mean():.2f} ± {group_0_gender.std():.2f} (n={len(group_0_gender)})" if len(group_0_gender) > 0 else "N/A",
+                    'Group 1': f"{group_1_gender.mean():.2f} ± {group_1_gender.std():.2f} (n={len(group_1_gender)})" if len(group_1_gender) > 0 else "N/A",
+                    'p-value (Controls vs Group 0)': f"{calc_pvalue(controls_matched, group_0_data, gender_col):.3e}" if calc_pvalue(controls_matched, group_0_data, gender_col) is not None else "N/A",
+                    'p-value (Controls vs Group 1)': f"{calc_pvalue(controls_matched, group_1_data, gender_col):.3e}" if calc_pvalue(controls_matched, group_1_data, gender_col) is not None else "N/A",
+                    'p-value (Group 0 vs Group 1)': f"{calc_pvalue(group_0_data, group_1_data, gender_col):.3e}" if calc_pvalue(group_0_data, group_1_data, gender_col) is not None else "N/A"
+                })
+            
+            # Selected feature statistics
+            if selected_feature in df_wnv3.columns and selected_feature in controls_matched.columns:
+                controls_feat = controls_matched[selected_feature].dropna()
+                group_0_feat = group_0_data[selected_feature].dropna() if not group_0_data.empty else pd.Series()
+                group_1_feat = group_1_data[selected_feature].dropna() if not group_1_data.empty else pd.Series()
+                
+                table_data.append({
+                    'Variable': selected_feature,
+                    'Controls': f"{controls_feat.mean():.2f} ± {controls_feat.std():.2f} (n={len(controls_feat)})",
+                    'Group 0': f"{group_0_feat.mean():.2f} ± {group_0_feat.std():.2f} (n={len(group_0_feat)})" if len(group_0_feat) > 0 else "N/A",
+                    'Group 1': f"{group_1_feat.mean():.2f} ± {group_1_feat.std():.2f} (n={len(group_1_feat)})" if len(group_1_feat) > 0 else "N/A",
+                    'p-value (Controls vs Group 0)': f"{calc_pvalue(controls_matched, group_0_data, selected_feature):.3e}" if calc_pvalue(controls_matched, group_0_data, selected_feature) is not None else "N/A",
+                    'p-value (Controls vs Group 1)': f"{calc_pvalue(controls_matched, group_1_data, selected_feature):.3e}" if calc_pvalue(controls_matched, group_1_data, selected_feature) is not None else "N/A",
+                    'p-value (Group 0 vs Group 1)': f"{calc_pvalue(group_0_data, group_1_data, selected_feature):.3e}" if calc_pvalue(group_0_data, group_1_data, selected_feature) is not None else "N/A"
+                })
+            
+            # Display table
+            if table_data :
+                stats_df = pd.DataFrame(table_data)
+                st.write("**Group Demographics**")
+                st.dataframe(stats_df, use_container_width=True)
+                # Add table to PPTX
+                add_table_to_pptx(stats_df, title="Group Demographics")
+            
+            # Create filtered dataframe with only Group 1 and Controls for plotting
+            df_wnv3_plot = df_wnv3[df_wnv3['Group'].isin(['Controls', group_1_label])].copy() if group_1_label is not None else df_wnv3[df_wnv3['Group'] == 'Controls'].copy()
+            
+            # run over boxplot_columns
+            for band in boxplot_columns:
+                results_df = analyze_and_correct(df_wnv3_plot, [band], groups=df_wnv3_plot['Group'].unique())
+                time.sleep(0.5)  # Wait 0.5 seconds for things to load
+                boxplot_plot_dabest(results_df, df_wnv3_plot, band, f'{selected_feature}', is_streamlit=True, selected_feature=selected_feature)
+                results_df = analyze_and_correct(df_wnv3, [band], groups=df_wnv3['Group'].unique())
+                time.sleep(0.5)  # Wait 0.5 seconds for things to load
+                boxplot_plot_dabest(results_df, df_wnv3, band, f'{selected_feature}', is_streamlit=True, selected_feature=selected_feature)
+            
+            st.divider()
+
+def vs_controls_run(project_name, df_wnv2, controls, boxplot_columns, analysis_type, feature_types_to_run=None):
+    """
+    Main function to run vs controls analysis. Calls both general groups and all features analysis.
+    """
+    # Run all features vs controls first (only if "vs_Controls" is in feature_types_to_run)
+    if feature_types_to_run is None or "vs_Controls" in feature_types_to_run:
+        vs_controls_all_features(df_wnv2, controls, boxplot_columns, analysis_type)
+    
+    # Run general groups vs controls (demographics and boxplot columns)
+    vs_controls_general_groups(project_name, df_wnv2, controls, boxplot_columns, analysis_type)
 
 def ml_plots_get_images(project_name, selected_feature):
     ml_plots_dir = f"{project_name}_figures/ml_plots"
@@ -3764,7 +4047,7 @@ def main():
     # Deduplicate while preserving order
     seen = set()
     opts = [x for x in default_options if not (x in seen or seen.add(x))]
-    selected_projects = st.sidebar.pills("Select Project(s)", opts, default=[x for x in ["COBRAD"] if x in opts],selection_mode ="multi")
+    selected_projects = st.sidebar.pills("Select Project(s)", opts, default=[x for x in ["TGA"] if x in opts],selection_mode ="multi")
     if not selected_projects:
         st.error("Please select at least one project.")
         return
@@ -3796,6 +4079,23 @@ def main():
             controls_others.append((project_name, temp_controls))
             cases_group_name_others.append((project_name, temp_cases_group_name))
     project_name = selected_projects[0]  # Use the first selected project for downstream logic
+    st.session_state['project_name'] = project_name  # Store project name for PPTX generation
+    
+    # Rename age column if there's exactly one column containing "age" as a whole word (case-insensitive)
+    age_cols = [col for col in df_wnv2.columns if re.search(r'\bage\b', col, re.IGNORECASE)]
+    if len(age_cols) == 1:
+        df_wnv2 = df_wnv2.rename(columns={age_cols[0]: 'age'})
+    
+    # Rename gender/sex column if there's exactly one column containing "gender" or "sex" as whole words (case-insensitive)
+    # Match gender/sex that is at word boundaries (including underscore as a boundary)
+    gender_cols = [col for col in df_wnv2.columns if re.search(r'(^|_|[^a-zA-Z0-9_])gender(_|[^a-zA-Z0-9_]|$)', col, re.IGNORECASE) or (re.search(r'(^|_|[^a-zA-Z0-9_])sex(_|[^a-zA-Z0-9_]|$)', col, re.IGNORECASE) and not re.search(r'(^|_|[^a-zA-Z0-9_])age(_|[^a-zA-Z0-9_]|$)', col, re.IGNORECASE))]
+    if len(gender_cols) == 1:
+        df_wnv2 = df_wnv2.rename(columns={gender_cols[0]: 'gender'})
+    # Store df_wnv2 in session state for Excel export
+    st.session_state['df_wnv2'] = df_wnv2
+    
+    # Add Excel download button at the top of sidebar
+    download_excel_button()
 
     st.title("EEG Analysis")
     # Iterate over each frequency band and plot the topomap
@@ -3815,7 +4115,8 @@ def main():
     clinical_features_numeric = [col for col in clinical_features if pd.api.types.is_numeric_dtype(df_wnv2[col])]
     # Sidebar for feature selection
     st.sidebar.header("Feature Selection")
-    feature_types = ('systole_diastole_comparison', 'ECG_Analysis', 'HEP','All',  'Clinical Feature', "EEG Feature", "ml_plots", "vs_Controls", "Pair Plot",'Raw','Spectrogram', ) # 'Longitudinal',
+    # 'systole_diastole_comparison', 'ECG_Analysis', 'HEP',
+    feature_types = ("vs_Controls",'All',  'Clinical Feature', "EEG Feature", "ml_plots",  "Pair Plot",'Raw','Spectrogram', ) # 'Longitudinal',
     feature_type = st.sidebar.selectbox("Select feature type to plot against the other type:", feature_types, index=0)
     
     # Sidebar for scatterplot size feature selection
@@ -3853,7 +4154,7 @@ def main():
             st.header(f"{current_feature_type} Analysis")
             bool_all_features = True
         if current_feature_type == "vs_Controls":
-            vs_controls_run(project_name,df_wnv2,controls,boxplot_columns,analysis_type)
+            vs_controls_run(project_name, df_wnv2, controls, boxplot_columns, analysis_type)
         elif current_feature_type == "HEP":
             HEP_plots(project_name,df_wnv2,controls,boxplot_columns,analysis_type,size_feature=size_feature, context_key="hep_main")
         elif current_feature_type == "Pair Plot":
@@ -3977,6 +4278,8 @@ def main():
                     boxplot_columns = boxplot_columns + clinical_features - selected_feature
                 # Display selected feature and plots
                 df_wnv3 = df_wnv2[df_wnv2[selected_feature].notna()].copy()
+                # Store df_wnv3 in session state for Excel export
+                st.session_state['df_wnv3'] = df_wnv3
                 unique_values = df_wnv3[selected_feature].unique()
                 # Save the raw data
                 print(f'Analyzing {selected_feature} with {len(unique_values)} unique values')
@@ -3992,15 +4295,21 @@ def main():
                             df_wnv3[selected_feature] -= 1
                         # if 1 'f' else 'm'
                         df_wnv3['Group'] = df_wnv3[selected_feature].apply(lambda x: 'f' if x == 1 else 'm')
+                        # Update session state
+                        st.session_state['df_wnv3'] = df_wnv3
                     else:
                         # group values based on band if =1, else f'not {band}'
                         org_selected_feature_for_plot = org_selected_feature(selected_feature)
                         df_wnv3['Group'] = df_wnv3[selected_feature].apply(lambda x: f'{org_selected_feature_for_plot}+' if x == 1 else f'{org_selected_feature_for_plot}-')
+                        # Update session state
+                        st.session_state['df_wnv3'] = df_wnv3
                     # run over df_wnv2_others
                     for idx, (project_name_other, df_wnv2_other) in enumerate(df_wnv2_others):
                         if idx ==0:
                             # concat with controls, df_wnv3
                             df_wnv3 = pd.concat([controls, df_wnv3], ignore_index=True)
+                            # Update session state
+                            st.session_state['df_wnv3'] = df_wnv3
                         if selected_feature == 'sex':
                             # Build a safe string representation of sex (map numeric codes to 'f'/'m' if possible)
                             if 'sex' in df_wnv2_other.columns:
@@ -4022,6 +4331,8 @@ def main():
                             df_wnv2_other['Group'] = project_name_other
                         # concat to df_wnv3
                         df_wnv3 = pd.concat([df_wnv3, df_wnv2_other], ignore_index=True)
+                        # Update session state
+                        st.session_state['df_wnv3'] = df_wnv3
                                     # st checkbox if HEP
                     if hep_checkbox is None:
                         hep_checkbox = st.checkbox("Show HEP & TSNE Plots", value=False, key=f"hep_checkbox_{selected_feature}")
@@ -4048,8 +4359,9 @@ def main():
             if bool_all_features:
                 # Show HEP checkbox only once for all features
                 hep_checkbox = st.checkbox("Show HEP & TSNE Plots", value=False, key="hep_checkbox_all")
-                
-                for feature in all_feat_list:
+                # remove size, n_samples, lowpass, highpass, duration_sec, parquet_file_name
+                all_feat_list_fixed = [feature for feature in all_feat_list if feature not in ['size', 'n_samples', 'lowpass', 'highpass', 'duration_sec', 'parquet_file_name']]
+                for feature in all_feat_list_fixed:
                     clinical_features, boxplot_columns = get_clinical_and_boxplot_cols(df_wnv2=df_wnv2)
                     selected_feature = feature
                     st.write(f"## Analyzing Feature: {selected_feature}")

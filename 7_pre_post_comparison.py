@@ -1212,6 +1212,323 @@ def create_single_feature_forest_plot(pre_vals, post_vals, feature, pre_label, p
     plt.tight_layout()
     return fig
 
+def create_paired_scatterplot(pre_df, post_df, feature, pre_label, post_label, pairing_info, p_value=None):
+    """
+    Create a paired line plot with boxplots showing PRE vs POST values.
+    X-axis has Pre and Post only, with lines connecting each patient and boxplots with STD.
+    
+    Parameters
+    ----------
+    pre_df : pd.DataFrame
+        PRE group data
+    post_df : pd.DataFrame
+        POST group data
+    feature : str
+        Feature name
+    pre_label : str
+        Label for PRE group
+    post_label : str
+        Label for POST group
+    pairing_info : dict or set
+        Pairing information
+    p_value : float, optional
+        P-value for title
+    
+    Returns
+    -------
+    fig : matplotlib.figure.Figure or None
+        Figure object if successful, None otherwise
+    """
+    # Get paired subjects
+    pre_subjects = set(pre_df['Subject_ID'].unique()) if len(pre_df) > 0 else set()
+    post_subjects = set(post_df['Subject_ID'].unique()) if len(post_df) > 0 else set()
+    common_subjects = pre_subjects.intersection(post_subjects)
+    
+    if len(common_subjects) < 2:
+        return None
+    
+    # Prepare paired data
+    pre_vals = []
+    post_vals = []
+    subject_ids = []
+    
+    for subject in common_subjects:
+        pre_val = pre_df[pre_df['Subject_ID'] == subject][feature].iloc[0] if len(pre_df[pre_df['Subject_ID'] == subject]) > 0 else np.nan
+        post_val = post_df[post_df['Subject_ID'] == subject][feature].iloc[0] if len(post_df[post_df['Subject_ID'] == subject]) > 0 else np.nan
+        
+        if not np.isnan(pre_val) and not np.isnan(post_val):
+            pre_vals.append(pre_val)
+            post_vals.append(post_val)
+            subject_ids.append(subject)
+    
+    if len(pre_vals) < 2:
+        return None
+    
+    # Create figure
+    fig, ax = plt.subplots(figsize=(8, 6))
+    
+    # X positions for Pre and Post
+    x_pre = 0
+    x_post = 1
+    x_positions = [x_pre, x_post]
+    x_labels = [pre_label, post_label]
+    
+    # Prepare data for boxplots
+    boxplot_data = [pre_vals, post_vals]
+    
+    # Create boxplots with STD
+    bp = ax.boxplot(boxplot_data, positions=x_positions, widths=0.3, 
+                    patch_artist=True, showmeans=True, meanline=True,
+                    boxprops=dict(facecolor='lightblue', alpha=0.5),
+                    medianprops=dict(color='black', linewidth=2),
+                    meanprops=dict(color='red', linewidth=1.5, linestyle='--'),
+                    whiskerprops=dict(color='black', linewidth=1),
+                    capprops=dict(color='black', linewidth=1),
+                    zorder=1)
+    
+    # Add STD information to boxplots
+    pre_mean = np.mean(pre_vals)
+    pre_std = np.std(pre_vals)
+    post_mean = np.mean(post_vals)
+    post_std = np.std(post_vals)
+    
+    # Draw STD error bars on boxplots
+    ax.errorbar(x_pre, pre_mean, yerr=pre_std, fmt='o', color='blue', 
+                capsize=5, capthick=2, markersize=8, label=f'{pre_label} Mean ± STD', zorder=3)
+    ax.errorbar(x_post, post_mean, yerr=post_std, fmt='s', color='red', 
+                capsize=5, capthick=2, markersize=8, label=f'{post_label} Mean ± STD', zorder=3)
+    
+    # Plot connecting lines for each patient
+    for i, (pre_val, post_val) in enumerate(zip(pre_vals, post_vals)):
+        ax.plot([x_pre, x_post], [pre_val, post_val], 'gray', alpha=0.4, linewidth=1, zorder=2)
+    
+    # Plot individual points
+    ax.scatter([x_pre] * len(pre_vals), pre_vals, color='blue', s=60, alpha=0.6, 
+              marker='o', zorder=4, edgecolors='darkblue', linewidths=1)
+    ax.scatter([x_post] * len(post_vals), post_vals, color='red', s=60, alpha=0.6, 
+              marker='s', zorder=4, edgecolors='darkred', linewidths=1)
+    
+    # Customize plot
+    ax.set_xticks(x_positions)
+    ax.set_xticklabels(x_labels, fontsize=12, fontweight='bold')
+    ax.set_ylabel(f'{feature} Value', fontsize=12, fontweight='bold')
+    ax.set_xlim(-0.3, 1.3)
+    
+    # Add title with p-value
+    if p_value is not None:
+        sig_marker = ' *' if p_value < 0.05 else ''
+        title = f'{feature}\np = {p_value:.3e}{sig_marker} (Paired, N={len(pre_vals)})'
+    else:
+        title = f'{feature}\n(Paired, N={len(pre_vals)})'
+    ax.set_title(title, fontsize=11, fontweight='bold')
+    
+    ax.legend(loc='best', fontsize=9)
+    ax.grid(True, alpha=0.3, axis='y', linestyle='--')
+    
+    plt.tight_layout()
+    return fig
+
+def create_simple_paired_scatterplot(pre_df, post_df, feature, pre_label, post_label, pairing_info, p_value=None):
+    """
+    Create a simple scatterplot with PRE and POST on x-axis, connecting lines for each patient.
+    
+    Parameters
+    ----------
+    pre_df : pd.DataFrame
+        PRE group data
+    post_df : pd.DataFrame
+        POST group data
+    feature : str
+        Feature name
+    pre_label : str
+        Label for PRE group
+    post_label : str
+        Label for POST group
+    pairing_info : dict or set
+        Pairing information
+    p_value : float, optional
+        P-value for title
+    
+    Returns
+    -------
+    fig : matplotlib.figure.Figure or None
+        Figure object if successful, None otherwise
+    """
+    # Get paired subjects
+    pre_subjects = set(pre_df['Subject_ID'].unique()) if len(pre_df) > 0 else set()
+    post_subjects = set(post_df['Subject_ID'].unique()) if len(post_df) > 0 else set()
+    common_subjects = pre_subjects.intersection(post_subjects)
+    
+    if len(common_subjects) < 2:
+        return None
+    
+    # Prepare paired data
+    pre_vals = []
+    post_vals = []
+    subject_ids = []
+    
+    for subject in common_subjects:
+        pre_val = pre_df[pre_df['Subject_ID'] == subject][feature].iloc[0] if len(pre_df[pre_df['Subject_ID'] == subject]) > 0 else np.nan
+        post_val = post_df[post_df['Subject_ID'] == subject][feature].iloc[0] if len(post_df[post_df['Subject_ID'] == subject]) > 0 else np.nan
+        
+        if not np.isnan(pre_val) and not np.isnan(post_val):
+            pre_vals.append(pre_val)
+            post_vals.append(post_val)
+            subject_ids.append(subject)
+    
+    if len(pre_vals) < 2:
+        return None
+    
+    # Create figure
+    fig, ax = plt.subplots(figsize=(8, 6))
+    
+    # X positions for PRE and POST
+    x_pre = 0
+    x_post = 1
+    x_positions = [x_pre, x_post]
+    x_labels = [pre_label, post_label]
+    
+    # Plot connecting lines for each patient
+    for i, (pre_val, post_val) in enumerate(zip(pre_vals, post_vals)):
+        ax.plot([x_pre, x_post], [pre_val, post_val], 'gray', alpha=0.3, linewidth=1, zorder=1)
+    
+    # Plot PRE points
+    ax.scatter([x_pre] * len(pre_vals), pre_vals, color='blue', s=100, alpha=0.6, 
+              marker='o', label=pre_label, zorder=2, edgecolors='darkblue', linewidths=1.5)
+    
+    # Plot POST points
+    ax.scatter([x_post] * len(post_vals), post_vals, color='red', s=100, alpha=0.6, 
+              marker='s', label=post_label, zorder=3, edgecolors='darkred', linewidths=1.5)
+    
+    # Add mean lines
+    pre_mean = np.mean(pre_vals)
+    post_mean = np.mean(post_vals)
+    ax.axhline(y=pre_mean, color='blue', linestyle='--', alpha=0.5, linewidth=1.5, label=f'{pre_label} Mean')
+    ax.axhline(y=post_mean, color='red', linestyle='--', alpha=0.5, linewidth=1.5, label=f'{post_label} Mean')
+    
+    # Customize plot
+    ax.set_xticks(x_positions)
+    ax.set_xticklabels(x_labels, fontsize=12, fontweight='bold')
+    ax.set_ylabel(f'{feature} Value', fontsize=12, fontweight='bold')
+    
+    # Add title with p-value
+    if p_value is not None:
+        sig_marker = ' *' if p_value < 0.05 else ''
+        title = f'{feature}\np = {p_value:.3e}{sig_marker} (Paired, N={len(pre_vals)})'
+    else:
+        title = f'{feature}\n(Paired, N={len(pre_vals)})'
+    ax.set_title(title, fontsize=11, fontweight='bold')
+    
+    ax.legend(loc='best', fontsize=9)
+    ax.grid(True, alpha=0.3, axis='y', linestyle='--')
+    
+    plt.tight_layout()
+    return fig
+
+def create_simple_paired_scatterplots_for_significant_features(pre_df, post_df, eeg_features, pre_label, post_label, 
+                                                                 pairing_info, is_mixed, significant_only=True):
+    """
+    Create simple scatterplots for all significant features showing PRE and POST on x-axis with connecting lines.
+    
+    Parameters
+    ----------
+    pre_df : pd.DataFrame
+        PRE group data
+    post_df : pd.DataFrame
+        POST group data
+    eeg_features : list
+        List of EEG feature names
+    pre_label : str
+        Label for PRE group
+    post_label : str
+        Label for POST group
+    pairing_info : dict or set
+        Pairing information
+    is_mixed : bool
+        Whether analysis is mixed paired/unpaired
+    significant_only : bool
+        If True, only show significant features (p < 0.05)
+    
+    Returns
+    -------
+    dict : Dictionary mapping feature names to figure objects
+    """
+    scatterplot_figs = {}
+    
+    for feature in eeg_features:
+        # Calculate p-value for this feature
+        p_value = None
+        if pairing_info is not None:
+            try:
+                result = calculate_effect_size_and_power(pre_df, post_df, feature, pairing_info)
+                if result[0] is not None:
+                    p_value = result[0]
+            except (KeyError, Exception):
+                pass
+        
+        # Filter for significant features if requested
+        if significant_only and (p_value is None or p_value >= 0.05):
+            continue
+        
+        # Create scatterplot for this feature
+        fig = create_simple_paired_scatterplot(pre_df, post_df, feature, pre_label, post_label, pairing_info, p_value=p_value)
+        if fig is not None:
+            scatterplot_figs[feature] = fig
+    
+    return scatterplot_figs
+
+def create_paired_scatterplots_for_significant_features(pre_df, post_df, eeg_features, pre_label, post_label, 
+                                                         pairing_info, is_mixed, significant_only=True):
+    """
+    Create scatterplots for all significant features showing paired PRE vs POST comparisons.
+    
+    Parameters
+    ----------
+    pre_df : pd.DataFrame
+        PRE group data
+    post_df : pd.DataFrame
+        POST group data
+    eeg_features : list
+        List of EEG feature names
+    pre_label : str
+        Label for PRE group
+    post_label : str
+        Label for POST group
+    pairing_info : dict or set
+        Pairing information
+    is_mixed : bool
+        Whether analysis is mixed paired/unpaired
+    significant_only : bool
+        If True, only show significant features (p < 0.05)
+    
+    Returns
+    -------
+    dict : Dictionary mapping feature names to figure objects
+    """
+    scatterplot_figs = {}
+    
+    for feature in eeg_features:
+        # Calculate p-value for this feature
+        p_value = None
+        if pairing_info is not None:
+            try:
+                result = calculate_effect_size_and_power(pre_df, post_df, feature, pairing_info)
+                if result[0] is not None:
+                    p_value = result[0]
+            except (KeyError, Exception):
+                pass
+        
+        # Filter for significant features if requested
+        if significant_only and (p_value is None or p_value >= 0.05):
+            continue
+        
+        # Create scatterplot for this feature
+        fig = create_paired_scatterplot(pre_df, post_df, feature, pre_label, post_label, pairing_info, p_value=p_value)
+        if fig is not None:
+            scatterplot_figs[feature] = fig
+    
+    return scatterplot_figs
+
 def create_median_std_forest_plot(pre_df, post_df, eeg_features, pre_label, post_label, is_mixed, pairing_info, significant_only=True):
     """
     Create a forest plot showing median ± STD for EEG features.
@@ -2105,28 +2422,45 @@ def main():
             # Create summary table for median ± STD (significant features only)
             st.markdown("### Summary Table: Median ± STD (Significant Features, p < 0.05)")
             summary_median_data = []
-            pre_vals = pre_df[feature].dropna().tolist()
-            post_vals = post_df[feature].dropna().tolist()
-            # Check if feature is significant
-            is_significant_feature = True
-            if pairing_info is not None:
-                try:
-                    result = calculate_effect_size_and_power(pre_df, post_df, feature, pairing_info)
-                    if result[0] is not None:
-                        p_value = result[0]
-                        # Mark as not significant if p >= 0.05
-                        if p_value >= 0.05:
+            
+            # Loop through all features to find significant ones
+            for feature in eeg_features_forest:
+                # Check if feature is significant
+                is_significant_feature = True
+                if pairing_info is not None:
+                    try:
+                        result = calculate_effect_size_and_power(pre_df, post_df, feature, pairing_info)
+                        if result[0] is not None:
+                            p_value = result[0]
+                            # Mark as not significant if p >= 0.05
+                            if p_value >= 0.05:
+                                is_significant_feature = False
+                        else:
+                            # Mark as not significant if p-value cannot be calculated
                             is_significant_feature = False
-                    else:
-                        # Mark as not significant if p-value cannot be calculated
+                    except (KeyError, Exception):
+                        # Mark as not significant if calculation fails
                         is_significant_feature = False
-                except (KeyError, Exception):
-                    # Mark as not significant if calculation fails
+                else:
                     is_significant_feature = False
 
-            if not is_significant_feature:
-                pass  # do not add to summary_median_data
-            else:
+                if not is_significant_feature:
+                    continue  # Skip non-significant features
+                
+                # Get paired data for this feature
+                pre_subjects = set(pre_df['Subject_ID'].unique()) if len(pre_df) > 0 else set()
+                post_subjects = set(post_df['Subject_ID'].unique()) if len(post_df) > 0 else set()
+                common_subjects = pre_subjects.intersection(post_subjects)
+                
+                pre_vals = []
+                post_vals = []
+                for subject in common_subjects:
+                    pre_val = pre_df[pre_df['Subject_ID'] == subject][feature].iloc[0] if len(pre_df[pre_df['Subject_ID'] == subject]) > 0 else np.nan
+                    post_val = post_df[post_df['Subject_ID'] == subject][feature].iloc[0] if len(post_df[post_df['Subject_ID'] == subject]) > 0 else np.nan
+                    
+                    if not np.isnan(pre_val) and not np.isnan(post_val):
+                        pre_vals.append(pre_val)
+                        post_vals.append(post_val)
                 
                 if len(pre_vals) > 0 or len(post_vals) > 0:
                     pre_median = np.median(pre_vals) if len(pre_vals) > 0 else np.nan
@@ -2151,6 +2485,72 @@ def main():
                 st.dataframe(summary_median_df, use_container_width=True)
         else:
             st.warning("Insufficient data to create median ± STD forest plot")
+        
+        # Paired scatterplots for significant features
+        if show_significant_only:
+            st.markdown("## 📊 Paired Scatterplots - Significant Features (p < 0.05)")
+        else:
+            st.markdown("## 📊 Paired Scatterplots - All Features")
+        st.markdown("Scatterplots showing paired PRE vs POST comparisons with connecting lines. Points above the diagonal line indicate increases from PRE to POST.")
+        
+        with st.spinner("Generating paired scatterplots..."):
+            scatterplot_figs = create_paired_scatterplots_for_significant_features(
+                pre_df, post_df, eeg_features_forest, pre_label, post_label,
+                pairing_info, is_mixed, significant_only=show_significant_only
+            )
+        
+        if scatterplot_figs:
+            # Display scatterplots in a grid (2 columns)
+            num_plots = len(scatterplot_figs)
+            cols_per_row = 2
+            
+            for idx, (feature_name, fig) in enumerate(scatterplot_figs.items()):
+                if idx % cols_per_row == 0:
+                    # Create new row
+                    cols = st.columns(cols_per_row)
+                
+                with cols[idx % cols_per_row]:
+                    st.markdown(f"### {feature_name}")
+                    st.pyplot(fig)
+                    plt.close(fig)
+        else:
+            if show_significant_only:
+                st.info("No significant features found for paired scatterplots (p < 0.05)")
+            else:
+                st.info("No features found for paired scatterplots")
+        
+        # Simple paired scatterplots (PRE and POST on x-axis)
+        if show_significant_only:
+            st.markdown("## 📈 Simple Paired Scatterplots - Significant Features (p < 0.05)")
+        else:
+            st.markdown("## 📈 Simple Paired Scatterplots - All Features")
+        st.markdown("Simple scatterplots with PRE and POST on x-axis, showing individual patient trajectories with connecting lines.")
+        
+        with st.spinner("Generating simple paired scatterplots..."):
+            simple_scatterplot_figs = create_simple_paired_scatterplots_for_significant_features(
+                pre_df, post_df, eeg_features_forest, pre_label, post_label,
+                pairing_info, is_mixed, significant_only=show_significant_only
+            )
+        
+        if simple_scatterplot_figs:
+            # Display scatterplots in a grid (2 columns)
+            num_plots = len(simple_scatterplot_figs)
+            cols_per_row = 2
+            
+            for idx, (feature_name, fig) in enumerate(simple_scatterplot_figs.items()):
+                if idx % cols_per_row == 0:
+                    # Create new row
+                    cols = st.columns(cols_per_row)
+                
+                with cols[idx % cols_per_row]:
+                    st.markdown(f"### {feature_name}")
+                    st.pyplot(fig)
+                    plt.close(fig)
+        else:
+            if show_significant_only:
+                st.info("No significant features found for simple paired scatterplots (p < 0.05)")
+            else:
+                st.info("No features found for simple paired scatterplots")
         
         # Topomaps for all EEG features (significant only)
         st.markdown("## 🧠 Topographic Maps - Significant EEG Features (p < 0.05)")

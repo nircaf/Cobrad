@@ -594,7 +594,7 @@ def remove_outliers(df, col, group_col=None, threshold=5, by_group=True):
         std = df[col].std()
         return df[np.abs(df[col] - mean) <= threshold * std].reset_index(drop=True)
     
-def boxplot_plot_dabest(results_df, combined_df, col, output_dir,figures_dir=None,is_streamlit=False,analysis_type=None, show_histograms=False):
+def boxplot_plot_dabest(results_df, combined_df, col, output_dir,figures_dir=None,is_streamlit=False,analysis_type=None, show_histograms=False, selected_feature=None):
     # Remove outliers from each group
     cleaned_df = remove_outliers(combined_df, col, 'Group')
     unique_groups = cleaned_df['Group'].unique()
@@ -716,7 +716,15 @@ def boxplot_plot_dabest(results_df, combined_df, col, output_dir,figures_dir=Non
         # plt_title = f"""p = {p_value:.3e}, r² = {r_squared:.2f}
         # Cohen's d = {cohen_d:.2f} with 95% CI [{cd['bca_low'].values[0]:.2f}, {cd['bca_high'].values[0]:.2f}]
         # Observed power = {100*observed_power[0]:.2f}%\n\n"""
-        plt_title = f"{col} by Group\n"
+        # Use selected_feature if provided, otherwise use col
+        title_text = selected_feature if selected_feature is not None else col
+        # Build p-value string for title
+        if pval_lines:
+            min_pval = min(pval for _, _, pval in pval_lines)
+            pval_str = f"p = {min_pval:.3e}"
+        else:
+            pval_str = ""
+        plt_title = f"{title_text} - Comparison between Groups\n{pval_str}"
         # suptitle
         est = dabest_obj.mean_diff.plot(raw_marker_size=3, raw_label=col,float_contrast=True,fig_size=(8,8),dpi=300)
         plt.suptitle(plt_title, fontsize=14)
@@ -731,7 +739,9 @@ def boxplot_plot_dabest(results_df, combined_df, col, output_dir,figures_dir=Non
             # Show p-value lines in Streamlit: first line, rest in expander
             if len(pval_lines) > 0 and any(pval < 0.05 for _, _, pval in pval_lines) or analysis_type =='Full':
                 st.divider()
-                st.subheader(f"Estimation Plot of {col} by Group")
+                # Use selected_feature if provided, otherwise use col
+                title_text = selected_feature if selected_feature is not None else col
+                st.subheader(f"Estimation Plot: {title_text}")
                 # Build DataFrame from pval_lines
                 pval_df = pd.DataFrame(pval_lines, columns=["Group 1", "Group 2", "P-value"])
                 pval_df["P-value"] = pval_df["P-value"].map(lambda x: f"{x:.3e}")  # format in scientific notation
@@ -886,7 +896,7 @@ if "pptx" not in st.session_state:
     st.session_state.pptx_sections = []  # Track sections for TOC
     st.session_state.current_section = None  # Track current section
 
-def _add_title_slide(pptx):
+def _add_title_slide(pptx, project_name=None):
     """Add a title slide to the presentation."""
     title_slide_layout = pptx.slide_layouts[0]  # Title slide layout
     slide = pptx.slides.add_slide(title_slide_layout)
@@ -894,8 +904,9 @@ def _add_title_slide(pptx):
     subtitle = slide.placeholders[1]
     
     title.text = "EEG Analysis Report"
+    project_display = project_name if project_name else "EEG Analysis"
     subtitle.text = "Statistical Analysis and Visualization\n" + \
-                   "Generated from Cobrad Pipeline"
+                   f"Generated from {project_display} Pipeline"
 
 def _add_toc_slide(pptx, sections):
     """Add a table of contents slide."""
@@ -926,6 +937,67 @@ def _add_toc_slide(pptx, sections):
         para = text_frame.paragraphs[0]
         para.font.size = Inches(0.25)
 
+def add_table_to_pptx(df, title="Group Statistics and Comparisons"):
+    """Add a DataFrame as a table slide to the PPTX presentation."""
+    if "pptx" not in st.session_state:
+        st.session_state.pptx = Presentation()
+        st.session_state.pptx_sections = []
+    
+    pptx = st.session_state.pptx
+    blank_slide_layout = pptx.slide_layouts[6]  # Blank layout
+    slide = pptx.slides.add_slide(blank_slide_layout)
+    
+    # Add title
+    title_left = Inches(0.5)
+    title_top = Inches(0.3)
+    title_width = Inches(9)
+    title_height = Inches(0.5)
+    title_box = slide.shapes.add_textbox(title_left, title_top, title_width, title_height)
+    title_frame = title_box.text_frame
+    title_frame.text = title
+    title_para = title_frame.paragraphs[0]
+    title_para.font.size = Inches(0.25)
+    title_para.font.bold = True
+    
+    # Calculate table dimensions
+    num_rows = len(df) + 1  # +1 for header
+    num_cols = len(df.columns)
+    
+    # Position and size the table
+    table_left = Inches(0.3)
+    table_top = Inches(1.0)
+    table_width = Inches(9.4)
+    table_height = Inches(0.3 * num_rows)  # Dynamic height based on rows
+    
+    # Add table to slide
+    table = slide.shapes.add_table(
+        num_rows, num_cols,
+        table_left, table_top, table_width, table_height
+    ).table
+    
+    # Set column widths (distribute evenly)
+    col_width = int(table_width / num_cols)
+    for col_idx in range(num_cols):
+        table.columns[col_idx].width = col_width
+    
+    # Populate header row
+    for col_idx, col_name in enumerate(df.columns):
+        cell = table.cell(0, col_idx)
+        cell.text = str(col_name)
+        cell.text_frame.paragraphs[0].font.bold = True
+        cell.text_frame.paragraphs[0].font.size = Inches(0.12)
+    
+    # Populate data rows
+    for row_idx, (_, row) in enumerate(df.iterrows(), start=1):
+        for col_idx, value in enumerate(row):
+            cell = table.cell(row_idx, col_idx)
+            cell.text = str(value)
+            cell.text_frame.paragraphs[0].font.size = Inches(0.10)
+    
+    # Track section
+    if title not in st.session_state.pptx_sections:
+        st.session_state.pptx_sections.append(title)
+
 def _get_section_name_from_filename(filename):
     """Determine section name from filename."""
     filename_lower = filename.lower()
@@ -951,6 +1023,72 @@ def _get_section_name_from_filename(filename):
         return 'Spectrogram Analysis'
     else:
         return 'General Analysis'
+
+def _extract_column_name_from_filename(filename):
+    """Extract column name(s) from filename patterns."""
+    import re
+    # Remove file extension
+    name_without_ext = filename.replace('.png', '').replace('.svg', '')
+    
+    # Pattern 1: average_trajectory_{project}_{column} or longitudinal_{project}_{column}
+    # Extract the last part after the last underscore (assuming it's the column)
+    if 'average_trajectory' in name_without_ext.lower() or 'longitudinal' in name_without_ext.lower():
+        parts = name_without_ext.split('_')
+        # Find the index of 'trajectory' or 'longitudinal'
+        if 'average_trajectory' in name_without_ext.lower():
+            idx = name_without_ext.lower().find('average_trajectory')
+            remaining = name_without_ext[idx + len('average_trajectory'):].lstrip('_')
+        else:
+            idx = name_without_ext.lower().find('longitudinal')
+            remaining = name_without_ext[idx + len('longitudinal'):].lstrip('_')
+        
+        # Split remaining and take the last part as column name
+        if remaining:
+            parts = remaining.split('_')
+            # Skip project name (usually first part), column is last
+            if len(parts) > 1:
+                return parts[-1]  # Last part is the column
+            elif len(parts) == 1:
+                return parts[0]
+    
+    # Pattern 2: scatterplot_{column}_vs_all_y_zscore
+    if 'scatterplot' in name_without_ext.lower():
+        match = re.search(r'scatterplot_([^_]+)_vs', name_without_ext.lower())
+        if match:
+            return match.group(1)
+        # Alternative: scatterplot_{column}.png
+        match = re.search(r'scatterplot_([^.]+)', name_without_ext.lower())
+        if match:
+            return match.group(1)
+    
+    # Pattern 3: pairplot_{columns_separated_by_underscores}
+    if 'pairplot' in name_without_ext.lower():
+        match = re.search(r'pairplot_(.+)', name_without_ext.lower())
+        if match:
+            cols = match.group(1)
+            # If multiple columns, return them joined
+            return cols.replace('_', ', ')
+    
+    # Pattern 4: {column}_dabest_plot
+    if 'dabest' in name_without_ext.lower():
+        match = re.search(r'^([^_]+)_dabest', name_without_ext.lower())
+        if match:
+            return match.group(1)
+    
+    # Pattern 5: {x_col}_vs_{y_col}_regression
+    if 'regression' in name_without_ext.lower() and '_vs_' in name_without_ext:
+        match = re.search(r'([^_]+)_vs_([^_]+)_regression', name_without_ext.lower())
+        if match:
+            return f"{match.group(1)} vs {match.group(2)}"
+    
+    # Pattern 6: Try to extract any column-like pattern (last meaningful segment)
+    # This is a fallback for other patterns
+    parts = name_without_ext.split('_')
+    if len(parts) > 1:
+        # Return the last part as it's likely the column name
+        return parts[-1]
+    
+    return None
 
 def _get_section_explanation(section_name):
     """Get explanation text for each section."""
@@ -1095,6 +1233,15 @@ def st_pyplot_func(fig, filename="plot",pval_df=None):
         st.session_state.pptx.slide_layouts[6]  # blank layout
     )
     
+    # Extract column name from filename
+    column_name = _extract_column_name_from_filename(filename)
+    
+    # Build slide title with section name and column name
+    if column_name:
+        slide_title = f"{section_name}: {column_name}"
+    else:
+        slide_title = section_name
+    
     # Add section label at top of slide
     left_label = Inches(0.5)
     top_label = Inches(0.2)
@@ -1102,7 +1249,7 @@ def st_pyplot_func(fig, filename="plot",pval_df=None):
     height_label = Inches(0.3)
     label_box = slide.shapes.add_textbox(left_label, top_label, width_label, height_label)
     label_frame = label_box.text_frame
-    label_frame.text = section_name
+    label_frame.text = slide_title
     label_para = label_frame.paragraphs[0]
     label_para.font.size = Inches(0.18)
     label_para.font.italic = True
@@ -1212,8 +1359,9 @@ def download_pptx_button(label="Download all plots as PPTX"):
     # Create a new presentation with title, TOC, and then all existing slides
     final_pptx = Presentation()
     
-    # Add title slide
-    _add_title_slide(final_pptx)
+    # Add title slide with project name from session state
+    project_name = st.session_state.get('project_name', None)
+    _add_title_slide(final_pptx, project_name)
     
     # Add TOC slide if we have sections
     if st.session_state.pptx_sections:
@@ -1241,6 +1389,113 @@ def download_pptx_button(label="Download all plots as PPTX"):
         key="pptx-download",
         use_container_width=False
     )
+
+def download_excel_button(label="Download analysis results as Excel", patient_df=None):
+    """Provide a Streamlit button to download patient-level analysis results as Excel."""
+    # Try to find patient-level data in session state if not provided
+    if patient_df is None:
+        # Check common session state keys for patient data (prioritize df_wnv3)
+        possible_keys = [
+            'df_wnv3', 'df_wnv2', 'combined_df', 'patient_results_df', 'analysis_results_df', 
+            'patient_df', 'results_df', 'df_wnv', 'controls_df'
+        ]
+        
+        patient_df = None
+        for key in possible_keys:
+            if key in st.session_state and isinstance(st.session_state[key], pd.DataFrame):
+                patient_df = st.session_state[key]
+                break
+        
+        # If still not found, try to combine common dataframes
+        if patient_df is None:
+            dfs_to_combine = []
+            if 'df_wnv3' in st.session_state and isinstance(st.session_state['df_wnv3'], pd.DataFrame):
+                dfs_to_combine.append(st.session_state['df_wnv3'])
+            elif 'df_wnv2' in st.session_state and isinstance(st.session_state['df_wnv2'], pd.DataFrame):
+                dfs_to_combine.append(st.session_state['df_wnv2'])
+            if 'df_wnv' in st.session_state and isinstance(st.session_state['df_wnv'], pd.DataFrame):
+                dfs_to_combine.append(st.session_state['df_wnv'])
+            if 'controls_df' in st.session_state and isinstance(st.session_state['controls_df'], pd.DataFrame):
+                dfs_to_combine.append(st.session_state['controls_df'])
+            if 'combined_df' in st.session_state and isinstance(st.session_state['combined_df'], pd.DataFrame):
+                dfs_to_combine.append(st.session_state['combined_df'])
+            
+            if dfs_to_combine:
+                patient_df = dfs_to_combine[0]  # Use the first (most relevant) dataframe
+    
+    # If no data found, show warning and return
+    if patient_df is None or patient_df.empty:
+        st.sidebar.warning("No patient data available for export.")
+        return
+    
+    # Aggregate by patient if patient_id column exists
+    if 'patient_id' in patient_df.columns:
+        # Get numeric and non-numeric columns
+        numeric_cols = patient_df.select_dtypes(include=[np.number]).columns.tolist()
+        non_numeric_cols = [col for col in patient_df.columns 
+                           if col not in numeric_cols and col not in ['patient_id']]
+        
+        # Group by patient_id and aggregate
+        agg_dict = {col: 'mean' for col in numeric_cols}
+        agg_dict.update({col: 'first' for col in non_numeric_cols})
+        
+        patient_df_agg = patient_df.groupby('patient_id').agg(agg_dict).reset_index()
+    elif 'patient_number' in patient_df.columns:
+        # Alternative patient identifier
+        numeric_cols = patient_df.select_dtypes(include=[np.number]).columns.tolist()
+        non_numeric_cols = [col for col in patient_df.columns 
+                           if col not in numeric_cols and col not in ['patient_number']]
+        
+        agg_dict = {col: 'mean' for col in numeric_cols}
+        agg_dict.update({col: 'first' for col in non_numeric_cols})
+        
+        patient_df_agg = patient_df.groupby('patient_number').agg(agg_dict).reset_index()
+    else:
+        # No patient identifier found, use data as-is
+        patient_df_agg = patient_df.copy()
+    
+    # Convert timezone-aware datetime columns to timezone-naive for Excel compatibility
+    def make_timezone_naive(df):
+        """Convert timezone-aware datetime columns to timezone-naive."""
+        df_copy = df.copy()
+        for col in df_copy.columns:
+            if pd.api.types.is_datetime64_any_dtype(df_copy[col]):
+                # Check if timezone-aware
+                if df_copy[col].dt.tz is not None:
+                    # Convert to UTC then remove timezone
+                    df_copy[col] = df_copy[col].dt.tz_convert('UTC').dt.tz_localize(None)
+        return df_copy
+    
+    # Apply timezone conversion
+    patient_df_agg = make_timezone_naive(patient_df_agg)
+    
+    # Create Excel file in memory
+    excel_buffer = io.BytesIO()
+    try:
+        with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
+            # Write main patient data
+            patient_df_agg.to_excel(writer, index=False, sheet_name='Patient Results')
+            
+            # If results_df exists in session state, add it as a separate sheet
+            if 'results_df' in st.session_state and isinstance(st.session_state['results_df'], pd.DataFrame):
+                if not st.session_state['results_df'].empty:
+                    results_df_clean = make_timezone_naive(st.session_state['results_df'])
+                    results_df_clean.to_excel(writer, index=False, sheet_name='Statistical Results')
+        
+        excel_buffer.seek(0)
+        
+        st.sidebar.download_button(
+            label=label,
+            data=excel_buffer.getvalue(),
+            file_name="analysis_results.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="excel-download",
+            use_container_width=False
+        )
+    except ImportError:
+        st.sidebar.error("openpyxl is required for Excel export. Please install it with: pip install openpyxl")
+    except Exception as e:
+        st.sidebar.error(f"Error creating Excel file: {str(e)}")
 
 def scatter_plot_with_regression(results_df, combined_df, x_col, y_col, output_dir, figures_dir=None, is_streamlit=False, analysis_type=None, show_histograms=False):
     plt.figure(figsize=(10, 6))
@@ -2049,19 +2304,155 @@ def enrich_tga_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 def tga_get_files():
-    def get_df_clinical(filepath="TGAEEG_ANONYM.xlsx"):
-        """Reads the anonymized clinical Excel file into a pandas DataFrame."""
+    def get_df_clinical():
+        """Finds and reads the clinical Excel file from EDF_Format/TGA directory."""
+        tga_dir = os.path.join('EDF_Format', 'TGA')
+        excel_files = []
+        
+        if not os.path.isdir(tga_dir):
+            raise ValueError(f"Directory {tga_dir} does not exist")
+        
+        for fname in os.listdir(tga_dir):
+            if fname.lower().endswith(('.xlsx', '.xls')):
+                excel_files.append(os.path.join(tga_dir, fname))
+        
+        if len(excel_files) == 0:
+            raise ValueError(f"No Excel file found in {tga_dir}")
+        elif len(excel_files) > 1:
+            print(f"Warning: Multiple Excel files found in {tga_dir}, using first one: {excel_files[0]}")
+        
+        filepath = excel_files[0]
         try:
             df = pd.read_excel(filepath)
+            # remove rows and col all nan
+            df = df.dropna(how='all')
+            df = df.dropna(axis=1, how='all')
             return df
         except Exception as e:
-            print(f"Error reading clinical file: {e}")
-            return None
+            raise ValueError(f"Error reading clinical file {filepath}: {e}")
 
+
+    def get_tga_controls():
+        """Get TGA controls from EDF_Format/TGA_control/control and merge with sex and age from Excel file."""
+        # Read controls from parquet_results/TGA_control directory
+        parquet_dir = os.path.join('parquet_results', 'TGA_control')
+        controls_list = []
+        
+        if os.path.isdir(parquet_dir):
+            for fname in sorted(os.listdir(parquet_dir)):
+                if not fname.lower().endswith('.parquet'):
+                    continue
+                fpath = os.path.join(parquet_dir, fname)
+                try:
+                    df = pd.read_parquet(fpath)
+                    # Ensure there's a file_name column
+                    if 'file_name' not in df.columns:
+                        base = fname.replace('.parquet', '').replace('.edf', '')
+                        df['file_name'] = base
+                    controls_list.append(df)
+                except Exception as e:
+                    print(f"Warning: failed reading {fpath}: {e}")
+                    continue
+        
+        if len(controls_list) == 0:
+            # If no parquet files found, try reading from TGA_controls.parquet in root directory
+            root_parquet_path = 'TGA_control.parquet'
+            if os.path.exists(root_parquet_path):
+                try:
+                    controls = pd.read_parquet(root_parquet_path)
+                    # Ensure there's a file_name column
+                    if 'file_name' not in controls.columns:
+                        # Try to extract from index or create a default
+                        controls['file_name'] = controls.index.astype(str)
+                except Exception as e:
+                    print(f"Warning: failed reading {root_parquet_path}: {e}")
+                    controls = None
+        else:
+            controls = pd.concat(controls_list, ignore_index=True)
+        
+        # Process controls similar to get_cobrad_controls
+        # Ensure file_name exists for ID extraction
+        if 'file_name' not in controls.columns:
+            raise ValueError("Controls dataframe must have 'file_name' column")
+        
+        controls['ID'] = controls['file_name'].apply(lambda x: x.split('_')[0] if '_' in str(x) else str(x).replace('.edf', '').replace('.EEG', '')).astype(str)
+        numeric_cols = controls.select_dtypes(include=[np.number]).columns
+        
+        # Keep file_name for merging later - use first file_name per ID
+        if 'duration_min' in controls.columns:
+            # Group by ID and aggregate, keeping file_name
+            def aggregate_group(x):
+                result = {}
+                for col in numeric_cols:
+                    if col != 'duration_min':
+                        result[col] = (x[col].multiply(x['duration_min'], axis=0)).sum(skipna=False) / x['duration_min'].sum(skipna=False)
+                result['file_name'] = x['file_name'].iloc[0]
+                return pd.Series(result)
+            
+            controls = controls.groupby('ID').apply(aggregate_group).reset_index()
+        else:
+            # If no duration_min, just take mean but keep file_name
+            agg_dict = {col: 'mean' for col in numeric_cols}
+            agg_dict['file_name'] = 'first'
+            controls = controls.groupby('ID').agg(agg_dict).reset_index()
+        
+        # Read Excel file to get sex and age
+        excel_path = 'EDF_Format/TGA_control/control/control_10JUL25.xlsx'
+        if os.path.exists(excel_path):
+            df_demo = pd.read_excel(excel_path)
+            # Convert gender column (Hebrew: נקבה = female, זכר = male)
+            df_demo['gender'] = df_demo['gender'].astype(str).str.strip()
+            df_demo['sex'] = df_demo['gender'].apply(lambda x: 'f' if 'נקבה' in x or 'female' in x.lower() or x == '2' else ('m' if 'זכר' in x or 'male' in x.lower() or x == '1' else np.nan))
+            df_demo = convert_sex_column(df_demo, 'sex')
+            
+            # Prepare for merge - use EEG FILE NAME to match with controls
+            df_demo['file_name_clean'] = df_demo['EEG FILE NAME'].astype(str).str.strip().str.upper()
+            # Remove .edf or .EEG extensions if present
+            df_demo['file_name_clean'] = df_demo['file_name_clean'].str.replace('.EDF', '', regex=False).str.replace('.EEG', '', regex=False)
+            # Create ID from file_name (similar to controls) - use the file_name itself as ID if no underscore
+            df_demo['ID'] = df_demo['file_name_clean'].apply(lambda x: x.split('_')[0] if '_' in str(x) else str(x)).astype(str)
+            
+            # Clean controls file_name for matching
+            if 'file_name' in controls.columns:
+                controls['file_name_clean'] = controls['file_name'].astype(str).str.strip().str.upper().str.replace('.EDF', '', regex=False).str.replace('.EEG', '', regex=False)
+                # Merge on file_name_clean first (most direct match)
+                controls = controls.merge(
+                    df_demo[['file_name_clean', 'sex', 'age']].drop_duplicates(subset='file_name_clean'),
+                    on='file_name_clean',
+                    how='left'
+                )
+                # If some rows don't have sex/age, try merging on ID as fallback
+                missing_mask = controls['sex'].isna() | controls['age'].isna()
+                if missing_mask.any():
+                    # Use existing ID column for controls that are missing data
+                    controls_missing = controls.loc[missing_mask, ['ID']].copy()
+                    # Merge on ID
+                    controls_missing = controls_missing.merge(
+                        df_demo[['ID', 'sex', 'age']].drop_duplicates(subset='ID'),
+                        on='ID',
+                        how='left'
+                    )
+                    # Update missing values
+                    controls.loc[missing_mask, 'sex'] = controls_missing['sex'].values
+                    controls.loc[missing_mask, 'age'] = controls_missing['age'].values
+                # Remove temporary column
+                controls = controls.drop(columns=['file_name_clean'], errors='ignore')
+            else:
+                # If no file_name in controls, just merge on ID
+                controls = controls.merge(
+                    df_demo[['ID', 'sex', 'age']].drop_duplicates(subset='ID'),
+                    on='ID',
+                    how='left'
+                )
+        else:
+            print(f"Warning: Excel file not found at {excel_path}, sex and age columns will not be added")
+        # rename sex to gender
+        controls = controls.rename(columns={'sex': 'gender'})
+        return controls
 
     # Example usage inside tga_get_files
     clinical_df = get_df_clinical()
-    clinical_df = convert_sex_column(clinical_df,'sex')
+    clinical_df = convert_sex_column(clinical_df,'Gender_Text')
     # read TGA.oarquet
     df_wnv = pd.read_parquet('TGA.parquet')
     # get clinical features
@@ -2069,7 +2460,9 @@ def tga_get_files():
     # remove from file_name .edf
     df_wnv['file_name'] = df_wnv['file_name'].str.replace('.edf', '', regex=False)
     patients_folder = "TGA"
-    controls = get_cobrad_controls("EDF")
+    controls = get_tga_controls()
+    # remove controls that are missing age or gender
+    controls = controls[controls['age'].notna() & controls['gender'].notna()]
     # df_wnv2 is merged df_wnv and clinical_df right on EEG FILE NAME, left on PATIENT_ID
     df_wnv2 = df_wnv.merge(clinical_df, left_on='file_name', right_on='EEG FILE NAME', how='inner')
     cases_group_name = "TGA"
@@ -2607,13 +3000,22 @@ def aggregate_dataframe(df_merged, weighted_avg):
     return df_merged
 #%% COBRAD
 def get_cobrad_controls(patients_folder='EDF'):
-    controls = pd.read_csv(f'{patients_folder}_controls.csv')
+    # read Controls_controls.parquet
+    controls = pd.read_parquet(f'Controls_controls.parquet')
     controls['ID'] = controls['file_name'].apply(lambda x: x.split('_')[0]).astype(str)
     numeric_cols = controls.select_dtypes(include=[np.number]).columns
     controls = controls.groupby('ID').apply(
         lambda x: (x[numeric_cols].multiply(x['duration_min'], axis=0)).sum(skipna=False) / x['duration_min'].sum(skipna=False)
     ).reset_index()
+
+    controls_dir = f'parquet_results/Controls'
+    age_gender_df = get_controls_ages_genders(controls_dir)
+    # Merge on ID
+    controls = controls.merge(age_gender_df[['ID', 'Age', 'Gender']], on='ID', how='left')
+    # Rename Age and Gender to lowercase
+    controls = controls.rename(columns={'Age': 'age', 'Gender': 'gender'})
     return controls
+
 def cobrad_get_files(sample_window_size=0,only_awake=False,sleep_only=False):
     patients_folder = "EDF"
     sheets_to_read = ['clinical', 'medications', 'npi-q', 'epworth', 'isi', 'ecog_12','Sheet4','seizures']
@@ -3241,7 +3643,7 @@ def clean_df_demographics(df_demographics,patient_names):
     df_demographics.iloc[:,0]
 
 
-def get_controls_ages_genders(selected_folder, controls_dir='Controls'):
+def get_controls_ages_genders(selected_folder, controls_dir='EDF_Format/Controls/Controls'):
     # Define age groups and their ranges
     age_groups = [
         '18-30 data', '31-40 data', '41-50 data', '51-60 data',
@@ -3252,8 +3654,8 @@ def get_controls_ages_genders(selected_folder, controls_dir='Controls'):
         (61, 70), (71, 80), (81, 90), (90, 120)
     ]
 
-    # Get control IDs from the selected folder (.csv files)
-    control_ids = [f.split('_')[0] for f in os.listdir(selected_folder) if f.endswith('.csv')]
+    # Get control IDs from the selected folder (.parquet files)
+    control_ids = [f.split('_')[0] for f in os.listdir(selected_folder) if f.endswith('.parquet')]
     results = []
 
     for group, (start, end) in zip(age_groups, age_groups_int):
@@ -3262,6 +3664,9 @@ def get_controls_ages_genders(selected_folder, controls_dir='Controls'):
 
         # Read demographics
         demo_path = os.path.join(group_path, f'{group_name}.xlsx')
+        if not os.path.exists(demo_path):
+            print(f"Warning: {demo_path} does not exist")
+            continue  # Skip if file doesn't exist
         df_demo = pd.read_excel(demo_path, header=None)
         # Find which column contains any of the control_ids
         col_with_ids = None
@@ -3279,11 +3684,15 @@ def get_controls_ages_genders(selected_folder, controls_dir='Controls'):
         # For age groups 61-90, also read "final data"
         if start >= 61 and end <= 90:
             demo_path2 = os.path.join(group_path, f'{group_name} final data.xlsx')
-            # rename column 5 to 'Age'
-            
-            df_demo2 = pd.read_excel(demo_path2, header=None)
-            df_demo2.rename(columns={5: 'Age'}, inplace=True)
-            df_demo2 = clean_df_demographics(df_demo2, control_ids)
+            if os.path.exists(demo_path2):
+                # rename column 5 to 'Age'
+                df_demo2 = pd.read_excel(demo_path2, header=None)
+                df_demo2.rename(columns={5: 'Age'}, inplace=True)
+                df_demo2 = clean_df_demographics(df_demo2, control_ids)
+            else:
+                print(f"Warning: {demo_path2} does not exist")
+                # If final data doesn't exist, use regular file like other age groups
+                df_demo2.rename(columns={7: 'Age'}, inplace=True)
         else:
             # rename column 7 to Age
             df_demo2.rename(columns={7: 'Age'}, inplace=True)

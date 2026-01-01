@@ -59,7 +59,7 @@ getcwd = os.getcwd()
 
 #%% INITIALIZATION
 # Parse command line arguments
-cases_project_name = 'Pre-Post_XCOPRI' # 'Controls' #'Seeg' #'CAP_Sleep_Database/CAP_Sleep_Database'
+cases_project_name = 'TGA_control/control' # 'Controls' #'Seeg' #'CAP_Sleep_Database/CAP_Sleep_Database'
 
 edf_dir = 'EDF_Format'
 # Where to load the data from 
