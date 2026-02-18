@@ -16,10 +16,11 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy import stats
-from scipy.signal import find_peaks, medfilt
+from scipy.signal import find_peaks, medfilt, hilbert, butter, filtfilt
 from scipy.stats import entropy
 from scipy.ndimage import median_filter
 import mne
+from mne.stats import permutation_cluster_1samp_test
 import neurokit2 as nk
 try:
     import pywt
@@ -1145,7 +1146,7 @@ def plot_comparison(df, stats_results, save_path=None):
     fig.suptitle('HEP Comparison: Systole vs Diastole', fontsize=16, fontweight='bold')
     
     metrics = ['mean_amplitude', 'peak_amplitude', 'rms', 'std_amplitude']
-    metric_labels = ['Mean Amplitude (μV)', 'Peak Amplitude (μV)', 'RMS (μV)', 'Std Amplitude (μV)']
+    metric_labels = ['Mean Amplitude (V)', 'Peak Amplitude (V)', 'RMS (V)', 'Std Amplitude (V)']
     
     for idx, (metric, label) in enumerate(zip(metrics, metric_labels)):
         ax = axes[idx // 2, idx % 2]
@@ -1164,7 +1165,7 @@ def plot_comparison(df, stats_results, save_path=None):
             patch.set_facecolor(color)
         
         ax.set_ylabel(label)
-        ax.set_title(f'{label.replace(" (μV)", "")}')
+        ax.set_title(f'{label.replace(" (V)", "")}')
         ax.grid(True, alpha=0.3)
         
         # Add statistical annotation if available
@@ -1240,11 +1241,11 @@ def print_statistics(stats_results):
             st.markdown(f"### {metric_name}")
             col1, col2, col3 = st.columns(3)
             with col1:
-                st.metric("Systole", f"{results['systole_mean']:.4f} ± {results['systole_std']:.4f} μV")
+                st.metric("Systole", f"{results['systole_mean']:.4f} ± {results['systole_std']:.4f} V")
             with col2:
-                st.metric("Diastole", f"{results['diastole_mean']:.4f} ± {results['diastole_std']:.4f} μV")
+                st.metric("Diastole", f"{results['diastole_mean']:.4f} ± {results['diastole_std']:.4f} V")
             with col3:
-                st.metric("Difference", f"{results['mean_difference']:.4f} μV")
+                st.metric("Difference", f"{results['mean_difference']:.4f} V")
             
             col4, col5, col6 = st.columns(3)
             with col4:
@@ -1273,9 +1274,9 @@ def print_statistics(stats_results):
             st.markdown("---")
         else:
             print(f"\n{metric_name}:")
-            print(f"  Systole:   {results['systole_mean']:.4f} ± {results['systole_std']:.4f} μV")
-            print(f"  Diastole:  {results['diastole_mean']:.4f} ± {results['diastole_std']:.4f} μV")
-            print(f"  Difference: {results['mean_difference']:.4f} μV")
+            print(f"  Systole:   {results['systole_mean']:.4f} ± {results['systole_std']:.4f} V")
+            print(f"  Diastole:  {results['diastole_mean']:.4f} ± {results['diastole_std']:.4f} V")
+            print(f"  Difference: {results['mean_difference']:.4f} V")
             print(f"  Cohen's d:  {results['cohens_d']:.4f}")
             print(f"  Paired t-test p-value:     {results['p_value_ttest']:.3e}")
             print(f"  Wilcoxon test p-value:     {results['p_value_wilcoxon']:.3e}")
@@ -1554,11 +1555,19 @@ def main():
         help="Select the sleep stage to analyze (or 'All' to analyze all stages combined)"
     )
     
-    base_dir = st.sidebar.text_input(
-        "Base Directory",
-        value='pickles_sleep_stage/EDF',
-        help="Base directory containing sleep stage subdirectories"
+    pickles_root = 'pickles_sleep_stage'
+    if os.path.exists(pickles_root):
+        folder_options = sorted([d for d in os.listdir(pickles_root) if os.path.isdir(os.path.join(pickles_root, d))])
+    else:
+        folder_options = ['EDF']
+        
+    selected_folder = st.sidebar.selectbox(
+        "Base Directory Folder",
+        options=folder_options,
+        index=folder_options.index('EDF') if 'EDF' in folder_options else 0,
+        help="Select the folder within pickles_sleep_stage"
     )
+    base_dir = os.path.join(pickles_root, selected_folder)
     
     output_dir = st.sidebar.text_input(
         "Output Directory",
@@ -1587,6 +1596,24 @@ def main():
         help="Method for aggregating PETH rates and event densities across patients (default: median)"
     )
     
+    # Test Type configuration
+    test_type = st.sidebar.selectbox(
+        "Significance Test Type",
+        options=["Cluster-Based Permutation", "Circular Statistics (Rayleigh)"],
+        index=0,
+        help="Choose the statistical test for significance."
+    )
+
+    # Jitter configuration
+    jitter_amount = st.sidebar.number_input(
+        "Jitter Amount (seconds)",
+        min_value=0.0,
+        max_value=1.0,
+        value=0.25,
+        step=0.01,
+        help="Amount of jitter to apply to R-peak timestamps for null hypothesis testing (default: 0.25)"
+    )
+
     # Processing mode configuration
     processing_mode = st.sidebar.selectbox(
         "Processing Mode",
@@ -1688,19 +1715,23 @@ def main():
                 mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
                 key="pptx_download_sidebar"
             )
+        
+    st.markdown("## 📊 First Patient EEG-ECG Alignment")
+    if st.button("Generate First Patient EEG-ECG Alignment Plot"):
+        plot_first_patient_eeg_ecg_aligned(loaded_files, sleep_stage, output_dir, save_results, binsize=binsize, aggregation_method=aggregation_method, processing_mode=processing_mode, sleep_stage_mapping=sleep_stage_mapping)
     
     # Run BPM peri-event analysis (PETH raster plots)
     st.markdown("---")
     st.markdown("## 📊 BPM Peri-Event Analysis")
-    BPM_peri_event_analysis(loaded_files, sleep_stage, output_dir, save_results, binsize=binsize, aggregation_method=aggregation_method, processing_mode=processing_mode, sleep_stage_mapping=sleep_stage_mapping)
-    
+    BPM_peri_event_analysis(loaded_files, sleep_stage, output_dir, save_results, binsize=binsize, aggregation_method=aggregation_method, processing_mode=processing_mode, sleep_stage_mapping=sleep_stage_mapping, jitter_amount=jitter_amount, test_type=test_type)
+
     # Run HEP systole/diastole comparison analysis
     st.markdown("---")
     st.markdown("## 🧠 HEP Systole/Diastole Comparison Analysis")
     MI_systole_diastole_comparison(loaded_files, sleep_stage, output_dir, save_results)
 
 
-def BPM_peri_event_analysis(loaded_files, sleep_stage, output_dir, save_results, binsize=0.05, aggregation_method='median', processing_mode='single', sleep_stage_mapping=None):
+def BPM_peri_event_analysis(loaded_files, sleep_stage, output_dir, save_results, binsize=0.05, aggregation_method='median', processing_mode='single', sleep_stage_mapping=None, jitter_amount=0.25, test_type="Cluster-Based Permutation"):
     """
     Run BPM peri-event analysis and create PETH raster plots.
     
@@ -1714,13 +1745,17 @@ def BPM_peri_event_analysis(loaded_files, sleep_stage, output_dir, save_results,
         Processing mode: 'single' for sequential or 'multithread' for parallel (default: 'single')
     sleep_stage_mapping : dict, optional
         Dictionary mapping patient_id to sleep_stage (default: None)
+    jitter_amount : float, optional
+         Amount of jitter to apply (default: 0.0)
+    test_type: str, optional
+        Test type (default: "Cluster-Based Permutation")
     """
     # Create PETH raster plot for the first file
     if loaded_files:
         significance_results = plot_peth_raster(loaded_files, file_index=0, minmax=(-0.5, 1.0), 
                         binsize=binsize, save_plot=save_results, save_dir=output_dir, 
                         aggregation_method=aggregation_method, processing_mode=processing_mode,
-                        sleep_stage_mapping=sleep_stage_mapping, sleep_stage=sleep_stage)
+                        sleep_stage_mapping=sleep_stage_mapping, sleep_stage=sleep_stage, jitter_amount=jitter_amount, test_type=test_type)
         
         # Add download button for significance results
         if significance_results:
@@ -2058,542 +2093,68 @@ def _process_patient_for_averaged_peth(file_data, minmax, binsize):
     except Exception as e:
         return None
 
-
-def plot_averaged_eeg_peth_raster(loaded_files, minmax=(-0.5, 1.0), binsize=0.05, save_plot=False, save_dir=None, aggregation_method='median', processing_mode='single', sleep_stage_mapping=None, sleep_stage='N1'):
+def plot_regional_averaged_eeg_peth_raster(loaded_files, minmax=(-0.5, 1.0), binsize=0.005, save_plot=False, save_dir=None, aggregation_method='median', processing_mode='single', sleep_stage_mapping=None, sleep_stage='N1'):
     """
-    Create averaged PETH and raster plots for EEG channels across all patients.
-    
-    Parameters
-    ----------
-    loaded_files : list
-        List of tuples (file_path, patient_id, raw_object)
-    minmax : tuple, optional
-        Time window around events in seconds (default: (-0.5, 1.0))
-    binsize : float, optional
-        Bin size for rate calculation in seconds (default: 0.05)
-    save_plot : bool, optional
-        Whether to save the plot (default: False)
-    save_dir : str, optional
-        Directory to save the plot (default: None)
-    aggregation_method : str, optional
-        Method for aggregating across patients: 'median' or 'mean' (default: 'median')
-    processing_mode : str, optional
-        Processing mode: 'single' for sequential or 'multithread' for parallel (default: 'single')
-    sleep_stage_mapping : dict, optional
-        Dictionary mapping patient_id to sleep_stage (default: None)
-    sleep_stage : str, optional
-        Current sleep stage being analyzed (default: 'N1')
-    
-    Returns
-    -------
-    matplotlib.figure.Figure or None
-        Figure object if plot was created, None otherwise
+    Create averaged PETH plots for each electrode across ALL patients.
+    Uses continuous EEG signal averaging.
     """
     if not PYNAPPLE_AVAILABLE:
         if 'st' in globals():
-            st.error("pynapple is not available. Please install it to use averaged PETH raster plots.")
+            st.error("pynapple is not available. Please install it to use regional PETH plots.")
         else:
-            print("pynapple is not available. Please install it to use averaged PETH raster plots.")
-        return None
-    
+            print("pynapple is not available. Please install it to use regional PETH plots.")
+        return []
+
     if not loaded_files:
-        return None
-    
-    # Collect data from all patients
-    all_channel_data = {}  # {channel_name: {'rates_list': [], 'events_list': []}}
-    common_channels = None
-    
+        return []
+
+    # Map for all possible electrodes we care about to collect data
+    regional_electrodes = {
+        'F': ['Fp1', 'Fpz', 'Fp2', 'F7', 'F3', 'Fz', 'F4', 'F8'],
+        'P': ['P3', 'Pz', 'P4'],
+        'T': ['T3', 'T4', 'T5', 'T6'],
+        'O': ['O1', 'Oz', 'O2'],
+        'C': ['C3', 'Cz', 'C4']
+    }
+    # Flatten list of electrodes of interest
+    electrodes_of_interest = set()
+    for region_list in regional_electrodes.values():
+        for elec in region_list:
+            electrodes_of_interest.add(elec.upper())
+
+    # Data structure: {electrode: [(time_axis, mean_signal), ...]}
+    all_electrode_data = {}
+    for elec in electrodes_of_interest:
+        all_electrode_data[elec] = []
+
     if 'st' in globals():
         progress_bar = st.progress(0)
         status_text = st.empty()
-    
-    async def process_patients_async():
-        """Process patients asynchronously using ThreadPoolExecutor."""
-        loop = asyncio.get_event_loop()
-        executor = ThreadPoolExecutor(max_workers=min(4, len(loaded_files)))
-        
-        tasks = []
-        for file_data in loaded_files:
-            task = loop.run_in_executor(executor, _process_patient_for_averaged_peth, file_data, minmax, binsize)
-            tasks.append(task)
-        
-        results = []
-        for i, task in enumerate(asyncio.as_completed(tasks)):
-            result = await task
-            if result is not None:
-                results.append(result)
-            if 'st' in globals():
-                status_text.text(f"Processing patients ({len(results)}/{len(loaded_files)})...")
-                progress_bar.progress(len(results) / len(loaded_files))
-        
-        executor.shutdown(wait=True)
-        return results
-    
-    if processing_mode == 'multithread':
-        # Process patients in parallel using asyncio
-        try:
-            if 'st' in globals():
-                status_text.text("Processing patients in parallel...")
-            results = asyncio.run(process_patients_async())
-            
-            # Combine results
-            for patient_id, channel_data, eeg_ch_names in results:
-                # Update common channels
-                if common_channels is None:
-                    common_channels = set(eeg_ch_names)
-                else:
-                    common_channels = common_channels.intersection(set(eeg_ch_names))
-                
-                # Merge channel data (with patient_id tracking for sleep stage grouping)
-                for ch_name, ch_data in channel_data.items():
-                    if ch_name not in all_channel_data:
-                        all_channel_data[ch_name] = {'rates_list': [], 'events_list': [], 'patient_ids': []}
-                    # Store patient_id with each rates_list entry
-                    for rate_data in ch_data['rates_list']:
-                        all_channel_data[ch_name]['rates_list'].append(rate_data)
-                        all_channel_data[ch_name]['patient_ids'].append(patient_id)
-                    all_channel_data[ch_name]['events_list'].extend(ch_data['events_list'])
-        except Exception as e:
-            if 'st' in globals():
-                st.warning(f"Error in parallel processing, falling back to sequential: {e}")
-            # Fall back to sequential processing
-            processing_mode = 'single'
-    
-    if processing_mode == 'single':
-        # Process patients sequentially (original behavior)
-        for file_idx, file_data in enumerate(loaded_files):
-            try:
-                file_path, patient_id, raw = file_data
-                if 'st' in globals():
-                    status_text.text(f"Processing {patient_id} ({file_idx + 1}/{len(loaded_files)})...")
-                    progress_bar.progress((file_idx + 1) / len(loaded_files))
-                
-                result = _process_patient_for_averaged_peth(file_data, minmax, binsize)
-                if result is None:
-                    continue
-                
-                patient_id, channel_data, eeg_ch_names = result
-                
-                # Update common channels
-                if common_channels is None:
-                    common_channels = set(eeg_ch_names)
-                else:
-                    common_channels = common_channels.intersection(set(eeg_ch_names))
-                
-                # Merge channel data (with patient_id tracking for sleep stage grouping)
-                for ch_name, ch_data in channel_data.items():
-                    if ch_name not in all_channel_data:
-                        all_channel_data[ch_name] = {'rates_list': [], 'events_list': [], 'patient_ids': []}
-                    # Store patient_id with each rates_list entry
-                    for rate_data in ch_data['rates_list']:
-                        all_channel_data[ch_name]['rates_list'].append(rate_data)
-                        all_channel_data[ch_name]['patient_ids'].append(patient_id)
-                    all_channel_data[ch_name]['events_list'].extend(ch_data['events_list'])
-            
-            except Exception as e:
-                if 'st' in globals():
-                    st.warning(f"Error processing {patient_id}: {e}")
-                else:
-                    print(f"Error processing {patient_id}: {e}")
-                continue
-    
-    if 'st' in globals():
-        progress_bar.empty()
-        status_text.empty()
-    
-    # Check if we have data
-    if not all_channel_data or not common_channels:
-        if 'st' in globals():
-            st.warning("No common EEG channels found across patients or no data collected.")
-        else:
-            print("No common EEG channels found across patients or no data collected.")
-        return None
-    
-    # Filter to only common channels
-    channels_to_plot = sorted([ch for ch in all_channel_data.keys() if ch in common_channels])
-    
-    if not channels_to_plot:
-        if 'st' in globals():
-            st.warning("No channels to plot after filtering.")
-        else:
-            print("No channels to plot after filtering.")
-        return None
-    
-    # Create plots
-    n_channels = len(channels_to_plot)
-    n_cols = 2  # PETH and Raster side by side
-    n_rows = n_channels
-    
-    fig_avg, axes = plt.subplots(n_rows, n_cols, figsize=(14, 3 * n_rows), sharex='col')
-    if n_channels == 1:
-        axes = axes.reshape(1, -1)
-    
-    for ch_idx, ch_name in enumerate(channels_to_plot):
-        ax_peth = axes[ch_idx, 0]
-        ax_raster = axes[ch_idx, 1]
-        
-        channel_data = all_channel_data[ch_name]
-        
-        # Plot 1: PETH (Average or Median based on aggregation_method)
-        if channel_data['rates_list']:
-            try:
-                # Interpolate all rates to common time axis
-                all_time_axes = [t for t, _ in channel_data['rates_list']]
-                all_rates = [r for _, r in channel_data['rates_list']]
-                
-                # Find common time range
-                min_time = max([t[0] for t in all_time_axes])
-                max_time = min([t[-1] for t in all_time_axes])
-                common_time = np.arange(min_time, max_time + binsize, binsize)
-                
-                # Interpolate each patient's rates to common time axis
-                interpolated_rates = []
-                patient_ids_list = channel_data.get('patient_ids', [])
-                for idx, (time_axis, rates) in enumerate(zip(all_time_axes, all_rates)):
-                    if len(time_axis) > 1 and len(rates) > 1:
-                        interp_rates = np.interp(common_time, time_axis, rates)
-                        interpolated_rates.append((interp_rates, patient_ids_list[idx] if idx < len(patient_ids_list) else None))
-                
-                if interpolated_rates:
-                    # Group by sleep stage if sleep_stage='All' and mapping is available
-                    if sleep_stage == 'All' and sleep_stage_mapping:
-                        # Group rates by sleep stage
-                        sleep_stage_groups = {}  # {stage: [interpolated_rates_array, ...]}
-                        all_rates_for_all = []  # For "All" line
-                        
-                        for interp_rates_arr, patient_id in interpolated_rates:
-                            all_rates_for_all.append(interp_rates_arr)
-                            if patient_id and patient_id in sleep_stage_mapping:
-                                stage = sleep_stage_mapping[patient_id]
-                                if stage not in sleep_stage_groups:
-                                    sleep_stage_groups[stage] = []
-                                sleep_stage_groups[stage].append(interp_rates_arr)
-                        
-                        # Define colors for each sleep stage
-                        stage_colors = {'N1': 'blue', 'N2': 'green', 'N3': 'red', 'R': 'orange', 'W': 'purple', 'All': 'black'}
-                        stage_line_styles = {'N1': '-', 'N2': '-', 'N3': '-', 'R': '-', 'W': '-', 'All': '--'}
-                        
-                        # Plot line for "All" (combined)
-                        if all_rates_for_all:
-                            all_rates_array = np.array(all_rates_for_all)
-                            if aggregation_method == 'median':
-                                agg_rates_all = np.median(all_rates_array, axis=0)
-                                # Calculate 95% confidence interval using bootstrap percentile method
-                                spread_lower_all, spread_upper_all = bootstrap_median_ci(all_rates_array, n_bootstrap=1000)
-                            else:
-                                agg_rates_all = np.mean(all_rates_array, axis=0)
-                                std_rates_all = np.std(all_rates_array, axis=0)
-                                spread_lower_all = agg_rates_all - std_rates_all
-                                spread_upper_all = agg_rates_all + std_rates_all
-                            
-                            ax_peth.plot(common_time, agg_rates_all, linewidth=2.5, 
-                                        color=stage_colors.get('All', 'black'), 
-                                        linestyle=stage_line_styles.get('All', '--'),
-                                        label=f'All (n={len(all_rates_for_all)})', alpha=0.9)
-                            ax_peth.fill_between(common_time, spread_lower_all, spread_upper_all, 
-                                                alpha=0.15, color=stage_colors.get('All', 'black'))
-                            
-                            # Perform max-statistic permutation test for "All" line
-                            try:
-                                sig_test_results = max_statistic_permutation_test(
-                                    all_rates_array, common_time, 
-                                    baseline_window=(-0.5, -0.2),
-                                    n_permutations=1000,
-                                    alpha_levels=[0.05, 0.01],
-                                    aggregation_method=aggregation_method
-                                )
-                                
-                                if sig_test_results['p_values'] is not None:
-                                    # Calculate y-axis range for marker placement
-                                    y_min, y_max = ax_peth.get_ylim()
-                                    y_range = y_max - y_min
-                                    marker_offset = y_range * 0.05  # 5% above the line
-                                    
-                                    # Plot markers for significant bins
-                                    sig_05 = sig_test_results['significant_bins'].get(0.05, np.zeros(len(common_time), dtype=bool))
-                                    sig_01 = sig_test_results['significant_bins'].get(0.01, np.zeros(len(common_time), dtype=bool))
-                                    
-                                    # Markers for p < 0.01 (higher significance)
-                                    if np.any(sig_01):
-                                        sig_01_times = common_time[sig_01]
-                                        sig_01_rates = agg_rates_all[sig_01] + marker_offset
-                                        ax_peth.scatter(sig_01_times, sig_01_rates, marker='*', s=100, 
-                                                       color='red', zorder=5, alpha=0.8, 
-                                                       label='p < 0.01 (All)' if not any([np.any(sig_01), np.any(sig_05)]) else '')
-                                    
-                                    # Markers for p < 0.05 (but not < 0.01)
-                                    sig_05_only = sig_05 & ~sig_01
-                                    if np.any(sig_05_only):
-                                        sig_05_times = common_time[sig_05_only]
-                                        sig_05_rates = agg_rates_all[sig_05_only] + marker_offset * 0.7
-                                        ax_peth.scatter(sig_05_times, sig_05_rates, marker='*', s=60, 
-                                                       color='orange', zorder=5, alpha=0.7,
-                                                       label='p < 0.05 (All)' if not np.any(sig_01) else '')
-                            except Exception as e:
-                                # Silently fail if test cannot be performed
-                                if 'st' in globals():
-                                    pass
-                                else:
-                                    print(f"Warning: Could not perform significance test for {ch_name} (All): {e}")
-                        
-                        # Plot line for each sleep stage
-                        for stage in sorted(sleep_stage_groups.keys()):
-                            stage_rates = sleep_stage_groups[stage]
-                            if len(stage_rates) > 0:
-                                stage_rates_array = np.array(stage_rates)
-                                if aggregation_method == 'median':
-                                    agg_rates_stage = np.median(stage_rates_array, axis=0)
-                                    # Calculate 95% confidence interval using bootstrap percentile method
-                                    spread_lower_stage, spread_upper_stage = bootstrap_median_ci(stage_rates_array, n_bootstrap=1000)
-                                else:
-                                    agg_rates_stage = np.mean(stage_rates_array, axis=0)
-                                    std_rates_stage = np.std(stage_rates_array, axis=0)
-                                    spread_lower_stage = agg_rates_stage - std_rates_stage
-                                    spread_upper_stage = agg_rates_stage + std_rates_stage
-                                
-                                ax_peth.plot(common_time, agg_rates_stage, linewidth=2, 
-                                            color=stage_colors.get(stage, 'gray'), 
-                                            linestyle=stage_line_styles.get(stage, '-'),
-                                            label=f'{stage} (n={len(stage_rates)})', alpha=0.8)
-                                ax_peth.fill_between(common_time, spread_lower_stage, spread_upper_stage, 
-                                                    alpha=0.2, color=stage_colors.get(stage, 'gray'))
-                        
-                        label_text = 'Median' if aggregation_method == 'median' else 'Mean'
-                        ax_peth.set_ylabel("Rate (events/sec)", fontsize=10)
-                        ax_peth.set_title(f"{label_text} PETH - {ch_name} (by Sleep Stage)", 
-                                         fontsize=11, fontweight='bold')
-                    else:
-                        # Original behavior: single line for all patients
-                        rates_only = [r for r, _ in interpolated_rates]
-                        rates_array = np.array(rates_only)
-                        
-                        if aggregation_method == 'median':
-                            agg_rates = np.median(rates_array, axis=0)
-                            # Calculate 95% confidence interval using bootstrap percentile method
-                            spread_lower, spread_upper = bootstrap_median_ci(rates_array, n_bootstrap=1000)
-                            spread_label = '95% CI'
-                            label_text = 'Median'
-                        else:  # mean
-                            agg_rates = np.mean(rates_array, axis=0)
-                            std_rates = np.std(rates_array, axis=0)
-                            spread_lower = agg_rates - std_rates
-                            spread_upper = agg_rates + std_rates
-                            label_text = 'Mean'
-                            spread_label = '±1 SD'
-                        
-                        ax_peth.plot(common_time, agg_rates, linewidth=2, color='blue', label=label_text)
-                        ax_peth.fill_between(common_time, spread_lower, spread_upper, 
-                                            alpha=0.3, color='blue', label=spread_label)
-                        ax_peth.set_ylabel("Rate (events/sec)", fontsize=10)
-                        ax_peth.set_title(f"{label_text} PETH - {ch_name} (n={len(rates_only)} patients)", 
-                                         fontsize=11, fontweight='bold')
-                        
-                        # Perform max-statistic permutation test for bin-wise significance
-                        try:
-                            sig_test_results = max_statistic_permutation_test(
-                                rates_array, common_time, 
-                                baseline_window=(-0.5, -0.2),
-                                n_permutations=1000,
-                                alpha_levels=[0.05, 0.01],
-                                aggregation_method=aggregation_method
-                            )
-                            
-                            if sig_test_results['p_values'] is not None:
-                                # Calculate y-axis range for marker placement
-                                y_min, y_max = ax_peth.get_ylim()
-                                y_range = y_max - y_min
-                                marker_offset = y_range * 0.05  # 5% above the line
-                                
-                                # Plot markers for significant bins
-                                sig_05 = sig_test_results['significant_bins'].get(0.05, np.zeros(len(common_time), dtype=bool))
-                                sig_01 = sig_test_results['significant_bins'].get(0.01, np.zeros(len(common_time), dtype=bool))
-                                
-                                # Markers for p < 0.01 (higher significance)
-                                if np.any(sig_01):
-                                    sig_01_times = common_time[sig_01]
-                                    sig_01_rates = agg_rates[sig_01] + marker_offset
-                                    ax_peth.scatter(sig_01_times, sig_01_rates, marker='*', s=100, 
-                                                   color='red', zorder=5, alpha=0.8, 
-                                                   label='p < 0.01' if not any([np.any(sig_01), np.any(sig_05)]) else '')
-                                
-                                # Markers for p < 0.05 (but not < 0.01)
-                                sig_05_only = sig_05 & ~sig_01
-                                if np.any(sig_05_only):
-                                    sig_05_times = common_time[sig_05_only]
-                                    sig_05_rates = agg_rates[sig_05_only] + marker_offset * 0.7
-                                    ax_peth.scatter(sig_05_times, sig_05_rates, marker='*', s=60, 
-                                                   color='orange', zorder=5, alpha=0.7,
-                                                   label='p < 0.05' if not np.any(sig_01) else '')
-                        except Exception as e:
-                            # Silently fail if test cannot be performed
-                            if 'st' in globals():
-                                pass  # Don't show error in Streamlit
-                            else:
-                                print(f"Warning: Could not perform significance test for {ch_name}: {e}")
-                    
-                    ax_peth.axvline(0.0, color='red', linestyle='--', linewidth=1, alpha=0.5)
-                    ax_peth.legend(fontsize=8)
-                    ax_peth.grid(True, alpha=0.3)
-                    ax_peth.set_xlim(minmax)
-                    ax_peth.tick_params(axis='x', labelsize=8, bottom=True)
-            except Exception as e:
-                ax_peth.text(0.5, 0.5, f'PETH Error: {str(e)[:40]}', 
-                           ha='center', va='center', transform=ax_peth.transAxes, fontsize=8, color='red')
-        else:
-            ax_peth.text(0.5, 0.5, 'No rate data', 
-                       ha='center', va='center', transform=ax_peth.transAxes, fontsize=9)
-        
-        # Plot 2: Average/Median Raster Plot (density of events)
-        if channel_data['events_list']:
-            try:
-                # Calculate histogram for each patient separately
-                time_bins = np.arange(minmax[0], minmax[1] + binsize, binsize)
-                patient_histograms = []
-                
-                for event_data in channel_data['events_list']:
-                    times = event_data['times']
-                    if len(times) > 0:
-                        hist_counts, _ = np.histogram(times, bins=time_bins)
-                        patient_histograms.append(hist_counts)
-                
-                if patient_histograms and len(patient_histograms) > 0:
-                    # Stack histograms and aggregate using selected method
-                    histograms_array = np.array(patient_histograms)
-                    
-                    if aggregation_method == 'median':
-                        agg_counts = np.median(histograms_array, axis=0)
-                        label_text = 'Median'
-                    else:  # mean
-                        agg_counts = np.mean(histograms_array, axis=0)
-                        label_text = 'Mean'
-                    
-                    # Create time axis for histogram (bin centers)
-                    bin_centers = (time_bins[:-1] + time_bins[1:]) / 2
-                    
-                    # Plot as a bar plot showing aggregated event density
-                    ax_raster.bar(bin_centers, agg_counts, width=binsize*0.8, 
-                                 color='blue', alpha=0.6, edgecolor='darkblue', linewidth=0.5)
-                    ax_raster.set_ylabel(f"{label_text} Events/Bin", fontsize=10)
-                    n_patients = len(patient_histograms)
-                    ax_raster.set_title(f"{label_text} Event Density - {ch_name} (n={n_patients} patients)", 
-                                       fontsize=11, fontweight='bold')
-                    ax_raster.axvline(0.0, color='red', linestyle='--', linewidth=1, alpha=0.5)
-                    ax_raster.set_xlim(minmax)
-                    ax_raster.grid(True, alpha=0.3, axis='y')
-                    ax_raster.tick_params(axis='x', labelsize=8, bottom=True)
-                    ax_raster.tick_params(axis='y', labelsize=8)
-            except Exception as e:
-                ax_raster.text(0.5, 0.5, f'Raster Error: {str(e)[:40]}', 
-                             ha='center', va='center', transform=ax_raster.transAxes, fontsize=8, color='red')
-        else:
-            ax_raster.text(0.5, 0.5, 'No event data', 
-                         ha='center', va='center', transform=ax_raster.transAxes, fontsize=9)
-        
-        # Set x-label and ticks for all subplots
-        ax_peth.set_xlabel("Time from R-peak (s)", fontsize=10)
-        ax_raster.set_xlabel("Time from R-peak (s)", fontsize=10)
-        
-        # Ensure x-axis ticks are visible
-        ax_peth.tick_params(labelsize=8, axis='both', which='major')
-        ax_raster.tick_params(labelsize=8, axis='both', which='major')
-        ax_peth.tick_params(axis='x', labelsize=8, bottom=True)
-        ax_raster.tick_params(axis='x', labelsize=8, bottom=True)
-    
-    # Determine aggregation label for title
-    agg_label = "Median" if aggregation_method == 'median' else "Average"
-    plt.suptitle(f"{agg_label} EEG Channel PETH & Raster Plots (Across All Patients)", 
-                fontsize=14, fontweight='bold', y=0.995)
-    plt.tight_layout(rect=[0, 0, 1, 0.99])
-    
-    # Save plot if requested
-    if save_plot and save_dir:
-        save_path_avg = os.path.join(save_dir, 'eeg_peth_raster_averaged.png')
-        plt.savefig(save_path_avg, dpi=300, bbox_inches='tight')
-        if 'st' in globals():
-            st.success(f"Averaged EEG PETH & Raster plots saved to {save_path_avg}")
-        else:
-            print(f"Averaged EEG PETH & Raster plots saved to {save_path_avg}")
-    
-    # Display in streamlit if available
-    display_plot_with_download(fig_avg, "eeg_peth_raster_averaged", "eeg_peth_raster_avg")
-    plt.close(fig_avg)
-    
-    return fig_avg
 
-
-def plot_regional_averaged_eeg_peth_raster(loaded_files, minmax=(-0.5, 1.0), binsize=0.05, save_plot=False, save_dir=None, aggregation_method='median', processing_mode='single', sleep_stage_mapping=None, sleep_stage='N1'):
-    """
-    Create averaged PETH and raster plots for regional EEG groups (F, C, T, P, O) across all patients.
-    Only uses the first 21 electrodes and groups them by prefix.
+    total_files = len(loaded_files)
     
-    Parameters
-    ----------
-    loaded_files : list
-        List of tuples (file_path, patient_id, raw_object)
-    minmax : tuple, optional
-        Time window around events in seconds (default: (-0.5, 1.0))
-    binsize : float, optional
-        Bin size for rate calculation in seconds (default: 0.05)
-    save_plot : bool, optional
-        Whether to save the plot (default: False)
-    save_dir : str, optional
-        Directory to save the plot (default: None)
-    aggregation_method : str, optional
-        Method for aggregating across patients: 'median' or 'mean' (default: 'median')
-    processing_mode : str, optional
-        Processing mode: 'single' for sequential or 'multithread' for parallel (default: 'single')
-    
-    Returns
-    -------
-    matplotlib.figure.Figure or None
-        Figure object if plot was created, None otherwise
-    """
-    if not PYNAPPLE_AVAILABLE:
+    # Process all patients
+    for idx, (file_path, patient_id, raw) in enumerate(loaded_files):
         if 'st' in globals():
-            st.error("pynapple is not available. Please install it to use regional PETH raster plots.")
-        else:
-            print("pynapple is not available. Please install it to use regional PETH raster plots.")
-        return None
-    
-    if not loaded_files:
-        return None
-    
-    # Regional prefixes to group
-    regional_prefixes = ['F', 'C', 'T', 'P', 'O']
-    
-    # Collect data from all patients, grouped by region
-    regional_data = {prefix: {'rates_list': [], 'events_list': []} for prefix in regional_prefixes}
-    
-    # Track unique electrodes per region across all patients
-    regional_electrodes = {prefix: set() for prefix in regional_prefixes}
-    
-    if 'st' in globals():
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-    
-    for file_idx, (file_path, patient_id, raw) in enumerate(loaded_files):
+            status_text.text(f"Processing patient {idx+1}/{total_files}: {patient_id}...")
+            progress_bar.progress((idx) / total_files)
+
         try:
-            if 'st' in globals():
-                status_text.text(f"Processing {patient_id} for regional plots ({file_idx + 1}/{len(loaded_files)})...")
-                progress_bar.progress((file_idx + 1) / len(loaded_files))
-            
             # Get sampling frequency
             sfreq = raw.info['sfreq']
-            
-            # Get channel names and data
             ch_names = raw.ch_names
             data = raw.get_data()
-            
+
             # Find ECG channel
             ch_lower = [ch.lower() for ch in ch_names]
             ecg_indices = [i for i, ch in enumerate(ch_lower) if 'ecg' in ch or 'ekg' in ch]
-            
+
             if not ecg_indices:
                 continue
-            
+
             ecg_ch_idx = ecg_indices[0]
             ecg_signal = data[ecg_ch_idx, :]
-            
+
             # Clean ECG and detect R-peaks
             try:
                 ecg_signal_clean, _ = clean_ecg_advanced(
@@ -2608,327 +2169,184 @@ def plot_regional_averaged_eeg_peth_raster(loaded_files, minmax=(-0.5, 1.0), bin
                 rpeaks = rpk['ECG_R_Peaks']
             except:
                 continue
-            
+
             if len(rpeaks) < 2:
                 continue
-            
-            # Convert R-peak indices to timestamps
+
             rpeak_times = rpeaks / sfreq
             rpeak_ts = nap.Ts(t=rpeak_times, time_units="s")
-            
-            # Find EEG channels (first 21 only)
-            eeg_ch_indices = []
-            eeg_ch_names = []
-            for i, ch in enumerate(ch_names):
-                ch_upper = ch.upper()
-                # Check if it's an EEG channel with regional prefix
-                if any(ch_upper.startswith(prefix) for prefix in regional_prefixes):
-                    eeg_ch_indices.append(i)
-                    eeg_ch_names.append(ch)
-                    if len(eeg_ch_indices) >= 21:  # Only first 21 electrodes
-                        break
-            
-            if not eeg_ch_indices:
-                continue
-            
-            # Group channels by regional prefix
-            regional_channels = {prefix: [] for prefix in regional_prefixes}
-            for ch_idx, ch_name in zip(eeg_ch_indices, eeg_ch_names):
-                ch_upper = ch_name.upper()
-                for prefix in regional_prefixes:
-                    if ch_upper.startswith(prefix):
-                        regional_channels[prefix].append((ch_idx, ch_name))
-                        regional_electrodes[prefix].add(ch_name.upper())  # Track unique electrodes
-                        break
-            
-            # Process each region
-            for region_prefix in regional_prefixes:
-                if not regional_channels[region_prefix]:
+
+            # Channel mapping
+            ch_name_to_idx = {ch.upper(): i for i, ch in enumerate(ch_names)}
+
+            # Process each electrode of interest if present
+            for elec_upper in electrodes_of_interest:
+                if elec_upper not in ch_name_to_idx:
                     continue
                 
-                # Collect events from all channels in this region
-                all_region_events = []
+                # finding original name
+                original_elec_name = next((ch for ch in ch_names if ch.upper() == elec_upper), elec_upper)
                 
-                for ch_idx, ch_name in regional_channels[region_prefix]:
-                    try:
-                        eeg_signal = data[ch_idx, :]
-                        
-                        # Detect events in EEG
-                        eeg_mean = np.mean(eeg_signal)
-                        eeg_std = np.std(eeg_signal)
-                        threshold = eeg_mean + 2 * eeg_std
-                        
-                        # Find peaks above threshold
-                        peaks, _ = find_peaks(eeg_signal, height=threshold, distance=int(sfreq * 0.1))
-                        
-                        if len(peaks) > 0:
-                            # Convert peak indices to timestamps
-                            peak_times = peaks / sfreq
-                            all_region_events.extend(peak_times)
-                    
-                    except Exception as e:
-                        continue
+                ch_idx = ch_name_to_idx[elec_upper]
                 
-                if len(all_region_events) > 0:
-                    # Create pynapple Ts object for all events in this region
-                    region_peak_ts = nap.Ts(t=np.array(all_region_events), time_units="s")
-                    
-                    # Compute perievent alignment around R-peaks
-                    peth_region = nap.compute_perievent(
-                        timestamps=region_peak_ts,
+                try:
+                    eeg_signal = data[ch_idx, :]
+                    time_index = np.arange(len(eeg_signal)) / sfreq
+                    eeg_signal_tsd = nap.Tsd(t=time_index, d=eeg_signal, time_units="s")
+
+                    peth_eeg = nap.compute_perievent_continuous(
+                        timeseries=eeg_signal_tsd,
                         tref=rpeak_ts,
                         minmax=minmax,
                         time_unit="s"
                     )
-                    
-                    if len(peth_region) > 0:
-                        # Calculate rates for this patient and region
-                        try:
-                            peth_region_count = peth_region.count(binsize)
-                            if hasattr(peth_region_count, 'values'):
-                                count_vals = peth_region_count.values
-                                if count_vals.ndim == 2:
-                                    rates = np.mean(count_vals, axis=1) / binsize
-                                else:
-                                    rates = count_vals / binsize
-                                
-                                if hasattr(peth_region_count, 'index'):
-                                    time_axis = peth_region_count.index.values
-                                else:
-                                    time_axis = np.arange(len(rates)) * binsize + minmax[0]
-                                
-                                regional_data[region_prefix]['rates_list'].append((time_axis, rates))
-                        except:
-                            pass
-                        
-                        # Collect events for raster plot
-                        try:
-                            peth_region_tsd = peth_region.to_tsd()
-                            regional_data[region_prefix]['events_list'].append({
-                                'times': peth_region_tsd.index.values,
-                                'events': peth_region_tsd.values
-                            })
-                        except:
-                            pass
-                    
-        except Exception as e:
-            if 'st' in globals():
-                st.warning(f"Error processing {patient_id} for regional plots: {e}")
-            else:
-                print(f"Error processing {patient_id} for regional plots: {e}")
+
+                    if len(peth_eeg) > 0:
+                        if hasattr(peth_eeg, 'values'):
+                            values = peth_eeg.values
+                            if values.ndim == 2:
+                                mean_signal = np.nanmean(values, axis=1)
+                            else:
+                                mean_signal = values
+                            
+                            if hasattr(peth_eeg, 'index'):
+                                time_axis = peth_eeg.index.values
+                            else:
+                                time_axis = np.linspace(minmax[0], minmax[1], len(mean_signal))
+                            
+                            # Find display name in regional_electrodes values
+                            display_name = elec_upper
+                            for r_list in regional_electrodes.values():
+                                for r_elec in r_list:
+                                    if r_elec.upper() == elec_upper:
+                                        display_name = r_elec
+                                        break
+                            
+                            if display_name in all_electrode_data:
+                                all_electrode_data[display_name].append((time_axis, mean_signal))
+
+                except Exception:
+                    continue
+
+        except Exception:
             continue
-        
-        if 'st' in globals():
-            progress_bar.empty()
-            status_text.empty()
-    
-    # Check if we have data
-    regions_with_data = [prefix for prefix in regional_prefixes if regional_data[prefix]['rates_list'] or regional_data[prefix]['events_list']]
-    
-    if not regions_with_data:
-        if 'st' in globals():
-            st.warning("No regional data found across patients.")
-        else:
-            print("No regional data found across patients.")
-        return None
-    
-    # Count electrodes per region
-    region_electrode_counts = {prefix: len(regional_electrodes[prefix]) for prefix in regional_prefixes}
-    
+
+    if 'st' in globals():
+        progress_bar.empty()
+        status_text.empty()
+
     # Create plots
-    n_regions = len(regions_with_data)
-    n_cols = 2  # PETH and Raster side by side
-    n_rows = n_regions
+    figures = []
     
-    fig_regional, axes = plt.subplots(n_rows, n_cols, figsize=(14, 3 * n_rows), sharex='col')
-    if n_regions == 1:
-        axes = axes.reshape(1, -1)
+    # Filter electrodes with data
+    electrodes_with_data = [e for e in all_electrode_data.keys() if all_electrode_data[e]]
     
-    for reg_idx, region_prefix in enumerate(regions_with_data):
-        ax_peth = axes[reg_idx, 0]
-        ax_raster = axes[reg_idx, 1]
+    # Group electrodes by region
+    electrodes_by_region = {}
+    for region, region_elecs in regional_electrodes.items():
+        electrodes_by_region[region] = [e for e in electrodes_with_data if e.upper() in [re.upper() for re in region_elecs]]
+
+    for region, region_elecs in electrodes_by_region.items():
+        if not region_elecs:
+            continue
+
+        n_electrodes = len(region_elecs)
+        # Single column layout
+        n_cols = 1
+        n_rows = n_electrodes
+
+        fig_region, axes = plt.subplots(n_rows, n_cols, figsize=(8, 4 * n_rows), constrained_layout=True)
         
-        region_data = regional_data[region_prefix]
+        if n_electrodes > 1:
+            axes_flat = axes.flatten()
+        else:
+            axes_flat = [axes]
         
-        # Plot 1: PETH (Average or Median based on aggregation_method)
-        if region_data['rates_list']:
-            try:
-                # Interpolate all rates to common time axis
-                all_time_axes = [t for t, _ in region_data['rates_list']]
-                all_rates = [r for _, r in region_data['rates_list']]
-                
-                # Find common time range
-                min_time = max([t[0] for t in all_time_axes])
-                max_time = min([t[-1] for t in all_time_axes])
-                common_time = np.arange(min_time, max_time + binsize, binsize)
-                
-                # Interpolate each patient's rates to common time axis
-                interpolated_rates = []
-                for time_axis, rates in zip(all_time_axes, all_rates):
-                    if len(time_axis) > 1 and len(rates) > 1:
-                        interp_rates = np.interp(common_time, time_axis, rates)
-                        interpolated_rates.append(interp_rates)
-                
-                if interpolated_rates:
-                    # Aggregate across patients using selected method
-                    if aggregation_method == 'median':
-                        agg_rates = np.median(interpolated_rates, axis=0)
-                        # Calculate 95% confidence interval using bootstrap percentile method
-                        interpolated_rates_array = np.array(interpolated_rates)
-                        spread_lower, spread_upper = bootstrap_median_ci(interpolated_rates_array, n_bootstrap=1000)
-                        spread_label = '95% CI'
-                        label_text = 'Median'
-                    else:  # mean
-                        agg_rates = np.mean(interpolated_rates, axis=0)
-                        std_rates = np.std(interpolated_rates, axis=0)
-                        spread_lower = agg_rates - std_rates
-                        spread_upper = agg_rates + std_rates
-                        label_text = 'Mean'
-                        spread_label = '±1 SD'
+        # Hide unused
+        for i in range(n_electrodes, len(axes_flat)):
+            axes_flat[i].set_visible(False)
+
+        for elec_idx, electrode in enumerate(region_elecs):
+            ax = axes_flat[elec_idx]
+            electrode_data_list = all_electrode_data.get(electrode, [])
+            
+            if electrode_data_list:
+                try:
+                    all_time_axes = [t for t, _ in electrode_data_list]
+                    all_signals = [s for _, s in electrode_data_list]
                     
-                    ax_peth.plot(common_time, agg_rates, linewidth=2, color='blue', label=label_text)
-                    ax_peth.fill_between(common_time, spread_lower, spread_upper, 
-                                        alpha=0.3, color='blue', label=spread_label)
-                    ax_peth.set_ylabel("Rate (events/sec)", fontsize=10)
-                    n_electrodes = region_electrode_counts.get(region_prefix, 0)
-                    ax_peth.set_title(f"{label_text} PETH - {region_prefix} Region (n={len(interpolated_rates)} patients, {n_electrodes} electrodes)", 
-                                     fontsize=11, fontweight='bold')
+                    min_time = max([t[0] for t in all_time_axes])
+                    max_time = min([t[-1] for t in all_time_axes])
+                    common_time = np.arange(min_time, max_time + binsize, binsize)
                     
-                    # Perform max-statistic permutation test for bin-wise significance
-                    try:
-                        interpolated_rates_array = np.array(interpolated_rates)
-                        sig_test_results = max_statistic_permutation_test(
-                            interpolated_rates_array, common_time, 
-                            baseline_window=(-0.5, -0.2),
-                            n_permutations=1000,
-                            alpha_levels=[0.05, 0.01],
-                            aggregation_method=aggregation_method
-                        )
+                    interpolated_signals = []
+                    for time_axis, signal in zip(all_time_axes, all_signals):
+                        if len(time_axis) > 1 and len(signal) > 1:
+                            interp_sig = np.interp(common_time, time_axis, signal)
+                            interpolated_signals.append(interp_sig)
+                    
+                    if interpolated_signals:
+                        n_patients = len(interpolated_signals)
+                        interpolated_signals_array = np.array(interpolated_signals)
                         
-                        if sig_test_results['p_values'] is not None:
-                            # Calculate y-axis range for marker placement
-                            y_min, y_max = ax_peth.get_ylim()
-                            y_range = y_max - y_min
-                            marker_offset = y_range * 0.05  # 5% above the line
-                            
-                            # Plot markers for significant bins
-                            sig_05 = sig_test_results['significant_bins'].get(0.05, np.zeros(len(common_time), dtype=bool))
-                            sig_01 = sig_test_results['significant_bins'].get(0.01, np.zeros(len(common_time), dtype=bool))
-                            
-                            # Markers for p < 0.01 (higher significance)
-                            if np.any(sig_01):
-                                sig_01_times = common_time[sig_01]
-                                sig_01_rates = agg_rates[sig_01] + marker_offset
-                                ax_peth.scatter(sig_01_times, sig_01_rates, marker='*', s=100, 
-                                               color='red', zorder=5, alpha=0.8, 
-                                               label='p < 0.01' if not any([np.any(sig_01), np.any(sig_05)]) else '')
-                            
-                            # Markers for p < 0.05 (but not < 0.01)
-                            sig_05_only = sig_05 & ~sig_01
-                            if np.any(sig_05_only):
-                                sig_05_times = common_time[sig_05_only]
-                                sig_05_rates = agg_rates[sig_05_only] + marker_offset * 0.7
-                                ax_peth.scatter(sig_05_times, sig_05_rates, marker='*', s=60, 
-                                               color='orange', zorder=5, alpha=0.7,
-                                               label='p < 0.05' if not np.any(sig_01) else '')
-                    except Exception as e:
-                        # Silently fail if test cannot be performed
-                        if 'st' in globals():
-                            pass
+                        if aggregation_method == 'median':
+                            agg_signal = np.median(interpolated_signals_array, axis=0)
+                            spread_lower, spread_upper = bootstrap_median_ci(interpolated_signals_array, n_bootstrap=1000)
+                            label_text = 'Median'
+                            spread_label = '95% CI'
                         else:
-                            print(f"Warning: Could not perform significance test for {region_prefix} region: {e}")
-                    
-                    ax_peth.axvline(0.0, color='red', linestyle='--', linewidth=1, alpha=0.5)
-                    ax_peth.legend(fontsize=8)
-                    ax_peth.grid(True, alpha=0.3)
-                    ax_peth.set_xlim(minmax)
-                    ax_peth.tick_params(axis='x', labelsize=8, bottom=True)
-            except Exception as e:
-                ax_peth.text(0.5, 0.5, f'PETH Error: {str(e)[:40]}', 
-                           ha='center', va='center', transform=ax_peth.transAxes, fontsize=8, color='red')
-        else:
-            ax_peth.text(0.5, 0.5, 'No rate data', 
-                       ha='center', va='center', transform=ax_peth.transAxes, fontsize=9)
+                            agg_signal = np.mean(interpolated_signals_array, axis=0)
+                            std_signal = np.std(interpolated_signals_array, axis=0)
+                            if n_patients > 1:
+                                se_signal = std_signal / np.sqrt(n_patients)
+                                t_critical = stats.t.ppf(0.975, df=n_patients - 1)
+                                spread_lower = agg_signal - t_critical * se_signal
+                                spread_upper = agg_signal + t_critical * se_signal
+                                spread_label = '95% CI'
+                            else:
+                                spread_lower = agg_signal - std_signal
+                                spread_upper = agg_signal + std_signal
+                                spread_label = '±1 SD'
+                            label_text = 'Mean'
+                        
+                        ax.plot(common_time, agg_signal, linewidth=2, color='blue', label=label_text)
+                        ax.fill_between(common_time, spread_lower, spread_upper, alpha=0.3, color='blue', label=spread_label)
+                        
+                        ax.set_title(f"{electrode} (n={n_patients})", fontsize=11, fontweight='bold')
+                        ax.set_ylabel("Amplitude (V)", fontsize=10)
+                        ax.set_xlabel("Time from R-peak (s)", fontsize=10)
+                        ax.axvline(0.0, color='red', linestyle='--', linewidth=1, alpha=0.5)
+                        ax.grid(True, alpha=0.3)
+                        ax.set_xlim(minmax)
+                        ax.legend(fontsize=8, loc='upper right')
+                    else:
+                        ax.text(0.5, 0.5, 'No valid interpolated data', ha='center', va='center', transform=ax.transAxes)
+                except Exception as e:
+                    ax.text(0.5, 0.5, f'Error: {str(e)[:20]}', ha='center', va='center', transform=ax.transAxes, color='red')
+            else:
+                ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax.transAxes)
         
-        # Plot 2: Average/Median Event Density
-        if region_data['events_list']:
-            try:
-                # Calculate histogram for each patient separately
-                time_bins = np.arange(minmax[0], minmax[1] + binsize, binsize)
-                patient_histograms = []
-                
-                for event_data in region_data['events_list']:
-                    times = event_data['times']
-                    if len(times) > 0:
-                        hist_counts, _ = np.histogram(times, bins=time_bins)
-                        patient_histograms.append(hist_counts)
-                
-                if patient_histograms and len(patient_histograms) > 0:
-                    # Stack histograms and aggregate using selected method
-                    histograms_array = np.array(patient_histograms)
-                    
-                    if aggregation_method == 'median':
-                        agg_counts = np.median(histograms_array, axis=0)
-                        label_text = 'Median'
-                    else:  # mean
-                        agg_counts = np.mean(histograms_array, axis=0)
-                        label_text = 'Mean'
-                    
-                    # Create time axis for histogram (bin centers)
-                    bin_centers = (time_bins[:-1] + time_bins[1:]) / 2
-                    
-                    # Plot as bar plot showing aggregated event density
-                    ax_raster.bar(bin_centers, agg_counts, width=binsize*0.8, 
-                                 color='#0C7BDC', alpha=0.6, edgecolor='#0A5FA8', linewidth=0.5)
-                    ax_raster.set_ylabel(f"{label_text} Events/Bin", fontsize=10)
-                    n_electrodes = region_electrode_counts.get(region_prefix, 0)
-                    n_patients = len(patient_histograms)
-                    ax_raster.set_title(f"{label_text} Event Density - {region_prefix} Region (n={n_patients} patients, {n_electrodes} electrodes)", 
-                                       fontsize=11, fontweight='bold')
-                    ax_raster.axvline(0.0, color='red', linestyle='--', linewidth=1, alpha=0.5)
-                    ax_raster.set_xlim(minmax)
-                    ax_raster.grid(True, alpha=0.3, axis='y')
-                    ax_raster.tick_params(axis='x', labelsize=8, bottom=True)
-                    ax_raster.tick_params(axis='y', labelsize=8)
-            except Exception as e:
-                ax_raster.text(0.5, 0.5, f'Raster Error: {str(e)[:40]}', 
-                             ha='center', va='center', transform=ax_raster.transAxes, fontsize=8, color='red')
-        else:
-            ax_raster.text(0.5, 0.5, 'No event data', 
-                         ha='center', va='center', transform=ax_raster.transAxes, fontsize=9)
+        # Add overarching title
+        fig_region.suptitle(f"{region} Region - Averaged HEP Waveforms (All Patients)", fontsize=14, fontweight='bold')
         
-        # Set x-label and ticks for all subplots
-        ax_peth.set_xlabel("Time from R-peak (s)", fontsize=10)
-        ax_raster.set_xlabel("Time from R-peak (s)", fontsize=10)
+        figures.append(fig_region)
         
-        # Ensure x-axis ticks are visible
-        ax_peth.tick_params(labelsize=8, axis='both', which='major')
-        ax_raster.tick_params(labelsize=8, axis='both', which='major')
-        ax_peth.tick_params(axis='x', labelsize=8, bottom=True)
-        ax_raster.tick_params(axis='x', labelsize=8, bottom=True)
-    
-    # Create title with electrode counts for each region
-    region_counts_str = ", ".join([f"{r}({region_electrode_counts.get(r, 0)})" for r in regions_with_data])
-    # Determine aggregation label for title
-    agg_label = "Median" if aggregation_method == 'median' else "Average"
-    plt.suptitle(f"Regional {agg_label} EEG PETH & Raster Plots ({region_counts_str} electrodes)", 
-                fontsize=14, fontweight='bold', y=0.995)
-    plt.tight_layout(rect=[0, 0, 1, 0.99])
-    
-    # Save plot if requested
-    if save_plot and save_dir:
-        save_path_regional = os.path.join(save_dir, 'eeg_peth_raster_regional_averaged.png')
-        plt.savefig(save_path_regional, dpi=300, bbox_inches='tight')
-        if 'st' in globals():
-            st.success(f"Regional averaged EEG PETH & Raster plots saved to {save_path_regional}")
-        else:
-            print(f"Regional averaged EEG PETH & Raster plots saved to {save_path_regional}")
-    
-    # Display in streamlit if available
-    display_plot_with_download(fig_regional, "eeg_peth_raster_regional_averaged", "eeg_peth_raster_regional_avg")
-    plt.close(fig_regional)
-    
-    return fig_regional
+        # Save if requested
+        if save_plot and save_dir:
+            save_path = os.path.join(save_dir, f'regional_all_patients_{region}.png')
+            fig_region.savefig(save_path, bbox_inches='tight')
+            if 'st' in globals():
+                st.success(f"Saved {save_path}")
+            
+        display_plot_with_download(fig_region, f"all_patients_{region}", f"all_patients_{region}")
+        plt.close(fig_region)
+
+    return figures
+ 
+
+                    
+
+
 
 
 def bootstrap_median_ci(rates_array, n_bootstrap=1000, confidence=0.95):
@@ -3222,9 +2640,244 @@ def max_statistic_permutation_test(interpolated_rates, common_time, baseline_win
     }
 
 
-def test_electrode_significance_per_patient(loaded_files, minmax=(-0.5, 1.0), binsize=0.05, 
+
+# -----------------------------------------------------------------------------
+# Circular Statistics Helpers
+# -----------------------------------------------------------------------------
+
+def calculate_kuiper_statistic(alpha1, alpha2):
+    """
+    Calculate Kuiper's test statistic V for two samples of circular data.
+    alpha1, alpha2: arrays of angles in radians.
+    """
+    n1 = len(alpha1)
+    n2 = len(alpha2)
+    
+    if n1 == 0 or n2 == 0:
+        return 0.0
+    
+    # Sort and wrap to [0, 2pi)
+    alpha1 = np.sort(np.mod(alpha1, 2*np.pi))
+    alpha2 = np.sort(np.mod(alpha2, 2*np.pi))
+    
+    # Combine and sort to find all evaluation points
+    all_alphas = np.concatenate([alpha1, alpha2])
+    
+    # Label the points: 0 for alpha1, 1 for alpha2
+    labels = np.concatenate([np.zeros(n1), np.ones(n2)])
+    
+    # Sort labels based on angles
+    sort_idx = np.argsort(all_alphas)
+    sorted_labels = labels[sort_idx]
+    
+    # Calculate CDFs
+    cdf1 = np.cumsum(sorted_labels == 0) / n1
+    cdf2 = np.cumsum(sorted_labels == 1) / n2
+    
+    # Difference
+    diff = cdf1 - cdf2
+    
+    D_plus = np.max(diff)
+    D_minus = np.max(-diff)
+    
+    return D_plus + D_minus
+
+def permutation_kuiper_test(alpha1, alpha2, n_permutations=1000):
+    """
+    Perform a permutation test using Kuiper's statistic.
+    Compares two circular distributions.
+    """
+    # Remove NaNs
+    alpha1 = alpha1[~np.isnan(alpha1)]
+    alpha2 = alpha2[~np.isnan(alpha2)]
+    
+    if len(alpha1) < 5 or len(alpha2) < 5:
+        return 1.0
+    
+    # Calculate observed statistic
+    V_obs = calculate_kuiper_statistic(alpha1, alpha2)
+    
+    # Combine
+    combined = np.concatenate([alpha1, alpha2])
+    n1 = len(alpha1)
+    
+    interactions_greater = 0
+    
+    for _ in range(n_permutations):
+        # Shuffle
+        np.random.shuffle(combined)
+        perm_samp1 = combined[:n1]
+        perm_samp2 = combined[n1:]
+        
+        V_perm = calculate_kuiper_statistic(perm_samp1, perm_samp2)
+        
+        if V_perm >= V_obs:
+            interactions_greater += 1
+            
+    return (interactions_greater + 1) / (n_permutations + 1)
+
+
+def test_electrode_significance_circular(loaded_files, band=(8, 12), n_permutations=1000, 
+                                        significance_threshold=0.05, processing_mode='single'):
+    """
+    Test if heart modulates EEG electrodes by comparing phase distributions at R-peaks 
+    vs P, Q, S, T waves using circular statistics (Kuiper's Test via permutation).
+    
+    Parameters
+    ----------
+    loaded_files : list
+        List of tuples (file_path, patient_id, raw_object)
+    band : tuple, optional
+        Frequency band for phase extraction (low, high) in Hz (default: (8, 12) Alpha)
+        If None, uses broadband (not recommended for phase).
+    n_permutations : int, optional
+        Number of permutations for significance testing (default: 1000)
+    significance_threshold : float, optional
+        Threshold for significance (default: 0.05)
+    processing_mode : str
+        'single' or 'multithread' (default: 'single')
+        
+    Returns
+    -------
+    dict : Results per patient
+    """
+    if not loaded_files:
+        return {}
+    
+    results = {}
+    
+    if 'st' in globals():
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+    for file_idx, (file_path, patient_id, raw) in enumerate(loaded_files):
+        try:
+            if 'st' in globals():
+                status_text.text(f"Circular Stats: Processing {patient_id} ({file_idx + 1}/{len(loaded_files)})...")
+                progress_bar.progress((file_idx + 1) / len(loaded_files))
+            
+            sfreq = raw.info['sfreq']
+            ch_names = raw.ch_names
+            data = raw.get_data()
+            
+            # 1. ECG Processing
+            ecg_indices = [i for i, ch in enumerate(ch_names) if 'ecg' in ch.lower() or 'ekg' in ch.lower()]
+            if not ecg_indices:
+                continue
+            ecg_signal = data[ecg_indices[0], :]
+            
+            # Clean and Peaks
+            try:
+                ecg_clean = nk.ecg_clean(ecg_signal, sampling_rate=sfreq)
+                _, rpk = nk.ecg_peaks(ecg_clean, sampling_rate=sfreq)
+                r_peaks = rpk['ECG_R_Peaks']
+                
+                # Delineate P, Q, S, T
+                waves, _ = nk.ecg_delineate(ecg_clean, r_peaks, sampling_rate=sfreq, method='dwt')
+                
+                # Extract indices (some might be NaNs)
+                indices = {
+                    'R': r_peaks,
+                    'P': np.array(waves['ECG_P_Peaks']),
+                    'Q': np.array(waves['ECG_Q_Peaks']),
+                    'S': np.array(waves['ECG_S_Peaks']),
+                    'T': np.array(waves['ECG_T_Peaks'])
+                }
+                
+                # Remove NaNs from indices
+                for key in indices:
+                    indices[key] = indices[key][~np.isnan(indices[key])].astype(int)
+                    # Clip to data bounds
+                    indices[key] = indices[key][(indices[key] >= 0) & (indices[key] < data.shape[1])]
+                    
+            except Exception as e:
+                print(f"ECG processing failed for {patient_id}: {e}")
+                continue
+                
+            # 2. EEG Processing
+            eeg_indices = [i for i, ch in enumerate(ch_names) 
+                          if 'eeg' in ch.lower() or any(elec in ch.upper() for elec in ['FP', 'F', 'C', 'P', 'O', 'T', 'A'])]
+            
+            if not eeg_indices:
+                continue
+            
+            patient_results = []
+            
+            # Pre-filter EEG if band is provided
+            eeg_data = data[eeg_indices, :]
+            eeg_ch_names = [ch_names[i] for i in eeg_indices]
+            
+            if band is not None:
+                # Use MNE filtering if possible, or scipy
+                # raw.exclude... we already have numpy array 'eeg_data'
+                # Let's use scipy butterworth
+                nyq = 0.5 * sfreq
+                low = band[0] / nyq
+                high = band[1] / nyq
+                b, a = butter(4, [low, high], btype='band')
+                eeg_data_filtered = filtfilt(b, a, eeg_data, axis=1)
+            else:
+                eeg_data_filtered = eeg_data
+                
+            # Compute Hilbert Phase
+            # analytic_signal = hilbert(eeg_data_filtered) # This might be memory intensive across all channels
+            # Do per channel
+            
+            for ch_idx, ch_name in enumerate(eeg_ch_names):
+                try:
+                    sig = eeg_data_filtered[ch_idx, :]
+                    analytic = hilbert(sig)
+                    phase = np.angle(analytic) # Radians [-pi, pi]
+                    
+                    # Extract phases at events
+                    phases = {}
+                    for wave_name, wave_idxs in indices.items():
+                        if len(wave_idxs) > 0:
+                            phases[wave_name] = phase[wave_idxs]
+                        else:
+                            phases[wave_name] = np.array([])
+                    
+                    if len(phases['R']) < 10: # Minimum trials
+                        continue
+                        
+                    # Compare R to P, Q, S, T
+                    comparisons = {}
+                    is_significant_any = False
+                    
+                    for wave in ['P', 'Q', 'S', 'T']:
+                        if len(phases[wave]) < 5:
+                            comparisons[wave] = np.nan
+                            continue
+                            
+                        # Run Permutation Test
+                        p_val = permutation_kuiper_test(phases['R'], phases[wave], n_permutations=n_permutations)
+                        comparisons[wave] = p_val
+                        
+                        if p_val < significance_threshold: # Simple threshold, maybe should correct?
+                            is_significant_any = True
+                    
+                    patient_results.append({
+                        'electrode': ch_name,
+                        'p_values': comparisons,
+                        'significant': is_significant_any
+                    })
+                    
+                except Exception as e:
+                    print(f"Error channel {ch_name}: {e}")
+                    continue
+            
+            results[patient_id] = patient_results
+            
+        except Exception as e:
+            print(f"Error processing {patient_id}: {e}")
+            continue
+            
+    return results
+
+
+def test_electrode_significance_per_patient(loaded_files, minmax=(-0.5, 1.0), binsize=0.1, 
                                             test_window=(-0.1, 0.1), baseline_window=(-0.5, -0.2), 
-                                            n_bootstrap=10000, significance_threshold=0.05, processing_mode='single'):
+                                            n_bootstrap=100, significance_threshold=0.05, processing_mode='single', jitter_amount=0.0):
     """
     Test significance of RR to channel peri-event analysis for each patient individually.
     For each patient, tests which electrodes show significant differences between test and baseline windows.
@@ -3247,6 +2900,8 @@ def test_electrode_significance_per_patient(loaded_files, minmax=(-0.5, 1.0), bi
         P-value threshold for significance (default: 0.05)
     processing_mode : str, optional
         Processing mode: 'single' for sequential or 'multithread' for parallel (default: 'single')
+    jitter_amount : float, optional
+        Amount of jitter to apply to timestamps in seconds (default: 0.0)
     
     Returns
     -------
@@ -3263,7 +2918,7 @@ def test_electrode_significance_per_patient(loaded_files, minmax=(-0.5, 1.0), bi
         return {}
     
     results = {}  # {patient_id: [(electrode, p_value, mean_diff), ...]}
-    
+    results_full_time = {}
     if 'st' in globals():
         progress_bar = st.progress(0)
         status_text = st.empty()
@@ -3304,7 +2959,7 @@ def test_electrode_significance_per_patient(loaded_files, minmax=(-0.5, 1.0), bi
                 _, rpk = nk.ecg_peaks(ecg_signal_clean, sampling_rate=sfreq)
                 rpeaks = rpk['ECG_R_Peaks']
             except Exception as e:
-                continue
+                raise e
             
             if len(rpeaks) < 2:
                 continue
@@ -3312,119 +2967,110 @@ def test_electrode_significance_per_patient(loaded_files, minmax=(-0.5, 1.0), bi
             # Convert R-peak indices to timestamps
             rpeak_times = rpeaks / sfreq
             rpeak_ts = nap.Ts(t=rpeak_times, time_units="s")
-            
+
             # Find EEG channels
             eeg_ch_indices = [i for i, ch in enumerate(ch_names) 
                             if 'eeg' in ch.lower() or any(elec in ch.upper() for elec in ['FP', 'F', 'C', 'P', 'O', 'T', 'A'])]
-            
-            if not eeg_ch_indices:
-                continue
-            
-            # Get EEG data
-            eeg_data = data[eeg_ch_indices, :]
-            eeg_ch_names = [ch_names[i] for i in eeg_ch_indices]
-            
-            # Store results for this patient
-            patient_results = []
-            
-            # Process each EEG channel
-            for ch_idx, ch_name in enumerate(eeg_ch_names):
-                try:
-                    eeg_signal = eeg_data[ch_idx, :]
-                    
-                    # Convert continuous EEG signal to pynapple Tsd object
-                    time_index = np.arange(len(eeg_signal)) / sfreq
-                    eeg_signal_tsd = nap.Tsd(t=time_index, d=eeg_signal, time_units="s")
-                    
-                    # Compute perievent alignment around R-peaks using continuous signal
-                    peth_eeg = nap.compute_perievent_continuous(
-                        timeseries=eeg_signal_tsd,
-                        tref=rpeak_ts,
-                        minmax=minmax,
-                        time_unit="s"
-                    )
-                    
-                    if len(peth_eeg) == 0:
-                        continue
-                    
-                    # Calculate rates for this electrode
-                    # For single-patient bootstrap, we need multiple samples
-                    # Split R-peaks into groups and compute separate PETHs for each group
+
+            if eeg_ch_indices:
+                eeg_data = data[eeg_ch_indices, :]
+                eeg_ch_names = [ch_names[i] for i in eeg_ch_indices]
+                patient_results = []
+                patient_results_list = []
+                
+                # Process each EEG channel
+                for ch_idx, ch_name in enumerate(eeg_ch_names):
                     try:
-                        # Split R-peaks into groups (e.g., 5 groups for better statistics)
-                        n_groups = min(10, len(rpeaks) // 5)  # At least 5 R-peaks per group
-                        if n_groups < 2:
-                            continue
+                        eeg_signal = eeg_data[ch_idx, :]
+                        time_index = np.arange(len(eeg_signal)) / sfreq
+                        eeg_signal_tsd = nap.Tsd(t=time_index, d=eeg_signal, time_units="s")
+
+                        # 1. OBSERVED HEP (Average across real R-peaks)
+                        peth_obs = nap.compute_perievent_continuous(eeg_signal_tsd, rpeak_ts, minmax=minmax)
+                        mask = (peth_obs.index.values >= test_window[0]) & (peth_obs.index.values <= test_window[1])
                         
-                        group_size = len(rpeaks) // n_groups
-                        rates_list = []
-                        
-                        for group_idx in range(n_groups):
-                            start_idx = group_idx * group_size
-                            end_idx = (group_idx + 1) * group_size if group_idx < n_groups - 1 else len(rpeaks)
+                        # X_obs shape: (Time_points,) -> average across trials
+                        X_obs = np.mean(peth_obs.values[mask, :], axis=1)
+
+                        # 2. NULL DISTRIBUTIONS (Jittering)
+                        # We generate many "fake" HEPs to see what happens by chance
+                        null_heps = []
+                        for _ in range(n_bootstrap):
+                            # Jitter timestamps using pynapple
+                            jittered_ts = nap.process.jitter_timestamps(rpeak_ts, max_jitter=jitter_amount)
                             
-                            # Get R-peaks for this group
-                            group_rpeaks = rpeaks[start_idx:end_idx]
-                            if len(group_rpeaks) < 2:
-                                continue
+                            # Compute HEP with jittered peaks
+                            peth_null = nap.compute_perievent_continuous(eeg_signal_tsd, jittered_ts, minmax=minmax)
                             
-                            # Create Ts object for this group's R-peaks
-                            group_rpeak_times = group_rpeaks / sfreq
-                            group_rpeak_ts = nap.Ts(t=group_rpeak_times, time_units="s")
-                            
-                            # Compute perievent alignment for this group using continuous signal
-                            group_peth_eeg = nap.compute_perievent_continuous(
-                                timeseries=eeg_signal_tsd,
-                                tref=group_rpeak_ts,
-                                minmax=minmax,
-                                time_unit="s"
-                            )
-                            
-                            if len(group_peth_eeg) == 0:
-                                continue
-                            
-                            # Calculate rates for this group
-                            group_peth_eeg_count = group_peth_eeg.count(binsize)
-                            if hasattr(group_peth_eeg_count, 'values'):
-                                group_count_vals = group_peth_eeg_count.values
-                                if group_count_vals.ndim == 2:
-                                    group_rates = np.mean(group_count_vals, axis=1) / binsize
-                                else:
-                                    group_rates = group_count_vals / binsize
-                                
-                                if hasattr(group_peth_eeg_count, 'index'):
-                                    group_time_axis = group_peth_eeg_count.index.values
-                                else:
-                                    group_time_axis = np.arange(len(group_rates)) * binsize + minmax[0]
-                                
-                                rates_list.append((group_time_axis, group_rates))
-                        
-                        # Test significance using bootstrap with multiple groups
-                        if len(rates_list) >= 2:
-                            p_value, mean_diff = bootstrap_pvalue_test(
-                                rates_list, 
-                                test_window=test_window,
-                                baseline_window=baseline_window,
-                                n_bootstrap=n_bootstrap
-                            )
-                            
-                            if not np.isnan(p_value):
-                                patient_results.append({
-                                    'electrode': ch_name,
-                                    'p_value': p_value,
-                                    'mean_diff': mean_diff,
-                                    'significant': p_value < significance_threshold
+                            # Average across trials for this permutation and store
+                            null_heps.append(np.mean(peth_null.values[mask, :], axis=1))
+
+                        null_matrix = np.array(null_heps) # Shape: (n_permutations, n_time_points)
+
+                        # 3. PREPARE FOR MNE CLUSTER TEST
+                        # We subtract the mean of the null from our observed data
+                        # Format for 1samp: (n_observations, n_times). 
+                        # Here, observations are the differences between observed HEP and each null HEP
+                        X_diff = X_obs - null_matrix 
+
+                        # Define threshold based on t-distribution
+                        threshold_value = stats.t.ppf(1 - 0.05 / 2, df=n_bootstrap - 1)
+
+                        T_obs, clusters, cluster_pv, H0 = permutation_cluster_1samp_test(
+                            X_diff,
+                            n_permutations=n_bootstrap,
+                            threshold=threshold_value,
+                            tail=0,
+                            out_type='indices',
+                            verbose=False
+                        )
+
+                        # 4. STORE RESULTS
+                        significant = False
+                        p_value = 1.0
+                        if len(cluster_pv) > 0:
+                            p_value = np.min(cluster_pv)
+                            significant = p_value < significance_threshold
+
+                        patient_results.append({
+                            'electrode': ch_name,
+                            'p_value': p_value,
+                            'significant': significant,
+                            'mean_amplitude': np.mean(X_obs) # Observed HEP mean in window
+                        })
+                        # The index of peth_obs contains the time relative to the R-peak (e.g., -0.2 to 0.8s)
+                        relative_times = peth_obs.index.values[mask]
+
+                        significant_windows = []
+
+                        for i, clu_idx in enumerate(clusters):
+                            if cluster_pv[i] < 0.05:
+                                # Extract the start and end relative to the R-peak
+                                # clu_idx is a tuple of arrays; for 1D, we take the first element
+                                time_start = relative_times[clu_idx[0][0]]
+                                time_end = relative_times[clu_idx[0][-1]]
+                                                                
+                                significant_windows.append({
+                                    'start': time_start,
+                                    'end': time_end,
+                                    'p_value': cluster_pv[i]
                                 })
+                        patient_results_list.append(
+                            {
+                                'patient_id': patient_id,
+                                'electrode': ch_name,
+                                'significant_windows': significant_windows
+
+                            }
+                        )
                     
                     except Exception as e:
                         continue
-                
-                except Exception as e:
-                    continue
             
             # Store results for this patient
-            if patient_results:
+            if patient_results: 
                 results[patient_id] = patient_results
+                results_full_time[patient_id] = patient_results_list
         
         except Exception as e:
             continue
@@ -3433,7 +3079,7 @@ def test_electrode_significance_per_patient(loaded_files, minmax=(-0.5, 1.0), bi
         progress_bar.empty()
         status_text.empty()
     
-    return results
+    return results,results_full_time
 
 
 def plot_significance_percentage_topomap(significance_results, save_plot=False, save_dir=None):
@@ -3621,7 +3267,7 @@ def plot_significance_percentage_topomap(significance_results, save_plot=False, 
         return None
 
 
-def plot_regional_electrode_averaged_eeg(loaded_files, minmax=(-0.5, 1.0), binsize=0.05, save_plot=False, save_dir=None, aggregation_method='median', processing_mode='single', sleep_stage_mapping=None, sleep_stage='N1'):
+def plot_regional_electrode_averaged_eeg(loaded_files, minmax=(-0.5, 1.0), binsize=0.005, save_plot=False, save_dir=None, aggregation_method='median', processing_mode='single', sleep_stage_mapping=None, sleep_stage='N1'):
     """
     Create averaged PETH and raster plots for each electrode within each region (F, P, T, O, C).
     Each region gets its own figure with subplots for each electrode, averaged across all patients.
@@ -4083,7 +3729,7 @@ def plot_significant_patients_electrode_peth(loaded_files, significance_results,
     # Structure: {electrode: {'rates_list': [], 'events_list': []}}
     all_electrode_data = {}
     for electrode in electrode_significant_patients.keys():
-        all_electrode_data[electrode] = {'rates_list': [], 'events_list': []}
+        all_electrode_data[electrode] = []
     
     if 'st' in globals():
         progress_bar = st.progress(0)
@@ -4171,34 +3817,24 @@ def plot_significant_patients_electrode_peth(loaded_files, significance_results,
                     )
                     
                     if len(peth_eeg) > 0:
-                        # Calculate rates for this patient and electrode
-                        try:
-                            peth_eeg_count = peth_eeg.count(binsize)
-                            if hasattr(peth_eeg_count, 'values'):
-                                count_vals = peth_eeg_count.values
-                                if count_vals.ndim == 2:
-                                    rates = np.mean(count_vals, axis=1) / binsize
-                                else:
-                                    rates = count_vals / binsize
-                                
-                                if hasattr(peth_eeg_count, 'index'):
-                                    time_axis = peth_eeg_count.index.values
-                                else:
-                                    time_axis = np.arange(len(rates)) * binsize + minmax[0]
-                                
-                                all_electrode_data[electrode]['rates_list'].append((time_axis, rates))
-                        except:
-                            pass
+                        # Calculate continuous mean signal for this patient and electrode
+                        # peth_eeg is a TsdFrame (Time x Trials)
+                        # We want to average across trials (axis 1)
+                        if hasattr(peth_eeg, 'values'):
+                            values = peth_eeg.values
+                            if values.ndim == 2:
+                                    mean_signal = np.nanmean(values, axis=1)
+                            else:
+                                mean_signal = values
                             
-                            # Collect events for raster plot
-                            try:
-                                peth_eeg_tsd = peth_eeg.to_tsd()
-                                all_electrode_data[electrode]['events_list'].append({
-                                    'times': peth_eeg_tsd.index.values,
-                                    'events': peth_eeg_tsd.values
-                                })
-                            except:
-                                pass
+                            if hasattr(peth_eeg, 'index'):
+                                time_axis = peth_eeg.index.values
+                            else:
+                                time_axis = np.linspace(minmax[0], minmax[1], len(mean_signal))
+                            
+                            all_electrode_data[electrode].append((time_axis, mean_signal))                    
+                        # Note: Raster plot (events_list) is not populated for continuous data 
+                        # as it requires different visualization than event histograms.
                 
                 except Exception as e:
                     continue
@@ -4211,15 +3847,7 @@ def plot_significant_patients_electrode_peth(loaded_files, significance_results,
         status_text.empty()
     
     # Filter electrodes that have data
-    electrodes_with_data = [e for e in electrode_significant_patients.keys() 
-                           if all_electrode_data[e]['rates_list'] or all_electrode_data[e]['events_list']]
-    
-    if not electrodes_with_data:
-        if 'st' in globals():
-            st.warning("No data available for significant electrodes.")
-        else:
-            print("No data available for significant electrodes.")
-        return []
+    electrodes_with_data = [e for e in all_electrode_data.keys() if all_electrode_data[e]]
     
     # Create plots - group by region for better organization
     regional_electrodes = {
@@ -4244,228 +3872,157 @@ def plot_significant_patients_electrode_peth(loaded_files, significance_results,
         
         # Create figure for this region
         n_electrodes = len(region_elecs)
-        n_cols = 2  # PETH and Raster side by side
+        
+        # Grid settings - using single column as requested
+        n_cols = 1
         n_rows = n_electrodes
-        
-        fig_region, axes = plt.subplots(n_rows, n_cols, figsize=(14, 3 * n_rows), sharex='col')
-        if n_electrodes == 1:
-            axes = axes.reshape(1, -1)
-        
+            
+        fig_region, axes = plt.subplots(n_rows, n_cols, figsize=(8, 4 * n_rows), constrained_layout=True)
+        # Flatten axes for easy iteration
+        if n_electrodes > 1:
+            axes_flat = axes.flatten()
+        else:
+            axes_flat = [axes]
+            
+        # Hide unused subplots
+        for i in range(n_electrodes, len(axes_flat)):
+            axes_flat[i].set_visible(False)
+            
         for elec_idx, electrode in enumerate(region_elecs):
-            ax_peth = axes[elec_idx, 0]
-            ax_raster = axes[elec_idx, 1]
+            ax = axes_flat[elec_idx]
             
-            electrode_data = all_electrode_data[electrode]
-            n_significant_patients = len(electrode_significant_patients[electrode])
+            # Get data for this electrode
+            electrode_data_list = all_electrode_data.get(electrode, [])
+            n_significant_patients = len(electrode_significant_patients.get(electrode, []))
             
-            # Plot 1: Average PETH
-            if electrode_data['rates_list']:
+            # Calculate stats for this electrode from significance_results
+            electrode_slopes = []
+            total_patients_with_electrode = 0
+            
+            for pid, res_list in significance_results.items():
+                for res in res_list:
+                    if res['electrode'] == electrode:
+                        total_patients_with_electrode += 1
+                        if res['significant']:
+                            electrode_slopes.append(res['mean_diff'])
+            
+            sig_percentage = 0
+            if total_patients_with_electrode > 0:
+                sig_percentage = (len(electrode_slopes) / total_patients_with_electrode) * 100
+                
+            group_p_value = np.nan
+            # Filter out NaNs and Infs
+            electrode_slopes = [s for s in electrode_slopes if np.isfinite(s)]
+            
+            if len(electrode_slopes) >= 2:
+                # One-sample t-test of slopes against 0
                 try:
+                    _, group_p_value = stats.ttest_1samp(electrode_slopes, 0)
+                except:
+                    group_p_value = np.nan
+            
+            p_str = "p=N/A"
+            if not np.isnan(group_p_value):
+                if group_p_value < 0.05:
+                    p_str = "p<0.001" if group_p_value < 0.001 else f"p={group_p_value:.3f}"
+        
+            if electrode_data_list:
+                try:
+                    # electrode_data_list contains tuples of (time_axis, mean_signal)
                     # Interpolate all rates to common time axis
-                    all_time_axes = [t for t, _ in electrode_data['rates_list']]
-                    all_rates = [r for _, r in electrode_data['rates_list']]
+                    all_time_axes = [t for t, _ in electrode_data_list]
+                    all_signals = [s for _, s in electrode_data_list]
                     
                     # Find common time range
                     min_time = max([t[0] for t in all_time_axes])
                     max_time = min([t[-1] for t in all_time_axes])
                     common_time = np.arange(min_time, max_time + binsize, binsize)
                     
-                    # Interpolate each patient's rates to common time axis
-                    interpolated_rates = []
-                    for time_axis, rates in zip(all_time_axes, all_rates):
-                        if len(time_axis) > 1 and len(rates) > 1:
-                            interp_rates = np.interp(common_time, time_axis, rates)
-                            interpolated_rates.append(interp_rates)
+                    # Interpolate each patient's signal to common time axis
+                    interpolated_signals = []
+                    for time_axis, signal in zip(all_time_axes, all_signals):
+                        if len(time_axis) > 1 and len(signal) > 1:
+                            interp_sig = np.interp(common_time, time_axis, signal)
+                            interpolated_signals.append(interp_sig)
                     
-                    if interpolated_rates:
+                    if interpolated_signals:
                         # Aggregate across significant patients using selected method
-                        n_patients = len(interpolated_rates)
+                        n_patients = len(interpolated_signals)
+                        interpolated_signals_array = np.array(interpolated_signals)
+                        
                         if aggregation_method == 'median':
-                            agg_rates = np.median(interpolated_rates, axis=0)
+                            agg_signal = np.median(interpolated_signals_array, axis=0)
                             # Calculate 95% confidence interval using bootstrap percentile method
-                            interpolated_rates_array = np.array(interpolated_rates)
-                            spread_lower, spread_upper = bootstrap_median_ci(interpolated_rates_array, n_bootstrap=1000)
+                            spread_lower, spread_upper = bootstrap_median_ci(interpolated_signals_array, n_bootstrap=1000)
                             label_text = 'Median'
                             spread_label = '95% CI'
                         else:  # mean
-                            agg_rates = np.mean(interpolated_rates, axis=0)
-                            std_rates = np.std(interpolated_rates, axis=0)
+                            agg_signal = np.mean(interpolated_signals_array, axis=0)
+                            std_signal = np.std(interpolated_signals_array, axis=0)
                             # Calculate 95% confidence interval
                             if n_patients > 1:
                                 # Standard error
-                                se_rates = std_rates / np.sqrt(n_patients)
+                                se_signal = std_signal / np.sqrt(n_patients)
                                 # t-critical value for 95% CI (two-tailed)
                                 t_critical = stats.t.ppf(0.975, df=n_patients - 1)
                                 # Confidence interval bounds
-                                spread_lower = agg_rates - t_critical * se_rates
-                                spread_upper = agg_rates + t_critical * se_rates
+                                spread_lower = agg_signal - t_critical * se_signal
+                                spread_upper = agg_signal + t_critical * se_signal
                                 spread_label = '95% CI'
                             else:
                                 # If only one patient, use SD as fallback
-                                spread_lower = agg_rates - std_rates
-                                spread_upper = agg_rates + std_rates
+                                spread_lower = agg_signal - std_signal
+                                spread_upper = agg_signal + std_signal
                                 spread_label = '±1 SD'
                             label_text = 'Mean'
                         
-                        # Perform bootstrapping test to get p-value
-                        p_value, mean_diff = bootstrap_pvalue_test(
-                            electrode_data['rates_list'],
-                            test_window=(-0.1, 0.1),  # Window around R-peak
-                            baseline_window=(-0.5, -0.2),  # Baseline window
-                            n_bootstrap=10000
-                        )
+                        # Plot aggregated signal
+                        ax.plot(common_time, agg_signal, linewidth=2, color='blue', label=label_text)
                         
-                        # Format p-value for display
-                        if not np.isnan(p_value):
-                            if p_value < 0.001:
-                                p_str = "p < 0.001"
-                            elif p_value < 0.01:
-                                p_str = f"p = {p_value:.3f}"
-                            else:
-                                p_str = f"p = {p_value:.3f}"
+                        # Update title with stats
+                        if p_str != "p=N/A":
+                            ax.set_title(f"{electrode} (n={n_patients}, {sig_percentage:.0f}% sig, {p_str})", fontsize=11, fontweight='bold')   
                         else:
-                            p_str = "p = N/A"
-                        
-                        ax_peth.plot(common_time, agg_rates, linewidth=2, color='blue', label=label_text)
-                        ax_peth.fill_between(common_time, spread_lower, spread_upper, 
+                            ax.set_title(f"{electrode} (n={n_patients}, {sig_percentage:.0f}% sig)", fontsize=11, fontweight='bold')    
+                        ax.fill_between(common_time, spread_lower, spread_upper, 
                                             alpha=0.3, color='blue', label=spread_label)
-                        ax_peth.set_ylabel("Rate (events/sec)", fontsize=10)
-                        ax_peth.set_title(f"{label_text} PETH - {electrode} (n={len(interpolated_rates)} significant patients, {p_str})", 
-                                         fontsize=11, fontweight='bold')
                         
-                        # Perform max-statistic permutation test for bin-wise significance
-                        try:
-                            interpolated_rates_array = np.array(interpolated_rates)
-                            sig_test_results = max_statistic_permutation_test(
-                                interpolated_rates_array, common_time, 
-                                baseline_window=(-0.5, -0.2),
-                                n_permutations=1000,
-                                alpha_levels=[0.05, 0.01],
-                                aggregation_method=aggregation_method
-                            )
-                            
-                            if sig_test_results['p_values'] is not None:
-                                # Calculate y-axis range for marker placement
-                                y_min, y_max = ax_peth.get_ylim()
-                                y_range = y_max - y_min
-                                marker_offset = y_range * 0.05  # 5% above the line
-                                
-                                # Plot markers for significant bins
-                                sig_05 = sig_test_results['significant_bins'].get(0.05, np.zeros(len(common_time), dtype=bool))
-                                sig_01 = sig_test_results['significant_bins'].get(0.01, np.zeros(len(common_time), dtype=bool))
-                                
-                                # Markers for p < 0.01 (higher significance)
-                                if np.any(sig_01):
-                                    sig_01_times = common_time[sig_01]
-                                    sig_01_rates = agg_rates[sig_01] + marker_offset
-                                    ax_peth.scatter(sig_01_times, sig_01_rates, marker='*', s=100, 
-                                                   color='red', zorder=5, alpha=0.8, 
-                                                   label='p < 0.01' if not any([np.any(sig_01), np.any(sig_05)]) else '')
-                                
-                                # Markers for p < 0.05 (but not < 0.01)
-                                sig_05_only = sig_05 & ~sig_01
-                                if np.any(sig_05_only):
-                                    sig_05_times = common_time[sig_05_only]
-                                    sig_05_rates = agg_rates[sig_05_only] + marker_offset * 0.7
-                                    ax_peth.scatter(sig_05_times, sig_05_rates, marker='*', s=60, 
-                                                   color='orange', zorder=5, alpha=0.7,
-                                                   label='p < 0.05' if not np.any(sig_01) else '')
-                        except Exception as e:
-                            # Silently fail if test cannot be performed
-                            if 'st' in globals():
-                                pass
-                            else:
-                                print(f"Warning: Could not perform significance test for {electrode}: {e}")
+                        ax.set_ylabel("Amplitude (V)", fontsize=10)
+                        ax.set_xlabel("Time from R-peak (s)", fontsize=10)
                         
-                        ax_peth.axvline(0.0, color='red', linestyle='--', linewidth=1, alpha=0.5)
-                        ax_peth.legend(fontsize=8)
-                        ax_peth.grid(True, alpha=0.3)
-                        ax_peth.set_xlim(minmax)
-                        ax_peth.tick_params(axis='x', labelsize=8, bottom=True)
+                        ax.axvline(0.0, color='red', linestyle='--', linewidth=1, alpha=0.5)
+                        ax.grid(True, alpha=0.3)
+                        ax.set_xlim(minmax)
+                        ax.legend(fontsize=8, loc='upper right')
+                        
+                    else:
+                        ax.text(0.5, 0.5, 'No valid interpolated data', 
+                               ha='center', va='center', transform=ax.transAxes, fontsize=9)
                 except Exception as e:
-                    ax_peth.text(0.5, 0.5, f'PETH Error: {str(e)[:40]}', 
-                               ha='center', va='center', transform=ax_peth.transAxes, fontsize=8, color='red')
+                    ax.text(0.5, 0.5, f'Error: {str(e)[:40]}', 
+                               ha='center', va='center', transform=ax.transAxes, fontsize=8, color='red')
             else:
-                ax_peth.text(0.5, 0.5, 'No rate data', 
-                           ha='center', va='center', transform=ax_peth.transAxes, fontsize=9)
-            
-            # Plot 2: Average/Median Event Density
-            if electrode_data['events_list']:
-                try:
-                    # Calculate histogram for each patient separately
-                    time_bins = np.arange(minmax[0], minmax[1] + binsize, binsize)
-                    patient_histograms = []
-                    
-                    for event_data in electrode_data['events_list']:
-                        times = event_data['times']
-                        if len(times) > 0:
-                            hist_counts, _ = np.histogram(times, bins=time_bins)
-                            patient_histograms.append(hist_counts)
-                    
-                    if patient_histograms and len(patient_histograms) > 0:
-                        # Stack histograms and aggregate using selected method
-                        histograms_array = np.array(patient_histograms)
-                        
-                        if aggregation_method == 'median':
-                            agg_counts = np.median(histograms_array, axis=0)
-                            label_text = 'Median'
-                        else:  # mean
-                            agg_counts = np.mean(histograms_array, axis=0)
-                            label_text = 'Mean'
-                        
-                        # Create time axis for histogram (bin centers)
-                        bin_centers = (time_bins[:-1] + time_bins[1:]) / 2
-                        
-                        # Plot as bar plot showing aggregated event density
-                        ax_raster.bar(bin_centers, agg_counts, width=binsize*0.8, 
-                                     color='blue', alpha=0.6, edgecolor='darkblue', linewidth=0.5)
-                        ax_raster.set_ylabel(f"{label_text} Events/Bin", fontsize=10)
-                        n_patients = len(patient_histograms)
-                        ax_raster.set_title(f"{label_text} Event Density - {electrode} (n={n_patients} significant patients)", 
-                                           fontsize=11, fontweight='bold')
-                        ax_raster.axvline(0.0, color='red', linestyle='--', linewidth=1, alpha=0.5)
-                        ax_raster.set_xlim(minmax)
-                        ax_raster.grid(True, alpha=0.3, axis='y')
-                        ax_raster.tick_params(axis='x', labelsize=8, bottom=True)
-                        ax_raster.tick_params(axis='y', labelsize=8)
-                except Exception as e:
-                    ax_raster.text(0.5, 0.5, f'Raster Error: {str(e)[:40]}', 
-                                 ha='center', va='center', transform=ax_raster.transAxes, fontsize=8, color='red')
-            else:
-                ax_raster.text(0.5, 0.5, 'No event data', 
-                             ha='center', va='center', transform=ax_raster.transAxes, fontsize=9)
-            
-            # Set x-label and ticks for all subplots
-            ax_peth.set_xlabel("Time from R-peak (s)", fontsize=10)
-            ax_raster.set_xlabel("Time from R-peak (s)", fontsize=10)
-            
-            # Ensure x-axis ticks are visible
-            ax_peth.tick_params(labelsize=8, axis='both', which='major')
-            ax_raster.tick_params(labelsize=8, axis='both', which='major')
-            ax_peth.tick_params(axis='x', labelsize=8, bottom=True)
-            ax_raster.tick_params(axis='x', labelsize=8, bottom=True)
+                ax.text(0.5, 0.5, 'No data', 
+                           ha='center', va='center', transform=ax.transAxes, fontsize=9)
         
         # Determine aggregation label for title
         agg_label = "Median" if aggregation_method == 'median' else "Average"
-        plt.suptitle(f"{region} Region - {agg_label} PETH & Raster Plots (Significant Patients Only)", 
-                    fontsize=14, fontweight='bold', y=0.995)
-        plt.tight_layout(rect=[0, 0, 1, 0.99])
+        fig_region.suptitle(f"{region} Region - {agg_label} HEP Waveforms (Significant Electrodes)", 
+                    fontsize=14, fontweight='bold', y=1.02)
         
         # Save plot if requested
         if save_plot and save_dir:
-            save_path_region = os.path.join(save_dir, f'eeg_peth_raster_{region}_region_significant_only.png')
-            plt.savefig(save_path_region, dpi=300, bbox_inches='tight')
+            save_path_region = os.path.join(save_dir, f'hep_waveforms_{region}_region_significant_electrodes.png')
+            fig_region.savefig(save_path_region, dpi=300, bbox_inches='tight')
             if 'st' in globals():
-                st.success(f"{region} region significant patients plots saved to {save_path_region}")
+                st.success(f"{region} region plots saved to {save_path_region}")
             else:
-                print(f"{region} region significant patients plots saved to {save_path_region}")
+                print(f"{region} region plots saved to {save_path_region}")
         
         # Display in streamlit if available
-        display_plot_with_download(fig_region, f"eeg_peth_raster_{region}_region_significant_only", f"regional_significant_{region}")
+        display_plot_with_download(fig_region, f"hep_waveforms_{region}_region", f"hep_waveforms_{region}")
         figures.append(fig_region)
         plt.close(fig_region)
-    
-    return figures
 
 
 def plot_peth_raster_per_patient(loaded_files, significance_results, minmax=(-0.5, 1.0), binsize=0.05, save_plot=False, save_dir=None, aggregation_method='median', processing_mode='single', sleep_stage_mapping=None, sleep_stage='N1'):
@@ -4616,39 +4173,21 @@ def plot_peth_raster_per_patient(loaded_files, significance_results, minmax=(-0.
                     )
                     
                     if len(peth_eeg) > 0:
-                        # Calculate rates for this patient and electrode
-                        time_axis = None
-                        rates = None
-                        events_dict = None
-                        
-                        try:
-                            peth_eeg_count = peth_eeg.count(binsize)
-                            if hasattr(peth_eeg_count, 'values'):
-                                count_vals = peth_eeg_count.values
-                                if count_vals.ndim == 2:
-                                    rates = np.mean(count_vals, axis=1) / binsize
-                                else:
-                                    rates = count_vals / binsize
-                                
-                                if hasattr(peth_eeg_count, 'index'):
-                                    time_axis = peth_eeg_count.index.values
-                                else:
-                                    time_axis = np.arange(len(rates)) * binsize + minmax[0]
-                        except:
-                            pass
-                        
-                        # Collect events for raster plot
-                        try:
-                            peth_eeg_tsd = peth_eeg.to_tsd()
-                            events_dict = {
-                                'times': peth_eeg_tsd.index.values,
-                                'events': peth_eeg_tsd.values
-                            }
-                        except:
-                            pass
-                        
-                        if time_axis is not None and rates is not None:
-                            electrode_patient_data[electrode].append((patient_id, time_axis, rates, events_dict))
+                        # Calculate continuous mean signal for this patient (average across trials)
+                        if hasattr(peth_eeg, 'values'):
+                            values = peth_eeg.values
+                            if values.ndim == 2:
+                                mean_signal = np.nanmean(values, axis=1)
+                            else:
+                                mean_signal = values
+                            
+                            if hasattr(peth_eeg, 'index'):
+                                time_axis = peth_eeg.index.values
+                            else:
+                                time_axis = np.linspace(minmax[0], minmax[1], len(mean_signal))
+                            
+                            # Store with None for events_dict as this is continuous data
+                            electrode_patient_data[electrode].append((patient_id, time_axis, mean_signal, None))
                 
                 except Exception as e:
                     continue
@@ -4663,13 +4202,6 @@ def plot_peth_raster_per_patient(loaded_files, significance_results, minmax=(-0.
     # Filter electrodes that have data
     electrodes_with_data = [e for e in electrode_patient_data.keys() 
                            if len(electrode_patient_data[e]) > 0]
-    
-    if not electrodes_with_data:
-        if 'st' in globals():
-            st.warning("No data available for significant electrodes.")
-        else:
-            print("No data available for significant electrodes.")
-        return []
     
     # Create plots - group by region for better organization
     regional_electrodes = {
@@ -4689,6 +4221,9 @@ def plot_peth_raster_per_patient(loaded_files, significance_results, minmax=(-0.
     
     # Create colormap for patients
     import matplotlib.cm as cm
+    unique_patients = list(significance_results.keys())
+    colors = cm.rainbow(np.linspace(0, 1, len(unique_patients)))
+    patient_colors = {pat: color for pat, color in zip(unique_patients, colors)}
     
     # Create plots for each region that has significant electrodes
     for region, region_elecs in electrodes_by_region.items():
@@ -4697,26 +4232,20 @@ def plot_peth_raster_per_patient(loaded_files, significance_results, minmax=(-0.
         
         # Create figure for this region
         n_electrodes = len(region_elecs)
-        n_cols = 2  # PETH and Raster side by side
+        n_cols = 1  # Only HEP
         n_rows = n_electrodes
         
-        fig_region, axes = plt.subplots(n_rows, n_cols, figsize=(16, 4 * n_rows), sharex='col')
+        fig_region, axes = plt.subplots(n_rows, n_cols, figsize=(10, 4 * n_rows), sharex=True)
         if n_electrodes == 1:
-            axes = axes.reshape(1, -1)
+            axes = np.array([axes])
         
         for elec_idx, electrode in enumerate(region_elecs):
-            ax_peth = axes[elec_idx, 0]
-            ax_raster = axes[elec_idx, 1]
+            ax_peth = axes[elec_idx]
             
             patient_data_list = electrode_patient_data[electrode]
             n_patients = len(patient_data_list)
             
-            # Get colormap for patients
-            colors_map = cm.get_cmap('tab20' if n_patients <= 20 else 'viridis')
-            patient_colors = {patient_id: colors_map(i / max(n_patients, 1)) 
-                            for i, (patient_id, _, _, _) in enumerate(patient_data_list)}
-            
-            # Plot 1: PETH with one line per patient
+            # Plot 1: Continuous PETH with one line per patient
             if patient_data_list:
                 try:
                     # Find common time range for interpolation
@@ -4725,134 +4254,42 @@ def plot_peth_raster_per_patient(loaded_files, significance_results, minmax=(-0.
                     max_time = min([t[-1] for t in all_time_axes])
                     common_time = np.arange(min_time, max_time + binsize, binsize)
                     
-                    # Prepare rates_list for bootstrap test
-                    rates_list_for_test = [(time_axis, rates) for _, time_axis, rates, _ in patient_data_list]
-                    
-                    # Perform bootstrapping test to get p-value
-                    p_value, mean_diff = bootstrap_pvalue_test(
-                        rates_list_for_test,
-                        test_window=(-0.1, 0.1),  # Window around R-peak
-                        baseline_window=(-0.5, -0.2),  # Baseline window
-                        n_bootstrap=10000
-                    )
-                    
-                    # Format p-value for display
-                    if not np.isnan(p_value):
-                        if p_value < 0.001:
-                            p_str = "p < 0.001"
-                        elif p_value < 0.01:
-                            p_str = f"p = {p_value:.3f}"
-                        else:
-                            p_str = f"p = {p_value:.3f}"
-                    else:
-                        p_str = "p = N/A"
-                    
                     # Plot each patient's PETH
-                    for patient_id, time_axis, rates, _ in patient_data_list:
-                        if len(time_axis) > 1 and len(rates) > 1:
+                    for patient_id, time_axis, mean_signal, _ in patient_data_list:
+                        if len(time_axis) > 1 and len(mean_signal) > 1:
                             # Interpolate to common time axis
-                            interp_rates = np.interp(common_time, time_axis, rates)
-                            color = patient_colors[patient_id]
-                            ax_peth.plot(common_time, interp_rates, linewidth=1.5, 
+                            interp_signal = np.interp(common_time, time_axis, mean_signal)
+                            color = patient_colors.get(patient_id, 'gray')
+                            ax_peth.plot(common_time, interp_signal, linewidth=1.5, 
                                        alpha=0.7, color=color, label=patient_id)
                     
-                    ax_peth.set_ylabel("Rate (events/sec)", fontsize=10)
-                    ax_peth.set_title(f"PETH per Patient - {electrode} (n={n_patients} patients, {p_str})", 
+                    ax_peth.set_ylabel("Amplitude (V)", fontsize=10)
+                    ax_peth.set_title(f"HEP per Patient - {electrode} (n={n_patients})", 
                                      fontsize=11, fontweight='bold')
                     ax_peth.axvline(0.0, color='red', linestyle='--', linewidth=1, alpha=0.5)
-                    ax_peth.legend(fontsize=7, ncol=2, loc='upper right')
+                    
+                    # Legend only if few patients to avoid crowding
+                    if n_patients <= 10:
+                        ax_peth.legend(fontsize=7, ncol=2, loc='upper right')
+                        
                     ax_peth.grid(True, alpha=0.3)
                     ax_peth.set_xlim(minmax)
                     ax_peth.tick_params(axis='x', labelsize=8, bottom=True)
                     ax_peth.tick_params(axis='y', labelsize=8)
                 except Exception as e:
-                    ax_peth.text(0.5, 0.5, f'PETH Error: {str(e)[:40]}', 
+                    ax_peth.text(0.5, 0.5, f'Plot Error: {str(e)[:40]}', 
                                ha='center', va='center', transform=ax_peth.transAxes, fontsize=8, color='red')
             else:
-                ax_peth.text(0.5, 0.5, 'No rate data', 
-                           ha='center', va='center', transform=ax_peth.transAxes, fontsize=9)
-            
-            # Plot 2: Raster with one line per patient
-            if patient_data_list:
-                try:
-                    # Prepare data for eventplot (raster plot)
-                    event_times_per_patient = []
-                    patient_labels = []
-                    
-                    for patient_id, _, _, events_dict in patient_data_list:
-                        if events_dict is not None:
-                            times = events_dict['times']
-                            # Filter times within the minmax range
-                            times_filtered = [t for t in times if minmax[0] <= t <= minmax[1]]
-                            if len(times_filtered) > 0:
-                                event_times_per_patient.append(times_filtered)
-                                patient_labels.append(patient_id)
-                    
-                    if event_times_per_patient:
-                        # Use eventplot for proper raster visualization
-                        y_positions = np.arange(len(event_times_per_patient))
-                        colors_list = [patient_colors[pid] for pid in patient_labels]
-                        
-                        ax_raster.eventplot(event_times_per_patient, positions=y_positions, 
-                                          colors=colors_list, linewidths=1.5, alpha=0.7)
-                        
-                        # Set y-axis ticks and labels
-                        ax_raster.set_yticks(y_positions)
-                        ax_raster.set_yticklabels(patient_labels, fontsize=7)
-                        ax_raster.set_ylabel("Patient", fontsize=10)
-                        ax_raster.set_xlabel("Time from R-peak (s)", fontsize=10)
-                        ax_raster.set_title(f"Raster per Patient - {electrode} (n={len(patient_labels)} patients)", 
-                                           fontsize=11, fontweight='bold')
-                        ax_raster.axvline(0.0, color='red', linestyle='--', linewidth=1, alpha=0.5)
-                        ax_raster.set_xlim(minmax)
-                        ax_raster.set_ylim(-0.5, len(patient_labels) - 0.5)
-                        ax_raster.grid(True, alpha=0.3, axis='x')
-                        ax_raster.tick_params(axis='x', labelsize=8, bottom=True)
-                        ax_raster.tick_params(axis='y', labelsize=7)
-                    else:
-                        ax_raster.text(0.5, 0.5, 'No event data within time range', 
-                                     ha='center', va='center', transform=ax_raster.transAxes, fontsize=9)
-                except Exception as e:
-                    # Fallback: simple scatter plot
-                    try:
-                        y_pos = 0
-                        for patient_id, _, _, events_dict in patient_data_list:
-                            if events_dict is not None:
-                                times = events_dict['times']
-                                times_filtered = [t for t in times if minmax[0] <= t <= minmax[1]]
-                                color = patient_colors[patient_id]
-                                if len(times_filtered) > 0:
-                                    # Plot events as vertical markers
-                                    ax_raster.scatter(times_filtered, [y_pos] * len(times_filtered), 
-                                                    color=color, s=10, alpha=0.7, marker='|', linewidths=2)
-                                    ax_raster.text(minmax[0] - 0.05, y_pos, 
-                                                 patient_id, ha='right', va='center', fontsize=7, color=color)
-                                y_pos += 1
-                        
-                        ax_raster.set_ylabel("Patient", fontsize=10)
-                        ax_raster.set_xlabel("Time from R-peak (s)", fontsize=10)
-                        ax_raster.set_title(f"Raster per Patient - {electrode} (n={n_patients} patients)", 
-                                           fontsize=11, fontweight='bold')
-                        ax_raster.axvline(0.0, color='red', linestyle='--', linewidth=1, alpha=0.5)
-                        ax_raster.set_xlim(minmax)
-                        ax_raster.set_ylim(-0.5, n_patients - 0.5)
-                        ax_raster.grid(True, alpha=0.3, axis='x')
-                        ax_raster.tick_params(axis='x', labelsize=8, bottom=True)
-                        ax_raster.tick_params(axis='y', labelsize=8)
-                    except Exception as e2:
-                        ax_raster.text(0.5, 0.5, f'Raster Error: {str(e2)[:40]}', 
-                                     ha='center', va='center', transform=ax_raster.transAxes, fontsize=8, color='red')
-            else:
-                ax_raster.text(0.5, 0.5, 'No event data', 
-                             ha='center', va='center', transform=ax_raster.transAxes, fontsize=9)
+                ax_peth.text(0.5, 0.5, 'No data', 
+                           ha='center', va='center', transform=ax_peth.transAxes, fontsize=9) 
         
-        plt.suptitle(f"{region} Region - PETH & Raster Plots (One Line per Patient)", 
+        plt.suptitle(f"{region} Region - Individual Patient HEPs", 
                     fontsize=14, fontweight='bold', y=0.995)
         plt.tight_layout(rect=[0, 0, 1, 0.99])
         
         # Save plot if requested
         if save_plot and save_dir:
-            save_path_region = os.path.join(save_dir, f'eeg_peth_raster_{region}_region_per_patient.png')
+            save_path_region = os.path.join(save_dir, f'hep_per_patient_{region}_region.png')
             plt.savefig(save_path_region, dpi=300, bbox_inches='tight')
             if 'st' in globals():
                 st.success(f"{region} region per-patient plots saved to {save_path_region}")
@@ -4860,14 +4297,171 @@ def plot_peth_raster_per_patient(loaded_files, significance_results, minmax=(-0.
                 print(f"{region} region per-patient plots saved to {save_path_region}")
         
         # Display in streamlit if available
-        display_plot_with_download(fig_region, f"eeg_peth_raster_{region}_region_per_patient", f"regional_per_patient_{region}")
+        display_plot_with_download(fig_region, f"hep_per_patient_{region}_region", f"regional_per_patient_{region}")
         figures.append(fig_region)
         plt.close(fig_region)
-    
+
     return figures
 
 
-def plot_peth_raster(loaded_files, file_index=0, minmax=(-0.5, 1.0), binsize=0.05, save_plot=False, save_dir=None, aggregation_method='median', processing_mode='single', sleep_stage_mapping=None, sleep_stage='N1'):
+def calc_rayleigh(angles):
+    """
+    Calculate Rayleigh test for uniformity.
+    angles: array of angles in radians
+    Returns: p-value
+    """
+    n = len(angles)
+    if n == 0:
+        return 1.0
+    
+    # Mean resultant length
+    r_vector = np.sum(np.exp(1j * angles))
+    r = np.abs(r_vector) / n
+    
+    # Rayleigh statistic Z
+    z = n * (r ** 2)
+    
+    # P-value approximation (valid for large n, typically n > 10)
+    # p = exp(-z) * [1 + (2z - z^2) / (4n) - ...]
+    # Simple approximation:
+    p_value = np.exp(-z)
+    
+    return p_value, r
+
+def test_circular_statistics_r_to_r(loaded_files):
+    """
+    Compute circular statistics on Heartbeat Evoked Potentials.
+    Iterates through heartbeats (R-to-R intervals), finds the phase of the
+    maximum EEG amplitude, and performs circular statistics.
+    
+    Returns
+    -------
+    sig_results_rayleigh : dict
+        Results of Rayleigh test for uniformity (Phase Locking).
+    sig_results_ww : dict
+        Results of Watson-Williams test (Mean phase difference).
+    sig_results_kuiper : dict
+        Results of Kuiper's test (Distribution shape diff).
+    """
+    if not PYNAPPLE_AVAILABLE:
+        print("pynapple not available. Skipping circular stats.")
+        return {}, {}, {}
+
+    sig_results_rayleigh = {}
+    sig_results_ww = {}
+    sig_results_kuiper = {}
+    
+    # Helper to clean and get R-peaks (reused logic)
+    def get_rpeaks(raw):
+        sfreq = raw.info['sfreq']
+        ch_names = raw.ch_names
+        data = raw.get_data()
+        
+        # Find ECG
+        ch_lower = [ch.lower() for ch in ch_names]
+        ecg_indices = [i for i, ch in enumerate(ch_lower) if 'ecg' in ch or 'ekg' in ch]
+        if not ecg_indices:
+            return None, sfreq, data, ch_names
+        
+        ecg_ch_idx = ecg_indices[0]
+        ecg_signal = data[ecg_ch_idx, :]
+        
+        try:
+            # Basic cleaning if advanced not available or just use raw if clean fails
+            # Assuming clean_ecg_advanced is available in scope as seen in other funcs
+            if 'clean_ecg_advanced' in globals():
+                ecg_clean, _ = clean_ecg_advanced(
+                    ecg_signal, sampling_rate=sfreq,
+                    median_window_ms=300, wavelet='db4',
+                    wavelet_levels=5, zscore_threshold=3.0
+                )
+            else:
+                ecg_clean = ecg_signal # Fallback
+            
+            _, rpk = nk.ecg_peaks(ecg_clean, sampling_rate=sfreq)
+            rpeaks = rpk['ECG_R_Peaks']
+            return rpeaks, sfreq, data, ch_names
+        except:
+            return None, sfreq, data, ch_names
+
+    if 'st' in globals():
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+
+    for file_idx, (file_path, patient_id, raw) in enumerate(loaded_files):
+        if 'st' in globals():
+            status_text.text(f"Circular Stats: Processing {patient_id}...")
+            progress_bar.progress((file_idx) / len(loaded_files))
+
+        rpeaks, sfreq, data, ch_names = get_rpeaks(raw)
+        if rpeaks is None or len(rpeaks) < 2:
+            continue
+            
+        # Filter for EEG channels
+        eeg_indices = [i for i, ch in enumerate(ch_names) 
+                       if 'eeg' in ch.lower() or any(elec in ch.upper() for elec in ['FP', 'F', 'C', 'P', 'O', 'T', 'A'])]
+        
+        patient_results = []
+        
+        for ch_idx in eeg_indices:
+            electrode = ch_names[ch_idx]
+            eeg_signal = data[ch_idx, :]
+            
+            # Extract phases of max amplitude in each R-R interval
+            peak_phases = []
+            
+            for i in range(len(rpeaks) - 1):
+                start = rpeaks[i]
+                end = rpeaks[i+1]
+                length = end - start
+                if length <= 0: continue
+                
+                # Segment
+                segment = eeg_signal[start:end]
+                
+                # Find index of max absolute amplitude
+                if len(segment) == 0: continue
+                
+                # Option: Max amplitude
+                peak_idx = np.argmax(np.abs(segment))
+                
+                # Convert to phase (0 to 2pi)
+                # 0 = R[i], 2pi = R[i+1]
+                phase = 2 * np.pi * (peak_idx / length)
+                peak_phases.append(phase)
+            
+            if len(peak_phases) > 10: # Minimum trials
+                peak_phases = np.array(peak_phases)
+                p_val, r_len = calc_rayleigh(peak_phases)
+                
+                # Calculate mean angle
+                mean_angle = stats.circmean(peak_phases)
+                
+                is_sig = p_val < 0.05
+                
+                patient_results.append({
+                    'electrode': electrode,
+                    'p_value': p_val,
+                    'mean_diff': r_len, # Using R-length as proxy for strength for now
+                    'mean_angle': mean_angle,
+                    'significant': is_sig,
+                    'phases': peak_phases # Store for potential WW/Kuiper later
+                })
+        
+        sig_results_rayleigh[patient_id] = patient_results
+        
+        # NOTE: Watson-Williams and Kuiper require Group comparisons (e.g. Healthy vs Patient)
+        # or Condition comparisons (Systole vs Diastole tasks? Hits vs Misses?).
+        # Currently we only have one list of files. 
+        # So we leave sig_results_ww and sig_results_kuiper empty or as placeholders.
+        
+    if 'st' in globals():
+        progress_bar.empty()
+        status_text.empty()
+        
+    return sig_results_rayleigh
+
+def plot_peth_raster(loaded_files, file_index=0, minmax=(-0.5, 1.0), binsize=0.05, save_plot=False, save_dir=None, aggregation_method='median', processing_mode='single', sleep_stage_mapping=None, sleep_stage='N1', jitter_amount=0.25, test_type="Cluster-Based Permutation"):
     """
     Create a Peri-Event Time Histogram (PETH) raster plot using pynapple.
     
@@ -4896,370 +4490,80 @@ def plot_peth_raster(loaded_files, file_index=0, minmax=(-0.5, 1.0), binsize=0.0
         Dictionary mapping patient_id to sleep_stage (default: None)
     sleep_stage : str, optional
         Current sleep stage being analyzed (default: 'N1')
+    jitter_amount : float, optional
+         Amount of jitter to apply (default: 0.0)
+    test_type: str, optional
+        Test type (default: "Cluster-Based Permutation")
     
     Returns
     -------
     matplotlib.figure.Figure or None
         Figure object if plot was created, None otherwise
     """
-    if not PYNAPPLE_AVAILABLE:
-        if 'st' in globals():
-            st.error("pynapple is not available. Please install it to use PETH raster plots.")
-        else:
-            print("pynapple is not available. Please install it to use PETH raster plots.")
-        return None
     
-    if not loaded_files or file_index >= len(loaded_files):
-        if 'st' in globals():
-            st.error(f"Invalid file index {file_index}. Only {len(loaded_files)} files available.")
-        else:
-            print(f"Invalid file index {file_index}. Only {len(loaded_files)} files available.")
-        return None
+    significance_results = {}
+    test_name = "Unknown"
     
-    # Initialize patient_id to handle cases where unpacking might fail
-    patient_id = f"file_{file_index}"
-    try:
-        file_path, patient_id, raw = loaded_files[file_index]
-    except (IndexError, ValueError, TypeError) as unpack_error:
-        if 'st' in globals():
-            st.error(f"Error unpacking file data at index {file_index}: {unpack_error}")
-        else:
-            print(f"Error unpacking file data at index {file_index}: {unpack_error}")
-        return None
-    
-    # Get sampling frequency
-    sfreq = raw.info['sfreq']
-    
-    # Get channel names and data
-    ch_names = raw.ch_names
-    data = raw.get_data()
-    
-    # Find ECG channel
-    ch_lower = [ch.lower() for ch in ch_names]
-    ecg_indices = [i for i, ch in enumerate(ch_lower) if 'ecg' in ch or 'ekg' in ch]
-    
-    if not ecg_indices:
-        if 'st' in globals():
-            st.warning(f"No ECG channel found in {patient_id}")
-        else:
-            print(f"No ECG channel found in {patient_id}")
-        return None
-    
-    ecg_ch_idx = ecg_indices[0]
-    ecg_signal2 = data[ecg_ch_idx, :]
-    # Advanced ECG cleaning: median filter, wavelet denoising, z-score thresholding
-    ecg_signal_clean, cleaning_info = clean_ecg_advanced(
-        ecg_signal2, 
-        sampling_rate=sfreq,
-        median_window_ms=300,  # 200-400 ms window
-        wavelet='db4',  # or 'sym4'
-        wavelet_levels=5,  # 5-8 levels
-        zscore_threshold=3.0
-    )
-    # Clean ECG signal and detect R-peaks
-    _, rpk = nk.ecg_peaks(ecg_signal_clean, sampling_rate=sfreq)
-    rpeaks = rpk['ECG_R_Peaks']
-    #print the bpm
-    print(f"BPM: {len(rpeaks) / (len(ecg_signal_clean) / sfreq) * 60}")
-    # Convert R-peak sample indices to timestamps (in seconds)
-    rpeak_times = rpeaks / sfreq
-    
-    # Create pynapple Ts object for R-peaks (these are the reference events)
-    rpeak_ts = nap.Ts(t=rpeak_times, time_units="s")
-    
-    # For raster plot, we'll use the R-peaks themselves as the events to align
-    # This creates a "self-aligned" plot showing the cardiac rhythm
-    # Alternatively, you could use other timestamps (e.g., EEG spikes)
-    event_ts = nap.Ts(t=rpeak_times, time_units="s")
-    
-    # Compute perievent alignment
-    peth = nap.compute_perievent(
-        timestamps=event_ts,
-        tref=rpeak_ts,
-        minmax=minmax,
-        time_unit="s"
-    )
-    
-    # Initialize fig to None
-    fig = None
-    
-    # Checkbox to show/hide PETH and Raster plots
+    if test_type == "Cluster-Based Permutation":
+        test_name = "Cluster-Based Permutation"
+        # Run permutation test with jitter support
+        significance_results, significance_results_all_t = test_electrode_significance_per_patient(
+            loaded_files, 
+            minmax=minmax, 
+            binsize=binsize,
+            test_window=(-0.1, 0.1), 
+            baseline_window=(-0.5, -0.2),
+            n_bootstrap=100, 
+            significance_threshold=0.05, 
+            processing_mode=processing_mode,
+            jitter_amount=jitter_amount
+        )
+    else: 
+        # Default to Circular Statistics
+        test_name = "Rayleigh"
+        significance_results = test_circular_statistics_r_to_r(loaded_files)
+
+    # title for the stat test type
     if 'st' in globals():
-        show_peth_raster = st.checkbox("Show PETH & Raster Plot", value=False, key=f"peth_raster_{file_index}")
-    else:
-        show_peth_raster = True  # Always show if not in Streamlit
-    
-    if show_peth_raster:
-        with st.expander("📊 Peri-Event Time Histogram (PETH) Raster Plot", expanded=True) if 'st' in globals() else contextlib.nullcontext():
-            # Create figure with two subplots: rate histogram and raster plot
-            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
-            
-            # Plot 1: Rate histogram (PETH)
-            if len(peth) > 0:
-                # Count events in bins and calculate mean rate
-                # Following pynapple documentation example: np.mean(peth.count(binsize), 1) / binsize
-                # Note: axis=1 means along columns (across events)
-                try:
-                    peth_count = peth.count(binsize)
-                    # Calculate mean rate across events, following pynapple example
-                    if hasattr(peth_count, 'values'):
-                        count_values = peth_count.values
-                    else:
-                        count_values = peth_count
-                    
-                    # Take mean across events (axis 1 for 2D, or just use values for 1D)
-                    if count_values.ndim == 2:
-                        rates = np.mean(count_values, axis=1) / binsize
-                    else:
-                        rates = count_values / binsize
-                    
-                    # Get time axis
-                    if hasattr(peth_count, 'index'):
-                        time_axis = peth_count.index.values
-                    else:
-                        time_axis = np.arange(len(rates)) * binsize + minmax[0]
-                except Exception as e:
-                    # Fallback: use rate column if available
-                    if hasattr(peth, 'rate'):
-                        rates = peth.rate.values
-                        time_axis = peth.index.values
-                    else:
-                        if 'st' in globals():
-                            st.warning(f"Could not calculate PETH rate: {e}")
-                        else:
-                            print(f"Could not calculate PETH rate: {e}")
-                        return None
-                
-                ax1.plot(time_axis, rates, linewidth=2, color='red')
-                ax1.set_ylabel("Rate (events/sec)", fontsize=12)
-                ax1.set_xlabel("Time from R-peak (s)", fontsize=12)
-                ax1.set_title(f"Peri-Event Time Histogram (PETH) - {patient_id}", fontsize=14, fontweight='bold')
-                ax1.axvline(0.0, color='black', linestyle='--', linewidth=1, alpha=0.5, label='R-peak')
-                ax1.legend()
-                ax1.grid(True, alpha=0.3)
-                ax1.tick_params(axis='x', labelsize=10, bottom=True)
-                ax1.tick_params(axis='y', labelsize=10)
-            
-            # Plot 2: Raster plot
-            if len(peth) > 0:
-                # Convert TsGroup to flattened timestamps for raster plot
-                peth_tsd = peth.to_tsd()
-                ax2.plot(peth_tsd.index.values, peth_tsd.values, "|", markersize=15, color='red', mew=2)
-                ax2.set_xlabel("Time from R-peak (s)", fontsize=12)
-                ax2.set_ylabel("Event", fontsize=12)
-                ax2.set_title("Raster Plot", fontsize=14, fontweight='bold')
-                ax2.axvline(0.0, color='black', linestyle='--', linewidth=1, alpha=0.5)
-                ax2.set_xlim(minmax)
-                ax2.grid(True, alpha=0.3)
-                ax2.tick_params(axis='x', labelsize=10, bottom=True)
-                ax2.tick_params(axis='y', labelsize=10)
-            
-            plt.tight_layout()
-            
-            # Save plot if requested
-            if save_plot and save_dir:
-                os.makedirs(save_dir, exist_ok=True)
-                save_path = os.path.join(save_dir, f'peth_raster_{patient_id}.png')
-                plt.savefig(save_path, dpi=300, bbox_inches='tight')
-                if 'st' in globals():
-                    st.success(f"Plot saved to {save_path}")
-                else:
-                    print(f"Plot saved to {save_path}")
-            
-            # Display in streamlit if available
-            display_plot_with_download(fig, f"peth_raster_{patient_id}", f"peth_raster_{patient_id}")
-    
-    # Create raster plots for each EEG channel (only for first patient)
-    if file_index == 0:
-        # Find EEG channels
-        eeg_ch_indices = [i for i, ch in enumerate(ch_names) 
-                        if 'eeg' in ch.lower() or any(elec in ch.upper() for elec in ['FP', 'F', 'C', 'P', 'O', 'T', 'A'])]
-        
-        if eeg_ch_indices and len(rpeaks) >= 2:
-            # Checkbox to show/hide EEG Channel PETH & Raster plots
-            if 'st' in globals():
-                show_eeg_peth_raster = st.checkbox("Show EEG Channel PETH & Raster Plots", value=False, key=f"eeg_peth_raster_{file_index}")
-            else:
-                show_eeg_peth_raster = True  # Always show if not in Streamlit
-            
-            if show_eeg_peth_raster:
-                with st.expander("📊 EEG Channel PETH & Raster Plots (Aligned to R-peaks)", expanded=True) if 'st' in globals() else contextlib.nullcontext():
-                    # Limit number of channels to plot (to avoid too many plots)
-                    max_channels_to_plot = 10
-                    eeg_ch_indices_plot = eeg_ch_indices[:max_channels_to_plot]
-                    
-                    # Get EEG data
-                    eeg_data = data[eeg_ch_indices_plot, :]
-                    eeg_ch_names = [ch_names[i] for i in eeg_ch_indices_plot]
-                    
-                    # Create PETH and raster plots for each EEG channel
-                    # Each channel gets 2 subplots: PETH (top) and Raster (bottom)
-                    n_channels = len(eeg_ch_indices_plot)
-                    n_cols = 2  # PETH and Raster side by side
-                    n_rows = n_channels  # One row per channel
-                    
-                    fig_eeg, axes = plt.subplots(n_rows, n_cols, figsize=(14, 3 * n_rows), sharex='col')
-                    if n_channels == 1:
-                        axes = axes.reshape(1, -1)
-                    
-                    for ch_idx, (eeg_idx, ch_name) in enumerate(zip(eeg_ch_indices_plot, eeg_ch_names)):
-                        ax_peth = axes[ch_idx, 0]  # PETH plot (left)
-                        ax_raster = axes[ch_idx, 1]  # Raster plot (right)
-                        
-                        try:
-                            # Get EEG signal for this channel
-                            eeg_signal = eeg_data[ch_idx, :]
-                            
-                            # Convert continuous EEG signal to pynapple Tsd object
-                            time_index = np.arange(len(eeg_signal)) / sfreq
-                            eeg_signal_tsd = nap.Tsd(t=time_index, d=eeg_signal, time_units="s")
-                            
-                            # Compute perievent alignment around R-peaks using continuous signal
-                            # Use -200ms to 600ms for EEG plots
-                            eeg_minmax = (-0.2, 0.6)
-                            peth_eeg = nap.compute_perievent_continuous(
-                                timeseries=eeg_signal_tsd,
-                                tref=rpeak_ts,
-                                minmax=eeg_minmax,
-                                time_unit="s"
-                            )
-                            
-                            if len(peth_eeg) > 0:
-                                # Plot 1: PETH (Rate Histogram)
-                                try:
-                                    peth_eeg_count = peth_eeg.count(binsize)
-                                    if hasattr(peth_eeg_count, 'values'):
-                                        count_vals = peth_eeg_count.values
-                                        if count_vals.ndim == 2:
-                                            rates_eeg = np.mean(count_vals, axis=1) / binsize
-                                        else:
-                                            rates_eeg = count_vals / binsize
-                                        
-                                        if hasattr(peth_eeg_count, 'index'):
-                                            time_axis_eeg = peth_eeg_count.index.values
-                                        else:
-                                            time_axis_eeg = np.arange(len(rates_eeg)) * binsize + eeg_minmax[0]
-                                        
-                                        ax_peth.plot(time_axis_eeg, rates_eeg, linewidth=2, color='blue')
-                                        ax_peth.set_ylabel("Rate (events/sec)", fontsize=10)
-                                        ax_peth.set_title(f"PETH - {ch_name}", fontsize=11, fontweight='bold')
-                                        ax_peth.axvline(0.0, color='red', linestyle='--', linewidth=1, alpha=0.5, label='R-peak')
-                                        ax_peth.legend(fontsize=8)
-                                        ax_peth.grid(True, alpha=0.3)
-                                        ax_peth.set_xlim(eeg_minmax)
-                                        ax_peth.tick_params(axis='x', labelsize=8, bottom=True)
-                                    else:
-                                        ax_peth.text(0.5, 0.5, 'Could not calculate rate', 
-                                                    ha='center', va='center', transform=ax_peth.transAxes, fontsize=9)
-                                except Exception as e:
-                                    ax_peth.text(0.5, 0.5, f'PETH Error: {str(e)[:40]}', 
-                                                ha='center', va='center', transform=ax_peth.transAxes, fontsize=8, color='red')
-                                
-                                # Plot 2: Raster Plot
-                                try:
-                                    peth_eeg_tsd = peth_eeg.to_tsd()
-                                    ax_raster.plot(peth_eeg_tsd.index.values, peth_eeg_tsd.values, "|", 
-                                                    markersize=12, color='blue', mew=1.5, alpha=0.7)
-                                    ax_raster.set_ylabel("Event", fontsize=10)
-                                    ax_raster.set_title(f"Raster - {ch_name}", fontsize=11, fontweight='bold')
-                                    ax_raster.axvline(0.0, color='red', linestyle='--', linewidth=1, alpha=0.5)
-                                    ax_raster.set_xlim(eeg_minmax)
-                                    ax_raster.grid(True, alpha=0.3)
-                                    ax_raster.tick_params(axis='x', labelsize=8, bottom=True)
-                                except Exception as e:
-                                    ax_raster.text(0.5, 0.5, f'Raster Error: {str(e)[:40]}', 
-                                                    ha='center', va='center', transform=ax_raster.transAxes, fontsize=8, color='red')
-                            else:
-                                ax_peth.text(0.5, 0.5, 'No events detected', 
-                                            ha='center', va='center', transform=ax_peth.transAxes, fontsize=9)
-                                ax_raster.text(0.5, 0.5, 'No events detected', 
-                                                ha='center', va='center', transform=ax_raster.transAxes, fontsize=9)
-                            
-                            # Set x-label and ticks for all subplots
-                            ax_peth.set_xlabel("Time from R-peak (s)", fontsize=10)
-                            ax_raster.set_xlabel("Time from R-peak (s)", fontsize=10)
-                            
-                            # Ensure x-axis ticks are visible
-                            ax_peth.tick_params(labelsize=8, axis='both', which='major')
-                            ax_raster.tick_params(labelsize=8, axis='both', which='major')
-                            ax_peth.tick_params(axis='x', labelsize=8, bottom=True)
-                            ax_raster.tick_params(axis='x', labelsize=8, bottom=True)
-                        
-                        except Exception as e:
-                            error_msg = f'Error: {str(e)[:40]}'
-                            ax_peth.text(0.5, 0.5, error_msg, 
-                                        ha='center', va='center', transform=ax_peth.transAxes, fontsize=8, color='red')
-                            ax_raster.text(0.5, 0.5, error_msg, 
-                                            ha='center', va='center', transform=ax_raster.transAxes, fontsize=8, color='red')
-                            ax_peth.set_title(f"PETH - {ch_name} (Error)", fontsize=11)
-                            ax_raster.set_title(f"Raster - {ch_name} (Error)", fontsize=11)
-                    
-                    plt.suptitle(f"EEG Channel PETH & Raster Plots - {patient_id}", fontsize=14, fontweight='bold', y=0.995)
-                    plt.tight_layout(rect=[0, 0, 1, 0.99])
-                    
-                    # Save plot if requested
-                    if save_plot and save_dir:
-                        save_path_eeg = os.path.join(save_dir, f'eeg_peth_raster_{patient_id}.png')
-                        plt.savefig(save_path_eeg, dpi=300, bbox_inches='tight')
-                        if 'st' in globals():
-                            st.success(f"EEG PETH & Raster plots saved to {save_path_eeg}")
-                        else:
-                            print(f"EEG PETH & Raster plots saved to {save_path_eeg}")
-                    
-                    # Display in streamlit if available
-                    display_plot_with_download(fig_eeg, f"eeg_peth_raster_{patient_id}", f"eeg_peth_raster_{patient_id}")
-                    plt.close(fig_eeg)
-    
-    
-    significance_results = test_electrode_significance_per_patient(loaded_files, minmax=minmax, binsize=binsize,
-                                            test_window=(-0.1, 0.1), baseline_window=(-0.5, -0.2),
-                                            n_bootstrap=100, significance_threshold=0.05, processing_mode=processing_mode)
-    
-    # Plot topomap of significance percentages
-    if significance_results:
-        if 'st' in globals():
-            st.markdown("---")
-            st.markdown("## 🗺️ Electrode Significance Topomap (Percentage of Patients)")
-        
-        plot_significance_percentage_topomap(significance_results, save_plot=save_plot, save_dir=save_dir)
-        
-        # Create DataFrame for topomap percentage data
-        if 'st' in globals():
-            electrode_counts = {}
-            for patient_id, patient_results in significance_results.items():
-                for result in patient_results:
-                    electrode = result['electrode']
-                    if electrode not in electrode_counts:
-                        electrode_counts[electrode] = {'significant': 0, 'total': 0}
+        st.title(f"Statistics Results: {test_name}")
+        if jitter_amount > 0 and test_type == "Cluster-Based Permutation":
+             st.info(f"Using Jittered Data (Control): Jitter = {jitter_amount}s")
+
+        electrode_counts = {}
+        for patient_id, patient_results in significance_results.items():
+            for result in patient_results:
+                electrode = result['electrode']
+                if electrode not in electrode_counts:
+                    electrode_counts[electrode] = {'significant': 0, 'total': 0}
                     electrode_counts[electrode]['total'] += 1
                     if result['significant']:
                         electrode_counts[electrode]['significant'] += 1
             
-            topomap_data = []
-            for electrode, counts in electrode_counts.items():
-                percentage = (counts['significant'] / counts['total']) * 100 if counts['total'] > 0 else 0
-                topomap_data.append({
-                    'electrode': electrode,
-                    'percentage_significant': percentage,
-                    'n_significant': counts['significant'],
-                    'n_total': counts['total']
-                })
+        topomap_data = []
+        for electrode, counts in electrode_counts.items():
+            percentage = (counts['significant'] / counts['total']) * 100 if counts['total'] > 0 else 0
+            topomap_data.append({
+                'electrode': electrode,
+                'percentage_significant': percentage,
+                'n_significant': counts['significant'],
+                'n_total': counts['total']
+            })
             
-            if topomap_data:
-                topomap_df = pd.DataFrame(topomap_data)
-                # Cache CSV data in session state to prevent reruns
-                cache_key = "topomap_percentage_csv"
-                if cache_key not in st.session_state:
-                    st.session_state[cache_key] = topomap_df.to_csv(index=False)
+        if topomap_data:
+            topomap_df = pd.DataFrame(topomap_data)
+            # Cache CSV data in session state to prevent reruns
+            cache_key = "topomap_percentage_csv"
+            if cache_key not in st.session_state:
+                st.session_state[cache_key] = topomap_df.to_csv(index=False)
                 
-                st.download_button(
-                    label="📥 Download Topomap Percentage Data (CSV)",
-                    data=st.session_state[cache_key],
-                    file_name=f"topomap_percentage_data_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                    mime="text/csv",
-                    key="download_topomap_data",
-                    use_container_width=False
-                )
+            st.download_button(
+                label="📥 Download Topomap Percentage Data (CSV)",
+                data=st.session_state[cache_key],
+                file_name=f"topomap_percentage_data_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv",
+                key="download_topomap_data",
+                use_container_width=False
+            )
         
         # Create averaged PETH plots for significant patients only
         if len(loaded_files) > 1:
@@ -5286,7 +4590,6 @@ def plot_peth_raster(loaded_files, file_index=0, minmax=(-0.5, 1.0), binsize=0.0
                                         aggregation_method=aggregation_method, processing_mode=processing_mode,
                                         sleep_stage_mapping=sleep_stage_mapping, sleep_stage=sleep_stage)
             
-            # Add download button for significant patients data (same as significance results)
             if 'st' in globals():
                 significance_data = []
                 for patient_id, patient_results in significance_results.items():
@@ -5307,6 +4610,12 @@ def plot_peth_raster(loaded_files, file_index=0, minmax=(-0.5, 1.0), binsize=0.0
                     if cache_key not in st.session_state:
                         st.session_state[cache_key] = sig_patients_df.to_csv(index=False)
                     
+                    if 'st' in globals():
+                        st.markdown("---")
+                        st.markdown("## 🗺️ Electrode Significance Topomap (Percentage of Patients)")
+                    
+                    plot_significance_percentage_topomap(significance_results, save_plot=save_plot, save_dir=save_dir)
+
                     st.download_button(
                         label="📥 Download Significant Patients PETH Data (CSV)",
                         data=st.session_state[cache_key],
@@ -5315,6 +4624,7 @@ def plot_peth_raster(loaded_files, file_index=0, minmax=(-0.5, 1.0), binsize=0.0
                         key="download_significant_patients_peth",
                         use_container_width=False
                     )
+                
     
     # Prepare electrode data for download buttons (used by multiple plot sections)
     all_electrode_data = []
@@ -5329,19 +4639,6 @@ def plot_peth_raster(loaded_files, file_index=0, minmax=(-0.5, 1.0), binsize=0.0
                     'significant': result['significant']
                 })
     
-    # Create averaged PETH and raster plots across all patients
-    if len(loaded_files) > 1:
-        if 'st' in globals():
-            st.markdown("---")
-            # Determine aggregation label for title
-            agg_label = "Median" if aggregation_method == 'median' else "Average"
-            st.markdown(f"## 📊 {agg_label} EEG Channel PETH & Raster Plots (Across All Patients)")
-        
-        plot_averaged_eeg_peth_raster(loaded_files, minmax=minmax, binsize=binsize,
-                                        save_plot=save_plot, save_dir=save_dir,
-                                        aggregation_method=aggregation_method, processing_mode=processing_mode,
-                                        sleep_stage_mapping=sleep_stage_mapping, sleep_stage=sleep_stage)
-        
         # Add download button for averaged plots data (using significance results)
         if 'st' in globals() and all_electrode_data:
             averaged_df = pd.DataFrame(all_electrode_data)
@@ -5725,6 +5022,176 @@ def plot_hep_pairgrid(df, sleep_stage='N1', save_plot=True, save_dir='hep_compar
         print(f"PairGrid plot saved to {save_dir}/pairgrid_all_{plot_name}.png")
 
 
+
+def plot_first_patient_eeg_ecg_aligned(loaded_files, sleep_stage, output_dir, save_results, binsize=0.05, aggregation_method='median', processing_mode='single', sleep_stage_mapping=None):
+    """
+    Plot EEG data aligned to ECG R-peaks for the first patient.
+    Plots y-axis in microVolts vs x-axis time (-0.5, 1.0) s.
+    One plot per electrode (grouped by region).
+    """
+    if not PYNAPPLE_AVAILABLE:
+        if 'st' in globals():
+            st.error("pynapple is not available.")
+        return
+
+    if not loaded_files:
+        if 'st' in globals():
+            st.warning("No files loaded.")
+        return
+
+    # Use first patient
+    file_path, patient_id, raw = loaded_files[0]
+    
+    if 'st' in globals():
+        st.info(f"Plotting aligned EEG for first patient: {patient_id}")
+    
+    # Parameters
+    minmax = (-0.5, 1.0)
+    
+    # Get sampling frequency and data
+    sfreq = raw.info['sfreq']
+    ch_names = raw.ch_names
+    data = raw.get_data()
+    
+    # Process ECG
+    ch_lower = [ch.lower() for ch in ch_names]
+    ecg_indices = [i for i, ch in enumerate(ch_lower) if 'ecg' in ch or 'ekg' in ch]
+    
+    if not ecg_indices:
+        if 'st' in globals():
+            st.warning(f"No ECG channel found in {patient_id}")
+        return
+        
+    ecg_ch_idx = ecg_indices[0]
+    ecg_signal = data[ecg_ch_idx, :]
+    
+    # Clean ECG
+    try:
+        ecg_signal_clean, _ = clean_ecg_advanced(
+            ecg_signal, 
+            sampling_rate=sfreq,
+            median_window_ms=300,
+            wavelet='db4',
+            wavelet_levels=5,
+            zscore_threshold=3.0
+        )
+        _, rpk = nk.ecg_peaks(ecg_signal_clean, sampling_rate=sfreq)
+        rpeaks = rpk['ECG_R_Peaks']
+    except Exception as e:
+        if 'st' in globals():
+            st.error(f"Error processing ECG for {patient_id}: {e}")
+        return
+
+    if len(rpeaks) < 2:
+        if 'st' in globals():
+            st.warning("Not enough R-peaks found.")
+        return
+
+    rpeak_times = rpeaks / sfreq
+    rpeak_ts = nap.Ts(t=rpeak_times, time_units="s")
+    
+    # Process EEG Channels
+    eeg_ch_indices = [i for i, ch in enumerate(ch_names) 
+                    if 'eeg' in ch.lower() or any(elec in ch.upper() for elec in ['FP', 'F', 'C', 'P', 'O', 'T', 'A'])]
+    
+    if not eeg_ch_indices:
+        if 'st' in globals():
+            st.warning("No EEG channels found.")
+        return
+
+    # Regional grouping
+    regional_electrodes = {
+        'F': ['Fp1', 'Fpz', 'Fp2', 'F7', 'F3', 'Fz', 'F4', 'F8'],
+        'P': ['P3', 'Pz', 'P4'],
+        'T': ['T3', 'T4', 'T5', 'T6'],
+        'O': ['O1', 'Oz', 'O2'],
+        'C': ['C3', 'Cz', 'C4']
+    }
+    
+    # Map channels to regions
+    channels_by_region = {region: [] for region in regional_electrodes}
+    other_channels = []
+    
+    for idx in eeg_ch_indices:
+        ch_name = ch_names[idx]
+        matched = False
+        for region, elecs in regional_electrodes.items():
+            if ch_name.upper() in [e.upper() for e in elecs]:
+                channels_by_region[region].append((idx, ch_name))
+                matched = True
+                break
+        if not matched:
+            other_channels.append((idx, ch_name))
+            
+    # Remove empty regions
+    channels_by_region = {k: v for k, v in channels_by_region.items() if v}
+    if other_channels:
+        channels_by_region['Other'] = other_channels
+
+    # Plotting
+    for region, channels in channels_by_region.items():
+        if not channels:
+            continue
+            
+        n_electrodes = len(channels)
+        n_cols = 1
+        n_rows = n_electrodes
+        
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(10, 3 * n_rows), sharex=True)
+        if n_electrodes == 1:
+            axes = np.array([axes])
+        else:
+            axes = axes.flatten()
+            
+        for i, (ch_idx, ch_name) in enumerate(channels):
+            ax = axes[i]
+            eeg_signal = data[ch_idx, :]
+            
+            # PETH
+            time_index = np.arange(len(eeg_signal)) / sfreq
+            eeg_tsd = nap.Tsd(t=time_index, d=eeg_signal, time_units="s")
+            
+            peth = nap.compute_perievent_continuous(
+                timeseries=eeg_tsd,
+                tref=rpeak_ts,
+                minmax=minmax,
+                time_unit="s"
+            )
+            
+            if len(peth) > 0:
+                # Mean across trials
+                if hasattr(peth, 'values') and peth.values.ndim == 2:
+                    mean_signal = np.nanmean(peth.values, axis=1)
+                    time_axis = peth.index.values
+                    
+                    # Plot all trials
+                    # ax.plot(time_axis, peth.values, color='gray', alpha=0.2, linewidth=0.5)
+                    
+                else:
+                     ax.text(0.5, 0.5, "No data dimensions", ha='center')
+                     continue
+                
+                ax.plot(time_axis, mean_signal, color='blue', linewidth=1.5, label='Mean')
+                
+                # Add +/- 1 SD shading
+                std_signal = np.nanstd(peth.values, axis=1)
+                ax.fill_between(time_axis, mean_signal - std_signal, mean_signal + std_signal, 
+                                color='blue', alpha=0.2, label='±1 SD')
+                                
+                ax.set_title(f"{ch_name} (aligned to ECG)", fontsize=10, fontweight='bold')
+                ax.set_ylabel("Amplitude (V)", fontsize=9)
+                ax.grid(True, alpha=0.3)
+                ax.axvline(0, color='red', linestyle='--', alpha=0.5)
+                # add legend
+                ax.legend()
+                
+        axes[-1].set_xlabel("Time (s)", fontsize=10)
+        plt.suptitle(f"{patient_id} - Region {region} - Aligned EEG", y=0.995)
+        plt.tight_layout()
+        
+        # Display
+        display_plot_with_download(fig, f"aligned_eeg_{patient_id}_{region}", f"aligned_eeg_{patient_id}_{region}")
+        plt.close(fig)
+
 if __name__ == "__main__":
     main()
-

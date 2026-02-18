@@ -1830,6 +1830,9 @@ def compare_sleep_stages_default_pairs(df_wnv3, power_bands, size_feature=None):
 
         # For each default pair, render per-stage comparisons
         for col1, col2 in default_pairs:
+            if not st.checkbox(f"Show Pair: {col1} vs {col2}", value=False, key=f"check_{band_name}_{col1}_{col2}"):
+                continue
+
             st.subheader(f"Pair: {col1} vs {col2}")
 
             # Collect importances across stages
@@ -4047,7 +4050,7 @@ def main():
     # Deduplicate while preserving order
     seen = set()
     opts = [x for x in default_options if not (x in seen or seen.add(x))]
-    selected_projects = st.sidebar.pills("Select Project(s)", opts, default=[x for x in ["TGA"] if x in opts],selection_mode ="multi")
+    selected_projects = st.sidebar.pills("Select Project(s)", opts, default=[x for x in ["COBRAD"] if x in opts],selection_mode ="multi")
     if not selected_projects:
         st.error("Please select at least one project.")
         return
@@ -4116,7 +4119,7 @@ def main():
     # Sidebar for feature selection
     st.sidebar.header("Feature Selection")
     # 'systole_diastole_comparison', 'ECG_Analysis', 'HEP',
-    feature_types = ("vs_Controls",'All',  'Clinical Feature', "EEG Feature", "ml_plots",  "Pair Plot",'Raw','Spectrogram', ) # 'Longitudinal',
+    feature_types = ("HEP","vs_Controls",'All',  'Clinical Feature', "EEG Feature", "ml_plots",  "Pair Plot",'Raw','Spectrogram', ) # 'Longitudinal',
     feature_type = st.sidebar.selectbox("Select feature type to plot against the other type:", feature_types, index=0)
     
     # Sidebar for scatterplot size feature selection

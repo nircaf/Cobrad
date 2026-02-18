@@ -46,7 +46,7 @@ except ImportError:
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils.eeg_utils import *
-
+import edf_cleaning
 # ------------------------------------------------------------------------------
 # Global settings
 # ------------------------------------------------------------------------------
@@ -818,9 +818,6 @@ def process_patients_n1_stage_hep(edf_root="EDF_Format/EDF", step_sec=5, n1_dura
     import yasa
     import mne
     import importlib.util
-    spec = importlib.util.spec_from_file_location("edf_cleaning", "1_edf_cleaning.py")
-    edf_cleaning = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(edf_cleaning)
     clean_mne_raw = edf_cleaning.clean_mne_raw
     
     # Get project name from edf_root
@@ -943,7 +940,23 @@ def process_patients_n1_stage_hep(edf_root="EDF_Format/EDF", step_sec=5, n1_dura
                     eog_name = 'EOG+'
                     print(f"Using EOG channel: {eog_name}")
                 else:
-                    print("No EOG channel found")
+                    # Check for LOC/ROC
+                    loc = 'LOC' if 'LOC' in raw.ch_names else None
+                    roc = 'ROC' if 'ROC' in raw.ch_names else None
+                    
+                    if loc and roc:
+                        # make a new channel loc-roc
+                        raw = mne.set_bipolar_reference(raw, anode=[loc], cathode=[roc], ch_name=['LOC-ROC'], drop_refs=False)
+                        eog_name = 'LOC-ROC'
+                        print(f"Created and using bipolar EOG channel: {eog_name}")
+                    elif loc:
+                        eog_name = loc
+                        print(f"Using EOG channel: {eog_name}")
+                    elif roc:
+                        eog_name = roc
+                        print(f"Using EOG channel: {eog_name}")
+                    else:
+                        print("No EOG channel found")
                 
                 # Find EMG channel (prefer EMG1+ over EMG2+)
                 emg_name = None
@@ -960,6 +973,8 @@ def process_patients_n1_stage_hep(edf_root="EDF_Format/EDF", step_sec=5, n1_dura
                 print(f"Running YASA sleep staging on {file_path}...")
                 ss = yasa.SleepStaging(raw, eeg_name=eeg_name, eog_name=eog_name, emg_name=emg_name)
                 predicted_stages = ss.predict()
+                # print how many epochs of each stage
+                print(f"Predicted stages counts: {pd.Series(predicted_stages).value_counts().to_dict()}")
                 
                 # Special handling for W: select 10 min of Wake right after the last adequate non-W run
                 if stage == 'W':
@@ -969,48 +984,62 @@ def process_patients_n1_stage_hep(edf_root="EDF_Format/EDF", step_sec=5, n1_dura
                     min_non_w_epochs = int(np.ceil(5 * 60 / epoch_duration_sec))
                     min_w_epochs = int(np.ceil(10 * 60 / epoch_duration_sec))  # 10 minutes of W
 
+                    # --- Smoothing: Merge short runs (< 2 epochs) into the prior run ---
+                    # Operate on a copy to avoid side effects
+                    smooth_stages = predicted_stages.copy()
+                    n_epochs = len(smooth_stages)
+                    
+                    if n_epochs > 0:
+                        current_label = smooth_stages[0]
+                        run_start_idx = 0
+                        
+                        for i in range(1, n_epochs):
+                            if smooth_stages[i] != current_label:
+                                # Run ended at i-1
+                                run_length = i - run_start_idx
+                                
+                                # Check if this finished run was too short
+                                if run_length <3 and run_start_idx > 0:
+                                    # Merge into prior
+                                    prev_label = smooth_stages[run_start_idx - 1]
+                                    smooth_stages[run_start_idx:i] = prev_label
+                                
+                                run_start_idx = i
+                                current_label = smooth_stages[i]
+                        
+                        # Check last run
+                        run_length = n_epochs - run_start_idx
+                        if run_length < 3 and run_start_idx > 0:
+                             prev_label = smooth_stages[run_start_idx - 1]
+                             smooth_stages[run_start_idx:] = prev_label
+                    
+                    # predicted_stages = smooth_stages
+
                     # Build runs of identical stages: (label, start_idx, length)
                     runs = []
-                    if len(predicted_stages) > 0:
-                        cur_label = predicted_stages[0]
+                    if len(smooth_stages) > 0:
+                        cur_label = smooth_stages[0]
                         cur_start = 0
                         cur_len = 1
-                        for i in range(1, len(predicted_stages)):
-                            if predicted_stages[i] == cur_label:
+                        for i in range(1, len(smooth_stages)):
+                            if smooth_stages[i] == cur_label:
                                 cur_len += 1
                             else:
                                 runs.append((cur_label, cur_start, cur_len))
-                                cur_label = predicted_stages[i]
+                                cur_label = smooth_stages[i]
                                 cur_start = i
                                 cur_len = 1
                         runs.append((cur_label, cur_start, cur_len))
 
-                    # Find the last non-W run (>= min_non_w_epochs) that is immediately followed by a W run (>= 10 min)
-                    selected_w_start_epoch = None
-                    for idx in range(len(runs) - 1, -1, -1):
-                        label, start_idx, length = runs[idx]
-                        if label == 'W' or length < min_non_w_epochs:
-                            continue
-                        # Check next run exists and is Wake
-                        if idx + 1 < len(runs):
-                            next_label, next_start, next_length = runs[idx + 1]
-                            if next_label == 'W' and next_length >= min_w_epochs:
-                                selected_w_start_epoch = next_start
-                                break
+                    # leave only runs > min_non_w_epochs
+                    runs = [run for run in runs if run[2] > min_non_w_epochs]
 
-                    if selected_w_start_epoch is None:
-                        print(f"No qualifying non-W->W transition (>= 5 min any non-W then >= 10 min W) in {file_path}. Skipping.")
-                        continue
-
-                    # Define the 10-minute Wake segment right after the N1 run
-                    segment_start_sec = selected_w_start_epoch * epoch_duration_sec
-                    segment_end_sec = (selected_w_start_epoch + min_w_epochs) * epoch_duration_sec
-                    stage_segments_in_file = [(segment_start_sec, segment_end_sec)]
-                    print(f"Selected 10 min W segment after last adequate non-W in {file_path}: {segment_start_sec:.1f}s - {segment_end_sec:.1f}s")
+                    # save in stage_segments_in_file the start sec and end sec of the W segments
+                    stage_segments_in_file = [(run[1] * epoch_duration_sec, (run[1] + run[2]) * epoch_duration_sec) for run in runs if run[0] == 'W']
 
                 else:
                     # Find specified sleep stage epochs (N1, N2, N3, R)
-                    stage_epochs = np.where(predicted_stages == stage)[0]
+                    stage_epochs = np.where(smooth_stages == stage)[0]
 
                     if len(stage_epochs) == 0:
                         print(f"No {stage} sleep stages found in {file_path}. Skipping.")
@@ -1240,10 +1269,10 @@ def process_patients_n1_stage_hep(edf_root="EDF_Format/EDF", step_sec=5, n1_dura
 # ------------------------------------------------------------------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Process EDF files for brain-heart coupling analysis')
-    parser.add_argument('-c', '--edf_root', type=str, default="EDF_Format/EDF",
+    parser.add_argument('-c', '--edf_root', type=str, default="EDF_Format/ASSY",
                         help='Root directory containing EDF files (default: EDF_Format/EDF)')
-    parser.add_argument('--mode', type=str, choices=['random', 'n1'], default='n1',
-                        help='Processing mode: random (select k random files) or n1 (extract N1 sleep stages)')
+    parser.add_argument('--mode', type=str, choices=['random', 'stage'], default='stage',
+                        help='Processing mode: random (select k random files) or stage (extract selected sleep stages)')
     # Controls for random mode
     parser.add_argument('-k', '--k_files', type=int, default=6,
                         help='Number of random EDF files to select per patient (default: 6)')
@@ -1252,7 +1281,7 @@ if __name__ == "__main__":
     # Controls for N1 mode
     parser.add_argument('--n1_duration_min', type=int, default=1,
                         help='Duration of stage segments to extract in minutes (default: 1)')
-    parser.add_argument('--stage', type=str, choices=['N1', 'N2', 'N3', 'R', 'W'], default='N1',
+    parser.add_argument('--stage', type=str, choices=['N1', 'N2', 'N3', 'R', 'W'], default='W',
                         help='Sleep stage to extract (N1, N2, N3, R, or W) (default: N2)')
     # Common controls
     parser.add_argument('-s', '--step_sec', type=int, default=5,
@@ -1263,6 +1292,6 @@ if __name__ == "__main__":
     if args.mode == 'random':
         # RAM-conscious processing: k random PKLs per patient from specified edf_root
         process_patients_random6(edf_root=args.edf_root, k=args.k_files, step_sec=args.step_sec, seed=args.seed)
-    elif args.mode == 'n1':
+    elif args.mode == 'stage':
         # Stage-specific sleep stage processing
         process_patients_n1_stage_hep(edf_root=args.edf_root, step_sec=args.step_sec, n1_duration_min=args.n1_duration_min, stage=args.stage)

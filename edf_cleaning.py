@@ -13,7 +13,6 @@ import re
 from multiprocessing import Pool, cpu_count
 from tqdm import tqdm
 import concurrent.futures
-import utils.eeg_utils as eeg_utils
 from scipy.signal import spectrogram
 import pickle
 from autoreject import AutoReject
@@ -28,7 +27,7 @@ from utils.eeg_utils import *
 import ray
 import argparse
 # Import and run the HEP processing
-from utils.HEP_parquet_generation import process_patients_random6
+from HEP_parquet_generation import process_patients_random6
 import glob
 
 @contextmanager
@@ -59,7 +58,7 @@ getcwd = os.getcwd()
 
 #%% INITIALIZATION
 # Parse command line arguments
-cases_project_name = 'TGA_control/control' # 'Controls' #'Seeg' #'CAP_Sleep_Database/CAP_Sleep_Database'
+cases_project_name = 'ASSY' # 'Controls' #'Seeg' #'CAP_Sleep_Database/CAP_Sleep_Database'
 
 edf_dir = 'EDF_Format'
 # Where to load the data from 
@@ -727,7 +726,7 @@ def eeg_edf_cleaning_pipeline():
         final_df.to_parquet(filename, index=False)
     
 
-    process_patients_random6(edf_root=f"parquet_HEP/{cases_project_name}_HEP",)
+    # process_patients_random6(edf_root=f"parquet_HEP/{cases_project_name}_HEP",)
 
 if __name__ == "__main__":
     eeg_edf_cleaning_pipeline()
