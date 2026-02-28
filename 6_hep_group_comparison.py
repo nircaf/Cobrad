@@ -36,6 +36,127 @@ try:
     HEARTPY_AVAILABLE = True
 except ImportError:
     HEARTPY_AVAILABLE = False
+
+import io
+
+try:
+    from pptx import Presentation
+    from pptx.util import Inches, Pt
+    PPTX_AVAILABLE = True
+except ImportError:
+    PPTX_AVAILABLE = False
+
+_original_st_pyplot = st.pyplot
+
+def custom_st_pyplot(fig=None, clear_figure=None, **kwargs):
+    if fig is None:
+        fig = plt.gcf()
+        
+    title = "Figure"
+    try:
+        if fig._suptitle:
+            title = fig._suptitle.get_text()
+        else:
+            for ax in fig.axes:
+                if ax.get_title():
+                    title = ax.get_title()
+                    break
+    except:
+        pass
+        
+    description = f"Plot: {title}\n"
+    
+    try:
+        stats = []
+        for ax in fig.axes:
+            lines = ax.get_lines()
+            for line in lines:
+                ydata = line.get_ydata()
+                if len(ydata) > 0:
+                    # check if ydata is numeric
+                    if hasattr(ydata, 'dtype') and np.issubdtype(ydata.dtype, np.number):
+                        label = line.get_label()
+                        stat_line = f"  {label if label and not label.startswith('_') else 'Data Line'}: Min={np.nanmin(ydata):.3f}, Max={np.nanmax(ydata):.3f}, Mean={np.nanmean(ydata):.3f}"
+                        if stat_line not in stats:
+                            stats.append(stat_line)
+        if stats:
+            description += "Numerical Summary:\n" + "\n".join(stats)
+            
+        # extract histogram data if present
+        hist_stats = []
+        for ax in fig.axes:
+            patches = ax.patches
+            if len(patches) > 5: # likely a histogram
+                heights = [p.get_height() for p in patches if isinstance(p, plt.Rectangle)]
+                if heights:
+                    hist_stats.append(f"  Histogram: {sum(heights):.0f} total items, max bin freq={max(heights):.0f}")
+        if hist_stats:
+            description += "\n" + "\n".join(hist_stats)
+    except:
+        pass
+        
+
+    if 'pptx_figures_data' not in st.session_state:
+        st.session_state.pptx_figures_data = []
+
+    _original_st_pyplot(fig, clear_figure=clear_figure, **kwargs)
+
+    if PPTX_AVAILABLE:
+        buf = io.BytesIO()
+        fig.savefig(buf, format='png', bbox_inches='tight')
+        buf.seek(0)
+
+        st.session_state.pptx_figures_data.append({
+            'title': title,
+            'description': description,
+            'image': buf
+        })
+
+st.pyplot = custom_st_pyplot
+
+def generate_pptx():
+    if not PPTX_AVAILABLE:
+        return None
+
+    prs = Presentation()
+
+    try:
+        title_only_slide_layout = prs.slide_layouts[5]
+    except IndexError:
+        title_only_slide_layout = prs.slide_layouts[0]
+
+    for item in st.session_state.get('pptx_figures_data', []):
+        slide = prs.slides.add_slide(title_only_slide_layout)
+
+        if slide.shapes.title:
+            slide.shapes.title.text = item['title']
+
+        pic_left = Inches(0.5)
+        pic_top = Inches(1.5)
+        pic_width = Inches(5.5)
+
+        item['image'].seek(0)
+        slide.shapes.add_picture(item['image'], pic_left, pic_top, width=pic_width)
+
+        txBox_left = Inches(6.2)
+        txBox_top = Inches(1.5)
+        txBox_width = Inches(3.3)
+        txBox_height = Inches(5.0)
+
+        txBox = slide.shapes.add_textbox(txBox_left, txBox_top, txBox_width, txBox_height)
+        tf = txBox.text_frame
+        tf.word_wrap = True
+        
+        # Add paragraphs
+        p = tf.paragraphs[0]
+        p.text = item['description']
+        p.font.size = Pt(14)
+
+    pptx_io = io.BytesIO()
+    prs.save(pptx_io)
+    pptx_io.seek(0)
+    return pptx_io
+
 def bandpass_ecg(x, fs, lo=3.0, hi=40.0, order=4):
     nyq = 0.5 * fs
     b, a = signal.butter(order, [lo/nyq, hi/nyq], btype="bandpass")
@@ -181,9 +302,31 @@ def detect_rpeaks_robust(ecg_signal_clean, sfreq):
             rpeaks = np.array(refined_rpeaks)
             rpeaks = np.unique(rpeaks)
             rpeaks = np.sort(rpeaks)
-    
+
+            rpeaks_sec = rpeaks / sfreq
+            rr_intervals = np.diff(rpeaks_sec)
+            # print the value count of vals in rr_interval who appear more then 3 times
+            unique_rr, counts = np.unique(rr_intervals, return_counts=True)
+            
+            mask = np.ones(len(rpeaks), dtype=bool)
+            for rr, count in zip(unique_rr, counts):
+                # is count more than 10%
+                if count > len(rr_intervals) * 0.1:
+                    print(f"RR interval {rr:.3f}s appears {count} times %{count/len(rr_intervals)*100:.1f}")
+                    # remove those from rpeaks (mark the second peak of the interval for removal)
+                    bad_idx = np.where(rr_intervals == rr)[0] + 1
+                    mask[bad_idx] = False
+            st.write(f"Removed {np.sum(~mask)/len(mask)*100:.1f}% of R-peaks due to repetitive artifacts.")
+            if np.sum(~mask) >= 0.2 * len(mask):
+                if 'st' in globals():
+                    st.warning("Skipping individual: >= 20% of R-peaks are marked as repetitive artifacts.")
+                print("Skipping individual: >= 20% of R-peaks are marked as repetitive artifacts.")
+                return np.array([], dtype=int)
+                
+            rpeaks = rpeaks[mask]
+            
             # 3. Filter peaks: if < 550ms between each other, keep first, remove second
-            min_dist = int(0.550 * sfreq)
+            min_dist = int(0.4 * sfreq)
             if len(rpeaks) > 0:
                 filtered_rpeaks = [rpeaks[0]]
                 for i in range(1, len(rpeaks)):
@@ -1941,7 +2084,265 @@ def plot_group_ecg_analysis(individuals, selected_group, selected_stage):
     else:
         st.warning("No ECG data found for this group to calculate average.")
 
-    # 2. Individual Patients
+    # 2. RR Interval Analysis
+    st.markdown("#### RR Interval Analysis")
+    
+    # Calculate RR intervals for all individuals
+    all_rr_intervals = []
+    patient_rr_intervals = {} # {pid: rr_intervals}
+    
+    if individuals:
+        # Estimate sampling rate from time vector of first individual
+        # times = individuals[0][2]
+        # fs = 1 / np.mean(np.diff(times))
+        # Better: use the median diff to be robust
+        times = individuals[0][2]
+        dt = np.median(np.diff(times))
+        fs = 1.0 / dt
+        
+        for ind in individuals:
+            pid = ind[0]
+            rpeaks = ind[4]
+            
+            if rpeaks is not None and len(rpeaks) > 1:
+                # Calculate RR intervals in seconds
+                rr_samples = np.diff(rpeaks)
+                rr_sec = rr_samples / fs
+                
+                # Filter physiological range? (e.g., 0.3s to 2.0s corresponds to 30-200 BPM)
+                # For now, let's keep it raw but maybe exclude obvious artifacts if needed
+                # valid_rr = rr_sec[(rr_sec > 0.3) & (rr_sec < 2.0)]
+                valid_rr = rr_sec 
+                
+                all_rr_intervals.extend(valid_rr)
+                patient_rr_intervals[pid] = valid_rr
+
+    # 2a. Group RR Histogram
+    if all_rr_intervals:
+        fig_rr_group, ax_rr_group = plt.subplots(figsize=(10, 5))
+        ax_rr_group.hist(all_rr_intervals, bins=50, color='purple', alpha=0.7, edgecolor='black')
+        
+        avg_rr = np.mean(all_rr_intervals)
+        std_rr = np.std(all_rr_intervals)
+        
+        ax_rr_group.set_title(f"Group RR Interval Distribution (n={len(all_rr_intervals)} beats)\nMean={avg_rr:.3f}s ({60/avg_rr:.1f} BPM), SD={std_rr:.3f}s")
+        ax_rr_group.set_xlabel("RR Interval (s)")
+        ax_rr_group.set_ylabel("Count")
+        ax_rr_group.set_xlim(right=1.3)
+        ax_rr_group.grid(True, alpha=0.3)
+        
+        st.pyplot(fig_rr_group, use_container_width=True)
+    else:
+        st.info("No RR intervals could be calculated.")
+
+    # 2b. Individual RR Histograms
+    if patient_rr_intervals:
+        st.markdown("#### Individual RR Interval Histograms")
+        
+        # Use existing slider or adding a new one? Use existing slider for consistency if possible?
+        # The existing slider `n_individuals` is already defined below for ECG plots. 
+        # But we haven't reached that part of the code yet (it's in original lines 1944+).
+        # We are inserting BEFORE line 1944. 
+        # So we can define a slider here or reuse the one for ECG plots if we move code.
+        # Let's add a separate section for this to be clean.
+        
+        # Grid layout
+        pids = list(patient_rr_intervals.keys())
+        n_pats_rr = len(pids)
+        
+        # Slider to limit number of plots if too many
+        n_show_rr = st.slider("Number of patients to show for RR Histograms", 1, n_pats_rr, min(4, n_pats_rr), key="rr_hist_slider")
+        
+        n_cols_rr = 2
+        n_rows_rr = int(np.ceil(n_show_rr / n_cols_rr))
+        
+        fig_rr_ind, axes_rr_ind = plt.subplots(n_rows_rr, n_cols_rr, figsize=(12, 4 * n_rows_rr))
+        if n_show_rr == 1:
+            axes_rr_ind = [axes_rr_ind]
+        else:
+            axes_rr_ind = axes_rr_ind.flatten()
+            
+        for idx in range(n_show_rr):
+            pid = pids[idx]
+            rr_data = patient_rr_intervals[pid]
+            ax = axes_rr_ind[idx]
+            
+            ax.hist(rr_data, bins=30, color='teal', alpha=0.6, edgecolor='black')
+            
+            mean_rr = np.mean(rr_data)
+            std_rr = np.std(rr_data)
+            
+            ax.set_title(f"{pid}\nMean={mean_rr:.3f}s, SD={std_rr:.3f}s")
+            ax.set_xlabel("RR (s)")
+            ax.set_xlim(right=1.3)
+            ax.grid(True, alpha=0.3)
+            
+        # Hide unused
+        for j in range(n_show_rr, len(axes_rr_ind)):
+            axes_rr_ind[j].axis('off')
+            
+        fig_rr_ind.tight_layout()
+        st.pyplot(fig_rr_ind, use_container_width=True)
+
+    # 2c. Normality test for individual RR intervals
+    if patient_rr_intervals:
+        st.markdown("#### RR Interval Normality Check (0.55s - 1.3s)")
+        st.write("Filtering RR intervals to [0.55s, 1.3s] and testing for normality.")
+        
+        test_type = st.selectbox("Distribution Test Type", ["Hartigan's Dip Test", "Gaussian Mixture Model (1 vs 2)", "Anderson-Darling"], index=0)
+        
+        if test_type == "Hartigan's Dip Test":
+            alpha_norm = st.slider("Significance (p-value)", min_value=0.001, max_value=0.200, value=0.050, step=0.005, format="%.3f", help="p < alpha means Multimodal.")
+        elif test_type == "Gaussian Mixture Model (1 vs 2)":
+            alpha_norm = st.slider("BIC Difference Threshold", min_value=0.0, max_value=50.0, value=5.0, step=1.0, format="%.1f", help="BIC diff > threshold means 2-components preferred (Bimodal).")
+        else: # Anderson-Darling
+            alpha_norm = st.slider("AD Statistic Threshold", min_value=50.0, max_value=150.0, value=100.0, step=1.0, help="AD statistic > threshold means Non-Gaussian (Complex).")
+        
+        try:
+            import diptest
+            from sklearn.mixture import GaussianMixture
+            from scipy import stats
+            DIPTEST_AVAILABLE = True
+        except ImportError:
+            DIPTEST_AVAILABLE = False
+            st.error("Please install 'diptest' and 'scikit-learn' to run these tests.")
+            
+        
+        bimodal_pids = []
+        unimodal_pids = []
+        filtered_p_vals = {}
+        filtered_data_dict = {}
+        
+        error_pids = []
+        
+        if DIPTEST_AVAILABLE:
+            for pid, rr_data in patient_rr_intervals.items():
+                rr_data = np.array(rr_data)
+                filt_rr = rr_data[(rr_data >= 0.55) & (rr_data <= 1.3)]
+                filtered_data_dict[pid] = filt_rr
+                
+                if len(filt_rr) >= 10:
+                    try:
+                        is_bimodal = False
+                        stat_to_show = np.nan
+                        
+                        if test_type == "Hartigan's Dip Test":
+                            # returns dip stat, p-value
+                            dip, p_val = diptest.diptest(filt_rr)
+                            stat_to_show = p_val
+                            is_bimodal = p_val < alpha_norm
+                            
+                        elif test_type == "Gaussian Mixture Model (1 vs 2)":
+                            X = filt_rr.reshape(-1, 1)
+                            gmm1 = GaussianMixture(n_components=1, random_state=42).fit(X)
+                            gmm2 = GaussianMixture(n_components=2, random_state=42).fit(X)
+                            
+                            bic1 = gmm1.bic(X)
+                            bic2 = gmm2.bic(X)
+                            
+                            bic_diff = bic1 - bic2 
+                            stat_to_show = bic_diff
+                            is_bimodal = bic_diff > alpha_norm
+                            
+                        elif test_type == "Anderson-Darling":
+                            res = stats.anderson(filt_rr, dist='norm')
+                            stat_to_show = res.statistic
+                            is_bimodal = res.statistic > alpha_norm
+
+                        if np.isnan(stat_to_show):
+                            error_pids.append((pid, stat_to_show))
+                        else:
+                            filtered_p_vals[pid] = stat_to_show
+                            if is_bimodal:
+                                bimodal_pids.append(pid)
+                            else:
+                                unimodal_pids.append(pid)
+                    except Exception as e:
+                        error_pids.append((pid, np.nan))
+                elif len(filt_rr) > 0:
+                    # Not enough data points
+                    error_pids.append((pid, np.nan))
+            
+            if error_pids:
+                st.error(f"Error calculating stats for patients: {', '.join([f'{pid}' for pid, _ in error_pids])}")
+                
+            # Plot Bimodal / Multimodal
+            if test_type == "Gaussian Mixture Model (1 vs 2)":
+                st.markdown(f"**Likely Bimodal/Complex Profiles (BIC Diff > {alpha_norm:.1f}) - {len(bimodal_pids)} patients**")
+            elif test_type == "Anderson-Darling":
+                st.markdown(f"**Non-Gaussian Profiles (AD > {alpha_norm:.1f}) - {len(bimodal_pids)} patients**")
+            else:
+                st.markdown(f"**Likely Multimodal Profiles (p < {alpha_norm:.3f}) - {len(bimodal_pids)} patients**")
+                
+            if bimodal_pids:
+                n_cols = 4
+                n_rows = int(np.ceil(len(bimodal_pids) / n_cols))
+                fig_bi, axes_bi = plt.subplots(n_rows, n_cols, figsize=(16, 4 * n_rows))
+                if isinstance(axes_bi, np.ndarray):
+                    axes_bi = axes_bi.flatten()
+                else:
+                    axes_bi = [axes_bi]
+                    
+                for idx, pid in enumerate(bimodal_pids):
+                    ax = axes_bi[idx]
+                    data = filtered_data_dict[pid]
+                    stat = filtered_p_vals[pid]
+                    ax.hist(data, bins=20, color='indianred', alpha=0.7, edgecolor='black')
+                    
+                    if test_type == "Hartigan's Dip Test":
+                        ax.set_title(f"{pid}\nDip-p={stat:.3f}, n={len(data)}")
+                    elif test_type == "Anderson-Darling":
+                        ax.set_title(f"{pid}\nAD={stat:.1f}, n={len(data)}")
+                    else:
+                        ax.set_title(f"{pid}\nBIC Diff={stat:.1f}, n={len(data)}")
+                        
+                    ax.set_xlim(0.55, 1.3)
+                    ax.grid(True, alpha=0.3)
+                    
+                for j in range(len(bimodal_pids), len(axes_bi)):
+                    axes_bi[j].axis('off')
+                fig_bi.tight_layout()
+                st.pyplot(fig_bi, use_container_width=True)
+                plt.close(fig_bi)
+            else:
+                st.info("No complex/bimodal distributions found for this threshold.")
+                
+            # Plot Unimodal
+            st.markdown(f"**Likely Unimodal Profiles - {len(unimodal_pids)} patients**")
+            if unimodal_pids:
+                n_cols = 4
+                n_rows = int(np.ceil(len(unimodal_pids) / n_cols))
+                fig_uni, axes_uni = plt.subplots(n_rows, n_cols, figsize=(16, 4 * n_rows))
+                if isinstance(axes_uni, np.ndarray):
+                    axes_uni = axes_uni.flatten()
+                else:
+                    axes_uni = [axes_uni]
+                    
+                for idx, pid in enumerate(unimodal_pids):
+                    ax = axes_uni[idx]
+                    data = filtered_data_dict[pid]
+                    stat = filtered_p_vals[pid]
+                    ax.hist(data, bins=20, color='mediumseagreen', alpha=0.7, edgecolor='black')
+                    
+                    if test_type == "Hartigan's Dip Test":
+                        ax.set_title(f"{pid}\nDip-p={stat:.3f}, n={len(data)}")
+                    elif test_type == "Anderson-Darling":
+                        ax.set_title(f"{pid}\nAD={stat:.1f}, n={len(data)}")
+                    else:
+                        ax.set_title(f"{pid}\nBIC Diff={stat:.1f}, n={len(data)}")
+                        
+                    ax.set_xlim(0.55, 1.3)
+                    ax.grid(True, alpha=0.3)
+                    
+                for j in range(len(unimodal_pids), len(axes_uni)):
+                    axes_uni[j].axis('off')
+                fig_uni.tight_layout()
+                st.pyplot(fig_uni, use_container_width=True)
+                plt.close(fig_uni)
+            else:
+                st.info("No unimodal distributions found for this threshold.")
+
+    # 3. Individual Patients
     st.markdown("#### Individual Patient ECGs")
     n_individuals = st.slider("Number of individual patients to show", min_value=1, max_value=len(individuals), value=min(4, len(individuals)), key="group_ecg_slider")
     
@@ -1989,7 +2390,7 @@ def run_single_group_analysis(base_path, selected_stage):
     """
     # Get available groups
     available_groups = [g for g in os.listdir(base_path) if os.path.isdir(os.path.join(base_path, g))]
-    selected_group = st.selectbox("Select Group", available_groups,index=1)
+    selected_group = st.selectbox("Select Group", available_groups, index=1)
     
     st.write(f"Processing individuals for {selected_group}...")
     individuals = get_group_individuals(selected_group, selected_stage, base_path)
@@ -1999,9 +2400,9 @@ def run_single_group_analysis(base_path, selected_stage):
     show_ecg_only = st.checkbox("Show ECG Only Plots", value=False)
     show_cleaning_comparison = st.checkbox("Show ECG Cleaning Comparison", value=False)
     show_noise_analysis = st.checkbox("Show ECG Repetitive Noise Analysis", value=False)
-    show_single_patient_all = st.checkbox("Show Single Patient All Channels", value=True)
+    show_single_patient_all = st.checkbox("Show Single Patient All Channels", value=False)
     show_patients_comparison = st.checkbox("Show EEG-ECG Patients Comparison", value=False)
-    show_group_ecg = st.checkbox("Show Group ECG Analysis", value=False)
+    show_group_ecg = st.checkbox("Show Group ECG Analysis", value=True)
     
     if individuals:
         if show_cleaning_comparison:
@@ -2067,7 +2468,8 @@ def run_single_group_analysis(base_path, selected_stage):
 def run_compare_sleep_stages_analysis(base_path):
     """
     Logic for Compare Sleep Stages mode.
-    Plots ECG HEP for a single patient across different sleep stages.
+    Plots ECG HEP and EEG HEP across different sleep stages for single patients or group averages 
+    (only for patients with valid data in ALL stages).
     """
     # 1. Select Group
     available_groups = [g for g in os.listdir(base_path) if os.path.isdir(os.path.join(base_path, g))]
@@ -2076,28 +2478,48 @@ def run_compare_sleep_stages_analysis(base_path):
         return
     selected_group = st.selectbox("Select Group", available_groups, index=1)
 
-    # 2. Select Patient
-    # Scan through sleep stages to find a list of all patients
+    # 2. Select Patient and Filter for Completeness
     sleep_stages = ['W', 'N1', 'N2', 'N3', 'R']
-    all_patients = set()
     
-    for stage in sleep_stages:
-        stage_dir = os.path.join(base_path, selected_group, stage)
-        if os.path.exists(stage_dir):
-            files = [f for f in os.listdir(stage_dir) if f.endswith('.pkl')]
-            for f in files:
-                pid_full = f.replace('.pkl', '').replace('.edf', '')
-                # Split by '_' and take the first part to get the base patient ID
-                pid_base = pid_full.split('_')[0]
-                all_patients.add(pid_base)
+    st.info("Scanning for patients with valid data (passed R-peaks test) across ALL sleep stages... (this may take a moment if not cached)")
+    progress_scan = st.progress(0)
     
+    valid_patients_per_stage = []
+    # Cache all loaded individuals per stage for quick access later
+    all_stage_individuals = {}
+    
+    for idx, stage in enumerate(sleep_stages):
+        # We use get_group_individuals to reliably find valid files that passed processing
+        stage_individuals = get_group_individuals(selected_group, stage, base_path)
+        all_stage_individuals[stage] = stage_individuals
+        
+        stage_patients = set()
+        for ind in stage_individuals:
+            pid_full = ind[0]
+            pid_base = pid_full.split('_')[0]
+            stage_patients.add(pid_base)
+        valid_patients_per_stage.append(stage_patients)
+        progress_scan.progress((idx + 1) / len(sleep_stages))
+        
+    progress_scan.empty()
+    
+    if valid_patients_per_stage:
+        all_patients = set.intersection(*valid_patients_per_stage)
+    else:
+        all_patients = set()
+        
     if not all_patients:
-        st.warning(f"No patients found in group {selected_group}")
+        st.warning(f"No patients found in group {selected_group} with valid data in ALL stages.")
         return
 
-    selected_pid = st.selectbox("Select Patient", sorted(list(all_patients)))
+    # 3. Choose Mode
+    analysis_mode = st.radio("Analysis Type", ["Single Patient", "Group Average"], horizontal=True)
 
-    # 3. Process Stages - Collect Data First
+    if analysis_mode == "Single Patient":
+        selected_pid = st.selectbox("Select Patient", sorted(list(all_patients)))
+    else:
+        selected_pid = "Group Average"
+
     st.subheader(f"Comparisons across Sleep Stages - {selected_pid} - {selected_group}")
     
     stage_data = {}
@@ -2110,56 +2532,58 @@ def run_compare_sleep_stages_analysis(base_path):
         'N3': 'blue',
         'R': 'red'
     }
-
-    progress_bar = st.progress(0)
     
-    for idx, stage in enumerate(sleep_stages):
-        progress_bar.progress((idx + 1) / len(sleep_stages))
+    for stage in sleep_stages:
+        stage_individuals = all_stage_individuals[stage]
         
-        # Find the specific file for this patient in this stage
-        # Since filename might have extra info, search for startswith selected_pid
-        stage_dir = os.path.join(base_path, selected_group, stage)
-        if not os.path.exists(stage_dir):
-            continue
+        if analysis_mode == "Single Patient":
+            for ind in stage_individuals:
+                pid_full = ind[0]
+                pid_base = pid_full.split('_')[0]
+                if pid_base == selected_pid:
+                    stage_data[stage] = {
+                        'ecg_hep': ind[5],
+                        'eeg_hep': ind[1],
+                        'times': ind[2],
+                        'ch_names': ind[3],
+                        'n_epochs': len(ind[4]),
+                        'n_subjects': 1
+                    }
+                    break
+        else:
+            # Group Average over all completely valid patients
+            ecg_heps = []
+            eeg_heps = []
+            n_epochs_list = []
+            times = None
+            ch_names = None
             
-        stage_files = [f for f in os.listdir(stage_dir) if f.startswith(selected_pid) and f.endswith('.pkl')]
-        
-        if not stage_files:
-            continue
-            
-        # Assuming only one file matches the base ID per stage
-        file_path = os.path.join(stage_dir, stage_files[0])
-        
-        with open(file_path, 'rb') as f:
-            try:
-                raw = pickle.load(f)
-            except Exception as e:
-                st.warning(f"Error loading {file_path}: {e}")
-                continue
-
-        # Process Data
-        # Pass the full found ID just in case, or base ID? The function uses it for logging/title mostly
-        results = process_file_data(raw, selected_pid)
-        if results is None:
-            continue
-            
-        raw, sfreq, rpeak_ts, rpeaks, minmax = results
-        
-        # Compute ECG HEP
-        ecg_hep_data, times, _ = compute_ecg_hep_avg(raw, rpeaks, sfreq, minmax, rpeak_ts=rpeak_ts)
-        # Compute EEG HEP
-        eeg_hep_data, _, ch_names = compute_hep_avg(raw, rpeaks, sfreq, minmax, rpeak_ts=rpeak_ts)
-        
-        stage_data[stage] = {
-            'ecg_hep': ecg_hep_data,
-            'eeg_hep': eeg_hep_data,
-            'times': times,
-            'ch_names': ch_names,
-            'n_epochs': len(rpeaks)
-        }
-
-    progress_bar.empty()
-    
+            for ind in stage_individuals:
+                pid_full = ind[0]
+                pid_base = pid_full.split('_')[0]
+                if pid_base in all_patients:
+                    if ind[5] is not None:
+                        ecg_heps.append(ind[5])
+                    if ind[1] is not None:
+                        eeg_heps.append(ind[1])
+                    n_epochs_list.append(len(ind[4]))
+                    times = ind[2]
+                    ch_names = ind[3]
+                    
+            if ecg_heps and eeg_heps:
+                avg_ecg = np.nanmean(ecg_heps, axis=0)
+                avg_eeg = np.nanmean(eeg_heps, axis=0)
+                avg_epochs = int(np.mean(n_epochs_list))
+                
+                stage_data[stage] = {
+                    'ecg_hep': avg_ecg,
+                    'eeg_hep': avg_eeg,
+                    'times': times,
+                    'ch_names': ch_names,
+                    'n_epochs': avg_epochs,
+                    'n_subjects': len(ecg_heps)
+                }
+                
     if not stage_data:
         st.warning("No data found for any stage.")
         return
@@ -2280,24 +2704,299 @@ def run_compare_sleep_stages_analysis(base_path):
             
         fig.tight_layout()
 
+def run_edf_viewer_mode(base_path_edf):
+    """
+    Logic for EDF Viewer mode.
+    Allows user to select a folder and view aggregate statistics about EDF files.
+    """
+    st.subheader("EDF Viewer Mode")
+
+    # 1. Folder Selection
+    if not os.path.exists(base_path_edf):
+        st.error(f"EDF Base Path not found: {base_path_edf}")
+        return
+
+    # specific logic for 'EDF_Format' structure: it might have subfolders
+    # We want to list directories in base_path_edf
+    try:
+        subdirs = [d for d in os.listdir(base_path_edf) if os.path.isdir(os.path.join(base_path_edf, d))]
+        subdirs.sort()
+    except Exception as e:
+        st.error(f"Error listing directories in {base_path_edf}: {e}")
+        return
+
+    if not subdirs:
+        st.warning(f"No subdirectories found in {base_path_edf}")
+        return
+
+    selected_folder = st.selectbox("Select Dataset Folder", subdirs)
+    folder_path = os.path.join(base_path_edf, selected_folder)
+
+    # 2. Scanning Files
+    st.write(f"Scanning files in `{folder_path}`...")
+    
+    # Find all .edf files (case insensitive)
+    edf_files = []
+    for root, dirs, files in os.walk(folder_path):
+        for file in files:
+            if file.lower().endswith('.edf'):
+                edf_files.append(os.path.join(root, file))
+    
+    if not edf_files:
+        st.warning("No .edf files found in selected folder.")
+        return
+
+    st.write(f"Found {len(edf_files)} EDF files. Extracting metadata...")
+
+    # 3. Extract Metadata
+    metadata_list = []
+    
+    # Use a progress bar
+    progress_bar = st.progress(0)
+    
+    for k, file_path in enumerate(edf_files):
+        try:
+            # Update progress
+            progress_bar.progress((k + 1) / len(edf_files))
+            
+            # Read header only (preload=False)
+            # Suppress MNE warnings for speed and cleanliness
+            with mne.utils.use_log_level('ERROR'):
+                 raw = mne.io.read_raw_edf(file_path, preload=False, verbose=False)
+            
+            # basic info
+            f_name = os.path.basename(file_path)
+            # Try to guess patient ID: default to filename, or split by _/-
+            # Heuristic: often "SubjectID_Condition.edf" or "ID-Date.edf"
+            # We'll just take the first part before _ or -
+            pid_guess = re.split(r'[_-]', f_name)[0]
+            
+            n_ch = len(raw.ch_names)
+            sfreq = raw.info['sfreq']
+            # raw.times is not reliable without loading data sometimes, or might be empty
+            # raw.n_times / raw.info['sfreq'] is safer if n_times is populated from header
+            dur = raw.n_times / sfreq if raw.n_times > 0 else 0
+            
+            meas_date = raw.info['meas_date']
+            
+            metadata_list.append({
+                'Filename': f_name,
+                'Path': file_path,
+                'PatientID_Guess': pid_guess,
+                'Duration_sec': dur,
+                'Duration_min': dur / 60,
+                'N_Channels': n_ch,
+                'Sf_Hz': sfreq,
+                'Meas_Date': meas_date,
+                'Channel_Names': raw.ch_names
+            })
+            
+            raw.close()
+            
+        except Exception as e:
+            # Store error info?
+            metadata_list.append({
+                'Filename': os.path.basename(file_path),
+                'Path': file_path,
+                'Error': str(e)
+            })
+            
+    progress_bar.empty()
+    
+    # Convert to DataFrame
+    df_meta = pd.DataFrame(metadata_list)
+    
+    # Separate successful reads vs errors
+    if 'Error' in df_meta.columns:
+        df_errors = df_meta[df_meta['Error'].notna()]
+        df_success = df_meta[df_meta['Error'].isna()]
+    else:
+        df_errors = pd.DataFrame()
+        df_success = df_meta
+
+    # 4. Display Statistics
+    if not df_success.empty:
+        st.success(f"Successfully read headers for {len(df_success)} files.")
+        
+        # --- Overview Metrics ---
+        col1, col2, col3, col4 = st.columns(4)
+        
+        total_dur_hours = df_success['Duration_sec'].sum() / 3600
+        avg_dur_min = df_success['Duration_min'].mean()
+        n_unique_pids = df_success['PatientID_Guess'].nunique()
+        n_total_files = len(df_success)
+        
+        col1.metric("Total Files", n_total_files)
+        col2.metric("Unique Patients (Est)", n_unique_pids)
+        col3.metric("Total Duration (hrs)", f"{total_dur_hours:.1f}")
+        col4.metric("Avg Duration (min)", f"{avg_dur_min:.1f}")
+        
+        # --- Channels Analysis ---
+        st.markdown("### Channel Analysis")
+        
+        # Collect all channels
+        all_channels = []
+        for ch_list in df_success['Channel_Names']:
+            all_channels.extend(ch_list)
+            
+        unique_channels = sorted(list(set(all_channels)))
+        
+        # Count frequency of each channel
+        from collections import Counter
+        ch_counts = Counter(all_channels)
+        
+        # Prepare DataFrame for Channel Frequency
+        df_ch_freq = pd.DataFrame.from_dict(ch_counts, orient='index', columns=['Count']).reset_index()
+        df_ch_freq.rename(columns={'index': 'Channel'}, inplace=True)
+        df_ch_freq['Percentage'] = (df_ch_freq['Count'] / n_total_files) * 100
+        df_ch_freq.sort_values(by='Count', ascending=False, inplace=True)
+        
+        # Display
+        st.write(f"**Total Unique Channels Found:** {len(unique_channels)}")
+        
+        # Tabs for different channel views
+        tab1, tab2 = st.tabs(["Channel Frequency", "Common Channels (>90%)"])
+        
+        with tab1:
+            st.dataframe(df_ch_freq, use_container_width=True)
+            
+        with tab2:
+            common_chs = df_ch_freq[df_ch_freq['Percentage'] > 90]['Channel'].tolist()
+            st.write(f"**Common Channels (present in >90% of files):** {len(common_chs)}")
+            st.write(", ".join(common_chs))
+            
+        # --- Detailed Table ---
+        st.markdown("### Detailed File Info")
+        
+        # Select columns to display
+        disp_cols = ['Filename', 'PatientID_Guess', 'Duration_min', 'N_Channels', 'Sf_Hz', 'Meas_Date']
+        st.dataframe(df_success[disp_cols], use_container_width=True)
+        
+        # Allow download of metadata
+        csv = df_success.to_csv(index=False).encode('utf-8')
+        st.download_button(
+            "Download Metadata CSV",
+            csv,
+            "edf_metadata.csv",
+            "text/csv",
+            key='download-csv'
+        )
+
+    # 5. Show Errors if any
+    if not df_errors.empty:
+        st.warning(f"Failed to read headers for {len(df_errors)} files.")
+        st.dataframe(df_errors[['Filename', 'Path', 'Error']], use_container_width=True)
+
+    # 6. Patient Histogram View
+    st.divider()
+    st.subheader("Patient Data Inspection (Histograms)")
+    
+    if not df_success.empty:
+        # File selector
+        selected_file_name = st.selectbox("Select Patient File", df_success['Filename'].tolist())
+        
+        # Get path for selected file
+        selected_file_path = df_success[df_success['Filename'] == selected_file_name]['Path'].iloc[0]
+        
+        if st.button("Load and Plot Histograms"):
+            try:
+                with st.spinner(f"Loading data for {selected_file_name}..."):
+                    # Load raw data
+                    # Suppress warnings
+                    with mne.utils.use_log_level('ERROR'):
+                        raw = mne.io.read_raw_edf(selected_file_path, preload=True, verbose=False)
+                    
+                    data = raw.get_data() # (n_channels, n_times)
+                    ch_names = raw.ch_names
+                    n_ch = len(ch_names)
+                    
+                    # Layout for histograms
+                    n_cols = 4
+                    n_rows = int(np.ceil(n_ch / n_cols))
+                    
+                    fig_hist, axes_hist = plt.subplots(n_rows, n_cols, figsize=(20, 4 * n_rows))
+                    if n_ch == 1:
+                        axes_hist = [axes_hist]
+                    else:
+                        axes_hist = axes_hist.flatten()
+                        
+                    st.write(f"Plotting histograms for {n_ch} channels...")
+                    
+                    # Plot histograms
+                    for i, ch_name in enumerate(ch_names):
+                        ax = axes_hist[i]
+                        ch_data = data[i, :]
+                        
+                        # Plot histogram
+                        # Use a reasonable number of bins, e.g., 50 or 100
+                        ax.hist(ch_data * 1e6, bins=100, color='skyblue', edgecolor='black', alpha=0.7)
+                        
+                        ax.set_title(ch_name)
+                        ax.set_xlabel("Amplitude (μV)")
+                        ax.set_ylabel("Count")
+                        ax.grid(True, alpha=0.3)
+                        
+                        # Add basic stats to title
+                        mean_val = np.mean(ch_data * 1e6)
+                        std_val = np.std(ch_data * 1e6)
+                        ax.set_title(f"{ch_name}\nμ={mean_val:.1f}, σ={std_val:.1f}")
+
+                    # Hide unused axes
+                    for j in range(n_ch, len(axes_hist)):
+                        axes_hist[j].axis('off')
+                        
+                    fig_hist.tight_layout()
+                    st.pyplot(fig_hist, use_container_width=True)
+                    
+                    raw.close()
+
+            except Exception as e:
+                st.error(f"Error loading or plotting data: {e}")
+
+
 def main():
     st.title("HEP Group Comparison Dashboard")
     st.write("Comparing Amplitude vs Time (Heartbeat Evoked Potential).")
 
+    st.sidebar.header("Export Tools")
+    if 'pptx_figures_data' in st.session_state and len(st.session_state.pptx_figures_data) > 0:
+        st.sidebar.write(f"Figures saved: {len(st.session_state.pptx_figures_data)}")
+        if st.sidebar.button("Prepare PowerPoint Report"):
+            with st.spinner("Generating PowerPoint..."):
+                pptx_io = generate_pptx()
+                if pptx_io:
+                    st.sidebar.download_button(
+                        label="Download PPTX",
+                        data=pptx_io,
+                        file_name="HEP_Report.pptx",
+                        mime="application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                    )
+                else:
+                    st.sidebar.error("python-pptx is not installed.")
+        if st.sidebar.button("Clear Saved Figures"):
+            st.session_state.pptx_figures_data = []
+            st.rerun()
+    else:
+        st.sidebar.write("No figures saved yet.")
+
+
     base_path = "/storage/pblab_shared_data/Nir/Cobrad/pickles_sleep_stage"
+    # Define base path for EDF Viewer
+    base_path_edf = "/storage/pblab_shared_data/Nir/Cobrad/EDF_Format"
 
     # Select Sleep Stage
     sleep_stages = ['N1', 'N2', 'N3', 'R', 'W']
-    selected_stage = st.selectbox("Select Sleep Stage", sleep_stages)
+    selected_stage = st.selectbox("Select Sleep Stage", sleep_stages, index=2)
     
     # Analysis Mode Selection
-    # Analysis Mode Selection
-    mode = st.radio("Analysis Mode", ["Single Group Analysis", "Compare Groups", "Compare Sleep Stages"], index=0)
+    mode = st.radio("Analysis Mode", ["Single Group Analysis", "Compare Groups", "Compare Sleep Stages", "EDF Viewer"], index=0)
 
     if mode == "Compare Groups":
         run_compare_groups_analysis(base_path, selected_stage)
     elif mode == "Compare Sleep Stages":
         run_compare_sleep_stages_analysis(base_path)
+    elif mode == "EDF Viewer":
+        run_edf_viewer_mode(base_path_edf)
     else: # Single Group Analysis
         run_single_group_analysis(base_path, selected_stage)
 

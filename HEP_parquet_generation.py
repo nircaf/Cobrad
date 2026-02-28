@@ -23,6 +23,18 @@ from pyprep.prep_pipeline import PrepPipeline
 from contextlib import contextmanager
 import sys
 import os
+import socket
+import logging
+
+os.makedirs('logs', exist_ok=True)
+logging.basicConfig(
+    filename='logs/hep_parquet_generation.log',
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger('HEP_parquet_generation')
+logger.info(f"Script started on host: {socket.gethostname()}, PID: {os.getpid()}")
+
 AUTOREJECT_AVAILABLE = True
 
 @contextmanager
@@ -758,39 +770,83 @@ def process_patients_random6(edf_root="EDF", k=6, step_sec=5, seed=42):
         print(f"Patient {patient_id}: {len(files)} PKL files found.")
         
         # Check if patient was already processed
+        logger.info(f"[random] Patient {patient_id}: started processing")
         if is_patient_processed(patient_id, temps_dir=TEMPS_DIR):
             print(f"Patient {patient_id}: already processed (parquet files exist). Skipping.")
+            logger.info(f"[random] Patient {patient_id}: already processed. Skipping.")
             continue
         
         selected = select_random_edfs_with_ecg(files, k=k, seed=seed)
         if len(selected) == 0:
             print(f"Patient {patient_id}: no PKLs with ECG channel. Skipping.")
+            logger.info(f"[random] Patient {patient_id}: no PKLs with ECG channel. Skipping.")
             continue
         print(f"Patient {patient_id}: selected {len(selected)} PKLs for processing.")
         raws = load_raws(selected)
         if len(raws) == 0:
             print(f"Patient {patient_id}: failed to load selected PKLs. Skipping.")
+            logger.warning(f"[random] Patient {patient_id}: failed to load selected PKLs. Skipping.")
             continue
 
-        results_df_dict = compute_brain_heart_coupling(
-            data_all=raws,
-            patient_id=patient_id,
-            bool_plots=False,
-            save_plot=True,
-            step_sec=step_sec
-        )
+        try:
+            results_df_dict = compute_brain_heart_coupling(
+                data_all=raws,
+                patient_id=patient_id,
+                bool_plots=False,
+                save_plot=True,
+                step_sec=step_sec
+            )
 
-        # Save averaged results per band for this patient
-        for band, results_df in results_df_dict.items():
-            results_path = os.path.join(TEMPS_DIR, f"{patient_id}_results_{band}.parquet")
-            print(f"Saving results for patient {patient_id}, band {band} to {results_path}")
-            # create the directory if it doesn't exist
-            os.makedirs(os.path.dirname(results_path), exist_ok=True)
-            results_df.to_parquet(results_path, index=False)
+            # Save averaged results per band for this patient
+            for band, results_df in results_df_dict.items():
+                results_path = os.path.join(TEMPS_DIR, f"{patient_id}_results_{band}.parquet")
+                print(f"Saving results for patient {patient_id}, band {band} to {results_path}")
+                # create the directory if it doesn't exist
+                os.makedirs(os.path.dirname(results_path), exist_ok=True)
+                results_df.to_parquet(results_path, index=False)
+                
+            logger.info(f"[random] Patient {patient_id}: successfully finished processing.")
+            
+        except Exception as e:
+            logger.error(f"[random] Patient {patient_id}: CRASHED during processing. Error: {e}", exc_info=True)
 
     # Aggregate across all patients
     plot_all_patients_band_means(bands=power_bands.keys(), step_sec=step_sec, temps_dir=TEMPS_DIR, save_dir=SAVE_DIR)
     print("All processing and plotting complete.")
+
+def smooth_sleep_stages(predicted_stages):
+    """
+    Smoothing: Merge short runs (< 3 epochs) into the prior run.
+    Operates on a copy of the array.
+    """
+    smooth_stages = predicted_stages.copy()
+    n_epochs = len(smooth_stages)
+    
+    if n_epochs > 0:
+        current_label = smooth_stages[0]
+        run_start_idx = 0
+        
+        for i in range(1, n_epochs):
+            if smooth_stages[i] != current_label:
+                # Run ended at i-1
+                run_length = i - run_start_idx
+                
+                # Check if this finished run was too short
+                if run_length < 3 and run_start_idx > 0:
+                    # Merge into prior
+                    prev_label = smooth_stages[run_start_idx - 1]
+                    smooth_stages[run_start_idx:i] = prev_label
+                
+                run_start_idx = i
+                current_label = smooth_stages[i]
+        
+        # Check last run
+        run_length = n_epochs - run_start_idx
+        if run_length < 3 and run_start_idx > 0:
+             prev_label = smooth_stages[run_start_idx - 1]
+             smooth_stages[run_start_idx:] = prev_label
+             
+    return smooth_stages
 
 def process_patients_n1_stage_hep(edf_root="EDF_Format/EDF", step_sec=5, n1_duration_min=1, stage='N1'):
     """
@@ -869,15 +925,16 @@ def process_patients_n1_stage_hep(edf_root="EDF_Format/EDF", step_sec=5, n1_dura
     
     for patient_id, files in patient_to_files.items():
         print(f"Patient {patient_id}: {len(files)} EDF files found.")
+        logger.info(f"[{stage}] Patient {patient_id}: started processing")
         
         # Check if patient was already processed
         if is_patient_processed(patient_id, temps_dir=TEMPS_DIR):
             print(f"Patient {patient_id}: already processed (parquet files exist). Skipping.")
+            logger.info(f"[{stage}] Patient {patient_id}: already processed. Skipping.")
             patient_stats['skipped_already_processed'] += 1
             continue
         
         # Process each file to find stage segments
-        # flip order of files
         stage_segments = []
         patient_file_stats = {
             'no_ecg': 0,
@@ -888,6 +945,30 @@ def process_patients_n1_stage_hep(edf_root="EDF_Format/EDF", step_sec=5, n1_dura
             'processing_error': 0,
             'successful': 0
         }
+        
+        # Check if patient already has pickles in pickles_sleep_stage
+        pickle_dir = os.path.join("pickles_sleep_stage", project_name, stage)
+        existing_pickles = []
+        if os.path.exists(pickle_dir):
+            existing_pickles = glob.glob(os.path.join(pickle_dir, f"{patient_id}_{stage}_*.pkl"))
+            
+        if existing_pickles:
+            print(f"Patient {patient_id}: Found {len(existing_pickles)} existing cleaned pickle files in {pickle_dir}. Loading pickles directly.")
+            logger.info(f"[{stage}] Patient {patient_id}: Found {len(existing_pickles)} existing pickles. Skipping EDF extraction.")
+            for pkl_file in existing_pickles:
+                try:
+                    with open(pkl_file, 'rb') as f:
+                        raw_stage_cleaned = pickle.load(f)
+                        stage_segments.append(raw_stage_cleaned)
+                    patient_file_stats['successful'] += 1
+                except Exception as e:
+                    print(f"Error loading pickle {pkl_file}: {e}")
+                    logger.error(f"[{stage}] Patient {patient_id}: Error loading pickle {pkl_file}: {e}")
+                    patient_file_stats['processing_error'] += 1
+                    patient_stats['file_level_stats']['processing_error'] += 1
+            # Empty the files list so the EDF scanning loop is bypassed
+            files = []
+
         for file_path in files:
             print(f"Processing {file_path} for {stage} sleep stages...")
             
@@ -977,43 +1058,17 @@ def process_patients_n1_stage_hep(edf_root="EDF_Format/EDF", step_sec=5, n1_dura
                 print(f"Predicted stages counts: {pd.Series(predicted_stages).value_counts().to_dict()}")
                 
                 # Special handling for W: select 10 min of Wake right after the last adequate non-W run
+                
+                # --- Smoothing: Merge short runs (< 3 epochs) into the prior run ---
+                # Apply smoothing for ALL cases as requested
+                smooth_stages = smooth_sleep_stages(predicted_stages)
+
                 if stage == 'W':
                     # YASA uses 30-second epochs by default
                     epoch_duration_sec = 30
                     # Require at least 5 minutes of any non-W stage before the Wake segment
                     min_non_w_epochs = int(np.ceil(5 * 60 / epoch_duration_sec))
                     min_w_epochs = int(np.ceil(10 * 60 / epoch_duration_sec))  # 10 minutes of W
-
-                    # --- Smoothing: Merge short runs (< 2 epochs) into the prior run ---
-                    # Operate on a copy to avoid side effects
-                    smooth_stages = predicted_stages.copy()
-                    n_epochs = len(smooth_stages)
-                    
-                    if n_epochs > 0:
-                        current_label = smooth_stages[0]
-                        run_start_idx = 0
-                        
-                        for i in range(1, n_epochs):
-                            if smooth_stages[i] != current_label:
-                                # Run ended at i-1
-                                run_length = i - run_start_idx
-                                
-                                # Check if this finished run was too short
-                                if run_length <3 and run_start_idx > 0:
-                                    # Merge into prior
-                                    prev_label = smooth_stages[run_start_idx - 1]
-                                    smooth_stages[run_start_idx:i] = prev_label
-                                
-                                run_start_idx = i
-                                current_label = smooth_stages[i]
-                        
-                        # Check last run
-                        run_length = n_epochs - run_start_idx
-                        if run_length < 3 and run_start_idx > 0:
-                             prev_label = smooth_stages[run_start_idx - 1]
-                             smooth_stages[run_start_idx:] = prev_label
-                    
-                    # predicted_stages = smooth_stages
 
                     # Build runs of identical stages: (label, start_idx, length)
                     runs = []
@@ -1036,7 +1091,6 @@ def process_patients_n1_stage_hep(edf_root="EDF_Format/EDF", step_sec=5, n1_dura
 
                     # save in stage_segments_in_file the start sec and end sec of the W segments
                     stage_segments_in_file = [(run[1] * epoch_duration_sec, (run[1] + run[2]) * epoch_duration_sec) for run in runs if run[0] == 'W']
-
                 else:
                     # Find specified sleep stage epochs (N1, N2, N3, R)
                     stage_epochs = np.where(smooth_stages == stage)[0]
@@ -1117,7 +1171,7 @@ def process_patients_n1_stage_hep(edf_root="EDF_Format/EDF", step_sec=5, n1_dura
                         raw_stage = raw.copy().crop(tmin=start_sec, tmax=end_sec)
                         
                         # Apply cleaning to the stage segment
-                        print(f"Cleaning {stage} segment: {start_sec:.1f}s - {end_sec:.1f}s ({end_sec-start_sec:.1f}s duration)")
+                        print(f"Cleaning {stage} segment: {start_sec:.1f}s - {end_sec:.1f}s ({end_sec-start_sec:.1f}s minutes: {(end_sec-start_sec)/60:.1f} minutes)")
                         raw_stage_cleaned = clean_mne_raw(raw_stage,file_path)
                         
                         # Save the cleaned MNE raw object to pickle
@@ -1141,12 +1195,14 @@ def process_patients_n1_stage_hep(edf_root="EDF_Format/EDF", step_sec=5, n1_dura
                         
             except Exception as e:
                 print(f"Error processing {file_path}: {e}")
+                logger.error(f"[{stage}] Patient {patient_id}: CRASHED during processing {file_path}. Error: {e}", exc_info=True)
                 patient_file_stats['processing_error'] += 1
                 patient_stats['file_level_stats']['processing_error'] += 1
                 continue
         
         if len(stage_segments) == 0:
             print(f"Patient {patient_id}: no {stage} segments found. Skipping.")
+            logger.info(f"[{stage}] Patient {patient_id}: no {stage} segments found. Skipping.")
             print(f"  Patient {patient_id} file statistics: {patient_file_stats}")
             patient_stats['skipped_no_segments'] += 1
             
@@ -1213,22 +1269,28 @@ def process_patients_n1_stage_hep(edf_root="EDF_Format/EDF", step_sec=5, n1_dura
         print(f"Patient {patient_id}: found {len(stage_segments)} {stage} segments for processing.")
         patient_stats['processed'] += 1
         
-        # Run brain-heart coupling analysis on stage segments
-        results_df_dict = compute_brain_heart_coupling(
-            data_all=stage_segments,
-            patient_id=f"{patient_id}_{stage}",
-            bool_plots=False,
-            save_plot=True,
-            step_sec=step_sec
-        )
+        try:
+            # Run brain-heart coupling analysis on stage segments
+            results_df_dict = compute_brain_heart_coupling(
+                data_all=stage_segments,
+                patient_id=f"{patient_id}_{stage}",
+                bool_plots=False,
+                save_plot=True,
+                step_sec=step_sec
+            )
 
-        # Save averaged results per band for this patient
-        for band, results_df in results_df_dict.items():
-            results_path = os.path.join(TEMPS_DIR, f"{patient_id}_{stage}_results_{band}.parquet")
-            print(f"Saving {stage} results for patient {patient_id}, band {band} to {results_path}")
-            # create the directory if it doesn't exist
-            os.makedirs(os.path.dirname(results_path), exist_ok=True)
-            results_df.to_parquet(results_path, index=False)
+            # Save averaged results per band for this patient
+            for band, results_df in results_df_dict.items():
+                results_path = os.path.join(TEMPS_DIR, f"{patient_id}_{stage}_results_{band}.parquet")
+                print(f"Saving {stage} results for patient {patient_id}, band {band} to {results_path}")
+                # create the directory if it doesn't exist
+                os.makedirs(os.path.dirname(results_path), exist_ok=True)
+                results_df.to_parquet(results_path, index=False)
+                
+            logger.info(f"[{stage}] Patient {patient_id}: successfully finished processing.")
+            
+        except Exception as e:
+            logger.error(f"[{stage}] Patient {patient_id}: CRASHED during processing. Error: {e}", exc_info=True)
 
     # Aggregate across all patients
     plot_all_patients_band_means(bands=power_bands.keys(), step_sec=step_sec, temps_dir=TEMPS_DIR, save_dir=SAVE_DIR)
@@ -1264,12 +1326,44 @@ def process_patients_n1_stage_hep(edf_root="EDF_Format/EDF", step_sec=5, n1_dura
     
     print(f"All {stage} stage processing and plotting complete.")
 
+def rename_edfs_to_upper(edf_root):
+    """
+    Renames all .edf files under edf_root to upper case (both filename and extension).
+    """
+    print(f"Checking for lowercase filenames (renaming to uppercase) in {edf_root}...")
+    count = 0
+    # Walk top-down so we can rename files inside directories
+    for root, dirs, files in os.walk(edf_root):
+        for file in files:
+            # Check if it is an .edf file (case-insensitive)
+            if file.lower().endswith(".edf"):
+                # If name is not fully uppercase
+                if file != file.upper():
+                    old_path = os.path.join(root, file)
+                    new_name = file.upper()
+                    new_path = os.path.join(root, new_name)
+
+                    # Only rename if destination doesn't exist (unless it's the same file on case-insensitive FS)
+                    # On Linux (ext4), case sensitive, so foo.edf and FOO.EDF are distinct.
+                    if os.path.exists(new_path):
+                        print(f"Skipping rename for {file} -> {new_name}: Target exists.")
+                        continue
+                    
+                    try:
+                        os.rename(old_path, new_path)
+                        print(f"Renamed: {file} -> {new_name}")
+                        count += 1
+                    except Exception as e:
+                        print(f"Failed to rename {old_path} -> {new_path}: {e}")
+
+    print(f"Renamed {count} files to uppercase.")
+
 # ------------------------------------------------------------------------------
 # Entry point
 # ------------------------------------------------------------------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Process EDF files for brain-heart coupling analysis')
-    parser.add_argument('-c', '--edf_root', type=str, default="EDF_Format/ASSY",
+    parser.add_argument('-c', '--edf_root', type=str, default="EDF_Format/Berkeley_ANTT",
                         help='Root directory containing EDF files (default: EDF_Format/EDF)')
     parser.add_argument('--mode', type=str, choices=['random', 'stage'], default='stage',
                         help='Processing mode: random (select k random files) or stage (extract selected sleep stages)')
@@ -1281,7 +1375,7 @@ if __name__ == "__main__":
     # Controls for N1 mode
     parser.add_argument('--n1_duration_min', type=int, default=1,
                         help='Duration of stage segments to extract in minutes (default: 1)')
-    parser.add_argument('--stage', type=str, choices=['N1', 'N2', 'N3', 'R', 'W'], default='W',
+    parser.add_argument('--stage', type=str, choices=['N1', 'N2', 'N3', 'R', 'W'], default='R',
                         help='Sleep stage to extract (N1, N2, N3, R, or W) (default: N2)')
     # Common controls
     parser.add_argument('-s', '--step_sec', type=int, default=5,
@@ -1289,6 +1383,9 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
     
+    # Rename .edf files to uppercase
+    rename_edfs_to_upper(args.edf_root)
+
     if args.mode == 'random':
         # RAM-conscious processing: k random PKLs per patient from specified edf_root
         process_patients_random6(edf_root=args.edf_root, k=args.k_files, step_sec=args.step_sec, seed=args.seed)
