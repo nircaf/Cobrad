@@ -1,9 +1,10 @@
-from utils.eeg_utils import *
+from utils.eeg_utils import get_clinical_and_boxplot_cols, wnv_get_files, cobrad_get_files
+import streamlit as st
+from sklearn.model_selection import cross_val_score
 import pandas as pd
 import numpy as np
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, roc_auc_score, confusion_matrix, roc_curve, auc
 import torch
 import torch.nn as nn
@@ -12,11 +13,8 @@ from torch.utils.data import DataLoader, TensorDataset
 import matplotlib.pyplot as plt
 import seaborn as sns
 import os
-from sklearn.impute import SimpleImputer
 from xgboost import XGBClassifier
 import json
-from sklearn.cluster import KMeans
-from sklearn.decomposition import PCA
 
 def plot_model_performance(y_true, y_pred, y_prob, model_name, dataset_name,output_folder):
     """
@@ -81,7 +79,7 @@ def prepare_data_vs_controls(cases_df, controls_df = None, target_col='target'):
     return X, y
 
 def medications_analysis(df_cases, database_name):
-    df_cases_copy = df_cases.copy()
+    _ = df_cases.copy()
     # Identify the separation point between clinical and EEG features
     separator_index = next((i for i, col in enumerate(df_cases.columns) if 'overall_' in col), None)
     if separator_index is None:
@@ -91,7 +89,7 @@ def medications_analysis(df_cases, database_name):
     # Split columns into clinical and EEG features
     clinical_features = [col for col in df_cases.columns[:separator_index] if col != 'Group']
     eeg_features = [col for col in df_cases.columns[separator_index:] if col != 'Group']
-    medication_cols = [col for col in df_cases.columns if col.startswith('medications_')]
+    _ = [col for col in df_cases.columns if col.startswith('medications_')]
     # remove 'medications_' from the column names
     df_cases.columns = [col.replace('medications_', '').strip() for col in df_cases.columns]
     clinical_features = [col.replace('medications_', '').strip() for col in clinical_features if col != 'sum']
@@ -147,7 +145,7 @@ def run_data_intra(df_cases,database_name):
             pass
 
 
-from sklearn.model_selection import cross_val_score
+
 
 def train_classical_ml(X_train, y_train, X_test, y_test, dataset_name, output_folder):
     """Train classical ML models with cross-validation and return metrics and predictions."""
@@ -310,7 +308,7 @@ def classify_drug_groups(df_cases, drug_groups, eeg_features, output_folder, fil
     Returns:
     - classification_results: Dictionary containing classification metrics for each drug group.
     """
-    classification_results = {}
+    _ = {}
 
     # Iterate over drug groups
     for group_name, drugs in drug_groups.items():

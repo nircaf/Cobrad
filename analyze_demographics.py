@@ -8,7 +8,7 @@ def analyze_assy(folder_path):
     Analyzes the ASSY dataset in the given folder.
     Expects a CSV file named 'ASSy_demographics.csv'.
     """
-    print(f"\n--- Analyzing Project: ASSY ---")
+    print("\n--- Analyzing Project: ASSY ---")
     
     # search for the specific csv file
     search_path = os.path.join(folder_path, "ASSy_demographics.csv")
@@ -50,7 +50,7 @@ def analyze_cobrad(folder_path):
     Analyzes the COBRAD dataset (EDF folder).
     Expects an Excel file containing 'clinical'.
     """
-    print(f"\n--- Analyzing Project: COBRAD (EDF) ---")
+    print("\n--- Analyzing Project: COBRAD (EDF) ---")
     
     # Search for xlsx files, prioritizing the one we saw earlier
     search_pattern = os.path.join(folder_path, "*clinical*.xlsx")

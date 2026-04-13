@@ -3,26 +3,20 @@ import re
 import glob
 import pickle
 import argparse
+from datetime import datetime
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import seaborn as sns
 
 import mne
 import neurokit2 as nk
 from scipy.signal import butter, filtfilt
-from scipy.stats import wilcoxon, zscore, pearsonr, entropy, ranksums, linregress
-from statsmodels.stats.multitest import fdrcorrection
+from scipy.stats import entropy
 
-from sklearn.feature_selection import mutual_info_regression
-from mne_connectivity import SpectralConnectivity as spectral_connectivity
 
 # Import for EEG cleaning pipeline
-from autoreject import AutoReject
-from pyprep.prep_pipeline import PrepPipeline
 from contextlib import contextmanager
 import sys
-import os
 import socket
 import logging
 
@@ -55,9 +49,8 @@ except ImportError:
 
 # Project utils: expects power_bands and compute_network_features at least.
 # sys append mother folder
-import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from utils.eeg_utils import *
+from utils.eeg_utils import power_bands, compute_network_features, only_plots, rename_channels, eeg_channels, eeg_dict_convertion
 import edf_cleaning
 # ------------------------------------------------------------------------------
 # Global settings
@@ -70,6 +63,19 @@ os.makedirs(TEMPS_DIR, exist_ok=True)
 # ------------------------------------------------------------------------------
 # Utilities
 # ------------------------------------------------------------------------------
+def get_project_name(path):
+    """
+    Extract the first folder after 'EDF_Format' in the given path.
+    If 'EDF_Format' is not in the path, returns the basename of the path.
+    """
+    norm_path = os.path.normpath(path)
+    parts = norm_path.split(os.sep)
+    if 'EDF_Format' in parts:
+        idx = parts.index('EDF_Format')
+        if len(parts) > idx + 1:
+            return parts[idx + 1]
+    return os.path.basename(norm_path)
+
 def is_patient_processed(patient_id, temps_dir=TEMPS_DIR):
     """
     Check if a patient was already processed by looking for their parquet files.
@@ -91,38 +97,52 @@ def is_patient_processed(patient_id, temps_dir=TEMPS_DIR):
     
     return True
 
-def get_processed_patients(temps_dir=TEMPS_DIR):
+def get_processed_patients(temps_dir=TEMPS_DIR, pickle_base_dir="pickles_sleep_stage"):
     """
-    Get a list of all patients that have been processed (have all parquet files).
-    
+    Get a list of all patients that have been fully processed.
+
+    A patient is considered processed when they have at least one pickle file in
+    ``pickles_sleep_stage/<project>/<stage>/``.
+
+    The project name and stage are inferred from the last component of ``temps_dir``
+    (e.g. ``parquets_HEP/EDF_N1`` → project=``EDF``, stage=``N1``).
+    When ``temps_dir`` has no recognisable ``<project>_<stage>`` suffix the function
+    returns an empty list (cannot determine pickle dir).
+
     Args:
-        temps_dir (str): Directory containing the parquet files
-        
+        temps_dir (str): Used only to derive the project/stage suffix.
+        pickle_base_dir (str): Root directory for sleep-stage pickles
+                               (default: ``"pickles_sleep_stage"``).
+
     Returns:
-        list: List of patient IDs that have been processed
+        list: Sorted list of patient IDs that have been fully processed.
     """
-    if not os.path.exists(temps_dir):
+    # --- Derive pickle directory from temps_dir suffix ---
+    folder_name = os.path.basename(os.path.normpath(temps_dir))
+    stage_match = re.match(r'^(.+)_(N1|N2|N3|R|W)$', folder_name)
+    if not stage_match:
+        return []  # Cannot determine project/stage
+
+    project_name = stage_match.group(1)
+    stage = stage_match.group(2)
+    pickle_dir = os.path.join(pickle_base_dir, project_name, stage)
+
+    if not os.path.isdir(pickle_dir):
         return []
-    
-    # Get all parquet files in the directory
-    parquet_files = glob.glob(os.path.join(temps_dir, "*_results_*.parquet"))
-    
-    # Extract patient IDs from filenames
-    patient_ids = set()
-    for file_path in parquet_files:
-        filename = os.path.basename(file_path)
-        # Extract patient ID from filename like "0345-010_results_alpha.parquet"
-        match = re.match(r'^(.+)_results_\w+\.parquet$', filename)
-        if match:
-            patient_ids.add(match.group(1))
-    
-    # Filter to only include patients with all expected bands
-    processed_patients = []
-    for patient_id in patient_ids:
-        if is_patient_processed(patient_id, temps_dir):
-            processed_patients.append(patient_id)
-    
+
+    # --- Collect patient IDs that have at least one pickle ---
+    processed_patients = set()
+    for pkl_path in glob.glob(os.path.join(pickle_dir, f"*_{stage}_*.pkl")):
+        filename = os.path.basename(pkl_path)
+        # filename pattern: <bare_patient_id>_<stage>_*.pkl
+        m = re.match(rf'^(.+)_{re.escape(stage)}_', filename)
+        if m:
+            bare_patient_id = m.group(1)
+            processed_patients.add(f"{bare_patient_id}_{stage}")
+
     return sorted(processed_patients)
+
+    
 def clean_ecg_signal(ecg_signal, sfreq, lowcut=0.5, highcut=40, order=4):
     nyq = 0.5 * sfreq
     low = lowcut / nyq
@@ -328,7 +348,8 @@ def compute_brain_heart_coupling(data_all, patient_id, bool_plots=False, save_pl
                 sd1 = np.std(dibi) / np.sqrt(2)
                 sd2 = np.sqrt(max(0, 2 * np.std(ibi)**2 - 0.5 * np.std(dibi)**2))
             else:
-                sd1 = np.nan; sd2 = np.nan
+                sd1 = np.nan
+                sd2 = np.nan
             cvi_ts.append(sd1)
             csi_ts.append(sd2)
 
@@ -354,7 +375,7 @@ def compute_brain_heart_coupling(data_all, patient_id, bool_plots=False, save_pl
             mi_results = {}
             metrics = {'Efficiency': eff_arr, 'Clustering': clu_arr, 'Modularity': mod_arr, 'Assortativity': ass_arr}
             for name, arr in metrics.items():
-                X = arr.reshape(-1, 1)
+                # X was used for mutual info regression, safe to skip since we nan it out
                 mic_sym = np.nan
                 mic_vag = np.nan
                 # mic_sym = mutual_info_regression(X, csi_arr_band, random_state=0)[0]
@@ -396,15 +417,13 @@ def compute_brain_heart_coupling(data_all, patient_id, bool_plots=False, save_pl
         arrs = np.stack([d.values for d in dfs_aligned], axis=0)
         n_files = len(dfs)
         n_rows, n_cols = arrs.shape[1], arrs.shape[2]
-        mean_arr = np.full((n_rows, n_cols), np.nan)
-        for i in range(n_rows):
-            for j in range(n_cols):
-                vals = arrs[:, i, j]
-                n_not_nan = np.sum(~np.isnan(vals))
-                if n_not_nan >= n_files / 2:
-                    mean_arr[i, j] = np.nanmean(vals)
-                else:
-                    mean_arr[i, j] = np.nan
+        n_not_nan = np.sum(~np.isnan(arrs), axis=0)
+        # Suppress warnings for all-NaN slices
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            mean_arr_raw = np.nanmean(arrs, axis=0)
+        mean_arr = np.where(n_not_nan >= n_files / 2, mean_arr_raw, np.nan)
         mean_df = pd.DataFrame(mean_arr, columns=all_columns)
         mean_df = mean_df.dropna(how="all")
         results_df_dict_avg[band] = mean_df
@@ -418,7 +437,7 @@ def plot_patient_band_means(patient_id, bands=None, step_sec=5, temps_dir=TEMPS_
     if bands is None:
         bands = list(power_bands.keys())
     for band in bands:
-        pattern = os.path.join(temps_dir, f"*{patient_id}*_results_{band}.csv")
+        pattern = os.path.join(temps_dir, f"*{patient_id}*_results_{band}.parquet")
         file_list = glob.glob(pattern)
         if not file_list:
             print(f"No files found for patient {patient_id}, band {band}")
@@ -426,7 +445,7 @@ def plot_patient_band_means(patient_id, bands=None, step_sec=5, temps_dir=TEMPS_
         dfs = []
         for f in file_list:
             try:
-                df = pd.read_csv(f)
+                df = pd.read_parquet(f)
                 dfs.append(df)
             except Exception as e:
                 print(f"Error reading {f}: {e}")
@@ -448,15 +467,12 @@ def plot_patient_band_means(patient_id, bands=None, step_sec=5, temps_dir=TEMPS_
         arrs = np.stack([d.values for d in dfs_aligned], axis=0)
         n_files = len(dfs)
         n_rows, n_cols = arrs.shape[1], arrs.shape[2]
-        mean_arr = np.full((n_rows, n_cols), np.nan)
-        for i in range(n_rows):
-            for j in range(n_cols):
-                vals = arrs[:, i, j]
-                n_not_nan = np.sum(~np.isnan(vals))
-                if n_not_nan >= n_files / 2:
-                    mean_arr[i, j] = np.nanmean(vals)
-                else:
-                    mean_arr[i, j] = np.nan
+        n_not_nan = np.sum(~np.isnan(arrs), axis=0)
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            mean_arr_raw = np.nanmean(arrs, axis=0)
+        mean_arr = np.where(n_not_nan >= n_files / 2, mean_arr_raw, np.nan)
         mean_df = pd.DataFrame(mean_arr, columns=all_columns)
         mean_df = mean_df.dropna(how="all")
         only_plots(mean_df, save_plot=True, save_dir=save_dir, edf_pickle_name=patient_id, band=band, step_sec=step_sec)
@@ -466,7 +482,7 @@ def plot_all_patients_band_means(bands=None, step_sec=5, temps_dir=TEMPS_DIR, sa
     if bands is None:
         bands = list(power_bands.keys())
     for band in bands:
-        pattern = os.path.join(temps_dir, f"*results_{band}.csv")
+        pattern = os.path.join(temps_dir, f"*results_{band}.parquet")
         file_list = glob.glob(pattern)
         if not file_list:
             print(f"No files found for band {band} (all patients)")
@@ -474,7 +490,7 @@ def plot_all_patients_band_means(bands=None, step_sec=5, temps_dir=TEMPS_DIR, sa
         dfs = []
         for f in file_list:
             try:
-                df = pd.read_csv(f)
+                df = pd.read_parquet(f)
                 dfs.append(df)
             except Exception as e:
                 print(f"Error reading {f}: {e}")
@@ -496,15 +512,12 @@ def plot_all_patients_band_means(bands=None, step_sec=5, temps_dir=TEMPS_DIR, sa
         arrs = np.stack([d.values for d in dfs_aligned], axis=0)
         n_files = len(dfs)
         n_rows, n_cols = arrs.shape[1], arrs.shape[2]
-        mean_arr = np.full((n_rows, n_cols), np.nan)
-        for i in range(n_rows):
-            for j in range(n_cols):
-                vals = arrs[:, i, j]
-                n_not_nan = np.sum(~np.isnan(vals))
-                if n_not_nan >= n_files / 2:
-                    mean_arr[i, j] = np.nanmean(vals)
-                else:
-                    mean_arr[i, j] = np.nan
+        n_not_nan = np.sum(~np.isnan(arrs), axis=0)
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            mean_arr_raw = np.nanmean(arrs, axis=0)
+        mean_arr = np.where(n_not_nan >= n_files / 2, mean_arr_raw, np.nan)
         mean_df = pd.DataFrame(mean_arr, columns=all_columns)
         mean_df = mean_df.dropna(how="all")
         only_plots(mean_df, save_plot=True, save_dir=save_dir, edf_pickle_name="ALL_PATIENTS", band=band, step_sec=step_sec)
@@ -518,6 +531,17 @@ def group_edf_files_by_patient(edf_root="pickles/EDF"):
     Walk pickle directory and group .pkl file paths by patient_id extracted via regex (\d{4}-\d{3}).
     """
     patient_to_files = {}
+    
+    if os.path.isfile(edf_root):
+        if edf_root.lower().endswith(".pkl"):
+            m = re.search(r'(\d{4}-\d{3})', edf_root)
+            if m:
+                pid = m.group(1)
+            else:
+                pid = os.path.basename(edf_root).split('.')[0]
+            patient_to_files.setdefault(pid, []).append(edf_root)
+        return patient_to_files
+
     for root, dirs, files in os.walk(edf_root):
         for file in files:
             if not file.lower().endswith(".pkl"):
@@ -538,6 +562,17 @@ def group_edf_files_by_patient_edf(edf_root="EDF_Format/EDF"):
     Walk EDF directory and group .edf file paths by patient_id extracted via regex (\d{4}-\d{3}).
     """
     patient_to_files = {}
+    
+    if os.path.isfile(edf_root):
+        if edf_root.lower().endswith(".edf"):
+            m = re.search(r'(\d{4}-\d{3})', edf_root)
+            if m:
+                pid = m.group(1)
+            else:
+                pid = os.path.basename(edf_root).split('.')[0]
+            patient_to_files.setdefault(pid, []).append(edf_root)
+        return patient_to_files
+
     for root, dirs, files in os.walk(edf_root):
         for file in files:
             if not file.lower().endswith(".edf"):
@@ -557,7 +592,8 @@ def edf_has_ecg(edf_path):
     """
     Check whether a pickled MNE Raw object (.pkl) contains an ECG channel.
     """
-    import sys, mne.io.array
+    import sys
+    import mne.io.array
     sys.modules['mne.io.array.array'] = mne.io.array
     try:
         with open(edf_path, 'rb') as f:
@@ -603,7 +639,8 @@ def detect_ecg_channels_from_data(raw, sfreq=None):
     - Amplitude: 0.2-2 mV (ECG) vs 10-100 µV (EEG)
     - Channel must meet ALL criteria to be classified as ECG
     """
-    import sys, mne.io.array
+    import sys
+    import mne.io.array
     sys.modules['mne.io.array.array'] = mne.io.array
     # clean data; resample 256, notch 50, bandpass 0.5-40
     sf = 256
@@ -672,7 +709,7 @@ def detect_ecg_channels_from_data(raw, sfreq=None):
                 metrics['heart_rate_bpm'] = None
                 metrics['peak_count'] = 0
                 
-        except Exception as e:
+        except Exception:
             metrics['heart_rate_bpm'] = None
             metrics['peak_count'] = 0
         
@@ -729,7 +766,8 @@ def load_raws(file_list):
     Load pickled MNE Raw objects from .pkl files.
     """
     raws = []
-    import sys, mne.io.array
+    import sys
+    import mne.io.array
     sys.modules['mne.io.array.array'] = mne.io.array
     for fp in file_list:
         try:
@@ -740,79 +778,6 @@ def load_raws(file_list):
         except Exception as e:
             print(f"Error loading {fp}: {e}")
     return raws
-
-def process_patients_random6(edf_root="EDF", k=6, step_sec=5, seed=42):
-    """
-    For each patient_id:
-      - find all their EDF files,
-      - randomly select up to k EDFs that contain an ECG channel,
-      - load those k files (only), and
-      - run compute_brain_heart_coupling with data_all as that list of Raw objects.
-    """
-    # get form edf_root the project name the is after the last /
-    project_name = edf_root.split('/')[-1]
-    # get TEMPS_DIR from globals
-    TEMPS_DIR = globals()['TEMPS_DIR']
-    TEMPS_DIR = os.path.join(TEMPS_DIR, project_name)
-    patient_to_files = group_edf_files_by_patient(edf_root=edf_root)
-    if not patient_to_files:
-        print(f"No EDF files found under {edf_root}.")
-        return
-    
-    # Check which patients are already processed
-    processed_patients = get_processed_patients(temps_dir=TEMPS_DIR)
-    if processed_patients:
-        print(f"Already processed patients: {', '.join(processed_patients)}")
-    else:
-        print("No patients have been processed yet.")
-
-    for patient_id, files in sorted(patient_to_files.items()):
-        print(f"Patient {patient_id}: {len(files)} PKL files found.")
-        
-        # Check if patient was already processed
-        logger.info(f"[random] Patient {patient_id}: started processing")
-        if is_patient_processed(patient_id, temps_dir=TEMPS_DIR):
-            print(f"Patient {patient_id}: already processed (parquet files exist). Skipping.")
-            logger.info(f"[random] Patient {patient_id}: already processed. Skipping.")
-            continue
-        
-        selected = select_random_edfs_with_ecg(files, k=k, seed=seed)
-        if len(selected) == 0:
-            print(f"Patient {patient_id}: no PKLs with ECG channel. Skipping.")
-            logger.info(f"[random] Patient {patient_id}: no PKLs with ECG channel. Skipping.")
-            continue
-        print(f"Patient {patient_id}: selected {len(selected)} PKLs for processing.")
-        raws = load_raws(selected)
-        if len(raws) == 0:
-            print(f"Patient {patient_id}: failed to load selected PKLs. Skipping.")
-            logger.warning(f"[random] Patient {patient_id}: failed to load selected PKLs. Skipping.")
-            continue
-
-        try:
-            results_df_dict = compute_brain_heart_coupling(
-                data_all=raws,
-                patient_id=patient_id,
-                bool_plots=False,
-                save_plot=True,
-                step_sec=step_sec
-            )
-
-            # Save averaged results per band for this patient
-            for band, results_df in results_df_dict.items():
-                results_path = os.path.join(TEMPS_DIR, f"{patient_id}_results_{band}.parquet")
-                print(f"Saving results for patient {patient_id}, band {band} to {results_path}")
-                # create the directory if it doesn't exist
-                os.makedirs(os.path.dirname(results_path), exist_ok=True)
-                results_df.to_parquet(results_path, index=False)
-                
-            logger.info(f"[random] Patient {patient_id}: successfully finished processing.")
-            
-        except Exception as e:
-            logger.error(f"[random] Patient {patient_id}: CRASHED during processing. Error: {e}", exc_info=True)
-
-    # Aggregate across all patients
-    plot_all_patients_band_means(bands=power_bands.keys(), step_sec=step_sec, temps_dir=TEMPS_DIR, save_dir=SAVE_DIR)
-    print("All processing and plotting complete.")
 
 def smooth_sleep_stages(predicted_stages):
     """
@@ -848,7 +813,7 @@ def smooth_sleep_stages(predicted_stages):
              
     return smooth_stages
 
-def process_patients_n1_stage_hep(edf_root="EDF_Format/EDF", step_sec=5, n1_duration_min=1, stage='N1'):
+def process_patients_n1_stage_hep(edf_root="EDF_Format/EDF", step_sec=5, n1_duration_min=10, stage='N1'):
     """
     For each patient_id:
       - find all their EDF files from EDF_Format/EDF directory,
@@ -867,17 +832,15 @@ def process_patients_n1_stage_hep(edf_root="EDF_Format/EDF", step_sec=5, n1_dura
     step_sec : int
         Step size in seconds for sliding window analysis
     n1_duration_min : int
-        Duration of stage segments to extract in minutes (default: 1)
+        Duration of stage segments to extract in minutes (default: 10)
     stage : str
         Sleep stage to extract (N1, N2, N3, R, or W) (default: N1)
     """
     import yasa
-    import mne
-    import importlib.util
     clean_mne_raw = edf_cleaning.clean_mne_raw
     
-    # Get project name from edf_root
-    project_name = edf_root.split('/')[-1]
+    # Get project name from edf_root (the first folder from EDF_Format)
+    project_name = get_project_name(edf_root)
     # Get TEMPS_DIR from globals
     TEMPS_DIR = globals()['TEMPS_DIR']
     TEMPS_DIR = os.path.join(TEMPS_DIR, f"{project_name}_{stage}")
@@ -896,7 +859,7 @@ def process_patients_n1_stage_hep(edf_root="EDF_Format/EDF", step_sec=5, n1_dura
         print("No patients have been processed yet.")
 
     # patient_to_files flip order
-    patient_to_files = dict(sorted(patient_to_files.items(), key=lambda x: x[0], reverse=True))
+    patient_to_files = dict(sorted(patient_to_files.items(), key=lambda x: x[0], reverse=False))
     
     # Diagnostic tracking
     patient_stats = {
@@ -924,12 +887,12 @@ def process_patients_n1_stage_hep(edf_root="EDF_Format/EDF", step_sec=5, n1_dura
     }
     
     for patient_id, files in patient_to_files.items():
-        print(f"Patient {patient_id}: {len(files)} EDF files found.")
+        logger.info(f"[{stage}] Patient {patient_id}: {len(files)} EDF files found.")
         logger.info(f"[{stage}] Patient {patient_id}: started processing")
         
         # Check if patient was already processed
-        if is_patient_processed(patient_id, temps_dir=TEMPS_DIR):
-            print(f"Patient {patient_id}: already processed (parquet files exist). Skipping.")
+        if is_patient_processed(f"{patient_id}_{stage}", temps_dir=TEMPS_DIR):
+            logger.warning(f"[{stage}] Patient {patient_id}: already processed (parquet files exist). Skipping.")
             logger.info(f"[{stage}] Patient {patient_id}: already processed. Skipping.")
             patient_stats['skipped_already_processed'] += 1
             continue
@@ -970,11 +933,11 @@ def process_patients_n1_stage_hep(edf_root="EDF_Format/EDF", step_sec=5, n1_dura
             files = []
 
         for file_path in files:
-            print(f"Processing {file_path} for {stage} sleep stages...")
+            logger.info(f"[{stage}] Processing {file_path} for {stage} sleep stages...")
             
             try:
                 # Load the EDF file using mne
-                raw = mne.io.read_raw_edf(file_path, preload=True)
+                raw = mne.io.read_raw_edf(file_path, preload=True, encoding='latin1')
                 # do notch 50 and low pass high pass
                 raw.notch_filter(np.arange(50, raw.info['sfreq']/2, 50))
                 raw.filter(l_freq=0.5, h_freq=raw.info['sfreq']/2 - 0.1)
@@ -983,11 +946,10 @@ def process_patients_n1_stage_hep(edf_root="EDF_Format/EDF", step_sec=5, n1_dura
                 # resample to 256 Hz
                 raw.resample(256)
                 raw = rename_channels(raw)
-                # Check if file has ECG channel
-                ch_lower = [ch.lower() for ch in raw.ch_names]
+                ch_lower = [ch.lower() for ch in raw.ch_names]                
                 ecg_indices = [i for i, ch in enumerate(ch_lower) if 'ecg' in ch or 'ekg' in ch]
                 if not ecg_indices:
-                    print(f"No ECG channel found in {file_path}. Skipping.")
+                    logger.warning(f"[{stage}] No ECG channel found in {file_path}. Skipping.")
                     patient_file_stats['no_ecg'] += 1
                     patient_stats['file_level_stats']['no_ecg'] += 1
                     continue
@@ -996,79 +958,155 @@ def process_patients_n1_stage_hep(edf_root="EDF_Format/EDF", step_sec=5, n1_dura
                 # Find the best channels for sleep staging
                 available_eeg_channels = [ch for ch in raw.ch_names if ch in eeg_channels]
                 if not available_eeg_channels:
-                    print(f"No suitable EEG channels found in {file_path}. Skipping.")
+                    logger.warning(f"[{stage}] No suitable EEG channels found in {file_path}. Skipping.")
                     patient_file_stats['no_eeg'] += 1
                     patient_stats['file_level_stats']['no_eeg'] += 1
                     continue
                 
-                # Select optimal EEG channel (prefer central electrodes like C3, C4, Cz)
-                central_eeg_channels = ['Cz','C3', 'C4']
-                eeg_name = None
-                for ch in central_eeg_channels:
-                    if ch in available_eeg_channels:
-                        eeg_name = ch
-                        break
-                
-                # If no central electrode, use the first available EEG channel
-                if eeg_name is None:
-                    eeg_name = available_eeg_channels[0]
-                
-                print(f"Using EEG channel: {eeg_name}")
-                
-                # Find EOG channel
+                # Resolve EOG channel
                 eog_name = None
                 if 'EOG+' in raw.ch_names:
                     eog_name = 'EOG+'
-                    print(f"Using EOG channel: {eog_name}")
                 else:
-                    # Check for LOC/ROC
                     loc = 'LOC' if 'LOC' in raw.ch_names else None
                     roc = 'ROC' if 'ROC' in raw.ch_names else None
-                    
                     if loc and roc:
-                        # make a new channel loc-roc
                         raw = mne.set_bipolar_reference(raw, anode=[loc], cathode=[roc], ch_name=['LOC-ROC'], drop_refs=False)
                         eog_name = 'LOC-ROC'
-                        print(f"Created and using bipolar EOG channel: {eog_name}")
                     elif loc:
                         eog_name = loc
-                        print(f"Using EOG channel: {eog_name}")
                     elif roc:
                         eog_name = roc
-                        print(f"Using EOG channel: {eog_name}")
-                    else:
-                        print("No EOG channel found")
-                
-                # Find EMG channel (prefer EMG1+ over EMG2+)
+                logger.debug(f"[{stage}] EOG channel: {eog_name}")
+
+                # Resolve EMG channel
                 emg_name = None
                 if 'EMG1+' in raw.ch_names:
                     emg_name = 'EMG1+'
-                    print(f"Using EMG channel: {emg_name}")
                 elif 'EMG2+' in raw.ch_names:
                     emg_name = 'EMG2+'
-                    print(f"Using EMG channel: {emg_name}")
-                else:
-                    print("No EMG channel found")
-                
-                # Run YASA sleep staging on the raw (uncleaned) data with all available channels
-                print(f"Running YASA sleep staging on {file_path}...")
-                ss = yasa.SleepStaging(raw, eeg_name=eeg_name, eog_name=eog_name, emg_name=emg_name)
-                predicted_stages = ss.predict()
-                # print how many epochs of each stage
-                print(f"Predicted stages counts: {pd.Series(predicted_stages).value_counts().to_dict()}")
-                
+                logger.debug(f"[{stage}] EMG channel: {emg_name}")
+
+                # Run YASA sleep staging — retry with next electrode if streak too short
+                logger.info(f"[{stage}] Running YASA sleep staging on {file_path}...")
+
+                def find_longest_stage_streak(stage_epochs, max_gap=3):
+                    """Longest continuous streak of stage epochs (gaps up to max_gap allowed)."""
+                    if len(stage_epochs) == 0:
+                        return None, 0
+                    longest_start = None
+                    longest_length = 0
+                    current_start = stage_epochs[0]
+                    current_length = 1
+                    current_end = stage_epochs[0]
+                    for i in range(1, len(stage_epochs)):
+                        gap = stage_epochs[i] - current_end
+                        if gap <= max_gap + 1:
+                            current_length += 1
+                            current_end = stage_epochs[i]
+                        else:
+                            if current_length > longest_length:
+                                longest_start = current_start
+                                longest_length = current_length
+                            current_start = stage_epochs[i]
+                            current_length = 1
+                            current_end = stage_epochs[i]
+                    if current_length > longest_length:
+                        longest_start = current_start
+                        longest_length = current_length
+                    return longest_start, longest_length
+
+                # Build ordered candidate list (same logic as run_yasa_staging)
+                ordered = [ch for ch in _YASA_EEG_PRIORITY if ch in available_eeg_channels]
+                remainder = [ch for ch in available_eeg_channels if ch not in ordered]
+                eeg_candidates = ordered + remainder
+
+                tried_electrodes = []
+                raw_staged = None
+                eeg_name = None
+                predicted_stages = None
+                stage_segments_in_file = None  # will be set once a valid electrode is found
+
+                for candidate in eeg_candidates:
+                    try:
+                        logger.debug(f"[{stage}] Trying EEG electrode: {candidate}")
+                        raw_try = prep_for_yasa(raw=raw.copy(), eeg_name=candidate)
+                        ss = yasa.SleepStaging(raw_try, eeg_name=candidate,
+                                               eog_name=eog_name, emg_name=emg_name)
+                        preds = ss.predict()
+                    except Exception as exc:
+                        logger.warning(f"[{stage}] YASA failed with '{candidate}': {exc}")
+                        tried_electrodes.append(candidate)
+                        continue
+
+                    smooth = smooth_sleep_stages(preds)
+
+                    if stage == 'W':
+                        # W handling — accept any result (W segments found later)
+                        raw_staged = raw_try
+                        eeg_name = candidate
+                        predicted_stages = preds
+                        logger.info(f"[{stage}] Accepted electrode '{candidate}' for W staging.")
+                        break
+
+                    # Non-W: check streak length
+                    s_epochs = np.where(smooth == stage)[0]
+                    if len(s_epochs) == 0:
+                        logger.warning(f"[{stage}] No {stage} epochs with electrode '{candidate}'. Trying next.")
+                        tried_electrodes.append(candidate)
+                        continue
+
+                    lon_start, lon_len = find_longest_stage_streak(s_epochs)
+                    epoch_duration_sec = 30
+                    min_stage_epochs = int(n1_duration_min * 60 / epoch_duration_sec)
+
+                    if lon_len >= min_stage_epochs:
+                        raw_staged = raw_try
+                        eeg_name = candidate
+                        predicted_stages = preds
+                        seg_start = lon_start * epoch_duration_sec
+                        seg_end   = (lon_start + lon_len) * epoch_duration_sec
+                        stage_segments_in_file = [(seg_start, seg_end)]
+                        logger.info(
+                            f"[{stage}] Electrode '{candidate}': longest streak "
+                            f"{lon_len} epochs ({lon_len * epoch_duration_sec / 60:.1f} min). Accepted."
+                        )
+                        break
+                    else:
+                        logger.warning(
+                            f"[{stage}] Electrode '{candidate}': longest streak "
+                            f"{lon_len} epochs ({lon_len * epoch_duration_sec / 60:.1f} min) "
+                            f"< required {n1_duration_min} min. Trying next electrode."
+                        )
+                        tried_electrodes.append(candidate)
+
+                if raw_staged is None or predicted_stages is None:
+                    logger.warning(
+                        f"[{stage}] All electrodes exhausted for {file_path}. "
+                        f"Tried: {tried_electrodes}. Skipping."
+                    )
+                    patient_file_stats['too_short'] += 1
+                    patient_stats['file_level_stats']['too_short'] += 1
+                    continue
+
+                raw = raw_staged
+                smooth_stages = smooth_sleep_stages(predicted_stages)
+                logger.info(f"[{stage}] Final electrode: '{eeg_name}'. "
+                            f"Stage counts: {pd.Series(predicted_stages).value_counts().to_dict()}")
+
+
                 # Special handling for W: select 10 min of Wake right after the last adequate non-W run
                 
                 # --- Smoothing: Merge short runs (< 3 epochs) into the prior run ---
                 # Apply smoothing for ALL cases as requested
-                smooth_stages = smooth_sleep_stages(predicted_stages)
+                # smooth_stages = smooth_sleep_stages(predicted_stages) # Already done above
 
                 if stage == 'W':
                     # YASA uses 30-second epochs by default
                     epoch_duration_sec = 30
                     # Require at least 5 minutes of any non-W stage before the Wake segment
                     min_non_w_epochs = int(np.ceil(5 * 60 / epoch_duration_sec))
-                    min_w_epochs = int(np.ceil(10 * 60 / epoch_duration_sec))  # 10 minutes of W
+                    # min_w_epochs is not currently used
 
                     # Build runs of identical stages: (label, start_idx, length)
                     runs = []
@@ -1092,76 +1130,12 @@ def process_patients_n1_stage_hep(edf_root="EDF_Format/EDF", step_sec=5, n1_dura
                     # save in stage_segments_in_file the start sec and end sec of the W segments
                     stage_segments_in_file = [(run[1] * epoch_duration_sec, (run[1] + run[2]) * epoch_duration_sec) for run in runs if run[0] == 'W']
                 else:
-                    # Find specified sleep stage epochs (N1, N2, N3, R)
-                    stage_epochs = np.where(smooth_stages == stage)[0]
-
-                    if len(stage_epochs) == 0:
-                        print(f"No {stage} sleep stages found in {file_path}. Skipping.")
-                        patient_file_stats['no_stage'] += 1
-                        patient_stats['file_level_stats']['no_stage'] += 1
-                        continue
-                
-                # Find the longest continuous streak of stage epochs (allowing gaps of up to 3 epochs)
-                def find_longest_stage_streak(stage_epochs, max_gap=3):
-                    """Find the longest continuous streak of stage epochs, allowing gaps of up to max_gap epochs."""
-                    if len(stage_epochs) == 0:
-                        return None, 0
-                    
-                    longest_start = None
-                    longest_length = 0
-                    current_start = stage_epochs[0]
-                    current_length = 1
-                    current_end = stage_epochs[0]
-                    
-                    for i in range(1, len(stage_epochs)):
-                        gap = stage_epochs[i] - current_end
-                        
-                        if gap <= max_gap + 1:  # Allow gap of up to max_gap epochs
-                            # Still part of the same streak
-                            current_length += 1
-                            current_end = stage_epochs[i]
-                        else:
-                            # Gap too large, check if this is the longest streak
-                            if current_length > longest_length:
-                                longest_start = current_start
-                                longest_length = current_length
-                            
-                            # Start new streak
-                            current_start = stage_epochs[i]
-                            current_length = 1
-                            current_end = stage_epochs[i]
-                    
-                    # Check the last streak
-                    if current_length > longest_length:
-                        longest_start = current_start
-                        longest_length = current_length
-                    
-                    return longest_start, longest_length
-                
-                if stage != 'W':
-                    # Find the longest stage streak
-                    longest_start, longest_length = find_longest_stage_streak(stage_epochs)
-                    
-                    if longest_start is None or longest_length == 0:
-                        print(f"No continuous {stage} epochs found in {file_path}. Skipping.")
+                    # For non-W stages, stage_segments_in_file is already set by the retry loop
+                    # If it's still None, it means no suitable segment was found even after retries
+                    if stage_segments_in_file is None or len(stage_segments_in_file) == 0:
+                        print(f"No continuous {stage} epochs found in {file_path} after electrode retry. Skipping.")
                         patient_file_stats['no_continuous'] += 1
                         patient_stats['file_level_stats']['no_continuous'] += 1
-                        continue
-                    
-                    # YASA uses 30-second epochs by default
-                    epoch_duration_sec = 30
-                    min_stage_epochs = int(n1_duration_min * 60 / epoch_duration_sec)
-                    
-                    # Check if the longest streak meets the minimum duration requirement
-                    if longest_length >= min_stage_epochs:
-                        segment_start_sec = longest_start * epoch_duration_sec
-                        segment_end_sec = (longest_start + longest_length) * epoch_duration_sec
-                        stage_segments_in_file = [(segment_start_sec, segment_end_sec)]
-                        print(f"Found longest {stage} streak: {longest_length} epochs ({longest_length * epoch_duration_sec / 60:.1f} minutes) in {file_path}")
-                    else:
-                        print(f"Longest {stage} streak ({longest_length} epochs, {longest_length * epoch_duration_sec / 60:.1f} minutes) is shorter than required {n1_duration_min} minutes in {file_path}. Skipping.")
-                        patient_file_stats['too_short'] += 1
-                        patient_stats['file_level_stats']['too_short'] += 1
                         continue
                 
                 # Crop the raw data to stage segments, clean them, and add to list
@@ -1171,8 +1145,18 @@ def process_patients_n1_stage_hep(edf_root="EDF_Format/EDF", step_sec=5, n1_dura
                         raw_stage = raw.copy().crop(tmin=start_sec, tmax=end_sec)
                         
                         # Apply cleaning to the stage segment
-                        print(f"Cleaning {stage} segment: {start_sec:.1f}s - {end_sec:.1f}s ({end_sec-start_sec:.1f}s minutes: {(end_sec-start_sec)/60:.1f} minutes)")
-                        raw_stage_cleaned = clean_mne_raw(raw_stage,file_path)
+                        original_duration = raw_stage.times[-1] if len(raw_stage.times) > 0 else 0
+                        logger.info(f"[{stage}] Cleaning {stage} segment: {start_sec:.1f}s - {end_sec:.1f}s (Duration: {original_duration/60:.1f} min)")
+                        
+                        raw_stage_cleaned = clean_mne_raw(raw_stage, file_path)
+                        
+                        if raw_stage_cleaned is not None:
+                            cleaned_duration = raw_stage_cleaned.times[-1] if len(raw_stage_cleaned.times) > 0 else 0
+                            snipped_sec = original_duration - cleaned_duration
+                            snipped_pct = (snipped_sec / original_duration * 100) if original_duration > 0 else 0
+                            logger.info(f"[{stage}] Cleaned segment. Snipped {snipped_sec:.1f}s ({snipped_pct:.1f}%). Remaining: {cleaned_duration/60:.1f} min")
+                        else:
+                            logger.error(f"[{stage}] clean_mne_raw returned None for {file_path}")
                         
                         # Save the cleaned MNE raw object to pickle
                         duration = int(end_sec - start_sec)
@@ -1182,7 +1166,7 @@ def process_patients_n1_stage_hep(edf_root="EDF_Format/EDF", step_sec=5, n1_dura
                         pickle_path = os.path.join(pickle_dir, pickle_filename)
                         with open(pickle_path, 'wb') as f:
                             pickle.dump(raw_stage_cleaned, f)
-                        print(f"Saved cleaned MNE raw to {pickle_path}")
+                        logger.info(f"[{stage}] Saved cleaned MNE raw to {pickle_path}")
                         
                         stage_segments.append(raw_stage_cleaned)
                         patient_file_stats['successful'] += 1
@@ -1267,6 +1251,9 @@ def process_patients_n1_stage_hep(edf_root="EDF_Format/EDF", step_sec=5, n1_dura
             continue
         
         print(f"Patient {patient_id}: found {len(stage_segments)} {stage} segments for processing.")
+        if len(stage_segments) > 3:
+            stage_segments = sorted(stage_segments, key=lambda r: r.n_times, reverse=True)[:3]
+            print(f"Patient {patient_id}: keeping longest 3 segments out of original set.")
         patient_stats['processed'] += 1
         
         try:
@@ -1304,7 +1291,7 @@ def process_patients_n1_stage_hep(edf_root="EDF_Format/EDF", step_sec=5, n1_dura
     print(f"Patients skipped (already processed): {patient_stats['skipped_already_processed']}")
     print(f"Patients skipped (no {stage} segments found): {patient_stats['skipped_no_segments']}")
     print(f"\n{'='*80}")
-    print(f"PATIENT-LEVEL FILTER BREAKDOWN (why patients were filtered):")
+    print("PATIENT-LEVEL FILTER BREAKDOWN (why patients were filtered):")
     print(f"{'='*80}")
     print(f"  Patients filtered - No ECG channel (all files): {patient_stats['patient_filter_reasons']['no_ecg']}")
     print(f"  Patients filtered - No suitable EEG channels (all files): {patient_stats['patient_filter_reasons']['no_eeg']}")
@@ -1314,7 +1301,7 @@ def process_patients_n1_stage_hep(edf_root="EDF_Format/EDF", step_sec=5, n1_dura
     print(f"  Patients filtered - Processing errors (all files): {patient_stats['patient_filter_reasons']['processing_error']}")
     print(f"  Patients filtered - Mixed reasons (multiple different failures): {patient_stats['patient_filter_reasons']['mixed']}")
     print(f"\n{'='*80}")
-    print(f"FILE-LEVEL FILTERING STATISTICS (across all patients):")
+    print("FILE-LEVEL FILTERING STATISTICS (across all patients):")
     print(f"{'='*80}")
     print(f"  Files skipped - No ECG channel: {patient_stats['file_level_stats']['no_ecg']}")
     print(f"  Files skipped - No suitable EEG channels: {patient_stats['file_level_stats']['no_eeg']}")
@@ -1332,6 +1319,22 @@ def rename_edfs_to_upper(edf_root):
     """
     print(f"Checking for lowercase filenames (renaming to uppercase) in {edf_root}...")
     count = 0
+    
+    if os.path.isfile(edf_root):
+        file = os.path.basename(edf_root)
+        if file.lower().endswith(".edf") and file != file.upper():
+            root = os.path.dirname(edf_root)
+            new_name = file.upper()
+            new_path = os.path.join(root, new_name)
+            if not os.path.exists(new_path):
+                try:
+                    os.rename(edf_root, new_path)
+                    print(f"Renamed: {file} -> {new_name}")
+                    return new_path
+                except Exception as e:
+                    print(f"Failed to rename {edf_root} -> {new_path}: {e}")
+        return edf_root
+
     # Walk top-down so we can rename files inside directories
     for root, dirs, files in os.walk(edf_root):
         for file in files:
@@ -1357,13 +1360,179 @@ def rename_edfs_to_upper(edf_root):
                         print(f"Failed to rename {old_path} -> {new_path}: {e}")
 
     print(f"Renamed {count} files to uppercase.")
+    return edf_root
+
+# YASA-recommended EEG channel priority (central > frontal > parietal > occipital)
+_YASA_EEG_PRIORITY = [
+    'Cz', 'C3', 'C4',           # central (best for YASA)
+    'Fz', 'F3', 'F4',           # frontal
+    'Pz', 'P3', 'P4',           # parietal
+    'Oz', 'O1', 'O2',           # occipital
+    'F7', 'F8', 'T3', 'T4',     # temporal / lateral
+    'T5', 'T6', 'P7', 'P8',
+]
+
+
+def run_yasa_staging(raw, available_eeg_channels, eog_name, emg_name, stage):
+    """
+    Try YASA sleep staging with EEG channels in priority order.
+
+    For each candidate channel (ordered by _YASA_EEG_PRIORITY, then whatever
+    is left in available_eeg_channels):
+      1. Apply prep_for_yasa() on a *copy* of raw so other channels are untouched.
+      2. Run yasa.SleepStaging and ss.predict().
+      3. If it succeeds, return (raw_prepped, eeg_name_used, predicted_stages).
+      4. If it fails, log the error and try the next channel.
+
+    Returns None if every channel fails.
+    """
+    # Build an ordered candidate list: priority channels first, remainder after
+    ordered = [ch for ch in _YASA_EEG_PRIORITY if ch in available_eeg_channels]
+    remainder = [ch for ch in available_eeg_channels if ch not in ordered]
+    candidates = ordered + remainder
+
+    for eeg_name in candidates:
+        try:
+            logger.debug(f"[{stage}] Trying EEG channel for YASA: {eeg_name}")
+            raw_try = prep_for_yasa(raw=raw.copy(), eeg_name=eeg_name)
+            ss = yasa.SleepStaging(raw_try, eeg_name=eeg_name,
+                                    eog_name=eog_name, emg_name=emg_name)
+            predicted_stages = ss.predict()
+            logger.info(f"[{stage}] YASA succeeded with EEG channel: {eeg_name}")
+            return raw_try, eeg_name, predicted_stages
+        except Exception as exc:
+            logger.warning(
+                f"[{stage}] YASA failed with EEG channel '{eeg_name}': {exc}. "
+                "Trying next channel..."
+            )
+
+    logger.error(f"[{stage}] All EEG channels exhausted — YASA staging failed.")
+    return None
+
+
+def prep_for_yasa(raw, eeg_name):
+    """
+    Checks and fixes amplitude scaling and filtering on the EEG channel
+    in-place on `raw` to optimise YASA sleep staging.
+    Returns the modified `raw` object (same instance, channel replaced).
+    """
+    # 1. Ensure data is in memory – required for in-place resampling / filtering.
+    if not raw.preload:
+        logger.debug("[prep_for_yasa] Data not preloaded – loading now.")
+        raw.load_data()
+    # 1. Work on a single-channel copy for scaling / filtering
+    raw_prep = raw.copy().pick_channels([eeg_name])
+    data = raw.get_data(picks=[eeg_name]).squeeze()  # (n_times,)
+
+    # Robust amplitude estimate: 99th–1st percentile avoids rail/clip artefacts
+    amplitude = float(np.percentile(data, 99) - np.percentile(data, 1))
+
+    if amplitude <= 0:
+        logger.warning(f"[_infer_and_fix_eeg_units] '{eeg_name}' appears flat, skipping.")
+        return
+
+    log_amp = np.log10(amplitude)
+
+    # Log-space centroids for each unit assumption
+    centroids = {
+        "V":  np.log10(1e-4),   # -4.0
+        "mV": np.log10(1e-1),   # -1.0
+        "µV": np.log10(1e+2),   # +2.0
+    }
+    scales = {"V": 1, "mV": 1e-3, "µV": 1e-6}
+
+    detected = min(centroids, key=lambda u: abs(log_amp - centroids[u]))
+    distance = abs(log_amp - centroids[detected])
+
+    logger.debug(
+        f"[_infer_and_fix_eeg_units] '{eeg_name}' robust p-p={amplitude:.2e}, "
+        f"log10={log_amp:.2f} → nearest centroid: {detected} (dist={distance:.2f} decades)"
+    )
+
+    if distance > 1.4:
+        # More than halfway to the next centroid — something is genuinely odd
+        logger.warning(
+            f"[_infer_and_fix_eeg_units] '{eeg_name}' amplitude={amplitude:.2e} is "
+            f"{distance:.1f} log-decades from '{detected}' centroid. "
+            "Data may be heavily artefacted or the unit is unexpected. Proceeding anyway."
+        )
+
+    if scales[detected] is None:
+        logger.debug(f"[_infer_and_fix_eeg_units] Already in V – no rescaling needed.")
+        
+
+    logger.warning(
+        f"[_infer_and_fix_eeg_units] Detected {detected} "
+        f"(amplitude={amplitude:.2e}), rescaling by {scales[detected]:.0e} → V."
+    )
+    raw.apply_function(lambda x: x * scales[detected], picks="all", channel_wise=False)
+    # 3. FIX FILTERING: apply standard sleep bandpass (0.3 – 35 Hz)
+    print("[*] Applying bandpass filter (0.1 - 40 Hz)")
+    raw_prep.filter(l_freq=0.1, h_freq=40, fir_design='firwin', verbose=False)
+
+    # 4. Write the prepared channel back into the original Raw object
+    ch_idx = raw.ch_names.index(eeg_name)
+    raw._data[ch_idx, :] = raw_prep.get_data()[0, :]
+    # resample raw to 100hz
+    raw.resample(100)
+    return raw
+    raw.info['sfreq']    
+
+def clean_duplicate_pickles(base_dir="pickles_sleep_stage"):
+    """
+    Remove duplicate patient pickles from the same sleep stage,
+    keeping only the one with the longest duration.
+    A patient is considered the same if their ID after an optional hyphen matches.
+    """
+    files = glob.glob(os.path.join(base_dir, "**", "*.pkl"), recursive=True)
+    groups = {}
+    for f in files:
+        basename = os.path.basename(f)
+        parts = basename.replace('.pkl', '').split('_')
+        if len(parts) < 4:
+            continue
+        
+        stage = parts[-3]
+        try:
+            duration = int(parts[-2])
+        except ValueError:
+            continue
+            
+        bare_patient_id = "_".join(parts[:-3])
+        
+        # Canonical patient ID: if there's a hyphen, take the part after it.
+        if '-' in bare_patient_id:
+            canon_id = bare_patient_id.split('-')[-1]
+        else:
+            canon_id = bare_patient_id
+            
+        # Group by canonical ID, stage, and the parent directory to avoid cross-project merging
+        key = (canon_id, stage, os.path.dirname(f))
+        groups.setdefault(key, []).append((duration, f, bare_patient_id))
+        
+    for key, items in groups.items():
+        if len(items) > 1:
+            # Sort by duration descending
+            items.sort(key=lambda x: x[0], reverse=True)
+            logger.info(f"Cleaning duplicates for patient {key[0]} in stage {key[1]}:")
+            print(f"Cleaning duplicates for patient {key[0]} in stage {key[1]}:")
+            logger.info(f"  Keeping: {items[0][1]} (duration={items[0][0]})")
+            print(f"  Keeping: {items[0][1]} (duration={items[0][0]})")
+            for item in items[1:]:
+                logger.info(f"  Removing: {item[1]} (duration={item[0]})")
+                print(f"  Removing: {item[1]} (duration={item[0]})")
+                try:
+                    os.remove(item[1])
+                except Exception as e:
+                    logger.error(f"  Failed to remove {item[1]}: {e}")
+                    print(f"  Failed to remove {item[1]}: {e}")
 
 # ------------------------------------------------------------------------------
 # Entry point
 # ------------------------------------------------------------------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Process EDF files for brain-heart coupling analysis')
-    parser.add_argument('-c', '--edf_root', type=str, default="EDF_Format/Berkeley_ANTT",
+    parser.add_argument('-c', '--edf_root', type=str, default="EDF_Format/Seeg",
                         help='Root directory containing EDF files (default: EDF_Format/EDF)')
     parser.add_argument('--mode', type=str, choices=['random', 'stage'], default='stage',
                         help='Processing mode: random (select k random files) or stage (extract selected sleep stages)')
@@ -1373,22 +1542,33 @@ if __name__ == "__main__":
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed for reproducible file selection (default: 42)')
     # Controls for N1 mode
-    parser.add_argument('--n1_duration_min', type=int, default=1,
-                        help='Duration of stage segments to extract in minutes (default: 1)')
-    parser.add_argument('--stage', type=str, choices=['N1', 'N2', 'N3', 'R', 'W'], default='R',
+    parser.add_argument('--n1_duration_min', type=int, default=10,
+                        help='Duration of stage segments to extract in minutes (default: 10)')
+    parser.add_argument('--stage', type=str, choices=['N1', 'N2', 'N3', 'R', 'W'], default='N3',
                         help='Sleep stage to extract (N1, N2, N3, R, or W) (default: N2)')
     # Common controls
     parser.add_argument('-s', '--step_sec', type=int, default=5,
                         help='Step size in seconds for sliding window (default: 5)')
     
     args = parser.parse_args()
+
+    # Setup run-specific logger
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    project_name = get_project_name(args.edf_root)
+    run_log_filename = f"logs/run_{project_name}_{args.mode}_{args.stage}_{timestamp}.log"
+    
+    run_handler = logging.FileHandler(run_log_filename)
+    run_handler.setLevel(logging.DEBUG)
+    run_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+    logger.addHandler(run_handler)
+    
+    logger.info(f"--- STARTED NEW RUN ---")
+    logger.info(f"Arguments: {vars(args)}")
+
+    # Clean duplicates in pickles_sleep_stage before processing
+    clean_duplicate_pickles("pickles_sleep_stage")
     
     # Rename .edf files to uppercase
-    rename_edfs_to_upper(args.edf_root)
+    args.edf_root = rename_edfs_to_upper(args.edf_root)
 
-    if args.mode == 'random':
-        # RAM-conscious processing: k random PKLs per patient from specified edf_root
-        process_patients_random6(edf_root=args.edf_root, k=args.k_files, step_sec=args.step_sec, seed=args.seed)
-    elif args.mode == 'stage':
-        # Stage-specific sleep stage processing
-        process_patients_n1_stage_hep(edf_root=args.edf_root, step_sec=args.step_sec, n1_duration_min=args.n1_duration_min, stage=args.stage)
+    process_patients_n1_stage_hep(edf_root=args.edf_root, step_sec=args.step_sec, n1_duration_min=args.n1_duration_min, stage=args.stage)

@@ -10,24 +10,16 @@ import numpy as np
 import warnings
 import mne
 import re
-from multiprocessing import Pool, cpu_count
 from tqdm import tqdm
-import concurrent.futures
-from scipy.signal import spectrogram
 import pickle
 from autoreject import AutoReject
 from pyprep.prep_pipeline import PrepPipeline
 import matplotlib.pyplot as plt
-import yasa
 # sklearn.preprocessing.MinMaxScaler
-from sklearn.preprocessing import MinMaxScaler
-from sklearn.decomposition import PCA
 from contextlib import contextmanager
-from utils.eeg_utils import *
+from utils.eeg_utils import clean_df_demographics, read_edf_mne, rename_channels, raise_error, eeg_data_to_features
 import ray
-import argparse
 # Import and run the HEP processing
-from HEP_parquet_generation import process_patients_random6
 import glob
 
 @contextmanager
@@ -177,7 +169,7 @@ def controls_match(sexes,ages,controls_ratio=4):
             file_path= f'{directory}/{group}/{edf_files}'
             try:
                 metadata, raw = read_edf_mne(file_path)
-            except:
+            except Exception:
                 continue
             # check that duration min 
             if metadata['duration_min'] > 14:
@@ -202,7 +194,7 @@ def controls_match(sexes,ages,controls_ratio=4):
 def choose_controls_WNV(directory,controls_ratio=4):
     # read the WNV_merged_291224_KP.xlsx
     # list files in temps_west_nile_virus folder
-    wnv_files = os.listdir(f'temps_west_nile_virus')
+    wnv_files = os.listdir('temps_west_nile_virus')
     # remove .DS_Store
     wnv_files = [file for file in wnv_files if file != '.DS_Store']
     wnv_files = [file.split('.edf')[0] for file in wnv_files]
@@ -214,6 +206,13 @@ def choose_controls_WNV(directory,controls_ratio=4):
     wnv_files = [int(file) for file in wnv_files]
     # get df in column ID matches with wnv_files
     # print what wnv_files are not in df
+    if 'df_wnv' not in globals():
+        global df_wnv
+        try:
+            df_wnv = pd.read_excel('WNV_merged_291224_KP.xlsx')
+        except Exception:
+            df_wnv = pd.DataFrame(columns=['ID', 'age', 'sex'])
+
     print([file for file in wnv_files if file not in df_wnv['ID'].values])
     df_wnv2 = df_wnv[df_wnv['ID'].isin(wnv_files)]
     ages = df_wnv2['age']
@@ -225,7 +224,7 @@ def choose_controls_WNV(directory,controls_ratio=4):
     return good_files_df       
 
 def choose_controls_EDF(directory,controls_ratio=4):
-    edf_files = os.listdir(f'temps_EDF')
+    edf_files = os.listdir('temps_EDF')
     # remove .DS_Store
     edf_files = [file for file in edf_files if file != '.DS_Store']
     edf_files = [file.split('.edf')[0] for file in edf_files]
@@ -284,7 +283,7 @@ def plot_not_prod(raw,is_prod,filename):
     if not is_prod:
         fig = raw.plot(show=False)
         # make folder if not exist
-        os.makedirs(f'figures/data_cleaning', exist_ok=True)
+        os.makedirs('figures/data_cleaning', exist_ok=True)
         fig.savefig(f'figures/data_cleaning/{filename}.png')
         plt.close(fig)
 
@@ -370,7 +369,6 @@ def manual_epoch_rejection(epochs, filename):
 
 
 def clean_mne_raw(raw,filename):
-    channels = raw.ch_names
     raw = rename_channels(raw)
     plot_not_prod(raw,is_prod,'pre_clean1')
     # Clean data
@@ -412,10 +410,10 @@ def clean_mne_raw(raw,filename):
             else:
                 raise_error(e, f"Unexpected interpolation error for {filename}")
     except Exception as e:
-        print(f'--------------------------------------------------')
+        print('--------------------------------------------------')
         print(f'Error in PrepPipeline: {e} for file: {filename}')
-        print(f'Falling back to manual preprocessing...')
-        print(f'--------------------------------------------------')
+        print('Falling back to manual preprocessing...')
+        print('--------------------------------------------------')
         
         
         # Fallback: Manual bad channel detection and standard referencing
@@ -473,10 +471,10 @@ def clean_mne_raw(raw,filename):
         epochs_clean, reject_log = ar.fit_transform(epochs, return_log=True)
         print(f'[{filename}] AutoReject successfully applied')
     except Exception as e:
-        print(f'--------------------------------------------------')
+        print('--------------------------------------------------')
         print(f'Error in AutoReject: {e} for file: {filename}')
-        print(f'Falling back to manual epoch rejection...')
-        print(f'--------------------------------------------------')
+        print('Falling back to manual epoch rejection...')
+        print('--------------------------------------------------')
         
         # Fallback: Manual epoch rejection using variance and amplitude criteria
         epochs_clean = manual_epoch_rejection(epochs, filename)
@@ -519,7 +517,6 @@ def process_file(row,filename,is_prod):
         print(f'{file_name}.parquet already exists')
         return 
     if metadata:
-        channels = raw.ch_names
         # Check the duration of the recording
         duration_s = raw.times[-1]  # Convert duration to milliseconds
         # duration_skip = 3 * 60  # Skip recordings less than 10 minutes
@@ -541,7 +538,6 @@ def process_file(row,filename,is_prod):
             n_segments = int(np.ceil(duration_s / max_duration_s))
             for i in range(start_i, n_segments):
                 segment_filename = f'{file_name}_{max_duration_s}_{i + 1}.parquet'
-                raw_channels = raw.ch_names
                 if os.path.exists(f'{temp_dir}/{segment_filename}'):
                     continue
                 start = i * max_duration_s  # Start time in seconds
@@ -560,12 +556,12 @@ def process_file(row,filename,is_prod):
                     if conn_df is not None:
                         # If conn_df is a DataFrame, save directly; if it's a dict, convert to DataFrame first
                         if isinstance(conn_df, pd.DataFrame):
-                            out_df = conn_df
+                            pass
                         else:
                             try:
-                                out_df = pd.DataFrame(conn_df)
+                                pd.DataFrame(conn_df)
                             except Exception:
-                                out_df = None
+                                pass
                         # if out_df is not None and not out_df.empty:
                         #     temp_conn_dir = f"{temp_dir}_conn_df"
                         #     os.makedirs(temp_conn_dir, exist_ok=True)
@@ -594,7 +590,7 @@ def process_file(row,filename,is_prod):
                 # if file name in parquet
                 if row['file_name'] in df_parquet['file_name'].values:
                     return 
-            except:
+            except Exception:
                 pass
             eeg_metadata, conn_df = analyze_eeg_data(raw,is_prod,row["file_name"])
             if eeg_metadata is None:

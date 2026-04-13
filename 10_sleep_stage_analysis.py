@@ -1,22 +1,15 @@
 import streamlit as st
 import os
-st.set_page_config(layout="wide")
 import pickle
 import numpy as np
 import mne
 import neurokit2 as nk
 import matplotlib.pyplot as plt
-from scipy.ndimage import median_filter
 import pandas as pd
-from scipy.signal import welch
 
-# Optional pptx support
-try:
-    from pptx import Presentation
-    from pptx.util import Inches, Pt
-    PPTX_AVAILABLE = True
-except ImportError:
-    PPTX_AVAILABLE = False
+import importlib.util
+st.set_page_config(layout="wide")
+PPTX_AVAILABLE = importlib.util.find_spec("pptx") is not None
 
 
 st.title("Sleep Stage Novel Analysis (Berkeley vs EDF)")
@@ -82,10 +75,12 @@ def load_pkl(file_path):
 def compute_pswe(psd_values):
     # Power Spectral Wavelet Entropy approximation
     total_power = float(np.sum(psd_values))
-    if total_power <= 0: return 0.0
+    if total_power <= 0:
+        return 0.0
     prob = psd_values / (total_power + 1e-12)
     n_bins = len(prob)
-    if n_bins <= 1: return 0.0
+    if n_bins <= 1:
+        return 0.0
     entropy = -np.sum(prob * np.log(prob + 1e-12))
     return float(entropy / np.log(n_bins))
 
@@ -152,7 +147,7 @@ def extract_features(raw):
                 hep_amp = np.mean(hep_data[idx, hep_window])
                 features[f"{ch_name}_HEP_amplitude"] = hep_amp
                 
-        except Exception as e:
+        except Exception:
             # If ECG processing fails, silently pass to avoid breaking the whole pipeline
             features["HRV_RMSSD"] = 0.0
             features["HRV_MeanNN"] = 0.0
@@ -171,7 +166,7 @@ def clean_eeg_super_res(raw):
     # Try CSD
     try:
         raw_cleaned = mne.preprocessing.compute_current_source_density(raw_cleaned)
-    except Exception as e:
+    except Exception:
         pass # Not all montages support CSD without proper coordinates
         
     return raw_cleaned
@@ -219,10 +214,12 @@ def main():
                     eeg_ch_name = raw.ch_names[eeg_ch_idx]
                     
                     ax1.plot(times, raw.get_data()[eeg_ch_idx, time_idx], label="Raw")
-                    ax1.legend(); ax1.set_title(f"Raw EEG ({eeg_ch_name})")
+                    ax1.legend()
+                    ax1.set_title(f"Raw EEG ({eeg_ch_name})")
                     
                     ax2.plot(times, raw_cleaned.get_data()[eeg_ch_idx, time_idx], label="Cleaned (Super Res)", color='orange')
-                    ax2.legend(); ax2.set_title(f"Cleaned EEG ({eeg_ch_name})")
+                    ax2.legend()
+                    ax2.set_title(f"Cleaned EEG ({eeg_ch_name})")
                     plt.tight_layout()
                     st.pyplot(fig)
                     

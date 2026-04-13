@@ -16,3 +16,28 @@ EDF_Format/*
 bin*
 __pycache__/
 .streamlit*
+
+# Folders starting with dot
+.claude/
+.downloads/
+.pytest_cache/
+.ruff_cache/
+
+# Other unnecessary folders
+cache/
+COBRAD_figures/
+figures/
+figures_HEP/
+hep_comparison_results/
+logs/
+parquet_results/
+parquets_HEP/
+pickles/
+pickles_sleep_stage/
+temps_*/
+WNV_figures/
+west_nile_virus/
+
+# Additional file types
+*.pyc
+.a5c/

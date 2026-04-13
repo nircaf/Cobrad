@@ -128,7 +128,6 @@ def get_numeric_picks(raw: mne.io.BaseRaw) -> List[int]:
     """Return indices of numeric channels only."""
     picks: List[int] = []
     for idx, ch in enumerate(raw.info["chs"]):
-        kind = ch.get("kind", None)
         try:
             ch_type = raw.get_channel_types(picks=[idx])[0]
         except Exception:

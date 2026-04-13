@@ -69,7 +69,7 @@ def read_edf_with_mne(file_path):
                     raw = mne.io.RawArray(data, info)
                     edf.close()
                     break
-                except:
+                except Exception:
                     raise last_error
     
     if raw is None:

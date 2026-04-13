@@ -7,19 +7,14 @@ import os
 import re
 import pickle
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from utils.eeg_utils import *
+from scipy.stats import zscore, ttest_ind, mannwhitneyu
+from utils.eeg_utils import plot_tsne_by_group, analyze_and_correct, boxplot_plot_dabest, scatter_plot_with_regression, get_clinical_and_boxplot_cols, download_pptx_button, eeg_channels, get_clinical_data, st_pyplot_func, raise_error, cobrad_get_files, wnv_get_files, tga_get_files, generic_get_files, download_excel_button, raw_run, spectrogram_run, get_controls_ages_genders, add_table_to_pptx, power_bands, only_plots, compute_network_features
 
 # Suppress PyDev debugger warnings for large data structures
-import os
 os.environ['PYDEVD_WARN_SLOW_RESOLVE_TIMEOUT'] = '10.0'
 import mne
-import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
 from scipy import stats
 from statsmodels.stats.multitest import multipletests
-import statsmodels.stats.multitest as smm
-from scipy.signal import spectrogram
 import statsmodels.api as sm
 from collections import Counter
 import time
@@ -57,6 +52,15 @@ plt.rc('axes',  labelsize=11)
 plt.rc('legend',  handlelength=4.0)
 plt.rc('axes',  titlesize=12)  # Set title size to be the same as x and y labels
 montage = mne.channels.make_standard_montage('standard_1020')
+
+# Global palettes for consistent plotting across the script
+GLOBAL_CLUSTER_PALETTE = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7', '#DDA0DD', '#98D8C8', '#F7DC6F']
+GLOBAL_PERFORMANCE_COLORS = {
+    'TP': '#2E8B57',    # Green
+    'TN': '#4169E1',    # Blue  
+    'FP': '#FF6347',    # Red
+    'FN': '#FFD700'     # Gold
+}
 
 
 def plot_electrode_importance_topomap(electrode_importance_dict, title="Electrode Importance Topomap"):
@@ -112,7 +116,7 @@ def plot_electrode_importance_topomap(electrode_importance_dict, title="Electrod
         plt.tight_layout()
         
         return fig
-    except Exception as e:
+    except Exception:
         # If there's an error (e.g., channel positions not found), return None
         return None
 
@@ -136,8 +140,6 @@ def plot_electrode_pvalue_topomap(electrode_importance_dict, title="Electrode P-
     fig : matplotlib.figure.Figure
         The figure object, or None if insufficient channels
     """
-    from scipy import stats
-    from statsmodels.stats.multitest import multipletests
     
     # Filter to only electrodes with non-zero importance and that exist in eeg_channels
     available_channels = []
@@ -191,7 +193,7 @@ def plot_electrode_pvalue_topomap(electrode_importance_dict, title="Electrode P-
     # Apply multiple comparison correction (FDR)
     try:
         _, p_corrected, _, _ = multipletests(p_values, method='fdr_bh', alpha=0.05)
-    except:
+    except Exception:
         p_corrected = np.array(p_values)
     
     try:
@@ -220,7 +222,7 @@ def plot_electrode_pvalue_topomap(electrode_importance_dict, title="Electrode P-
         plt.tight_layout()
         
         return fig
-    except Exception as e:
+    except Exception:
         # If there's an error, return None
         return None
 
@@ -349,7 +351,6 @@ def pairplot_columns(df, clinical_features, eeg_features, hue=None, output_dir=N
             st_pyplot_func(plt.gcf(), filename=f'scatterplot_{columns[j]}_vs_all_y_zscore.png')
             plt.close()
 
-from scipy.stats import mannwhitneyu
 
 def vs_controls_general_groups(project_name, df_wnv2, controls, boxplot_columns, analysis_type):
     """
@@ -358,17 +359,22 @@ def vs_controls_general_groups(project_name, df_wnv2, controls, boxplot_columns,
     df_wnv2['Group'] = project_name
     controls['Group'] = 'Controls'
     combined_df = pd.concat([df_wnv2, controls], ignore_index=True, axis=0)
-    controls_dir = f'temps_Controls_EDF'
+    controls_dir = 'temps_Controls_EDF'
     try:
         st.header('Controls Demographics')
         # get controls demographic from get_controls_ages_genders(controls_dir)
         controls_demographics_df = get_controls_ages_genders(controls_dir)
-        # Use renamed columns if available, otherwise use original names
-        age_col = 'age' if 'age' in df_wnv2.columns else 'clinical_age_at_visit'
-        gender_col = 'gender' if 'gender' in df_wnv2.columns else 'clinical_sex, 1=male'
-        cobrad_ages = df_wnv2[age_col]
-        cobrad_sexes = df_wnv2[gender_col]
-        cobrad_sexes -= 1
+        # Find age and gender columns dynamically or use fallbacks
+        age_candidates = [col for col in df_wnv2.columns if 'age' in col.lower()]
+        gender_candidates = [col for col in df_wnv2.columns if 'gender' in col.lower() or ('sex' in col.lower() and 'age' not in col.lower())]
+        
+        age_col = age_candidates[0] if age_candidates else 'clinical_age_at_visit'
+        gender_col = gender_candidates[0] if gender_candidates else 'clinical_sex, 1=male'
+        
+        cobrad_ages = df_wnv2[age_col] if age_col in df_wnv2.columns else pd.Series(dtype=float)
+        cobrad_sexes = df_wnv2[gender_col] if gender_col in df_wnv2.columns else pd.Series(dtype=float)
+        if not cobrad_sexes.empty:
+            cobrad_sexes = cobrad_sexes - 1
         st.write(f"Controls Demographics: N= {controls_demographics_df.shape[0]}, mean age {controls_demographics_df['Age'].mean():.2f} ± {controls_demographics_df['Age'].std():.2f}")
         # Display mean gender (assuming 1=male, 0=female or similar coding)
         st.write(f"Mean gender (1=female): {controls_demographics_df['Gender'].mean():.2f} ± {controls_demographics_df['Gender'].std():.2f}")
@@ -480,11 +486,15 @@ def vs_controls_all_features(df_wnv2, controls, boxplot_columns, analysis_type):
             
             # Get group 1's age and gender for matching controls
             group_1_data = df_wnv3[df_wnv3[selected_feature] == 1].copy()
-            # Use renamed columns if available, otherwise use original names
-            age_col = 'age' if 'age' in group_1_data.columns else 'clinical_age_at_visit'
-            gender_col = 'gender' if 'gender' in group_1_data.columns else 'clinical_sex, 1=male'
-            group_1_ages = group_1_data[age_col].dropna()
-            group_1_sexes = group_1_data[gender_col].dropna()
+            # Find age and gender columns dynamically or use fallbacks
+            age_candidates = [col for col in group_1_data.columns if 'age' in col.lower()]
+            gender_candidates = [col for col in group_1_data.columns if 'gender' in col.lower() or ('sex' in col.lower() and 'age' not in col.lower())]
+            
+            age_col = age_candidates[0] if age_candidates else 'clinical_age_at_visit'
+            gender_col = gender_candidates[0] if gender_candidates else 'clinical_sex, 1=male'
+            
+            group_1_ages = group_1_data[age_col].dropna() if age_col in group_1_data.columns else pd.Series(dtype=float)
+            group_1_sexes = group_1_data[gender_col].dropna() if gender_col in group_1_data.columns else pd.Series(dtype=float)
             
             if group_1_ages.empty or group_1_sexes.empty:
                 if group_1_ages.empty:
@@ -534,6 +544,9 @@ def vs_controls_all_features(df_wnv2, controls, boxplot_columns, analysis_type):
             matched_controls_indices = list(set(matched_controls_indices))
             controls_matched = controls.loc[matched_controls_indices].copy()
             
+            # Align column names for demographic variables
+            controls_matched = controls_matched.rename(columns={'age': age_col, 'gender': gender_col})
+            
             if controls_matched.empty:
                 reason = f"Skipping {selected_feature}: No matched controls data found after filtering"
                 print(reason)
@@ -558,9 +571,12 @@ def vs_controls_all_features(df_wnv2, controls, boxplot_columns, analysis_type):
                 continue
             
             # Create statistics table for age, gender, and selected_feature
-            # Get age and gender columns
-            age_col = 'age' if 'age' in df_wnv3.columns else 'clinical_age_at_visit'
-            gender_col = 'gender' if 'gender' in df_wnv3.columns else 'clinical_sex, 1=male'
+            # Find age and gender columns dynamically or use fallbacks
+            age_candidates = [col for col in df_wnv3.columns if 'age' in col.lower()]
+            gender_candidates = [col for col in df_wnv3.columns if 'gender' in col.lower() or ('sex' in col.lower() and 'age' not in col.lower())]
+            
+            age_col = age_candidates[0] if age_candidates else 'clinical_age_at_visit'
+            gender_col = gender_candidates[0] if gender_candidates else 'clinical_sex, 1=male'
             
             # Prepare data for table
             table_data = []
@@ -580,7 +596,7 @@ def vs_controls_all_features(df_wnv2, controls, boxplot_columns, analysis_type):
                         return None
                     stat, pval = mannwhitneyu(g1, g2, alternative='two-sided')
                     return pval
-                except:
+                except Exception:
                     return None
             
             # Age statistics
@@ -1021,7 +1037,7 @@ def HEP_plots2(project_name, df_wnv3, controls, boxplot_columns, analysis_type, 
                     try:
                         cached_df = pd.read_parquet(cache_path)
                         return cached_df, patient_id
-                    except Exception as e:
+                    except Exception:
                         # Continue with processing if cache load fails
                         pass
                 
@@ -1036,14 +1052,14 @@ def HEP_plots2(project_name, df_wnv3, controls, boxplot_columns, analysis_type, 
                     # Save individual patient data to cache
                     try:
                         patient_results.to_parquet(cache_path, index=False)
-                    except Exception as e:
+                    except Exception:
                         pass
                     
                     return patient_results, patient_id
                 else:
                     return None, patient_id
                     
-            except Exception as e:
+            except Exception:
                 return None, pickle_file
         
         # Use ThreadPoolExecutor for parallel processing
@@ -1174,7 +1190,7 @@ def HEP_plots2(project_name, df_wnv3, controls, boxplot_columns, analysis_type, 
         status_text.empty()
         
         st.success(f"Completed analysis for {band_name} band with {len(results_df)} time windows (averaged across {len(all_patient_results)} patients)")
-        st.info(f"📊 Results show mean values across patients for each time window")
+        st.info("📊 Results show mean values across patients for each time window")
         st.divider()
 
 
@@ -1245,7 +1261,7 @@ def calculate_hep_measurements_for_patient(raw, patient_id, band_name, band_rang
                 efficiency, clustering, assortativity, modularity = compute_network_features(
                     window_data, sfreq, band_range
                 )
-            except Exception as e:
+            except Exception:
                 continue
             
             # Calculate power bands for this window
@@ -1272,7 +1288,7 @@ def calculate_hep_measurements_for_patient(raw, patient_id, band_name, band_rang
                 for band_name in power_bands_window:
                     mean_power_bands[f"{band_name}_power"] = np.mean(power_bands_window[band_name])
                 
-            except Exception as e:
+            except Exception:
                 # Set default values for power bands
                 mean_power_bands = {}
                 for band_name in power_bands:
@@ -1298,7 +1314,7 @@ def calculate_hep_measurements_for_patient(raw, patient_id, band_name, band_rang
                     # Calculate SD1 and SD2 using the same method as HEP_parquet_generation.py
                     if len(rpeaks) > 2:
                         # Convert R-peak indices to times
-                        r_times = rpeaks / sfreq
+                        _ = rpeaks / sfreq
                         
                         # Calculate inter-beat intervals (IBI)
                         ibi = np.diff(rpeaks) / sfreq
@@ -1314,11 +1330,11 @@ def calculate_hep_measurements_for_patient(raw, patient_id, band_name, band_rang
                         vagal_sd1 = np.nan
                         sympathetic_sd2 = np.nan
                     
-                except Exception as e:
+                except Exception:
                     vagal_sd1 = np.nan
                     sympathetic_sd2 = np.nan
                     
-            except Exception as e:
+            except Exception:
                 vagal_sd1 = np.nan
                 sympathetic_sd2 = np.nan
             
@@ -1353,7 +1369,53 @@ def calculate_hep_measurements_for_patient(raw, patient_id, band_name, band_rang
         return None
 
 
-def HEP_plots(project_name, df_wnv3, controls, boxplot_columns, analysis_type, selected_feature=None, size_feature=None, context_key=None):
+def load_and_average_hep_results(directory, band_name, df_clinical, group_label):
+    """Utility to load HEP parquets from a directory, link to clinical data, and return averaged results."""
+    if not directory or not os.path.exists(directory):
+        return pd.DataFrame(), pd.DataFrame()
+    
+    patient_dfs = []
+    clinical_rows = []
+    
+    # Filter files for the specific band
+    files = [f for f in os.listdir(directory) if f.endswith(f"_{band_name}.parquet")]
+    for file in files:
+        file_path = os.path.join(directory, file)
+        try:
+            df = pd.read_parquet(file_path)
+            if df.empty:
+                continue
+            
+            # Extract subject ID (matches the split logic from original code)
+            raw_id = file.split('_')[0]
+            # For EDF data, original logic was removing first char
+            patient_id = raw_id[1:] if "EDF_" in directory else raw_id
+            
+            # Average patient's time windows
+            p_mean = df.select_dtypes(include=[np.number]).mean()
+            p_mean_df = pd.DataFrame([p_mean])
+            p_mean_df['Group'] = group_label
+            p_mean_df['ID'] = patient_id
+            
+            patient_dfs.append(p_mean_df)
+            
+            # Match clinical data
+            if df_clinical is not None and not df_clinical.empty:
+                matching = df_clinical[df_clinical['ID'] == patient_id]
+                if not matching.empty:
+                    clinical_rows.append(matching)
+        except Exception:
+            continue
+            
+    if not patient_dfs:
+        return pd.DataFrame(), pd.DataFrame()
+        
+    results_df = pd.concat(patient_dfs, ignore_index=True)
+    df_clinical_clean = pd.concat(clinical_rows, ignore_index=True) if clinical_rows else pd.DataFrame()
+    return results_df, df_clinical_clean
+
+
+def HEP_plots(project_name, df_wnv3, controls, boxplot_columns, analysis_type, selected_feature=None, size_feature=None, context_key="hep_main"):
     # if size_feature is None:
     #     size_feature = 'clinical_moca'
     if project_name == 'COBRAD':
@@ -1361,17 +1423,19 @@ def HEP_plots(project_name, df_wnv3, controls, boxplot_columns, analysis_type, s
         sleep_stage = st.selectbox(
             "Select Sleep Stage",
             options=['N1','All',  'N2', 'N3', 'R', 'W'],
-            index=1,  # Default to All
-            key='sleep_stage_selection'
+            index=3,  # Default to All
+            key=f'sleep_stage_selection_{context_key}'
         )
         if sleep_stage == 'All':
             st.subheader("Analyzing all sleep stages: EDF_N1, EDF_N2, EDF_N3, EDF_R, EDF_W")
         else:
             st.subheader(f"Analyzing: EDF_{sleep_stage}")
         # Define directory if single stage
-        edf_hep_dir = None if sleep_stage == 'All' else f'parquets_HEP/EDF_{sleep_stage}'
+        edf_hep_dir = f'parquets_HEP/EDF_{sleep_stage}'
+        berkeley_hep_dir = f'parquets_HEP/Berkeley_data_{sleep_stage}'
     else:
         return
+
     # If 'All' selected, run cross-stage comparison and return
     if project_name == 'COBRAD' and sleep_stage == 'All':
         compare_sleep_stages_default_pairs(df_wnv3, power_bands, size_feature)
@@ -1380,79 +1444,75 @@ def HEP_plots(project_name, df_wnv3, controls, boxplot_columns, analysis_type, s
     # Run over power bands (single stage flow)
     for band_name, band_range in power_bands.items():
         st.write(f"Analyzing power band: {band_name}")
-        dfs = []
-        hue = None
-        df_wnv3_clean = pd.DataFrame()
-        # Process EDF_HEP directory (Dementia group)
-        if os.path.exists(edf_hep_dir):
-            edf_band_files = [f for f in os.listdir(edf_hep_dir) if f.endswith(f"_{band_name}.parquet")]
-            for file in edf_band_files:
-                file_path = os.path.join(edf_hep_dir, file)
-                try:
-                    df = pd.read_parquet(file_path)
-                    if not df.empty:
-                        # Extract patient ID from filename (assuming format like "patient_123_band.parquet")
-                        patient_id = file.split('_')[0][1:]
-                        matching_rows = df_wnv3[df_wnv3['ID'] == patient_id]
-                        if not matching_rows.empty:
-                            # df = pd.concat([matching_rows, df], ignore_index=True,axis=1)
-                            # add to df_wnv3_clean matching_rows rows
-                            df_wnv3_clean = pd.concat([df_wnv3_clean, matching_rows], ignore_index=True,axis=0)
-                            df['Group'] = 'Dementia'
-                            dfs.append(df)
-                except Exception as e:
-                    st.warning(f"Could not read {file} from EDF_HEP: {e}")
         
-        if dfs:
-            # Group by 'Group' and compute mean for each group
-            group_dfs = []
-            # Get unique groups from the loaded data (Dementia and Control)
-            unique_groups = list(set([df['Group'].iloc[0] for df in dfs if 'Group' in df.columns and not df.empty]))
+        # Load both datasets using the helper
+        results_edf, clinical_edf = load_and_average_hep_results(edf_hep_dir, band_name, df_wnv3, 'Dementia')
+        results_berkeley, clinical_berkeley = load_and_average_hep_results(berkeley_hep_dir, band_name, df_wnv3, 'Berkeley')
+        
+        if results_edf.empty and results_berkeley.empty:
+            st.warning(f"No data found for band {band_name} in either dataset.")
+            continue
             
-            for group in unique_groups:
-                group_patients2 = []
-                for df in dfs:
-                    if 'Group' in df.columns and df['Group'].iloc[0] == group:
-                        group_patients2.append(df)
-                group_patients = [df for df in group_patients2]
-                if group_patients:
-                    # Get mean of each df (returns a Series) and concat to DataFrame
-                    group_mean_df = pd.concat([df.drop(columns=['Group'], errors='ignore').mean() for df in group_patients], axis=1).T
-                    group_mean_df['Group'] = group
-                    group_dfs.append(group_mean_df)
-            results_df = pd.concat(group_dfs, ignore_index=True)
-            # # concat with df_wnv3_clean assume same index
-            # results_df = pd.concat([pd.concat(group_dfs), df_wnv3_clean], axis=1)
-            # remove cols more than 50% NaN
-            results_df = results_df.loc[:, results_df.isnull().mean() < 0.5]
-            # remove rows with any NaN
-            results_df = results_df.dropna()
-            hue = results_df['Group']
-            st.write(f"Loaded {len(results_df)} group means for band {band_name}")
-        else:
-            st.write(f"No data found for band {band_name}")
-        #  apply zscore each column (only numeric columns)
-        numeric_cols = results_df.select_dtypes(include=[np.number]).columns
-        results_df[numeric_cols] = results_df[numeric_cols].apply(zscore)
-        # results_df size_feature fillna max
-        if size_feature:
-            # remove rows where size_feature is NaN
-            results_df = results_df[results_df[size_feature].notna()]
-        st.dataframe(results_df)    
-        if size_feature:
-            # results_df leave columns 'Vagal_SD1','Sympathetic_SD2','Efficiency','Clustering','Modularity','Assortativity',size_feature
-            results_df = results_df[['Vagal_SD1','Sympathetic_SD2','Efficiency','Clustering','Modularity','Assortativity',size_feature]]
-        # Add cluster number selection
-        n_clusters = 2
-        
-        # Use the original only_plots function
-        only_plots(results_df, save_plot='', save_dir='', edf_pickle_name="plot", band=band_name, step_sec=5, is_streamlit=True, hue=hue, size_feature=size_feature)
-        # Add pair-wise clustering analysis
-        st.subheader("Pair-wise Clustering Analysis")
-        pair_clustering_analysis(results_df, df_wnv3_clean, n_clusters=n_clusters, context_key=context_key)
-        
-        st.divider()
+        def process_and_plot_block(df, clinical_df, label, is_comparison=False):
+            """Internal helper to process, z-score, and plot each analysis block."""
+            if df.empty:
+                return
+            st.subheader(f"{label} Individual Analysis")
+            
+            # Apply z-score normalization to numeric metrics
+            df_processed = df.copy()
+            numeric_cols = df_processed.select_dtypes(include=[np.number]).columns
+            for col in numeric_cols:
+                # Check for standard deviation to avoid NaNs from zero variance
+                if df_processed[col].std() > 0:
+                    df_processed[col] = zscore(df_processed[col].fillna(df_processed[col].mean()))
+            
+            # Handle size feature filtering if specified
+            if size_feature and size_feature in df_processed.columns:
+                df_processed = df_processed[df_processed[size_feature].notna()]
+            
+            st.write(f"Included {len(df_processed)} subjects in this analysis.")
+            st.dataframe(df_processed)
+            
+            # Metrics for visualization
+            metrics_to_plot = ['Vagal_SD1', 'Sympathetic_SD2', 'Efficiency', 'Clustering', 'Modularity', 'Assortativity']
+            if size_feature and size_feature in df_processed.columns:
+                metrics_to_plot.append(size_feature)
+            # Filter to only existing columns
+            plot_cols = [c for c in metrics_to_plot if c in df_processed.columns]
+            
+            # Main plot visualization
+            only_plots(
+                df_processed[plot_cols + ['Group']], 
+                save_plot='', save_dir='', edf_pickle_name="plot", 
+                band=band_name, step_sec=5, is_streamlit=True, 
+                hue=df_processed['Group'], size_feature=size_feature
+            )
+            
+            # Only perform clustering if not in comparison mode
+            if not is_comparison:
+                st.subheader("Clinical Pair-wise Clustering Analysis")
+                # Use a unique key for each label and band to avoid StreamlitDuplicateElementKey
+                # Sanitize label for key (remove spaces, parentheses)
+                clean_label = label.lower().replace(" ", "_").replace("(", "").replace(")", "").replace("-", "_")
+                unique_key = f"{context_key}_{clean_label}_{band_name}"
+                pair_clustering_analysis(df_processed, clinical_df, n_clusters=2, context_key=unique_key)
 
+        # 1. Display EDF Group Analysis
+        if not results_edf.empty:
+            process_and_plot_block(results_edf, clinical_edf, "EDF (Dementia)")
+            
+        # 2. Display Berkeley Group Analysis
+        if not results_berkeley.empty:
+            process_and_plot_block(results_berkeley, clinical_berkeley, "Berkeley Data")
+            
+        # 3. Display Comparison Analysis
+        if not results_edf.empty and not results_berkeley.empty:
+            st.subheader(f"Comparison: EDF vs Berkeley - {band_name}")
+            combined_comp = pd.concat([results_edf, results_berkeley], ignore_index=True)
+            process_and_plot_block(combined_comp, pd.concat([clinical_edf, clinical_berkeley]), "Combined Comparison", is_comparison=True)
+            
+        st.divider()
 
 def compare_sleep_stages_default_pairs(df_wnv3, power_bands, size_feature=None):
     """Compare default feature pairs across all sleep stages.
@@ -1668,7 +1728,7 @@ def compare_sleep_stages_default_pairs(df_wnv3, power_bands, size_feature=None):
                                                       scatter=False,
                                                       line_kws={'alpha': 0.8, 'linewidth': 2.5, 'label': stage},
                                                       ci=95)
-                                        except:
+                                        except Exception:
                                             # Fallback
                                             from scipy import stats
                                             slope, intercept, r_value, p_value, std_err = stats.linregress(x_clean, y_clean)
@@ -1694,7 +1754,7 @@ def compare_sleep_stages_default_pairs(df_wnv3, power_bands, size_feature=None):
                                         _, p_val = mannwhitneyu(data1['y'], data2['y'], alternative='two-sided')
                                         sig = '***' if p_val < 0.001 else '**' if p_val < 0.01 else '*' if p_val < 0.05 else ''
                                         p_value_text.append(f"{stage1} vs {stage2}: {p_val:.4f}{sig}")
-                                    except:
+                                    except Exception:
                                         pass
                             
                             # Display p-values in upper corner
@@ -1791,7 +1851,7 @@ def compare_sleep_stages_default_pairs(df_wnv3, power_bands, size_feature=None):
                                         # Format with asterisks
                                         sig = '***' if p_val < 0.001 else '**' if p_val < 0.01 else '*' if p_val < 0.05 else ''
                                         row_data[combo_name] = f"{p_val:.4f}{sig}"
-                                    except:
+                                    except Exception:
                                         row_data[combo_name] = "N/A"
                                 else:
                                     row_data[combo_name] = "N/A"
@@ -1930,7 +1990,7 @@ def compare_sleep_stages_default_pairs(df_wnv3, power_bands, size_feature=None):
                                     if isinstance(feature, str) and electrode in feature:
                                         electrode_importance[electrode] += importance_df.iloc[idx]['importance']
                             
-                            electrode_df = pd.DataFrame({
+                            _ = pd.DataFrame({
                                 'electrode': list(electrode_importance.keys()),
                                 'total_importance': list(electrode_importance.values())
                             }).sort_values('total_importance', ascending=False)
@@ -2354,7 +2414,7 @@ def pair_clustering_analysis(results_df, df_wnv3_clean, n_clusters=2, context_ke
     st.write(f"Total pairs to analyze: {total_pairs}")
     
     # Add checkbox to run all pairs
-    run_all_pairs = st.checkbox("Run all pairs", value=False)
+    run_all_pairs = st.checkbox("Run all pairs", value=False, key=f"run_all_pairs_{key_suffix}")
     
     # Limit to 4 specific pairs unless checkbox is checked
     if not run_all_pairs:
@@ -2397,14 +2457,19 @@ def pair_clustering_analysis(results_df, df_wnv3_clean, n_clusters=2, context_ke
     results_summary = []
     # Dictionary to store top 10 features per pair for overall aggregation
     all_pair_features = {}  # {pair_name: {feature: importance}}
-    # cluster_labels is SD1 SD2 labels
-    # Perform K-means clustering
-    X_pair = results_df[['Sympathetic_SD2', 'Vagal_SD1']]
+    # Perform base K-means clustering on SD1/SD2
+    X_pair = results_df[['Sympathetic_SD2', 'Vagal_SD1']].dropna()
+    
+    if len(X_pair) < n_clusters:
+        st.warning(f"Not enough valid continuous data points ({len(X_pair)}) for base SD1/SD2 clustering. Need at least {n_clusters}.")
+        return
+        
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X_pair)
     
     kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-    cluster_labels = kmeans.fit_predict(X_scaled)
+    # create a pd.Series aligned with X_pair.index
+    cluster_labels_series = pd.Series(kmeans.fit_predict(X_scaled), index=X_pair.index)
     for i, (col1_name, col2_name) in enumerate(pairs):
         with st.expander(f"Pair {i+1}: {col1_name} vs {col2_name}", expanded=False):
             with st.spinner(f"Processing pair {i+1}: {col1_name} vs {col2_name}..."):
@@ -2414,9 +2479,15 @@ def pair_clustering_analysis(results_df, df_wnv3_clean, n_clusters=2, context_ke
                 if len(pair_data) < n_clusters:
                     st.warning(f"Not enough data points for pair {col1_name} vs {col2_name}")
                     continue
-                # Add cluster labels to data
+                # Add cluster labels to data using aligned index
                 pair_data_with_clusters = pair_data.copy()
-                pair_data_with_clusters['cluster'] = cluster_labels
+                pair_data_with_clusters['cluster'] = cluster_labels_series
+                pair_data_with_clusters = pair_data_with_clusters.dropna(subset=['cluster'])
+                
+                if len(pair_data_with_clusters) < n_clusters:
+                    st.warning(f"Not enough common data points ({len(pair_data_with_clusters)}) after mapping base clusters for pair {col1_name} vs {col2_name}")
+                    continue
+                    
                 # Find common indices between pair data and clinical data
                 common_indices = pair_data_with_clusters.index.intersection(df_wnv3_clean.index)
                 
@@ -2456,9 +2527,8 @@ def pair_clustering_analysis(results_df, df_wnv3_clean, n_clusters=2, context_ke
                 # Create scatter plot with clusters - color each cluster differently
                 fig, ax = plt.subplots(1, 1, figsize=(10, 8))
                 unique_clusters = pair_data_with_clusters['cluster'].unique()
-                # Use a vibrant color palette for clusters
-                color_palette = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7', '#DDA0DD', '#98D8C8', '#F7DC6F']
-                cluster_colors = {cluster: color_palette[i % len(color_palette)] for i, cluster in enumerate(unique_clusters)}
+                # Use vibrant global color palette for clusters
+                cluster_colors = {cluster: GLOBAL_CLUSTER_PALETTE[i % len(GLOBAL_CLUSTER_PALETTE)] for i, cluster in enumerate(unique_clusters)}
                 
                 for cluster in unique_clusters:
                     mask = pair_data_with_clusters['cluster'] == cluster
@@ -2489,8 +2559,7 @@ def pair_clustering_analysis(results_df, df_wnv3_clean, n_clusters=2, context_ke
                     common_indices = pair_data_with_clusters.index.intersection(df_wnv3_clean.index)
                     
                     if len(common_indices) < 10:  # Need sufficient data
-                        # raise using func
-                        raise_error(f"Not enough common data points ({len(common_indices)}) for clinical feature analysis")
+                        st.error(f"Not enough common data points ({len(common_indices)}) for clinical feature analysis")
                         return
                     # Get clinical features (numeric columns from df_wnv3_clean)
                     clinical_features = df_wnv3_clean.select_dtypes(include=[np.number]).columns.tolist()
@@ -2499,12 +2568,12 @@ def pair_clustering_analysis(results_df, df_wnv3_clean, n_clusters=2, context_ke
                         continue
                     # remove clinical features end_time, segmnent, start_time, duration_min, number_of_signals
                     clinical_features = [feature for feature in clinical_features if feature not in ['end_time', 'segment', 'start_time', 'duration_min', 'number_of_signals']]
-                    # Prepare data for classification
-                    X_clinical = df_wnv3_clean[clinical_features]
+                    # Prepare data for classification using only common indices
+                    X_clinical = df_wnv3_clean.loc[common_indices, clinical_features]
                     # dropna columns where 50% + is Nan. otherwise, use median for the rest
                     X_clinical = X_clinical.dropna(axis=1, thresh=int(X_clinical.shape[0]/2))
                     X_clinical = X_clinical.fillna(X_clinical.median())
-                    y_clusters = pair_data_with_clusters['cluster']
+                    y_clusters = pair_data_with_clusters.loc[common_indices, 'cluster']
                     
                     # Split data
                     X_train, X_test, y_train, y_test = train_test_split(
@@ -2552,7 +2621,7 @@ def pair_clustering_analysis(results_df, df_wnv3_clean, n_clusters=2, context_ke
                                 'feature': clinical_features,
                                 'importance': perm_importance.importances_mean
                             }).sort_values('importance', ascending=False)
-                        except:
+                        except Exception:
                             # Final fallback: equal importance
                             importance_df = pd.DataFrame({
                                 'feature': clinical_features,
@@ -2753,7 +2822,7 @@ def pair_clustering_analysis(results_df, df_wnv3_clean, n_clusters=2, context_ke
                         if len(X_clinical_temp) > 0 and len(common_indices) == len(pairgrid_data):
                             X_clinical_global = X_clinical_temp
                             classifier_global = classifier
-            except:
+            except Exception:
                 pass
         
         # Create pairgrid - we'll compute clustering and performance groups per pair inside the plotting functions
@@ -2781,9 +2850,10 @@ def pair_clustering_analysis(results_df, df_wnv3_clean, n_clusters=2, context_ke
             if len(X_clinical_global) > 0 and classifier_global is not None:
                 try:
                     # Align X_clinical_global with X_pair indices
-                    X_clinical_aligned = X_clinical_global.loc[X_pair.index] if len(X_clinical_global) > 0 else pd.DataFrame()
-                    if len(X_clinical_aligned) == len(X_pair):
-                        classifier_predictions = classifier_global.predict(X_clinical_global)
+                    if len(X_clinical_global) > 0:
+                        X_clinical_aligned = X_clinical_global.loc[X_pair.index.intersection(X_clinical_global.index)]
+                        if len(X_clinical_aligned) == len(X_pair):
+                            classifier_predictions = classifier_global.predict(X_clinical_aligned)
                         
                         # Create performance groups based on classifier vs K-means clusters
                         performance_groups = []
@@ -2796,16 +2866,8 @@ def pair_clustering_analysis(results_df, df_wnv3_clean, n_clusters=2, context_ke
                                 performance_groups.append('FP')
                             elif true_cluster == 1 and pred_cluster == 0:
                                 performance_groups.append('FN')
-                except:
+                except Exception:
                     pass
-            
-            # Use specific colors for TP, TN, FP, FN
-            performance_colors = {
-                'TP': '#2E8B57',    # Green
-                'TN': '#4169E1',    # Blue  
-                'FP': '#FF6347',    # Red
-                'FN': '#FFD700'     # Gold
-            }
             
             # Plot with performance groups if available, otherwise use clusters
             if performance_groups is not None:
@@ -2813,19 +2875,18 @@ def pair_clustering_analysis(results_df, df_wnv3_clean, n_clusters=2, context_ke
                 for group in unique_groups:
                     mask = [g == group for g in performance_groups]
                     if sum(mask) > 0:
-                        color = performance_colors.get(group, '#808080')  # Default gray
+                        color = GLOBAL_PERFORMANCE_COLORS.get(group, '#808080')  # Default gray
                         ax.scatter(X_pair.iloc[mask, 0], X_pair.iloc[mask, 1], 
-                                  c=[color], 
+                                  c=[color], label=group,
                                   alpha=0.7, s=50)
             else:
                 # Plot by cluster if no performance groups
                 unique_clusters = np.unique(cluster_labels_pair)
-                color_palette = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7', '#DDA0DD', '#98D8C8', '#F7DC6F']
                 for cluster in unique_clusters:
                     mask = cluster_labels_pair == cluster
-                    color = color_palette[cluster % len(color_palette)]
+                    color = GLOBAL_CLUSTER_PALETTE[cluster % len(GLOBAL_CLUSTER_PALETTE)]
                     ax.scatter(X_pair.iloc[mask, 0], X_pair.iloc[mask, 1], 
-                              c=[color], 
+                              c=[color], label=f'Cluster {cluster}',
                               alpha=0.7, s=50)
             
             # Add cluster centers
@@ -2835,7 +2896,7 @@ def pair_clustering_analysis(results_df, df_wnv3_clean, n_clusters=2, context_ke
                     ax.scatter(centers[:, 0], centers[:, 1], 
                              c='red', marker='x', s=200, linewidths=3, 
                              label='Centroids')
-                except:
+                except Exception:
                     pass
         
         def plot_lower_cluster(x, y, **kwargs):
@@ -2875,15 +2936,8 @@ def pair_clustering_analysis(results_df, df_wnv3_clean, n_clusters=2, context_ke
                                 performance_groups.append('FP')
                             elif true_cluster == 1 and pred_cluster == 0:
                                 performance_groups.append('FN')
-                except:
+                except Exception:
                     pass
-            
-            performance_colors = {
-                'TP': '#2E8B57',    # Green
-                'TN': '#4169E1',    # Blue  
-                'FP': '#FF6347',    # Red
-                'FN': '#FFD700'     # Gold
-            }
             
             # Plot with performance groups if available, otherwise use clusters
             if performance_groups is not None:
@@ -2891,19 +2945,18 @@ def pair_clustering_analysis(results_df, df_wnv3_clean, n_clusters=2, context_ke
                 for group in unique_groups:
                     mask = [g == group for g in performance_groups]
                     if sum(mask) > 0:
-                        color = performance_colors.get(group, '#808080')  # Default gray
+                        color = GLOBAL_PERFORMANCE_COLORS.get(group, '#808080')  # Default gray
                         ax.scatter(X_pair.iloc[mask, 0], X_pair.iloc[mask, 1], 
-                                  c=[color], 
+                                  c=[color], label=group,
                                   alpha=0.6, s=30)
             else:
                 # Plot by cluster if no performance groups
                 unique_clusters = np.unique(cluster_labels_pair)
-                color_palette = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7', '#DDA0DD', '#98D8C8', '#F7DC6F']
                 for cluster in unique_clusters:
                     mask = cluster_labels_pair == cluster
-                    color = color_palette[cluster % len(color_palette)]
+                    color = GLOBAL_CLUSTER_PALETTE[cluster % len(GLOBAL_CLUSTER_PALETTE)]
                     ax.scatter(X_pair.iloc[mask, 0], X_pair.iloc[mask, 1], 
-                              c=[color], 
+                              c=[color], label=f'Cluster {cluster}',
                               alpha=0.6, s=30)
         
         def plot_diag_cluster(x, **kwargs):
@@ -2913,7 +2966,7 @@ def pair_clustering_analysis(results_df, df_wnv3_clean, n_clusters=2, context_ke
             # For diagonal, we need to get the pair context - use the x feature with itself
             # But since it's diagonal, we just show the distribution
             # Try to get performance groups if we can align with X_clinical_global
-            performance_colors = {
+            _ = {
                 'TP': '#2E8B57',    # Green
                 'TN': '#4169E1',    # Blue  
                 'FP': '#FF6347',    # Red
@@ -2925,7 +2978,7 @@ def pair_clustering_analysis(results_df, df_wnv3_clean, n_clusters=2, context_ke
             try:
                 # We can't compute clustering without a pair, so just show regular histogram
                 ax.hist(x.dropna(), alpha=0.6, bins=15, density=True)
-            except:
+            except Exception:
                 pass
         
         # Apply the plotting functions
@@ -3080,11 +3133,18 @@ def run_classifier_comparison_on_results(results_df, X_clinical):
         return None
     
     # Use all numeric features for comparison
-    y_groups = results_df['cluster']
+    # Align indices to ensure consistent sample sizes
+    common_indices = results_df.dropna(subset=['cluster']).index.intersection(X_clinical.index)
+    if len(common_indices) < 2:
+        st.warning("Not enough common samples between clinical features and clusters.")
+        return None
+        
+    y_groups = results_df.loc[common_indices, 'cluster']
+    X_clinical_aligned = X_clinical.loc[common_indices]
     
     # Scale the features
     scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X_clinical)
+    X_scaled = scaler.fit_transform(X_clinical_aligned)
     
     # Run classifier comparison
     return compare_all_classifiers_on_scaled_data(X_scaled, y_groups)
@@ -3102,7 +3162,7 @@ def compare_all_classifiers_on_scaled_data(X_scaled, y_true, test_size=0.3):
     test_size : float
         Proportion of data to use for testing (default: 0.3)
     """
-    from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, StackingClassifier
+    from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
     from sklearn.linear_model import LogisticRegression
     from sklearn.neural_network import MLPClassifier
     from xgboost import XGBClassifier
@@ -3111,7 +3171,6 @@ def compare_all_classifiers_on_scaled_data(X_scaled, y_true, test_size=0.3):
     from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
     import matplotlib.pyplot as plt
     import pandas as pd
-    import numpy as np
     
     # Define all classifiers
     classifiers = {
@@ -3144,7 +3203,6 @@ def compare_all_classifiers_on_scaled_data(X_scaled, y_true, test_size=0.3):
     
     # Run classifiers in parallel
     from concurrent.futures import ThreadPoolExecutor, as_completed
-    import threading
     
     def train_and_evaluate_classifier(name_classifier_tuple):
         """Train and evaluate a single classifier"""
@@ -3360,7 +3418,7 @@ def rf_classifier_analysis(df_wnv2, selected_feature, eeg_features, key_suffix="
     
     # Check if we have enough samples in each class
     if len(y[y == 0]) < 3 or len(y[y == 1]) < 3:
-        st.warning(f"Insufficient samples for binary classification (need at least 3 in each class)")
+        st.warning("Insufficient samples for binary classification (need at least 3 in each class)")
         return
     
     # Get EEG features (only those that exist in df_clean)
@@ -3516,14 +3574,14 @@ def rf_classifier_analysis(df_wnv2, selected_feature, eeg_features, key_suffix="
         
         # Predictions
         y_pred = selected_classifier.predict(X_test)
-        y_pred_proba = selected_classifier.predict_proba(X_test)[:, 1]
+        _ = selected_classifier.predict_proba(X_test)[:, 1]
         
         # Display results
         st.subheader(f"{selected_classifier_name} Classifier Results: Predicting {selected_feature}")
         
         # Classification report
         st.write("**Classification Report:**")
-        report = classification_report(y_test, y_pred, target_names=[group_name_0, group_name_1], output_dict=True)
+        _ = classification_report(y_test, y_pred, target_names=[group_name_0, group_name_1], output_dict=True)
         st.text(classification_report(y_test, y_pred, target_names=[group_name_0, group_name_1]))
         
         # Metrics
@@ -3637,7 +3695,7 @@ def rf_classifier_analysis(df_wnv2, selected_feature, eeg_features, key_suffix="
                 plt.close(fig)
                 
                 # Display electrode importance table
-                st.write(f"**Feature Importance by Electrode:**")
+                st.write("**Feature Importance by Electrode:**")
                 st.dataframe(electrode_df_nonzero, use_container_width=True)
                 
                 # Try to create topomap if available
@@ -3677,7 +3735,6 @@ def rf_regressor_analysis(df_wnv2, selected_feature, eeg_features, key_suffix=""
     from lightgbm import LGBMRegressor
     from sklearn.model_selection import train_test_split
     from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-    from sklearn.preprocessing import StandardScaler
     
     # Checkbox to show/hide the entire regressor analysis section
     show_regressor = st.checkbox(
@@ -3977,7 +4034,7 @@ def rf_regressor_analysis(df_wnv2, selected_feature, eeg_features, key_suffix=""
             # Get eeg_channels if available (try to import or use a default list)
             try:
                 from utils.eeg_utils import eeg_channels
-            except:
+            except Exception:
                 # If not available, try to extract from feature names
                 eeg_channels = set()
                 for feature in X.columns:
@@ -4018,7 +4075,7 @@ def rf_regressor_analysis(df_wnv2, selected_feature, eeg_features, key_suffix=""
                 plt.close(fig)
                 
                 # Display electrode importance table
-                st.write(f"**Feature Importance by Electrode:**")
+                st.write("**Feature Importance by Electrode:**")
                 st.dataframe(electrode_df_nonzero, use_container_width=True)
                 
                 # Try to create topomap if available
@@ -4041,13 +4098,190 @@ def rf_regressor_analysis(df_wnv2, selected_feature, eeg_features, key_suffix=""
         st.error(f"Error in RF regressor analysis: {str(e)}")
 
 
+def _get_edf_overview_data_impl(selected_projects, progress_bar=None, status_text=None):
+    if isinstance(selected_projects, str):
+        selected_projects = [selected_projects]
+        
+    edf_files = []
+    actual_dirs_used = []
+    
+    for project in selected_projects:
+        # Heuristics to find the actual directory containing EDF files
+        search_dirs = [os.path.join('EDF_Format', project), project, 'EDF', os.path.join('EDF_Format', 'EDF')]
+        actual_dir = None
+        
+        for d in search_dirs:
+            if os.path.exists(d):
+                # Check if this directory actually contains EDF files
+                has_edf = False
+                for root, dirs, files in os.walk(d):
+                    if any(f.lower().endswith('.edf') for f in files):
+                        has_edf = True
+                        break
+                if has_edf:
+                    actual_dir = d
+                    break
+                    
+        if actual_dir is None:
+            actual_dir = os.path.join('EDF_Format', project) # Fallback
+
+        if actual_dir not in actual_dirs_used:
+            actual_dirs_used.append(actual_dir)
+
+        # Find all EDF files in actual_dir or its subdirectories
+        if os.path.exists(actual_dir):
+            for root, dirs, files in os.walk(actual_dir):
+                for file in files:
+                    if file.lower().endswith('.edf'):
+                        edf_files.append(os.path.join(root, file))
+
+    # Remove duplicates if any projects share the same directory structure
+    edf_files = list(set(edf_files))
+    
+    import re
+    patient_data = {}
+    total_files = len(edf_files)
+    
+    for idx, f in enumerate(edf_files):
+        if status_text:
+            status_text.text(f"Analyzing EDF files... ({idx}/{total_files})")
+        if progress_bar:
+            progress_bar.progress(idx / total_files if total_files > 0 else 0)
+            
+        try:
+            # Load raw data without preloading to read metadata fast
+            raw = mne.io.read_raw_edf(f, preload=False, verbose='ERROR')
+            duration = raw.times[-1] if raw.times is not None and len(raw.times) > 0 else 0
+            sfreq = raw.info['sfreq']
+            ch_names = raw.ch_names
+            
+            base_name = os.path.basename(f)
+            # Combine multipart EDFs (e.g. '0345-037 P2.EDF', '0345-035 (1).EDF')
+            patient_id = re.sub(r'(?i)(\s+p\d+|\s*\(\d+\)|_p\d+)?\.edf$', '', base_name)
+            
+            if patient_id not in patient_data:
+                patient_data[patient_id] = {
+                    'Files': [base_name],
+                    'Duration (s)': duration,
+                    'Sampling Frequency (Hz)': sfreq,
+                    'Channels': set(ch_names)
+                }
+            else:
+                patient_data[patient_id]['Files'].append(base_name)
+                patient_data[patient_id]['Duration (s)'] += duration
+                patient_data[patient_id]['Channels'].update(ch_names)
+                
+        except Exception as e:
+            pass # Skip files that can't be read
+            
+    if status_text:
+        status_text.text(f"Analyzing EDF files... ({total_files}/{total_files})")
+    if progress_bar:
+        progress_bar.progress(1.0)
+            
+    data = []
+    all_channels_count = Counter()
+    total_patients = len(patient_data)
+    
+    for pid, info in patient_data.items():
+        data.append({
+            'Patient': pid,
+            'File': ' + '.join(sorted(info['Files'])),
+            'Parts': len(info['Files']),
+            'Duration (s)': info['Duration (s)'],
+            'Duration (min)': info['Duration (s)'] / 60.0,
+            'Sampling Frequency (Hz)': info['Sampling Frequency (Hz)'],
+            'Num Channels': len(info['Channels'])
+        })
+        all_channels_count.update(info['Channels'])
+        
+    df = pd.DataFrame(data)
+    
+    # Calculate channel statistics
+    channel_stats = []
+    for ch, count in all_channels_count.items():
+        channel_stats.append({
+            'Channel': ch,
+            'Count': count,
+            'Percentage (%)': (count / total_patients) * 100 if total_patients > 0 else 0
+        })
+    ch_df = pd.DataFrame(channel_stats).sort_values('Count', ascending=False) if channel_stats else pd.DataFrame()
+    
+    return actual_dirs_used, df, ch_df
+
+@st.cache_data(show_spinner=False)
+def get_edf_overview_data(selected_projects):
+    return _get_edf_overview_data_impl(selected_projects)
+
+def overview_edf_files(selected_projects):
+    st.header("EDF Files Overview")
+    
+    # Check if this is a test run (either explicitly true or default when outside a session)
+    if st.runtime.exists() and 'test_run' in st.session_state:
+        is_test_run = st.session_state.get('test_run', False)
+    else:
+        is_test_run = True # Safe default
+        
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    status_text.text("Analyzing EDF files metadata...")
+    
+    if is_test_run:
+        # Bypass cache for test runs
+        actual_dirs_used, df, ch_df = _get_edf_overview_data_impl(selected_projects, progress_bar, status_text)
+    else:
+        # Use cached version for regular runs
+        actual_dirs_used, df, ch_df = get_edf_overview_data(selected_projects)
+        progress_bar.progress(1.0)
+        status_text.text("Analysis complete (loaded from cache)!")
+        
+        
+    if df.empty:
+        projects_str = ", ".join(selected_projects) if isinstance(selected_projects, (list, tuple)) else selected_projects
+        st.warning(f"No valid EDF files found for project(s): {projects_str}.")
+        return
+        
+    st.write(f"**Total distinct patients analyzed**: {len(df)}")
+    
+    st.write("**Folders Analyzed:**")
+    for d in actual_dirs_used:
+        st.write(f"- `{d}`")
+        
+    with st.expander("Analyzed Patients & Files List"):
+        for _, row in df.iterrows():
+            if row['Parts'] > 1:
+                st.write(f"- **{row['Patient']}** (Merged {row['Parts']} files: {row['File']})")
+            else:
+                st.write(f"- **{row['Patient']}** ({row['File']})")
+            
+    col1, col2 = st.columns(2)
+    with col1:
+        st.subheader("Duration Distribution")
+        fig, ax = plt.subplots(figsize=(6, 4))
+        sns.histplot(df['Duration (min)'].dropna(), bins=20, kde=True, ax=ax)
+        ax.set_xlabel('Duration (minutes)')
+        ax.set_ylabel('Count')
+        st.pyplot(fig)
+        plt.close(fig)
+        
+    with col2:
+        st.subheader("Sampling Frequencies")
+        if 'Sampling Frequency (Hz)' in df.columns:
+            sfreq_counts = df['Sampling Frequency (Hz)'].value_counts().reset_index()
+            sfreq_counts.columns = ['Sampling Frequency (Hz)', 'Count']
+            st.dataframe(sfreq_counts, use_container_width=True)
+        
+    st.subheader("Channel Overview")
+    st.write("Percentage of patients/files that have each specific electrode:")
+    st.dataframe(ch_df.round(2) if not ch_df.empty else ch_df, use_container_width=True)
+    
+    st.subheader("Files Metadata Summary")
+    st.dataframe(df.describe().round(2), use_container_width=True)
+
 # Streamlit App
 def main():
     # options to choose from folders in pickles
-    default_options = ["COBRAD", "WNV"] +  [f for f in os.listdir('parquet_results') if os.path.isdir(os.path.join('parquet_results', f))] 
-    # allow multiple selection for project
-    # default_options = ["COBRAD", "WNV"] reading_epilepsy_cut
-    # Deduplicate while preserving order
+    default_options = ["COBRAD", "WNV"] +  [f for f in os.listdir('EDF_Format') if os.path.isdir(os.path.join('EDF_Format', f))] 
     seen = set()
     opts = [x for x in default_options if not (x in seen or seen.add(x))]
     selected_projects = st.sidebar.pills("Select Project(s)", opts, default=[x for x in ["COBRAD"] if x in opts],selection_mode ="multi")
@@ -4077,6 +4311,7 @@ def main():
             controls = temp_controls
             controls['Group'] = 'Control'
             cases_group_name = temp_cases_group_name
+            primary_patients_folder = patients_folder
         else:
             df_wnv2_others.append((project_name, temp_df_wnv2))
             controls_others.append((project_name, temp_controls))
@@ -4119,7 +4354,7 @@ def main():
     # Sidebar for feature selection
     st.sidebar.header("Feature Selection")
     # 'systole_diastole_comparison', 'ECG_Analysis', 'HEP',
-    feature_types = ("HEP","vs_Controls",'All',  'Clinical Feature', "EEG Feature", "ml_plots",  "Pair Plot",'Raw','Spectrogram', ) # 'Longitudinal',
+    feature_types = ("HEP","vs_Controls",'All',  'Clinical Feature', "EEG Feature", "ml_plots",  "Pair Plot",'Raw','Spectrogram',"Overview" ) # 'Longitudinal',
     feature_type = st.sidebar.selectbox("Select feature type to plot against the other type:", feature_types, index=0)
     
     # Sidebar for scatterplot size feature selection
@@ -4135,7 +4370,7 @@ def main():
     else:
         analysis_type = "Full"
         
-    dict_features = {}
+    _ = {}
     bool_all_features = False
     cols_to_skip = ['ID','annotations','bad_channels','Group','patient_number','size','n_samples']
     clinical_features = [feature for feature in clinical_features if feature not in cols_to_skip]
@@ -4156,6 +4391,10 @@ def main():
         if feature_type == "All":
             st.header(f"{current_feature_type} Analysis")
             bool_all_features = True
+            
+        if current_feature_type == "Overview":
+            overview_edf_files(tuple(selected_projects))
+            
         if current_feature_type == "vs_Controls":
             vs_controls_run(project_name, df_wnv2, controls, boxplot_columns, analysis_type)
         elif current_feature_type == "HEP":
@@ -4178,7 +4417,7 @@ def main():
                 spectrogram_run(cases_group_name,win_sec=win_sec)
                 st.divider()
                 st.subheader("Spectrogram Controls")
-                spectrogram_run(f'Controls',win_sec=win_sec)
+                spectrogram_run('Controls',win_sec=win_sec)
             except Exception as e:
                 st.error(f"Error running spectrogram: {e}")
         elif current_feature_type == "Raw":
@@ -4420,7 +4659,7 @@ def extract_sleep_stage_segment(raw, stage='N1', min_duration_min=1):
     try:
         # Check if file has ECG channel (optional but preferred)
         ch_lower = [ch.lower() for ch in raw.ch_names]
-        ecg_indices = [i for i, ch in enumerate(ch_lower) if 'ecg' in ch or 'ekg' in ch]
+        _ = [i for i, ch in enumerate(ch_lower) if 'ecg' in ch or 'ekg' in ch]
         
         # Find the best channels for sleep staging
         available_eeg_channels = [ch for ch in raw.ch_names if ch in eeg_channels]
@@ -4572,7 +4811,7 @@ def extract_sleep_stage_segment(raw, stage='N1', min_duration_min=1):
             else:
                 return None
                 
-    except Exception as e:
+    except Exception:
         return None
 
 
@@ -4620,8 +4859,7 @@ def compute_all_network_features(raw, patient_id):
         
         # Import required libraries
         from mne_connectivity import SpectralConnectivity as spectral_connectivity
-        from scipy.signal import coherence, hilbert, welch
-        from scipy.stats import pearsonr
+        from scipy.signal import hilbert, welch
         import networkx as nx
         from itertools import combinations
         import pandas as pd
@@ -4787,7 +5025,7 @@ def compute_all_network_features(raw, patient_id):
                 features[f'median_mpf_EEG {ch}'] = float(np.median(mpf_list_per_ch[i])) if len(mpf_list_per_ch[i]) > 0 else 0.0
                 features[f'dfv_mean_EEG {ch}'] = float(np.mean(df_list_per_ch[i])) if len(df_list_per_ch[i]) > 0 else 0.0
                 features[f'dfv_std_EEG {ch}'] = float(dfv_arr[i])
-        except Exception as e:
+        except Exception:
             # If EEG feature computation fails, continue with network features
             pass
         
@@ -4820,7 +5058,7 @@ def compute_all_network_features(raw, patient_id):
                 coherence_matrix = np.nan_to_num(coherence_matrix, nan=0.0, posinf=0.0, neginf=0.0)
             np.fill_diagonal(coherence_matrix, 1.0)
             features['coherence_matrix'] = coherence_matrix
-        except:
+        except Exception:
             coherence_matrix = np.corrcoef(eeg_data)
             coherence_matrix = np.nan_to_num(coherence_matrix, nan=0.0, posinf=0.0, neginf=0.0)
             np.fill_diagonal(coherence_matrix, 1.0)
@@ -4851,7 +5089,7 @@ def compute_all_network_features(raw, patient_id):
                 imaginary_coherence = np.abs(np.imag(np.fft.fft(eeg_data)))
             np.fill_diagonal(imaginary_coherence, 0.0)
             features['imaginary_coherence'] = imaginary_coherence
-        except:
+        except Exception:
             features['imaginary_coherence'] = np.zeros((n_eeg_channels, n_eeg_channels))
         
         # 3. wPLI (Weighted Phase Lag Index)
@@ -4879,7 +5117,7 @@ def compute_all_network_features(raw, patient_id):
                 wPLI_matrix = np.zeros((n_eeg_channels, n_eeg_channels))
             np.fill_diagonal(wPLI_matrix, 0.0)
             features['wPLI_matrix'] = wPLI_matrix
-        except:
+        except Exception:
             features['wPLI_matrix'] = np.zeros((n_eeg_channels, n_eeg_channels))
         
         # 4. PLI (Phase Lag Index)
@@ -4907,7 +5145,7 @@ def compute_all_network_features(raw, patient_id):
                 PLI_matrix = np.zeros((n_eeg_channels, n_eeg_channels))
             np.fill_diagonal(PLI_matrix, 0.0)
             features['PLI_matrix'] = PLI_matrix
-        except:
+        except Exception:
             features['PLI_matrix'] = np.zeros((n_eeg_channels, n_eeg_channels))
         
         # 5. Amplitude Envelope Correlation (AEC)
@@ -4919,7 +5157,7 @@ def compute_all_network_features(raw, patient_id):
             amplitude_envelope_corr = np.nan_to_num(amplitude_envelope_corr, nan=0.0, posinf=0.0, neginf=0.0)
             np.fill_diagonal(amplitude_envelope_corr, 1.0)
             features['amplitude_envelope_corr'] = amplitude_envelope_corr
-        except:
+        except Exception:
             amplitude_envelope_corr = np.corrcoef(eeg_data)
             amplitude_envelope_corr = np.nan_to_num(amplitude_envelope_corr, nan=0.0, posinf=0.0, neginf=0.0)
             np.fill_diagonal(amplitude_envelope_corr, 1.0)
@@ -4936,7 +5174,7 @@ def compute_all_network_features(raw, patient_id):
                 phase_locking_value[i, j] = phase_locking_value[j, i] = plv
             np.fill_diagonal(phase_locking_value, 1.0)
             features['phase_locking_value'] = phase_locking_value
-        except:
+        except Exception:
             features['phase_locking_value'] = np.zeros((n_eeg_channels, n_eeg_channels))
         
         # Use coherence_matrix as base for graph metrics
@@ -4958,7 +5196,7 @@ def compute_all_network_features(raw, patient_id):
             degrees = dict(G.degree())
             graph_degree = np.array([degrees.get(i, 0) for i in range(n_eeg_channels)])
             features['graph_degree'] = graph_degree
-        except:
+        except Exception:
             features['graph_degree'] = np.zeros(n_eeg_channels)
         
         # 8. Graph Strength (weighted degree)
@@ -4966,7 +5204,7 @@ def compute_all_network_features(raw, patient_id):
             strengths = dict(G.degree(weight='weight'))
             graph_strength = np.array([strengths.get(i, 0) for i in range(n_eeg_channels)])
             features['graph_strength'] = graph_strength
-        except:
+        except Exception:
             features['graph_strength'] = np.sum(conn_matrix, axis=1) - np.diag(conn_matrix)
         
         # 9. Clustering Coefficient
@@ -4974,14 +5212,14 @@ def compute_all_network_features(raw, patient_id):
             clustering_coeff = nx.clustering(G)
             clustering_coefficient = np.array([clustering_coeff.get(i, 0) for i in range(n_eeg_channels)])
             features['clustering_coefficient'] = clustering_coefficient
-        except:
+        except Exception:
             features['clustering_coefficient'] = np.zeros(n_eeg_channels)
         
         # 10. Global Efficiency
         try:
             global_efficiency = nx.global_efficiency(G)
             features['global_efficiency'] = global_efficiency if np.isfinite(global_efficiency) else 0.0
-        except:
+        except Exception:
             features['global_efficiency'] = 0.0
         
         # 11. Characteristic Path Length
@@ -4998,7 +5236,7 @@ def compute_all_network_features(raw, patient_id):
                     if len(comp) > 1:
                         path_lengths.append(nx.average_shortest_path_length(subgraph))
                 features['characteristic_path_length'] = np.mean(path_lengths) if path_lengths else np.inf
-        except:
+        except Exception:
             features['characteristic_path_length'] = np.inf
         
         # 12. Modularity
@@ -5006,7 +5244,7 @@ def compute_all_network_features(raw, patient_id):
             communities = nx.community.greedy_modularity_communities(G)
             modularity = nx.community.modularity(G, communities)
             features['modularity'] = modularity if np.isfinite(modularity) else 0.0
-        except:
+        except Exception:
             features['modularity'] = 0.0
         
         # 13. Betweenness Centrality
@@ -5014,7 +5252,7 @@ def compute_all_network_features(raw, patient_id):
             betweenness = nx.betweenness_centrality(G)
             betweenness_centrality = np.array([betweenness.get(i, 0) for i in range(n_eeg_channels)])
             features['betweenness_centrality'] = betweenness_centrality
-        except:
+        except Exception:
             features['betweenness_centrality'] = np.zeros(n_eeg_channels)
         
         # 14. Eigenvector Centrality
@@ -5022,7 +5260,7 @@ def compute_all_network_features(raw, patient_id):
             eigenvector = nx.eigenvector_centrality(G, max_iter=100)
             eigenvector_centrality = np.array([eigenvector.get(i, 0) for i in range(n_eeg_channels)])
             features['eigenvector_centrality'] = eigenvector_centrality
-        except:
+        except Exception:
             features['eigenvector_centrality'] = np.zeros(n_eeg_channels)
         
         # 15. Participation Coefficient
@@ -5045,7 +5283,7 @@ def compute_all_network_features(raw, patient_id):
                     part_coef = 1 - sum((kis.get(m, 0) / ki) ** 2 for m in range(M))
                     participation_coefficient[i] = part_coef
             features['participation_coefficient'] = participation_coefficient
-        except:
+        except Exception:
             features['participation_coefficient'] = np.zeros(n_eeg_channels)
         
         # 16. Small Worldness
@@ -5059,14 +5297,14 @@ def compute_all_network_features(raw, patient_id):
                 features['small_worldness'] = small_worldness if np.isfinite(small_worldness) else 0.0
             else:
                 features['small_worldness'] = 0.0
-        except:
+        except Exception:
             features['small_worldness'] = 0.0
         
         # 17. Assortativity
         try:
             assortativity = nx.degree_pearson_correlation_coefficient(G)
             features['assortativity'] = assortativity if np.isfinite(assortativity) else 0.0
-        except:
+        except Exception:
             features['assortativity'] = 0.0
         
         # 18. Network Entropy
@@ -5078,7 +5316,7 @@ def compute_all_network_features(raw, patient_id):
             else:
                 network_entropy = 0.0
             features['network_entropy'] = network_entropy if np.isfinite(network_entropy) else 0.0
-        except:
+        except Exception:
             features['network_entropy'] = 0.0
         
         # 19. Dynamic Connectivity Entropy (simplified - variance of connectivity over time)
@@ -5109,20 +5347,20 @@ def compute_all_network_features(raw, patient_id):
                             var_val = np.var(window_conn)
                             if np.isfinite(var_val) and not np.isnan(var_val):
                                 conn_variance.append(var_val)
-                    except:
+                    except Exception:
                         continue
             dynamic_connectivity_entropy = np.std(conn_variance) if conn_variance else 0.0
             if not np.isfinite(dynamic_connectivity_entropy):
                 dynamic_connectivity_entropy = 0.0
             features['dynamic_connectivity_entropy'] = dynamic_connectivity_entropy
-        except:
+        except Exception:
             features['dynamic_connectivity_entropy'] = 0.0
         
         # 20. Functional Connectivity Density
         try:
             functional_connectivity_density = np.mean(conn_matrix)
             features['functional_connectivity_density'] = functional_connectivity_density
-        except:
+        except Exception:
             features['functional_connectivity_density'] = 0.0
         
         # 21. PCA Components (explaining 95% variance)
@@ -5153,7 +5391,7 @@ def compute_all_network_features(raw, patient_id):
             features['pca_explained_variance_ratio'] = pca.explained_variance_ratio_
             features['pca_n_components_95'] = n_components_95
             features['pca_total_variance_explained'] = np.sum(pca.explained_variance_ratio_)
-        except Exception as e:
+        except Exception:
             features['pca_components_95'] = np.zeros((1, eeg_data.shape[1]))
             features['pca_explained_variance_ratio'] = np.array([0.0])
             features['pca_n_components_95'] = 0
@@ -5197,7 +5435,7 @@ def compute_all_network_features(raw, patient_id):
             
             # Option 2: Try to use a neural network autoencoder if available
             try:
-                import tensorflow as tf
+                pass
                 from tensorflow import keras
                 from tensorflow.keras import layers
                 
@@ -5248,11 +5486,11 @@ def compute_all_network_features(raw, patient_id):
             except ImportError:
                 # TensorFlow not available, use PCA-based autoencoder only
                 pass
-            except Exception as e:
+            except Exception:
                 # Neural network training failed, use PCA-based autoencoder only
                 pass
                 
-        except Exception as e:
+        except Exception:
             features['autoencoder_features_95'] = np.zeros((1, eeg_data.shape[1]))
             features['autoencoder_n_components_95'] = 0
             features['autoencoder_variance_explained'] = 0.0
@@ -5287,7 +5525,7 @@ def compute_all_network_features(raw, patient_id):
                 else:
                     time_domain_matrix = np.zeros((3, 3))
                 features['time_domain_matrix'] = time_domain_matrix
-            except:
+            except Exception:
                 features['time_domain_matrix'] = np.zeros((3, 3))
             
             # Heart-Brain Coherence
@@ -5297,7 +5535,7 @@ def compute_all_network_features(raw, patient_id):
                 min_len = min(len(eeg_power), len(ecg_power))
                 heart_brain_coherence = np.corrcoef(eeg_power[:min_len], ecg_power[:min_len])[0, 1]
                 features['heart_brain_coherence'] = heart_brain_coherence if np.isfinite(heart_brain_coherence) else 0.0
-            except:
+            except Exception:
                 features['heart_brain_coherence'] = 0.0
             
             features['phase_amplitude_coupling'] = np.zeros(n_eeg_channels)
@@ -5394,7 +5632,7 @@ def load_from_cache(cache_path):
         try:
             with open(cache_path, 'rb') as f:
                 return pickle.load(f)
-        except Exception as e:
+        except Exception:
             # If cache is corrupted, return None
             return None
     return None
@@ -5414,7 +5652,7 @@ def save_to_cache(cache_path, data):
     try:
         with open(cache_path, 'wb') as f:
             pickle.dump(data, f)
-    except Exception as e:
+    except Exception:
         # If caching fails, just continue without cache
         pass
 
@@ -5438,7 +5676,6 @@ def extract_systole_diastole_segments(raw, sfreq):
         - 'indices': Sample indices for the segments
     """
     import neurokit2 as nk
-    import numpy as np
     
     # Get channel names and data
     ch_names = raw.ch_names
@@ -5457,14 +5694,14 @@ def extract_systole_diastole_segments(raw, sfreq):
     # Clean ECG signal
     try:
         ecg_clean = nk.ecg_clean(ecg_signal, sampling_rate=sfreq)
-    except:
+    except Exception:
         ecg_clean = ecg_signal
     
     # Detect R-peaks
     try:
         _, rpk = nk.ecg_peaks(ecg_clean, sampling_rate=sfreq)
         rpeaks = rpk['ECG_R_Peaks']
-    except:
+    except Exception:
         # Fallback: simple peak detection
         from scipy.signal import find_peaks
         peaks, _ = find_peaks(ecg_clean, distance=int(sfreq * 0.3))
@@ -5523,8 +5760,6 @@ def extract_systole_diastole_segments(raw, sfreq):
     # Concatenate all segments
     if systole_segments_eeg and diastole_segments_eeg:
         # Pad segments to same length for concatenation
-        max_systole_len = max(seg.shape[1] for seg in systole_segments_eeg) if systole_segments_eeg else 0
-        max_diastole_len = max(seg.shape[1] for seg in diastole_segments_eeg) if diastole_segments_eeg else 0
         
         # For feature extraction, we'll use all segments separately
         return {
@@ -5627,7 +5862,7 @@ def compute_autoencoder_features(data, feature_name_prefix="", variance_threshol
         # Also store the full encoded features (flattened) for more detailed analysis
         features[f'{feature_name_prefix}_autoencoder_features_full'] = encoded.flatten()
         
-    except Exception as e:
+    except Exception:
         # Return empty features on error
         pass
     
@@ -6326,7 +6561,7 @@ def forest_plot_all_features(df_wnv3, selected_feature, target_features, analysi
     - target_features: List of EEG features to compare
     - analysis_type: "Full" or "Significant" to filter results
     """
-    from scipy.stats import mannwhitneyu, ttest_ind
+    from scipy.stats import mannwhitneyu
     
     # Prepare data for analysis
     df_clean = df_wnv3[df_wnv3[selected_feature].notna()].copy()
@@ -6572,7 +6807,6 @@ def load_clinical_data_with_dates(project_name):
     """
     import os
     import pandas as pd
-    from pathlib import Path
     
     clinical_df = pd.DataFrame()
     edf_proj_dir = os.path.join('EDF_Format', project_name)
@@ -6612,8 +6846,6 @@ def load_raw_parquet_files(project_name):
     """
     import os
     import pandas as pd
-    import glob
-    from pathlib import Path
     
     parquet_dir = os.path.join('parquet_results', project_name)
     df_list = []
@@ -6664,7 +6896,7 @@ def find_date_columns(df):
                 try:
                     pd.to_datetime(sample_values.iloc[0])
                     date_columns.append(col)
-                except:
+                except Exception:
                     pass
     
     return date_columns
@@ -6693,7 +6925,6 @@ def create_average_trajectory_plot(df_plot_normalized, x_col, actual_y_col, proj
     """
     import matplotlib.pyplot as plt
     import numpy as np
-    from scipy import stats
     import statsmodels.api as sm
     
     # Calculate average trajectory
@@ -6745,14 +6976,6 @@ def create_average_trajectory_plot(df_plot_normalized, x_col, actual_y_col, proj
     ax.legend(loc='best')
     
     # Add statistical significance annotation
-    if p_value < 0.001:
-        sig_text = "p < 0.001"
-    elif p_value < 0.01:
-        sig_text = "p < 0.01"
-    elif p_value < 0.05:
-        sig_text = "p < 0.05"
-    else:
-        sig_text = "p ≥ 0.05 (not significant)"
     
     plt.tight_layout()
     

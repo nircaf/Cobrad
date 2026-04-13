@@ -2,10 +2,7 @@ import os
 import glob
 import numpy as np
 import pandas as pd
-from scipy.io import loadmat
-from scipy.stats import zscore
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split
 from scipy.stats import iqr
 import mne
 import matplotlib.pyplot as plt
@@ -13,73 +10,42 @@ import seaborn as sns
 from scipy import stats
 from statsmodels.stats.multitest import multipletests
 import statsmodels.stats.multitest as smm
-from scipy.signal import spectrogram
-import mne_connectivity
 from mne_connectivity import SpectralConnectivity as spectral_connectivity
 import statsmodels.api as sm
 import streamlit as st
 import json
-import pickle, uuid
-import re, io
+import pickle
+import uuid
+import re
+import io
 from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor
 from scipy.signal import welch
 import dabest
 from statsmodels.stats.power import TTestIndPower
-from scipy.stats import wilcoxon, zscore, pearsonr, entropy, ranksums, linregress, spearmanr
+from scipy.stats import spearmanr
 from statsmodels.stats.multitest import fdrcorrection
 from scipy.stats import mannwhitneyu
-from sklearn.linear_model import HuberRegressor
-import sys, mne.io.array
+import sys
+import mne.io.array
 sys.modules['mne.io.array.array'] = mne.io.array
 # Optional imports for plotly functionality
 try:
-    import plotly.graph_objects as go
-    import plotly.express as px
-    from plotly.subplots import make_subplots
+    import plotly.graph_objects as go  # noqa: F401
+    import plotly.express as px  # noqa: F401
+    from plotly.subplots import make_subplots  # noqa: F401
     PLOTLY_AVAILABLE = True
 except ImportError:
     PLOTLY_AVAILABLE = False
 
-eeg_channels = ['Fp1', 'Fp2', 'F3', 'F4', 'C3', 'C4', 'P3', 'P4', 'O1', 'O2', 'F7',
-       'F8', 'T3', 'T4', 'T5', 'T6', 'Fz', 'Cz', 'Pz', 'A1','A2', 'Fpz', 'Oz','AF7','AF8']
+_config = json.load(open(os.path.join(os.path.dirname(__file__), 'config.json')))
+eeg_channels = _config['eeg_channels']
+eeg_dict_convertion = _config['eeg_dict_convertion']
+
 
 # Base color palette for consistent plotting across functions
 BASE_PALETTE = ["#1F77B4", "#E41A1C", "#2CA02C", "#FF7F0E", "#9467BD",
                "#8C564B", "#17BECF", "#D62728", "#BCBD22", "#7F7F7F"]
-
-eeg_dict_convertion = {
-       'Fp2-F4': 'Fp2',
-       'F4-C4': 'F4',
-       'C4-P4': 'C4',
-       'P4-O2': 'P4',
-       'Fp2-F8': 'Oz',
-       'F8-T4': 'F8',
-       'T4-T6': 'T4',
-       'T6-O2': 'T6',
-       'Fz-Cz': 'Fz',
-       'Cz-Pz': 'Cz',
-       'Fp1-F3': 'Fp1',
-       'F3-C3': 'F3',
-       'C3-P3': 'C3',
-       'P3-O1': 'P3',
-       'Fp1-F7': 'Fpz',
-       'F7-T3': 'F7',
-       'T3-T5': 'T3',
-       'T5-O1': 'T5',
-       'EOG1+': 'eog',
-       'EOG2+': 'eog',
-       'ECG1+': 'ecg',
-        'ECG2+': 'ecg',
-        'C3-G2': 'C3',
-        'Fp2-G2-1': 'Fp2',
-        'T4-G2': 'T4',
-        'Fp1-G2-0': 'AF7',
-        'Fp2-G2-0': 'AF8',
-        'T3-G2': 'T3',
-    'C4-G2': 'C4',
-    'Fp1-G2-1': 'Fp1',
-}
 
 
 def st_progress_updater(total: int, label: str = "Progress"):
@@ -162,8 +128,7 @@ power_bands = {
     "gamma": [30, 100]
 }
 
-import numpy as np
-import mne
+import mne  # noqa: E402
 
 def slice_stratified_windows(
     raw: mne.io.BaseRaw,
@@ -388,6 +353,7 @@ def mean_of_resized_arrays(arrays):
 
 def rename_channels(raw):
     try:
+        channel_names = raw.ch_names
         # remove channels that don't have EEG, ECG, or EOG in their name from raw
         # raw.drop_channels([channel for channel in raw.ch_names if 'EEG' not in channel])
         # remove EEG from channel name
@@ -418,8 +384,25 @@ def rename_channels(raw):
             # Remove channels where both splits already exist
             if channels_to_remove:
                 raw.drop_channels(channels_to_remove)
+        # Drop duplicate targets: if multiple source channels map to the same name, keep only the first
+        seen_targets = {}
+        dupes_to_drop = []
+        for src, tgt in valid_rename_dict.items():
+            if tgt in seen_targets:
+                dupes_to_drop.append(src)
+            else:
+                seen_targets[tgt] = src
+        # Also drop sources whose target already exists as an unrenamed channel
+        existing_channels = set(raw.ch_names)
+        for src, tgt in list(valid_rename_dict.items()):
+            if tgt in existing_channels and src != tgt and src not in dupes_to_drop:
+                dupes_to_drop.append(src)
+        if dupes_to_drop:
+            valid_rename_dict = {k: v for k, v in valid_rename_dict.items() if k not in dupes_to_drop}
+            raw.drop_channels([ch for ch in dupes_to_drop if ch in raw.ch_names])
         raw.rename_channels(valid_rename_dict)
-    except:
+    except Exception:
+        print("Error in rename_channels, proceeding without renaming. Error details:")
         pass
     for channel in raw.ch_names:
         if channel.lower() in [ch.lower() for ch in eeg_channels]:
@@ -606,7 +589,7 @@ def boxplot_plot_dabest(results_df, combined_df, col, output_dir,figures_dir=Non
 
         # Extract p-value and Cohen's d from dabest results
         dabest_results = dabest_obj.mean_diff.results
-        p_value = dabest_results['pvalue_mann_whitney'].values[0] if 'pvalue_mann_whitney' in dabest_results else np.nan
+        dabest_results['pvalue_mann_whitney'].values[0] if 'pvalue_mann_whitney' in dabest_results else np.nan
         dabest_results.columns
 
         def add_sig_lines(is_streamlit=False, est=None):
@@ -617,7 +600,7 @@ def boxplot_plot_dabest(results_df, combined_df, col, output_dir,figures_dir=Non
             else:
                 ax = plt.gca()
             y_min, y_max = ax.get_ylim()
-            xticks = ax.get_xticks()
+            ax.get_xticks()
             xticklabels = [tick.get_text() for tick in ax.get_xticklabels()]
             if not any(xticklabels):
                 xticklabels = [str(g) for g in unique_groups]
@@ -678,12 +661,12 @@ def boxplot_plot_dabest(results_df, combined_df, col, output_dir,figures_dir=Non
         grand_mean = cleaned_df[col].mean()
         ss_between = sum(cleaned_df.groupby('Group').size() * (group_means - grand_mean) ** 2)
         ss_total = sum((cleaned_df[col] - grand_mean) ** 2)
-        r_squared = ss_between / ss_total if ss_total > 0 else np.nan
+        ss_between / ss_total if ss_total > 0 else np.nan
         def cohen_d_power():
             # Format Cohen's d
             try:
                 cd = dabest_obj.cohens_d.results
-                cohen_d = cd['difference'].values[0] if 'difference' in cd.columns else np.nan
+                cd['difference'].values[0] if 'difference' in cd.columns else np.nan
             except Exception as e:
                 st.write(f"Could not compute Cohen's d: {e}")
                 return 
@@ -772,8 +755,7 @@ def boxplot_plot_dabest(results_df, combined_df, col, output_dir,figures_dir=Non
     return # results_df
     figures_dir = 'figures'
 
-from collections import defaultdict
-import numpy as np
+from collections import defaultdict  # noqa: E402
 
 def annotate_pvals_with_jitter(ax, pval_lines, cleaned_df, col, unique_groups):
     """Annotate pairwise p-values with U-bars + stars while:
@@ -886,9 +868,8 @@ def annotate_pvals_with_jitter(ax, pval_lines, cleaned_df, col, unique_groups):
 
         stack_counter[key] += 1
 
-from pptx import Presentation
-from pptx.util import Inches
-from pptx.enum.text import PP_ALIGN
+from pptx import Presentation  # noqa: E402
+from pptx.util import Inches  # noqa: E402
 
 # initialize session state pptx only once
 if "pptx" not in st.session_state:
@@ -1709,7 +1690,7 @@ def wnv_get_files():
     # merge the dataframes
     df_merged_outer = pd.merge(df_wnv, cases, on='ID', how='outer',indicator=True)
     df_merged = df_merged_outer[df_merged_outer['_merge'] == 'both']
-    wnv_files = os.listdir(f'west_nile_virus')
+    wnv_files = os.listdir('west_nile_virus')
     # remove .DS_Store
     wnv_files = [file for file in wnv_files if 'DS_Store' not in file]
     wnv_files = [file.split('.edf')[0] for file in wnv_files]
@@ -1788,7 +1769,6 @@ def read_edf_mne(file_path):
     
     raw = None
     last_error = None
-    int_conversion_error = False
     
     for i, params in enumerate(read_attempts):
         try:
@@ -1802,7 +1782,7 @@ def read_edf_mne(file_path):
             last_error = e
             error_str = str(e)
             error_repr = repr(e)
-            error_type = type(e).__name__
+            type(e).__name__
             # Check for the specific empty string to int error in multiple ways
             is_int_error = (
                 "invalid literal for int()" in error_str or 
@@ -1815,9 +1795,8 @@ def read_edf_mne(file_path):
             )
             
             if is_int_error:
-                int_conversion_error = True
                 print(f"Warning: MNE attempt {i+1} failed with int conversion error for {os.path.basename(file_path)}: {error_str}")
-                print(f"  Trying pyedflib as alternative reading method...")
+                print("  Trying pyedflib as alternative reading method...")
                 # Try using pyedflib as fallback immediately when we detect this error
                 try:
                     import pyedflib
@@ -1841,7 +1820,7 @@ def read_edf_mne(file_path):
                     # Create Raw object
                     raw = mne.io.RawArray(data, info)
                     edf.close()
-                    print(f"Successfully read file using pyedflib fallback")
+                    print("Successfully read file using pyedflib fallback")
                     break
                 except ImportError:
                     print("pyedflib not available for fallback reading")
@@ -1860,7 +1839,7 @@ def read_edf_mne(file_path):
                     continue
                 else:
                     # Last attempt failed, try pyedflib as final fallback
-                    print(f"Warning: All MNE attempts failed. Trying pyedflib as final fallback...")
+                    print("Warning: All MNE attempts failed. Trying pyedflib as final fallback...")
                     try:
                         import pyedflib
                         # Read with pyedflib and convert to MNE format
@@ -1883,7 +1862,7 @@ def read_edf_mne(file_path):
                         # Create Raw object
                         raw = mne.io.RawArray(data, info)
                         edf.close()
-                        print(f"Successfully read file using pyedflib fallback")
+                        print("Successfully read file using pyedflib fallback")
                         break
                     except ImportError:
                         print("pyedflib not available for fallback reading")
@@ -1918,7 +1897,7 @@ def read_edf_mne(file_path):
     except Exception as e:
         # If metadata creation fails, create minimal metadata and warn
         print(f"Warning: Could not extract full metadata from {os.path.basename(file_path)}: {e}")
-        print(f"  Creating minimal metadata...")
+        print("  Creating minimal metadata...")
         try:
             metadata = {
                 'file_name': os.path.basename(file_path),
@@ -2468,7 +2447,7 @@ def tga_get_files():
     cases_group_name = "TGA"
     return df_wnv, patients_folder, controls, df_wnv2, cases_group_name
 
-from pathlib import Path
+from pathlib import Path  # noqa: E402
 def get_clinical_data(project_name):
     # Attempt to find a clinical Excel file under EDF_Format/{project_name}
     clinical_df = pd.DataFrame()
@@ -2636,7 +2615,7 @@ def generic_get_files(project_name: str):
             clinical_df_matched = clinical_df[clinical_df['matched_parquet_id'].notna()].copy()
             
             if len(clinical_df_matched) == 0:
-                print(f"Warning: No matching IDs found between clinical and parquet data")
+                print("Warning: No matching IDs found between clinical and parquet data")
                 df_merged = pd.DataFrame()
             else:
                 # Merge using the matched parquet ID
@@ -2688,7 +2667,7 @@ def generic_get_files(project_name: str):
     # assess if df_merged is empty
     if df_merged.empty:
         return df_parquet, patients_folder, controls, df_wnv2, cases_group_name
-        raise ValueError(f"No matching IDs found between clinical and parquet data")
+        raise ValueError("No matching IDs found between clinical and parquet data")
     df_wnv2 = aggregate_dataframe(df_merged, weighted_avg)
     # Create grouped/aggregated df (df_wnv2) similar to other loaders
     if not df_wnv2.empty:
@@ -2972,20 +2951,20 @@ def aggregate_dataframe(df_merged, weighted_avg):
         if 'duration_min' in df_merged.columns:
             numeric_cols = df_merged.select_dtypes(include=[np.number]).columns
             try:
-                df_wnv2 = (
+                (
                     df_merged.groupby('ID')
                     .apply(weighted_avg, weight_col='duration_min', numeric_cols=numeric_cols)
                     .reset_index(drop=True)
                 )
             except Exception:
                 print("Warning: weighted average failed at ID level, falling back to simple mean")
-                df_wnv2 = (
+                (
                     df_merged.groupby('ID')
                     .mean(numeric_only=True)
                     .reset_index()
                 )
         else:
-            df_wnv2 = (
+            (
                 df_merged.groupby('ID')
                 .mean(numeric_only=True)
                 .reset_index()
@@ -3001,14 +2980,14 @@ def aggregate_dataframe(df_merged, weighted_avg):
 #%% COBRAD
 def get_cobrad_controls(patients_folder='EDF'):
     # read Controls_controls.parquet
-    controls = pd.read_parquet(f'Controls_controls.parquet')
+    controls = pd.read_parquet('Controls_controls.parquet')
     controls['ID'] = controls['file_name'].apply(lambda x: x.split('_')[0]).astype(str)
     numeric_cols = controls.select_dtypes(include=[np.number]).columns
     controls = controls.groupby('ID').apply(
         lambda x: (x[numeric_cols].multiply(x['duration_min'], axis=0)).sum(skipna=False) / x['duration_min'].sum(skipna=False)
     ).reset_index()
 
-    controls_dir = f'parquet_results/Controls'
+    controls_dir = 'parquet_results/Controls'
     age_gender_df = get_controls_ages_genders(controls_dir)
     # Merge on ID
     controls = controls.merge(age_gender_df[['ID', 'Age', 'Gender']], on='ID', how='left')
@@ -3104,7 +3083,7 @@ def cobrad_get_files(sample_window_size=0,only_awake=False,sleep_only=False):
             patient_metadata = {}
             # Use ProcessPoolExecutor for parallel processing
             with ProcessPoolExecutor() as executor:
-                results = list(tqdm(executor.map(process_file, files, [pickles_location] * len(files), [sample_window_size] * len(files)), 
+                list(tqdm(executor.map(process_file_2, files, [pickles_location] * len(files), [sample_window_size] * len(files)), 
                                     total=len(files), desc="Processing files"))
 
             # Aggregate metadata for each patient
@@ -3153,7 +3132,7 @@ def cobrad_get_files(sample_window_size=0,only_awake=False,sleep_only=False):
     for col in df_wnv2.columns:
         try:
             df_wnv2[col] = pd.to_numeric(df_wnv2[col])
-        except:
+        except Exception:
             # print(f'Could not convert {col} to numeric')
             pass
     # if 'COBRAD_descriptive.xlsx' doesnt exist
@@ -3230,9 +3209,7 @@ def custom_describe(df):
     # round 2
     return df_ret.round(2)
 
-import mne
-import matplotlib.pyplot as plt
-import numpy as np
+import mne  # noqa: E402
 
 def detect_sleep_stages(raw, plot=True):
     """
@@ -3553,10 +3530,10 @@ def raw_run(cases_group_name='EDF'):
     fig_fast = speeding_raw.plot(show=False, block=False)
     st_pyplot_func(fig_fast)
 
-import yasa
-import os, pickle, pandas as pd
-import streamlit as st
-from mne.time_frequency import psd_array_welch  # for PSD
+import yasa  # noqa: E402
+import pandas as pd  # noqa: E402
+import streamlit as st  # noqa: E402
+from mne.time_frequency import psd_array_welch  # for PSD  # noqa: E402
 
 def spectrogram_run(group, win_sec=5,is_streamlit=False):
 
@@ -3575,7 +3552,7 @@ def spectrogram_run(group, win_sec=5,is_streamlit=False):
         raw = pd.read_pickle(f'pickles/{group}/{pickle_file}')
         data = raw.get_data()
         arr.append(data)
-        channels = raw.info['ch_names']
+        raw.info['ch_names']
         progress.progress(i / total_files)
 
     arr_mean = mean_of_resized_arrays(arr)
@@ -3603,7 +3580,7 @@ def spectrogram_run(group, win_sec=5,is_streamlit=False):
 
     # --- Generate spectrogram figure ---
     st.write(f"Mean Spectrogram over {n_samples} samples")
-    fig = plot_spectrogram_mean(group, arr_mean, win_sec=win_sec, sf=sf)
+    plot_spectrogram_mean(group, arr_mean, win_sec=win_sec, sf=sf)
 
 def plot_spectrogram_mean(group,arr_mean,figures_dir=None,win_sec=5,sf=256):
     # mean over all channels
@@ -3714,9 +3691,9 @@ def get_controls_ages_genders(selected_folder, controls_dir='EDF_Format/Controls
     final_df = convert_sex_column(final_df,'Gender')
     return final_df
 
-from itertools import combinations
-from scipy.signal import coherence, windows
-import networkx as nx
+from itertools import combinations  # noqa: E402
+from scipy.signal import coherence, windows  # noqa: E402
+import networkx as nx  # noqa: E402
 def compute_network_features(eeg_data, sfreq, freq_band, threshold_density=0.2):
     """
     Compute network features from EEG data using coherence in a given frequency band.
@@ -3763,7 +3740,7 @@ def compute_network_features(eeg_data, sfreq, freq_band, threshold_density=0.2):
                     f, Cxy = coherence(eeg_data[i], eeg_data[j], fs=sfreq, 
                                        window=windows.hann(window_size),
                                        nperseg=window_size, noverlap=window_size//2)
-                except:
+                except Exception:
                     # If coherence fails, use correlation as fallback
                     corr = np.corrcoef(eeg_data[i], eeg_data[j])[0, 1]
                     if np.isfinite(corr):
@@ -3787,7 +3764,7 @@ def compute_network_features(eeg_data, sfreq, freq_band, threshold_density=0.2):
                 
             coh_matrix[i, j] = coh_matrix[j, i] = mean_coh
             
-        except Exception as e:
+        except Exception:
             # If coherence calculation fails, set to 0
             coh_matrix[i, j] = coh_matrix[j, i] = 0.0
 
@@ -3806,28 +3783,28 @@ def compute_network_features(eeg_data, sfreq, freq_band, threshold_density=0.2):
         clustering = nx.transitivity(G)
         if not np.isfinite(clustering):
             clustering = 0.0
-    except:
+    except Exception:
         clustering = 0.0
 
     try:
         efficiency = nx.global_efficiency(G)
         if not np.isfinite(efficiency):
             efficiency = 0.0
-    except:
+    except Exception:
         efficiency = 0.0
 
     try:
         assortativity = nx.degree_pearson_correlation_coefficient(G)
         if not np.isfinite(assortativity):
             assortativity = 0.0
-    except:
+    except Exception:
         assortativity = 0.0
 
     try:
         modularity = nx.algorithms.community.modularity(G, nx.community.label_propagation_communities(G))
         if not np.isfinite(modularity):
             modularity = 0.0
-    except:
+    except Exception:
         modularity = 0.0
 
     return efficiency, clustering, assortativity, modularity
@@ -3835,11 +3812,9 @@ def compute_network_features(eeg_data, sfreq, freq_band, threshold_density=0.2):
 def _create_interactive_significant_pairs_plot(df_pair, var_names, pair_to_stats, name, save_plot, save_dir, is_streamlit, hue, size_values, palette_dict):
     """Create an interactive scatter plot showing only significant pairs using Plotly."""
     import plotly.graph_objects as go
-    import plotly.express as px
     from plotly.subplots import make_subplots
     import numpy as np
     from scipy.stats import spearmanr
-    import pandas as pd
     
     # Find significant pairs (p < 0.05)
     significant_pairs = []
@@ -4053,7 +4028,7 @@ def _plot_metric_vs_hrv(t, arrs, labels, save_plot, name, save_dir, is_streamlit
         n = len(arrs[0])
         # assert are all the arrs same length
         assert all(len(arr) == n for arr in arrs), "All input arrays must"
-        df2 = pd.DataFrame({label: arr for label, arr in zip(labels, arrs)})
+        pd.DataFrame({label: arr for label, arr in zip(labels, arrs)})
         df = pd.DataFrame({
             'value': np.concatenate(arrs),
             'group': np.concatenate([[label]*n for label in labels]),
@@ -4096,7 +4071,7 @@ def _plot_metric_vs_hrv(t, arrs, labels, save_plot, name, save_dir, is_streamlit
                     try:
                         x_numeric = pd.to_numeric(x, errors='coerce')
                         y_numeric = pd.to_numeric(y, errors='coerce')
-                    except:
+                    except Exception:
                         r, p = np.nan, np.nan
                         pair_indices.append((i, j))
                         r_vals.append(r)
@@ -4132,8 +4107,10 @@ def _plot_metric_vs_hrv(t, arrs, labels, save_plot, name, save_dir, is_streamlit
             ax = kwargs.get('ax', plt.gca())
             i = j = None
             for idx, col in enumerate(var_names):
-                if np.all(x == df_pair[col]): i = idx
-                if np.all(y == df_pair[col]): j = idx
+                if np.all(x == df_pair[col]):
+                    i = idx
+                if np.all(y == df_pair[col]):
+                    j = idx
             if i is not None and j is not None and i != j:
                 key = (min(i, j), max(i, j))
                 r, p_fdr = pair_to_stats.get(key, (np.nan, np.nan))
@@ -4144,7 +4121,7 @@ def _plot_metric_vs_hrv(t, arrs, labels, save_plot, name, save_dir, is_streamlit
             try:
                 x_numeric = pd.to_numeric(x, errors='coerce')
                 y_numeric = pd.to_numeric(y, errors='coerce')
-            except:
+            except Exception:
                 # If conversion fails, skip this plot
                 return
             
@@ -4215,7 +4192,7 @@ def _plot_metric_vs_hrv(t, arrs, labels, save_plot, name, save_dir, is_streamlit
             try:
                 x_numeric = pd.to_numeric(x, errors='coerce')
                 y_numeric = pd.to_numeric(y, errors='coerce')
-            except:
+            except Exception:
                 # If conversion fails, skip this plot
                 return
             
@@ -4230,8 +4207,10 @@ def _plot_metric_vs_hrv(t, arrs, labels, save_plot, name, save_dir, is_streamlit
             t_temp = np.linspace(min(min(x_clean), min(y_clean)), max(max(x_clean), max(y_clean)), num=len(x_clean))
             i = j = None
             for idx, col in enumerate(var_names):
-                if np.all(x == df_pair[col]): i = idx
-                if np.all(y == df_pair[col]): j = idx
+                if np.all(x == df_pair[col]):
+                    i = idx
+                if np.all(y == df_pair[col]):
+                    j = idx
             if i is not None and j is not None and i != j:
                 key = (min(i, j), max(i, j))
                 r, p_fdr = pair_to_stats.get(key, (np.nan, np.nan))
@@ -4366,11 +4345,6 @@ def enhanced_clustering_plots(results_df, df_wnv3_clean, save_plot, save_dir, ed
     """
     from sklearn.cluster import KMeans
     from sklearn.ensemble import RandomForestClassifier
-    from sklearn.preprocessing import StandardScaler
-    from sklearn.model_selection import train_test_split
-    from sklearn.metrics import classification_report, confusion_matrix
-    import matplotlib.pyplot as plt
-    import seaborn as sns
     
     # Define the clustering features
     cluster_features = [
@@ -4475,7 +4449,6 @@ def _create_enhanced_pairgrid(results_df, features, cluster_labels, feature_impo
     import matplotlib.pyplot as plt
     import seaborn as sns
     from scipy.stats import spearmanr
-    from statsmodels.stats.multitest import fdrcorrection
     
     # Prepare data for plotting
     df_plot = results_df[features + ['cluster']].dropna()
@@ -4493,8 +4466,6 @@ def _create_enhanced_pairgrid(results_df, features, cluster_labels, feature_impo
         ax = kwargs.get('ax', plt.gca())
         
         # Get cluster labels for this plot
-        x_name = x.name
-        y_name = y.name
         
         # Create scatter plot with cluster colors
         for cluster_id in range(n_clusters):

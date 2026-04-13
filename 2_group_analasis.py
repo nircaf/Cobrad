@@ -1,19 +1,13 @@
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
-from scipy import stats
-from statsmodels.stats.multitest import multipletests
 import numpy as np
-import os
 import mne
-from scipy.stats import ttest_ind
-import statsmodels.stats.multitest as smm
-from scipy.signal import spectrogram
-import yasa
-from sklearn.decomposition import PCA
-import statsmodels.api as sm
-from collections import Counter
-from utils.eeg_utils import *
+from utils.eeg_utils import (
+    tga_get_files, wnv_get_files, eeg_channels, eeg_dict_convertion, analyze_and_correct,
+    spectogram_run, get_clinical_and_boxplot_cols, save_raw_data, boxplot_plot,
+    process_group_data, scatter_plot_with_regression, topomap_group_data
+)
 
 
 # plt.style.use('science')
@@ -81,7 +75,7 @@ else:
 #%% Spectrogram
 spec_group_name = 'west_nile_virus' if cases_group_name == 'WNV' else 'EDF'
 spectogram_run(spec_group_name,figures_dir)
-spectogram_run(f'Controls',figures_dir)
+spectogram_run('Controls',figures_dir)
 
 #%% clinical data analysis
 clinical_columns, boxplot_columns = get_clinical_and_boxplot_cols(df_wnv2=df_wnv2)
@@ -91,7 +85,7 @@ df_wnv2 = df_wnv2.replace('nan', np.nan)
 for col in df_wnv2.columns:
     try:
         df_wnv2[col] = pd.to_numeric(df_wnv2[col])
-    except:
+    except Exception:
         # print(f'Could not convert {col} to numeric')
         pass
 numeric_cols = df_wnv2.select_dtypes(include=[np.number]).columns

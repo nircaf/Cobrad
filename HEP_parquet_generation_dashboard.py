@@ -9,8 +9,6 @@ import os
 import glob
 import json
 import argparse
-import threading
-import time
 import re
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime
@@ -18,7 +16,7 @@ from datetime import datetime
 # ── Configuration ──────────────────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PARQUETS_HEP_DIR = os.path.join(BASE_DIR, "parquets_HEP")
-EDF_ROOT = os.path.join(BASE_DIR, "EDF_Format", "Berkeley_data")
+EDF_ROOT = os.path.join(BASE_DIR, "pickles_sleep_stage", "Berkeley_data")
 
 STAGES = ["R", "W", "N1", "N2", "N3"]
 STAGE_COLORS = {
@@ -32,30 +30,50 @@ STAGE_COLORS = {
 
 # ── Data collection ─────────────────────────────────────────────────────────────
 def get_all_patients(edf_root):
-    """Find all unique patients in the EDF directory."""
+    """Find all unique patients in the EDF/Pickles directory."""
     patient_ids = set()
     for root, dirs, files in os.walk(edf_root):
         for file in files:
-            if not file.lower().endswith(".edf"):
+            if not (file.lower().endswith(".edf") or file.lower().endswith(".pkl")):
                 continue
             m = re.search(r'(\d{4}-\d{3})', file)
             if m:
                 patient_ids.add(m.group(1))
             else:
-                patient_ids.add(file.split('.')[0])
+                if file.lower().endswith('.pkl'):
+                    # e.g. SSS11_SR_W_6030_5.pkl -> SSS11_SR
+                    # e.g. ASSY16_CHECKIFEXP_EKG_W_6150_5.pkl -> ASSY16_CHECKIFEXP_EKG
+                    match = re.search(r'^(.*?)_(W|N1|N2|N3|R)_', file)
+                    if match:
+                        patient_ids.add(match.group(1))
+                    else:
+                        patient_ids.add(file.split('.')[0])
+                else:
+                    patient_ids.add(file.split('.')[0])
     return sorted(list(patient_ids))
 
 def count_total_patients(edf_root):
     """Count unique patient IDs in the EDF directory (one entry per folder/file)."""
     return len(get_all_patients(edf_root))
 
-def parse_logs():
-    """Parse the log file to get the latest status of each patient per stage."""
-    log_file = os.path.join(BASE_DIR, "logs", "hep_parquet_generation.log")
-    
+def parse_logs(edf_root_name="Berkeley_data"):
+    """Parse the log files to get the latest status of each patient per stage."""
+    log_dir = os.path.join(BASE_DIR, "logs")
     status_dict = {s: {} for s in STAGES}
-    if not os.path.exists(log_file):
+    
+    if not os.path.exists(log_dir):
         return status_dict
+        
+    # Find all matching logs for this project
+    log_files = glob.glob(os.path.join(log_dir, f"run_{edf_root_name}_*.log"))
+    # Fallback to old log if specific logs don't exist
+    if not log_files:
+        old_log = os.path.join(log_dir, "hep_parquet_generation.log")
+        if os.path.exists(old_log):
+            log_files = [old_log]
+            
+    # Sort by mtime ascending so newer run logs overwrite older run states
+    log_files.sort(key=os.path.getmtime)
         
     # Match: 2026-02-28 23:59:59,999 - ... - INFO - [N1] Patient 1234-567: started processing
     # Group 1: Timestamp
@@ -67,88 +85,188 @@ def parse_logs():
     # regex matches:
     # 2026-02-28 23:03:36,442 - HEP_parquet_generation - INFO - [N1] Patient 0345-010: started processing
     
-    try:
-        with open(log_file, "r") as f:
-            for line in f:
-                # Basic string manipulation is often faster/more reliable than strict regex if formats change slightly
-                if " - [" in line and "] Patient " in line:
-                    try:
-                        parts = line.split(" - [", 1)
-                        if len(parts) > 1:
-                            stage_part = parts[1].split("] Patient ", 1)
-                            if len(stage_part) > 1:
-                                stage = stage_part[0]
-                                patient_part = stage_part[1].split(":", 1)
-                                if len(patient_part) > 1:
-                                    patient = patient_part[0]
-                                    msg = patient_part[1].strip()
-                                    
-                                    if stage not in status_dict:
-                                        status_dict[stage] = {}
+    for log_file in log_files:
+        try:
+            with open(log_file, "r") as f:
+                for line in f:
+                    # Basic string manipulation is often faster/more reliable than strict regex if formats change slightly
+                    if " - [" in line and "] Patient " in line:
+                        try:
+                            parts = line.split(" - [", 1)
+                            if len(parts) > 1:
+                                stage_part = parts[1].split("] Patient ", 1)
+                                if len(stage_part) > 1:
+                                    stage = stage_part[0]
+                                    patient_part = stage_part[1].split(":", 1)
+                                    if len(patient_part) > 1:
+                                        patient = patient_part[0]
+                                        msg = patient_part[1].strip()
                                         
-                                    status = None
-                                    if "started processing" in msg:
-                                        status = "RUNNING"
-                                    elif "successfully finished" in msg:
-                                        status = "SUCCESS"
-                                    elif "CRASHED" in msg:
-                                        status = "FAILED"
-                                    elif "Skipping" in msg:
-                                        status = "SKIPPED"
-                                        
-                                    if status:
-                                        status_dict[stage][patient] = {
-                                            "status": status,
-                                            "msg": msg
-                                        }
-                    except Exception:
-                        pass
-    except Exception as e:
-        print(f"Error parsing logs: {e}")
-        
+                                        if stage not in status_dict:
+                                            status_dict[stage] = {}
+                                            
+                                        status = None
+                                        if "started processing" in msg:
+                                            status = "RUNNING"
+                                        elif "successfully finished" in msg:
+                                            status = "SUCCESS"
+                                        elif "CRASHED" in msg:
+                                            status = "FAILED"
+                                        elif "Skipping" in msg:
+                                            status = "SKIPPED"
+                                            
+                                        if status:
+                                            status_dict[stage][patient] = {
+                                                "status": status,
+                                                "msg": msg
+                                            }
+                        except Exception:
+                            pass
+        except Exception as e:
+            print(f"Error parsing logs {log_file}: {e}")
+            
     return status_dict
 
 
-def get_stage_stats(stage):
+def get_stage_stats(stage, edf_root_name="Berkeley_data"):
     """Return (processed_count, list_of_patient_ids) for a given stage."""
-    stage_dir = os.path.join(PARQUETS_HEP_DIR, f"Berkeley_data_{stage}")
+    stage_dir = os.path.join(BASE_DIR, "pickles_sleep_stage", edf_root_name, stage)
     if not os.path.isdir(stage_dir):
         return 0, []
-    alpha_files = glob.glob(os.path.join(stage_dir, f"*_{stage}_results_alpha.parquet"))
-    patient_ids = []
-    for fpath in sorted(alpha_files):
+    pkl_files = glob.glob(os.path.join(stage_dir, f"*_{stage}_*.pkl"))
+    patient_ids = set()
+    for fpath in pkl_files:
         fname = os.path.basename(fpath)
-        # filename: {patient_id}_{stage}_results_alpha.parquet
-        pid = fname.replace(f"_{stage}_results_alpha.parquet", "")
-        patient_ids.append(pid)
-    return len(patient_ids), patient_ids
+        pid = fname.split(f"_{stage}")[0]
+        patient_ids.add(pid)
+    return len(patient_ids), sorted(list(patient_ids))
 
 
-def get_recently_modified(stage, n=5):
+def get_parquet_stats(stage, edf_root_name="Berkeley_data"):
+    """Return (parquet_count, list_of_patient_ids) for a given stage."""
+    # The directory is parquets_HEP/{edf_root_name}_{stage}
+    stage_dir = os.path.join(PARQUETS_HEP_DIR, f"{edf_root_name}_{stage}")
+    if not os.path.isdir(stage_dir):
+        return 0, []
+    
+    # We look for any results parquets for this stage
+    parquet_files = glob.glob(os.path.join(stage_dir, f"*_{stage}_results_*.parquet"))
+    patient_ids = set()
+    for fpath in parquet_files:
+        fname = os.path.basename(fpath)
+        # e.g. REW609_REST_NOFILT_N1_results_alpha.parquet
+        # pid = REW609_REST_NOFILT
+        pid = fname.split(f"_{stage}")[0]
+        patient_ids.add(pid)
+    return len(patient_ids), sorted(list(patient_ids))
+
+
+def get_recently_modified(stage, edf_root_name="Berkeley_data", n=5):
     """Return the n most recently modified alpha parquets for a stage."""
-    stage_dir = os.path.join(PARQUETS_HEP_DIR, f"Berkeley_data_{stage}")
+    stage_dir = os.path.join(BASE_DIR, "pickles_sleep_stage", edf_root_name, stage)
     if not os.path.isdir(stage_dir):
         return []
-    alpha_files = glob.glob(os.path.join(stage_dir, f"*_{stage}_results_alpha.parquet"))
-    alpha_files.sort(key=os.path.getmtime, reverse=True)
+    pkl_files = glob.glob(os.path.join(stage_dir, f"*_{stage}_*.pkl"))
+    pkl_files.sort(key=os.path.getmtime, reverse=True)
     result = []
-    for fpath in alpha_files[:n]:
+    seen = set()
+    for fpath in pkl_files:
+        if len(result) >= n: break
         fname = os.path.basename(fpath)
-        pid = fname.replace(f"_{stage}_results_alpha.parquet", "")
+        pid = fname.split(f"_{stage}")[0]
+        if pid in seen: continue
+        seen.add(pid)
         mtime = datetime.fromtimestamp(os.path.getmtime(fpath)).strftime("%Y-%m-%d %H:%M:%S")
         result.append({"patient_id": pid, "modified": mtime})
     return result
 
 
-def collect_data():
-    all_patients = get_all_patients(EDF_ROOT)
+def get_zellij_sessions():
+    """Scrapes running python processes to extract active dashboard data per-project."""
+    import subprocess
+    sessions_by_project = {}
+    
+    try:
+        # ps format: pid,etimes,command
+        ps_output = subprocess.check_output(
+            ["ps", "-eo", "pid,etimes,command"], 
+            text=True, stderr=subprocess.DEVNULL
+        )
+        
+        worker_id = 1
+        for line in ps_output.split("\n"):
+            if "HEP_parquet_generation.py" in line and "python" in line and not "grep" in line:
+                parts = line.split(None, 2)
+                if len(parts) < 3:
+                    continue
+                
+                pid = parts[0]
+                etimes = int(parts[1])
+                cmd = parts[2]
+                
+                # Format uptime
+                h = etimes // 3600
+                m = (etimes % 3600) // 60
+                if h > 0:
+                    uptime_str = f"{h}h {m}m"
+                else:
+                    uptime_str = f"{m}m"
+                
+                # Extract --stage
+                stage = "Unknown"
+                stage_match = re.search(r'--stage\s+(\w+)', cmd)
+                if stage_match:
+                    stage = stage_match.group(1)
+                    
+                # Extract --edf_root
+                project = "Unknown Project"
+                root_match = re.search(r'--edf_root\s+([^\s;]+)', cmd)
+                if root_match:
+                    project = root_match.group(1)
+                    project = project.strip('\'"')
+                
+                # Extract patient from command path
+                patient = "Unknown"
+                m_pat = re.search(r'(\d{4}-\d{3})', cmd)
+                if m_pat:
+                    patient = m_pat.group(1)
+                else:
+                    patient = os.path.basename(project).split('.')[0]
+                
+                # We can't easily capture Zellij pane screen for tqdm progress, so we just say processing
+                status_text = "Processing..."
+                
+                # For UI display logic
+                if project not in sessions_by_project:
+                    sessions_by_project[project] = []
+                    
+                sessions_by_project[project].append({
+                    "session_id": f"worker_{worker_id}",
+                    "stage": stage,
+                    "patient": patient,
+                    "progress": status_text,
+                    "uptime": uptime_str
+                })
+                worker_id += 1
+                
+    except subprocess.CalledProcessError:
+        pass
+        
+    return sessions_by_project
+
+
+
+def collect_data(edf_root_name="Berkeley_data"):
+    target_edf_root = os.path.join(BASE_DIR, "EDF_Format", edf_root_name)
+    all_patients = get_all_patients(target_edf_root)
     total = len(all_patients)
-    log_status = parse_logs()
+    log_status = parse_logs(edf_root_name)
     
     stages_data = {}
     for stage in STAGES:
-        count, processed_patients = get_stage_stats(stage)
-        recent = get_recently_modified(stage, n=5)
+        count, processed_patients = get_stage_stats(stage, edf_root_name)
+        parquet_count, _ = get_parquet_stats(stage, edf_root_name)
+        recent = get_recently_modified(stage, edf_root_name, n=5)
         
         # Combine processed items with log status
         stage_log_status = log_status.get(stage, {})
@@ -188,8 +306,10 @@ def collect_data():
         
         stages_data[stage] = {
             "count": count,
+            "parquet_count": parquet_count,
             "total": total,
             "pct": round(count / total * 100, 1) if total > 0 else 0,
+            "parquet_pct": round(parquet_count / total * 100, 1) if total > 0 else 0,
             "patients_meta": patients_meta,
             "running": currently_running,
             "failed": failed_patients,
@@ -199,6 +319,7 @@ def collect_data():
     return {
         "total": total,
         "stages": stages_data,
+        "zellij_sessions": get_zellij_sessions(),
         "updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
 
@@ -516,7 +637,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <body>
 
 <header>
-  <h1>🧠 HEP Processing Dashboard</h1>
+  <div style="display: flex; align-items: center; gap: 20px;">
+      <h1>🧠 HEP Processing Dashboard</h1>
+      <select id="dir-select" style="background: var(--surface2); border: 1px solid var(--border); color: var(--text); padding: 8px 12px; border-radius: 8px; font-size: 0.9rem; font-family: 'Inter', sans-serif; cursor: pointer; outline: none;">
+          <option value="Berkeley_data">Berkeley_data (Loading...)</option>
+      </select>
+  </div>
   <div class="meta">
     <div class="dot"></div>
     <span id="updated">Loading…</span>
@@ -532,6 +658,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <div class="lbl">Total Patients</div>
   </div>
   <!-- per-stage summary injected by JS -->
+</div>
+
+<!-- Active Processing Zellij Sessions -->
+<div class="summary-card" style="flex-direction: column; align-items: stretch;" id="zellij-container">
+  <h2 style="font-size:1rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:16px;">Active Processing Tabs (Zellij)</h2>
+  <div id="zellij-grid" style="display: flex; flex-direction: column; gap: 20px;">
+      <!-- project entries injected here -->
+  </div>
 </div>
 
 <!-- Stage cards -->
@@ -554,15 +688,103 @@ let lastData = null;
 
 async function fetchData(){
   try {
-    const r = await fetch('/api/data');
+    const dir = document.getElementById('dir-select').value;
+    const r = await fetch('/api/data?dir=' + encodeURIComponent(dir));
     lastData = await r.json();
     render(lastData);
   } catch(e){ console.error(e); }
 }
 
+async function fetchDirectories() {
+    try {
+        const r = await fetch('/api/directories');
+        const dirs = await r.json();
+        const select = document.getElementById('dir-select');
+        
+        // Save currently selected option
+        const currentSelection = select.value;
+        select.innerHTML = '';
+        
+        dirs.forEach(d => {
+            const opt = document.createElement('option');
+            opt.value = d;
+            opt.textContent = "📁 " + d;
+            select.appendChild(opt);
+        });
+        
+        // Restore selection or default to first
+        if (dirs.includes(currentSelection)) {
+            select.value = currentSelection;
+        } else if (dirs.includes('Berkeley_data')) {
+            select.value = 'Berkeley_data';
+        } else if (dirs.length > 0) {
+            select.value = dirs[0];
+        }
+        
+    } catch(e) { console.error("Failed to fetch directories:", e); }
+}
+
+// Add event listener to dir selector
+document.getElementById('dir-select').addEventListener('change', () => {
+    secs = 30; // reset timer
+    document.getElementById('cards-grid').innerHTML = '<div style="color:var(--muted);">Loading new directory data...</div>';
+    fetchData();
+});
+
 function render(data){
   document.getElementById('updated').textContent = 'Updated: ' + data.updated;
   document.getElementById('total-patients').textContent = data.total;
+
+  // Zellij Container Update
+  const tc = document.getElementById('zellij-grid');
+  tc.innerHTML = '';
+  if (!data.zellij_sessions || Object.keys(data.zellij_sessions).length === 0) {
+      tc.innerHTML = '<span style="color:var(--muted);font-size:0.8rem;">No active processing workers detected.</span>';
+  } else {
+      for (const [project, sessions] of Object.entries(data.zellij_sessions)) {
+          const pdiv = document.createElement('div');
+          pdiv.style.background = "var(--surface2)";
+          pdiv.style.borderRadius = "8px";
+          pdiv.style.padding = "16px";
+          
+          let sessHtml = `<h3 style="font-size:0.9rem;margin-bottom:12px;color:var(--accent);">📁 Project: ${project}</h3>`;
+          sessHtml += `<div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(250px, 1fr));gap:12px;">`;
+          
+          sessions.forEach(s => {
+              const color = STAGE_COLORS[s.stage] || '#fff';
+              let statHtml = '';
+              
+              if (s.patient.includes("Idle")) {
+                  statHtml = `
+                    <div style="font-size:0.75rem; color:var(--muted); display:flex; align-items:center; gap:6px;">
+                        <div class="dot" style="width:6px;height:6px;background:#6b7280;box-shadow:none;animation:none;"></div>
+                        ${s.patient}
+                    </div>`;
+              } else {
+                  statHtml = `
+                    <div style="font-size:0.8rem; font-family:monospace; margin-bottom:6px; color:#e2e8f0; display:flex; align-items:center; gap:6px;">
+                        <div class="dot" style="width:6px;height:6px;background:#3b82f6;"></div>
+                        ${s.patient}
+                    </div>
+                    <div style="font-size:0.7rem; color:#9ca3af; background:#111; padding:4px 8px; border-radius:4px; font-family:monospace; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">
+                        > ${s.progress}
+                    </div>`;
+              }
+              
+              sessHtml += `
+              <div style="background:#0f1117; padding:12px; border-radius:8px; border-left:3px solid ${color};">
+                  <div style="display:flex; justify-content:space-between; margin-bottom:8px;">
+                      <span style="font-weight:600;font-size:0.8rem;color:${color};">Stage ${s.stage}</span>
+                      <span style="font-size:0.7rem;color:var(--muted);">zellij: ${s.session_id} &nbsp;·&nbsp; ⏱ ${s.uptime || '?'}</span>
+                  </div>
+                  ${statHtml}
+              </div>`;
+          });
+          sessHtml += `</div>`;
+          pdiv.innerHTML = sessHtml;
+          tc.appendChild(pdiv);
+      }
+  }
 
   // Summary extra items
   const sc = document.getElementById('summary-card');
@@ -573,7 +795,7 @@ function render(data){
     const div = document.createElement('div');
     div.className = 'summary-item stage-summary';
     div.innerHTML = `
-      <div class="num" style="background:linear-gradient(135deg,${sd.color},${sd.color}aa);-webkit-background-clip:text;-webkit-text-fill-color:transparent;">${sd.count}</div>
+      <div class="num" style="background:linear-gradient(135deg,${sd.color},${sd.color}aa);-webkit-background-clip:text;-webkit-text-fill-color:transparent;">${sd.count} <small style="font-size:0.5em;color:var(--muted)">pkl</small> | ${sd.parquet_count} <small style="font-size:0.5em;color:var(--muted)">pq</small></div>
       <div class="lbl">Stage ${s}</div>
     `;
     sc.appendChild(div);
@@ -613,7 +835,7 @@ function render(data){
     card.innerHTML = `
       <div class="card-header">
         <div>
-          <div class="count-big" style="color:${sd.color}">${sd.count}</div>
+          <div class="count-big" style="color:${sd.color}">${sd.count} <small style="font-size:0.5em;opacity:0.6;">pkl</small> | ${sd.parquet_count} <small style="font-size:0.5em;opacity:0.6;">pq</small></div>
           <div class="count-label">/ ${sd.total} total patients</div>
         </div>
         <span class="stage-badge" style="background:${sd.color}">${s}</span>
@@ -621,7 +843,11 @@ function render(data){
       <div class="prog-wrap">
         <div class="prog-bar" style="width:${sd.pct}%;background:${sd.color}"></div>
       </div>
-      <div class="pct">${sd.pct}% parquets generated</div>
+      <div class="pct">${sd.pct}% pickles generated</div>
+      <div class="prog-wrap" style="height:6px; margin-top:12px;">
+        <div class="prog-bar" style="width:${sd.parquet_pct}%;background:${sd.color};opacity:0.7;"></div>
+      </div>
+      <div class="pct">${sd.parquet_pct}% parquets generated</div>
       <div style="margin-top:20px;">${activeStatusHtml}</div>
       <div class="recent-title">Recently Generated Parquets</div>
       <ul class="recent-list">${recentHtml}</ul>
@@ -636,7 +862,7 @@ function render(data){
     const btn = document.createElement('button');
     btn.className = 'tab-btn' + (s===currentTab?'':' inactive');
     btn.style.background = STAGE_COLORS[s];
-    btn.textContent = `${s} (${data.stages[s].count})`;
+    btn.textContent = `${s} (pkl:${data.stages[s].count} | pq:${data.stages[s].parquet_count})`;
     btn.onclick = ()=>{ currentTab=s; renderPatients(data); updateTabStyles(); };
     tabs.appendChild(btn);
   });
@@ -675,27 +901,51 @@ function tick(){
 }
 setInterval(tick, 1000);
 
-fetchData();
+// Initialize
+fetchDirectories().then(() => {
+    fetchData();
+});
 </script>
 </body>
 </html>
 """
 
 
-# ── HTTP Server ─────────────────────────────────────────────────────────────────
+from urllib.parse import urlparse, parse_qs
+
 class DashboardHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass  # silence default access log
 
     def do_GET(self):
-        if self.path == "/" or self.path == "/index.html":
+        parsed_path = urlparse(self.path)
+        
+        if parsed_path.path == "/" or parsed_path.path == "/index.html":
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
             self.wfile.write(HTML_TEMPLATE.encode())
 
-        elif self.path == "/api/data":
-            data = collect_data()
+        elif parsed_path.path == "/api/directories":
+            edf_format_root = os.path.join(BASE_DIR, "EDF_Format")
+            try:
+                # get subdirectories, ignoring weird files
+                directories = [d for d in os.listdir(edf_format_root) if os.path.isdir(os.path.join(edf_format_root, d))]
+                directories.sort()
+            except Exception:
+                directories = ["Berkeley_data"]
+                
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(directories).encode())
+
+        elif parsed_path.path == "/api/data":
+            # Extract dir parameter or default to Berkeley_data
+            query_params = parse_qs(parsed_path.query)
+            edf_root_name = query_params.get('dir', ['Berkeley_data'])[0]
+            
+            data = collect_data(edf_root_name)
             payload = json.dumps(data).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")

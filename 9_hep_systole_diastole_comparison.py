@@ -8,15 +8,12 @@ and compares them statistically and visually.
 
 import os
 import pickle
-import contextlib
-import asyncio
-from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy import stats
-from scipy.signal import find_peaks, medfilt, hilbert, butter, filtfilt
+from scipy.signal import find_peaks, hilbert, butter, filtfilt
 from scipy.stats import entropy
 from scipy.ndimage import median_filter
 import mne
@@ -39,12 +36,12 @@ except ImportError:
 
 # Try to import PDF generation libraries
 try:
-    from reportlab.lib.pagesizes import letter, A4
+    from reportlab.lib.pagesizes import letter, A4  # noqa: F401
     from reportlab.lib import colors
     from reportlab.lib.units import inch
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, PageBreak, Table, TableStyle
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, PageBreak, Table, TableStyle  # noqa: F401
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-    from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
+    from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT  # noqa: F401
     REPORTLAB_AVAILABLE = True
 except ImportError:
     REPORTLAB_AVAILABLE = False
@@ -53,7 +50,7 @@ except ImportError:
 try:
     from pptx import Presentation
     from pptx.util import Inches, Pt
-    from pptx.enum.text import PP_ALIGN
+    from pptx.enum.text import PP_ALIGN  # noqa: F401
     from pptx.dml.color import RGBColor
     PPTX_AVAILABLE = True
 except ImportError:
@@ -62,11 +59,12 @@ except ImportError:
 warnings.filterwarnings('ignore')
 
 # Fix for MNE pickle loading
-import sys, mne.io.array
+import sys  # noqa: E402
+import mne.io.array  # noqa: E402
 sys.modules['mne.io.array.array'] = mne.io.array
 
 # Import _plot_metric_vs_hrv from utils
-from utils.eeg_utils import _plot_metric_vs_hrv
+from utils.eeg_utils import _plot_metric_vs_hrv  # noqa: E402
 
 
 def download_plot_as_svg(fig, filename, cache_key=None):
@@ -277,7 +275,7 @@ def calculate_total_avg_bpm(loaded_files):
                 # ecg_signal = nk.ecg_bandpass(ecg_signal, sampling_rate=sfreq, low_cut=0.5, high_cut=20)
                 # 
                 ecg_clean = nk.ecg_clean(ecg_signal, sampling_rate=sfreq)
-            except:
+            except Exception:
                 ecg_clean = ecg_signal
             
             # Detect R-peaks
@@ -629,13 +627,13 @@ def plot_hr_with_segments(segments, raw, patient_id, sfreq, save_path=None, max_
     # Calculate heart rate from R-peaks
     try:
         ecg_clean = nk.ecg_clean(ecg_signal, sampling_rate=sfreq)
-    except:
+    except Exception:
         ecg_clean = ecg_signal
     
     try:
         _, rpk = nk.ecg_peaks(ecg_clean, sampling_rate=sfreq)
         rpeaks = rpk['ECG_R_Peaks']
-    except:
+    except Exception:
         peaks, _ = find_peaks(ecg_clean, distance=int(sfreq * 0.3))
         rpeaks = peaks
     
@@ -1098,7 +1096,7 @@ def compare_systole_diastole(df):
         # Wilcoxon signed-rank test (non-parametric)
         try:
             w_stat, p_value_wilcoxon = stats.wilcoxon(diastole_vals, systole_vals)
-        except:
+        except Exception:
             p_value_wilcoxon = np.nan
         
         # Effect size (Cohen's d for paired samples)
@@ -1627,7 +1625,7 @@ def main():
     
     # Display sleep stage info
     if sleep_stage == 'All':
-        st.markdown(f"**Sleep Stage:** All (N1, N2, N3, R, W combined)")
+        st.markdown("**Sleep Stage:** All (N1, N2, N3, R, W combined)")
     else:
         st.markdown(f"**Sleep Stage:** {sleep_stage}")
     st.markdown(f"**Base Directory:** {base_dir}")
@@ -2008,7 +2006,7 @@ def _process_patient_for_averaged_peth(file_data, minmax, binsize):
             )
             _, rpk = nk.ecg_peaks(ecg_signal_clean, sampling_rate=sfreq)
             rpeaks = rpk['ECG_R_Peaks']
-        except:
+        except Exception:
             return None
         
         if len(rpeaks) < 2:
@@ -2072,7 +2070,7 @@ def _process_patient_for_averaged_peth(file_data, minmax, binsize):
                                     time_axis = np.arange(len(rates)) * binsize + minmax[0]
                                 
                                 channel_data[ch_name]['rates_list'].append((time_axis, rates))
-                        except:
+                        except Exception:
                             pass
                         
                         # Collect events for raster plot
@@ -2082,15 +2080,15 @@ def _process_patient_for_averaged_peth(file_data, minmax, binsize):
                                 'times': peth_eeg_tsd.index.values,
                                 'events': peth_eeg_tsd.values
                             })
-                        except:
+                        except Exception:
                             pass
             
-            except Exception as e:
+            except Exception:
                 continue
         
         return (patient_id, channel_data, eeg_ch_names)
     
-    except Exception as e:
+    except Exception:
         return None
 
 def plot_regional_averaged_eeg_peth_raster(loaded_files, minmax=(-0.5, 1.0), binsize=0.005, save_plot=False, save_dir=None, aggregation_method='median', processing_mode='single', sleep_stage_mapping=None, sleep_stage='N1'):
@@ -2167,7 +2165,7 @@ def plot_regional_averaged_eeg_peth_raster(loaded_files, minmax=(-0.5, 1.0), bin
                 )
                 _, rpk = nk.ecg_peaks(ecg_signal_clean, sampling_rate=sfreq)
                 rpeaks = rpk['ECG_R_Peaks']
-            except:
+            except Exception:
                 continue
 
             if len(rpeaks) < 2:
@@ -2185,7 +2183,7 @@ def plot_regional_averaged_eeg_peth_raster(loaded_files, minmax=(-0.5, 1.0), bin
                     continue
                 
                 # finding original name
-                original_elec_name = next((ch for ch in ch_names if ch.upper() == elec_upper), elec_upper)
+                _ = next((ch for ch in ch_names if ch.upper() == elec_upper), elec_upper)
                 
                 ch_idx = ch_name_to_idx[elec_upper]
                 
@@ -3064,7 +3062,7 @@ def test_electrode_significance_per_patient(loaded_files, minmax=(-0.5, 1.0), bi
                             }
                         )
                     
-                    except Exception as e:
+                    except Exception:
                         continue
             
             # Store results for this patient
@@ -3072,7 +3070,7 @@ def test_electrode_significance_per_patient(loaded_files, minmax=(-0.5, 1.0), bi
                 results[patient_id] = patient_results
                 results_full_time[patient_id] = patient_results_list
         
-        except Exception as e:
+        except Exception:
             continue
     
     if 'st' in globals():
@@ -3359,7 +3357,7 @@ def plot_regional_electrode_averaged_eeg(loaded_files, minmax=(-0.5, 1.0), binsi
                 )
                 _, rpk = nk.ecg_peaks(ecg_signal_clean, sampling_rate=sfreq)
                 rpeaks = rpk['ECG_R_Peaks']
-            except:
+            except Exception:
                 continue
             
             if len(rpeaks) < 2:
@@ -3415,7 +3413,7 @@ def plot_regional_electrode_averaged_eeg(loaded_files, minmax=(-0.5, 1.0), binsi
                                             time_axis = np.arange(len(rates)) * binsize + minmax[0]
                                         
                                         all_electrode_data[region][electrode]['rates_list'].append((time_axis, rates))
-                                except:
+                                except Exception:
                                     pass
                                 
                                 # Collect events for raster plot
@@ -3425,10 +3423,10 @@ def plot_regional_electrode_averaged_eeg(loaded_files, minmax=(-0.5, 1.0), binsi
                                         'times': peth_eeg_tsd.index.values,
                                         'events': peth_eeg_tsd.values
                                     })
-                                except:
+                                except Exception:
                                     pass
                     
-                    except Exception as e:
+                    except Exception:
                         continue
         
         except Exception as e:
@@ -3782,7 +3780,7 @@ def plot_significant_patients_electrode_peth(loaded_files, significance_results,
                     )
                     _, rpk = nk.ecg_peaks(ecg_signal_clean, sampling_rate=sfreq)
                     rpeaks = rpk['ECG_R_Peaks']
-                except:
+                except Exception:
                     continue
                 
                 if len(rpeaks) < 2:
@@ -3836,10 +3834,10 @@ def plot_significant_patients_electrode_peth(loaded_files, significance_results,
                         # Note: Raster plot (events_list) is not populated for continuous data 
                         # as it requires different visualization than event histograms.
                 
-                except Exception as e:
+                except Exception:
                     continue
             
-            except Exception as e:
+            except Exception:
                 continue
     
     if 'st' in globals():
@@ -3893,7 +3891,7 @@ def plot_significant_patients_electrode_peth(loaded_files, significance_results,
             
             # Get data for this electrode
             electrode_data_list = all_electrode_data.get(electrode, [])
-            n_significant_patients = len(electrode_significant_patients.get(electrode, []))
+            _ = len(electrode_significant_patients.get(electrode, []))
             
             # Calculate stats for this electrode from significance_results
             electrode_slopes = []
@@ -3918,7 +3916,7 @@ def plot_significant_patients_electrode_peth(loaded_files, significance_results,
                 # One-sample t-test of slopes against 0
                 try:
                     _, group_p_value = stats.ttest_1samp(electrode_slopes, 0)
-                except:
+                except Exception:
                     group_p_value = np.nan
             
             p_str = "p=N/A"
@@ -4138,7 +4136,7 @@ def plot_peth_raster_per_patient(loaded_files, significance_results, minmax=(-0.
                     )
                     _, rpk = nk.ecg_peaks(ecg_signal_clean, sampling_rate=sfreq)
                     rpeaks = rpk['ECG_R_Peaks']
-                except:
+                except Exception:
                     continue
                 
                 if len(rpeaks) < 2:
@@ -4189,10 +4187,10 @@ def plot_peth_raster_per_patient(loaded_files, significance_results, minmax=(-0.
                             # Store with None for events_dict as this is continuous data
                             electrode_patient_data[electrode].append((patient_id, time_axis, mean_signal, None))
                 
-                except Exception as e:
+                except Exception:
                     continue
             
-            except Exception as e:
+            except Exception:
                 continue
     
     if 'st' in globals():
@@ -4348,8 +4346,8 @@ def test_circular_statistics_r_to_r(loaded_files):
         return {}, {}, {}
 
     sig_results_rayleigh = {}
-    sig_results_ww = {}
-    sig_results_kuiper = {}
+    _ = {}
+    _ = {}
     
     # Helper to clean and get R-peaks (reused logic)
     def get_rpeaks(raw):
@@ -4381,7 +4379,7 @@ def test_circular_statistics_r_to_r(loaded_files):
             _, rpk = nk.ecg_peaks(ecg_clean, sampling_rate=sfreq)
             rpeaks = rpk['ECG_R_Peaks']
             return rpeaks, sfreq, data, ch_names
-        except:
+        except Exception:
             return None, sfreq, data, ch_names
 
     if 'st' in globals():
@@ -4414,13 +4412,15 @@ def test_circular_statistics_r_to_r(loaded_files):
                 start = rpeaks[i]
                 end = rpeaks[i+1]
                 length = end - start
-                if length <= 0: continue
+                if length <= 0:
+                    continue
                 
                 # Segment
                 segment = eeg_signal[start:end]
                 
                 # Find index of max absolute amplitude
-                if len(segment) == 0: continue
+                if len(segment) == 0:
+                    continue
                 
                 # Option: Max amplitude
                 peak_idx = np.argmax(np.abs(segment))
@@ -5004,7 +5004,7 @@ def plot_hep_pairgrid(df, sleep_stage='N1', save_plot=True, save_dir='hep_compar
     if 'st' in globals():
         st.info("Creating PairGrid plot for HEP metrics (hue: Systole/Diastole)...")
     else:
-        print(f"\nCreating PairGrid plot for HEP metrics (hue: Systole/Diastole)...")
+        print("\nCreating PairGrid plot for HEP metrics (hue: Systole/Diastole)...")
     
     _plot_metric_vs_hrv(
         t=t,

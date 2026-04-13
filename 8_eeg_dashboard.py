@@ -3,14 +3,11 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-import seaborn as sns
-import matplotlib.pyplot as plt
 from scipy import stats
-from scipy.stats import ttest_ind, mannwhitneyu, chi2_contingency
+from scipy.stats import ttest_ind, mannwhitneyu
+from utils.eeg_utils import cobrad_get_files
 import warnings
 warnings.filterwarnings('ignore')
-from utils.eeg_utils import cobrad_get_files
 
 # Page configuration
 st.set_page_config(
@@ -356,7 +353,6 @@ def create_multi_histogram_plot(df, columns, color_by_binary=None):
                 
                 if color_by_binary and color_by_binary in df.columns:
                     # Create colored histogram by binary groups
-                    binary_data = df[color_by_binary].dropna()
                     combined_data = df[[col, color_by_binary]].dropna()
                     
                     for binary_value in combined_data[color_by_binary].unique():

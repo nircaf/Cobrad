@@ -5,14 +5,11 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 import seaborn as sns
 import os
-import glob
 import re
-from utils.eeg_utils import *
+from utils.eeg_utils import eeg_channels, rename_channels, read_edf_mne, load_pre_post_data
 import mne
 from scipy import stats, signal
-from statsmodels.stats.multitest import multipletests
 import dabest
-from statsmodels.stats.power import TTestIndPower
 import warnings
 import io
 from datetime import datetime
@@ -88,7 +85,7 @@ def create_dabest_plot(pre_data, post_data, feature, title_suffix=""):
     # Get Cohen's d for paired data
     try:
         cohen_d = dabest_obj.cohens_d.results['difference'].values[0]
-    except:
+    except Exception:
         cohen_d = np.nan
     
     # Create plot
@@ -514,9 +511,9 @@ def create_spectrograms(pre_df, post_df, dataset_name, pre_label, post_label):
                             data = pre_raw_crop.get_data()
                             data_avg = np.mean(data, axis=0)  # Average across channels
                             pre_data_by_region[region].append(data_avg)
-                        except Exception as e:
+                        except Exception:
                             continue
-                except Exception as e:
+                except Exception:
                     continue
                 
                 # Load POST pickle file
@@ -547,9 +544,9 @@ def create_spectrograms(pre_df, post_df, dataset_name, pre_label, post_label):
                             data = post_raw_crop.get_data()
                             data_avg = np.mean(data, axis=0)  # Average across channels
                             post_data_by_region[region].append(data_avg)
-                        except Exception as e:
+                        except Exception:
                             continue
-                except Exception as e:
+                except Exception:
                     continue
             
             # Calculate global mean and std for each region (combining PRE and POST)
@@ -643,9 +640,9 @@ def create_spectrograms(pre_df, post_df, dataset_name, pre_label, post_label):
                                     pre_spectrograms_by_region[region].append(Sxx_interp)
                                 else:
                                     pre_spectrograms_by_region[region].append(Sxx_filtered)
-                        except Exception as e:
+                        except Exception:
                             continue
-                except Exception as e:
+                except Exception:
                     continue
                 
                 # Load and process POST pickle file with z-scoring
@@ -706,9 +703,9 @@ def create_spectrograms(pre_df, post_df, dataset_name, pre_label, post_label):
                                 post_spectrograms_by_region[region].append(Sxx_interp)
                             else:
                                 post_spectrograms_by_region[region].append(Sxx_filtered)
-                        except Exception as e:
+                        except Exception:
                             continue
-                except Exception as e:
+                except Exception:
                     continue
             
             # Clear progress bar
@@ -807,14 +804,14 @@ def create_spectrograms(pre_df, post_df, dataset_name, pre_label, post_label):
         try:
             pre_raw = mne.io.read_raw_edf(pre_edf_file, preload=True, verbose=False)
             post_raw = mne.io.read_raw_edf(post_edf_file, preload=True, verbose=False)
-        except Exception as e:
+        except Exception:
             # Try using the utility function
             try:
                 pre_raw = read_edf_mne(pre_edf_file)
                 post_raw = read_edf_mne(post_edf_file)
                 if pre_raw is None or post_raw is None:
                     return None
-            except:
+            except Exception:
                 return None
         
         # Pick a representative EEG channel (prefer central channels)
@@ -920,7 +917,7 @@ def create_spectrograms(pre_df, post_df, dataset_name, pre_label, post_label):
         plt.tight_layout()
         return fig
         
-    except Exception as e:
+    except Exception:
         # Return None if anything fails
         return None
 
@@ -1277,7 +1274,7 @@ def create_paired_scatterplot(pre_df, post_df, feature, pre_label, post_label, p
     boxplot_data = [pre_vals, post_vals]
     
     # Create boxplots with STD
-    bp = ax.boxplot(boxplot_data, positions=x_positions, widths=0.3, 
+    ax.boxplot(boxplot_data, positions=x_positions, widths=0.3, 
                     patch_artist=True, showmeans=True, meanline=True,
                     boxprops=dict(facecolor='lightblue', alpha=0.5),
                     medianprops=dict(color='black', linewidth=2),
@@ -1771,7 +1768,7 @@ def calculate_effect_size_and_power(pre_data, post_data, feature, pairing_info=N
         try:
             stat, p_value = stats.mannwhitneyu(all_post_vals, all_pre_vals, alternative='two-sided')
             test_type = 'unpaired'
-        except:
+        except Exception:
             p_value = np.nan
             test_type = 'unpaired'
         
@@ -1784,7 +1781,7 @@ def calculate_effect_size_and_power(pre_data, post_data, feature, pairing_info=N
                 cohen_d = (np.mean(all_post_vals) - np.mean(all_pre_vals)) / pooled_std
             else:
                 cohen_d = np.nan
-        except:
+        except Exception:
             cohen_d = np.nan
         
         # Statistical power for unpaired t-test
@@ -1796,7 +1793,7 @@ def calculate_effect_size_and_power(pre_data, post_data, feature, pairing_info=N
                                   ratio=len(all_post_vals)/len(all_pre_vals) if len(all_pre_vals) > 0 else 1,
                                   alpha=0.05, 
                                   alternative='two-sided')
-        except:
+        except Exception:
             power = np.nan
         
     else:
@@ -1822,7 +1819,7 @@ def calculate_effect_size_and_power(pre_data, post_data, feature, pairing_info=N
         try:
             stat, p_value = stats.wilcoxon(post_vals, pre_vals, alternative='two-sided')
             test_type = 'paired'
-        except:
+        except Exception:
             p_value = np.nan
             test_type = 'paired'
         
@@ -1830,7 +1827,7 @@ def calculate_effect_size_and_power(pre_data, post_data, feature, pairing_info=N
         try:
             differences = np.array(post_vals) - np.array(pre_vals)
             cohen_d = np.mean(differences) / np.std(differences, ddof=1)
-        except:
+        except Exception:
             cohen_d = np.nan
         
         # Statistical power for paired t-test
@@ -1841,7 +1838,7 @@ def calculate_effect_size_and_power(pre_data, post_data, feature, pairing_info=N
                                   nobs=len(pre_vals), 
                                   alpha=0.05, 
                                   alternative='two-sided')
-        except:
+        except Exception:
             power = np.nan
     
     # Effect size interpretation
@@ -2119,16 +2116,16 @@ def main():
     
     # Show paired subjects info
     if is_mixed:
-        paired_subjects = pairing_info.get('paired', set())
-        unpaired_pre = pairing_info.get('unpaired_pre', set())
-        unpaired_post = pairing_info.get('unpaired_post', set())
-        info_text = f"Analysis includes:\n"
+        pairing_info.get('paired', set())
+        pairing_info.get('unpaired_pre', set())
+        pairing_info.get('unpaired_post', set())
+        info_text = "Analysis includes:\n"
         info_text += f"- {pairing_info.get('paired_count', 0)} paired subjects (both PRE and POST)\n"
         if pairing_info.get('unpaired_pre_count', 0) > 0:
             info_text += f"- {pairing_info.get('unpaired_pre_count', 0)} unpaired PRE subjects\n"
         if pairing_info.get('unpaired_post_count', 0) > 0:
             info_text += f"- {pairing_info.get('unpaired_post_count', 0)} unpaired POST subjects\n"
-        info_text += f"\nUsing unpaired statistical tests (Mann-Whitney U) for all data."
+        info_text += "\nUsing unpaired statistical tests (Mann-Whitney U) for all data."
         st.info(info_text)
     elif pairing_info:
         st.info(f"Analysis includes {len(pairing_info)} subjects with both PRE and POST data: {', '.join(sorted(list(pairing_info)[:10]))}{'...' if len(pairing_info) > 10 else ''}")
@@ -2231,7 +2228,7 @@ def main():
         # Create a grid layout for all features
         num_features = len(eeg_features)
         cols_per_row = 3  # Number of columns per row
-        num_rows = (num_features + cols_per_row - 1) // cols_per_row
+        (num_features + cols_per_row - 1) // cols_per_row
         
 
         
@@ -2501,7 +2498,7 @@ def main():
         
         if scatterplot_figs:
             # Display scatterplots in a grid (2 columns)
-            num_plots = len(scatterplot_figs)
+            len(scatterplot_figs)
             cols_per_row = 2
             
             for idx, (feature_name, fig) in enumerate(scatterplot_figs.items()):
@@ -2534,7 +2531,7 @@ def main():
         
         if simple_scatterplot_figs:
             # Display scatterplots in a grid (2 columns)
-            num_plots = len(simple_scatterplot_figs)
+            len(simple_scatterplot_figs)
             cols_per_row = 2
             
             for idx, (feature_name, fig) in enumerate(simple_scatterplot_figs.items()):
