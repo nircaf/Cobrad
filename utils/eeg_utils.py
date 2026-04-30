@@ -363,6 +363,10 @@ def rename_channels(raw):
         # rename channels based on eeg_utils.eeg_dict_convertion
         valid_channels = set(raw.info['ch_names'])
         valid_rename_dict = {k: v for k, v in eeg_dict_convertion.items() if k in valid_channels}
+        # if less than 10 valid_rename_dict, raise an error
+        if len(valid_rename_dict) < 10:
+            print(f"Warning: Only {len(valid_rename_dict)} valid channel renames found. Check eeg_dict_convertion and raw channel names.")
+            raise ValueError("Not enough valid channel renames found.")
         # if valid_rename_dict == {}, use the first .split('-')[0] as the channel name if it already exists, use .split('-')[1]
         if len(valid_rename_dict) == 0:
             channels_to_remove = []
@@ -420,6 +424,7 @@ def rename_channels(raw):
             if channel.lower() == 'eog':
                 ch_type = 'eog'
             elif channel.lower() == 'ecg':
+                # rename channel name to ECG
                 ch_type = 'ecg'
             else:
                 ch_type = 'emg'
@@ -427,7 +432,36 @@ def rename_channels(raw):
             raw.set_channel_types({channel: ch_type})
         else:
             raw.set_channel_types({channel: 'misc'})
+    # if ecg exist change it to                 raw.rename_channels({channel: 'ECG'})
+    if any(ch.lower() == 'ecg' for ch in raw.ch_names):
+        raw.rename_channels({ch: 'ECG' for ch in raw.ch_names if ch.lower() == 'ecg'})
     return raw
+
+
+def detect_line_frequency(raw):
+    """
+    Automatically detect if the data has 50Hz or 60Hz line noise.
+    """
+    # 1. Compute PSD (using Welch's method for stability)
+    # We only care about the 45-65Hz range to save computation
+    spectrum = raw.compute_psd(method='welch', fmin=45, fmax=65, tmax=30)
+    psds, freqs = spectrum.get_data(return_freqs=True)
+    
+    # Average across all channels
+    mean_psd = np.mean(psds, axis=0)
+    
+    # 2. Find power at 50Hz and 60Hz
+    # We look for the closest index to exactly 50 and 60
+    idx_50 = np.argmin(np.abs(freqs - 50))
+    idx_60 = np.argmin(np.abs(freqs - 60))
+    
+    pwr_50 = mean_psd[idx_50]
+    pwr_60 = mean_psd[idx_60]
+    
+    line_freq = 50 if pwr_50 > pwr_60 else 60
+    
+    print(f"Detected Line Frequency: {line_freq}Hz (Power ratio {pwr_50/pwr_60:.2f})")
+    return line_freq
 
 def stat_text_get(group_data, col=None):
     lower_bound = -1e-30

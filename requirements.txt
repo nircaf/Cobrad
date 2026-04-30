@@ -40,3 +40,5 @@ ipykernel
 jupyter-client
 wfdb
 heartpy
+python-picard
+mne_icalabel

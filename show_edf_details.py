@@ -92,7 +92,7 @@ def read_edf_with_mne(file_path):
     return metadata, raw
 
 def main():
-    edf_path = "/storage/pblab_shared_data/Nir/Cobrad/EDF_Format/Seeg/SEEG_23_01/SEEG_23_01_020523_1128.edf"
+    edf_path = "EDF_Format/CAP_Sleep_Database/BRUX1.EDF"
     
     print(f"Reading EDF file: {edf_path}")
     print("=" * 80)

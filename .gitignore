@@ -9,6 +9,7 @@ __pycache__*/
 venv/
 # xlsx that start with ~
 ~$*.xlsx
+.codex
 *.h5
 *.log
 EDF.csv

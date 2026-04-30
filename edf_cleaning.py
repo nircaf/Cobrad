@@ -1,5 +1,6 @@
 import os
 from collections import defaultdict
+import io
 import pandas as pd
 import sys
 try:
@@ -16,8 +17,8 @@ from autoreject import AutoReject
 from pyprep.prep_pipeline import PrepPipeline
 import matplotlib.pyplot as plt
 # sklearn.preprocessing.MinMaxScaler
-from contextlib import contextmanager
-from utils.eeg_utils import clean_df_demographics, read_edf_mne, rename_channels, raise_error, eeg_data_to_features
+from contextlib import contextmanager, redirect_stdout
+from utils.eeg_utils import clean_df_demographics, read_edf_mne, rename_channels, raise_error, eeg_data_to_features, detect_line_frequency
 import ray
 # Import and run the HEP processing
 import glob
@@ -50,7 +51,7 @@ getcwd = os.getcwd()
 
 #%% INITIALIZATION
 # Parse command line arguments
-cases_project_name = 'ASSY' # 'Controls' #'Seeg' #'CAP_Sleep_Database/CAP_Sleep_Database'
+cases_project_name = 'Berkeley_data' # 'Controls' #'Seeg' #'CAP_Sleep_Database/CAP_Sleep_Database'
 
 edf_dir = 'EDF_Format'
 # Where to load the data from 
@@ -249,7 +250,7 @@ def list_files_and_find_duplicates(directory):
 
     for root, _, files in os.walk(directory):
         for file in files:
-            if file.endswith('.edf'):
+            if file.endswith('.edf') or file.endswith('.EDF'):
                 file_path = os.path.join(root, file)
                 file_size = os.path.getsize(file_path)
                 file_size_map[file_size].append(file_path)
@@ -366,14 +367,33 @@ def manual_epoch_rejection(epochs, filename):
     else:
         return epochs[good_epochs_mask]
 
-
+eeg_list = [
+    # --- Standard 10-20 ---
+    'Fp1', 'Fp2', 'Fpz', 'F3', 'F4', 'F7', 'F8', 'Fz',
+    'C3', 'C4', 'Cz', 'T3', 'T4', 'T5', 'T6',  # Note: older nomenclature
+    'T7', 'T8', 'P7', 'P8',                   # Note: modern nomenclature
+    'P3', 'P4', 'Pz', 'O1', 'O2', 'Oz',
+    'A1', 'A2', 'M1', 'M2',                   # References/Mastoids
+    # --- Extended 10-10 (Pre-Frontal / Frontal) ---
+    'AFp1', 'AFp2', 'AF3', 'AF4', 'AF7', 'AF8', 'AFz',
+    # --- Extended 10-10 (Frontal-Central / Frontal-Temporal) ---
+    'FC1', 'FC2', 'FC3', 'FC4', 'FC5', 'FC6', 'FCz',
+    'FT7', 'FT8', 'FT9', 'FT10',
+    # --- Extended 10-10 (Central-Parietal / Temporal-Parietal) ---
+    'CP1', 'CP2', 'CP3', 'CP4', 'CP5', 'CP6', 'CPz',
+    'TP7', 'TP8', 'TP9', 'TP10',
+    # --- Extended 10-10 (Parietal-Occipital) ---
+    'PO1', 'PO2', 'PO3', 'PO4', 'PO7', 'PO8', 'POz'
+]
 
 def clean_mne_raw(raw,filename):
     raw = rename_channels(raw)
+    ch_names= raw.info['ch_names']
     plot_not_prod(raw,is_prod,'pre_clean1')
     # Clean data
     # Filter the data
     raw.resample(256.)
+    data_length = raw.times[-1]
     nyquist_freq = raw.info['sfreq'] / 2
     picks = mne.pick_types(raw.info, eeg=True, exclude='bads')
     if len(picks) == 0:
@@ -385,109 +405,300 @@ def clean_mne_raw(raw,filename):
     # picks = mne.pick_types(raw.info, meg=False, eeg=True, stim=False, eog=False)
     # raw.pick(picks)
     # Initialize the PrepPipeline with fallback
-    prep_params = {
-        "ref_chs": "eeg",
-        "reref_chs": "eeg",
-        "line_freqs": np.arange(50, nyquist_freq, 50),
-    }
-    
+    line_freq =  detect_line_frequency(raw)
+    # 1. Normalize the comprehensive list for comparison
+    eeg_list_lower = [ch.lower() for ch in eeg_list]
+
+    # 2. Identify which channels in your current 'raw' object are EEG
+    mapping = {}
+    for ch in raw.ch_names:
+        if ch.lower() in eeg_list_lower:
+            mapping[ch] = 'eeg'
+        # Optional: ensure your polygraphic channels are labeled too
+        elif 'ecg' in ch.lower():
+            mapping[ch] = 'ecg'
+        elif 'emg' in ch.lower():
+            mapping[ch] = 'emg'
+        elif 'eog' in ch.lower():
+            mapping[ch] = 'eog'
+        else:
+            mapping[ch] = 'misc'  # or 'stim', 'resp', etc. based on your data
+
+    # 3. Apply types
+    raw.set_channel_types(mapping)
+    # 4. Set the montage (PyPREP needs this for RANSAC and spatial filtering)
+    montage = mne.channels.make_standard_montage('standard_1020')
+    raw.set_montage(montage, on_missing='warn')
+    # Get the data (channels x time)
+    data = raw.get_data(picks='eeg')
+
+    # 1. Calculate the standard deviation per channel
+    # We add a tiny epsilon (1e-25) to avoid division by zero if a channel IS actually 0
+    sd = np.std(data, axis=1, keepdims=True)
+    sd[sd == 0] = 1.0 
+
+    # 2. Standardize: (Data - Mean) / SD
+    # This makes the new SD exactly 1.0 for every channel
+    standardized_data = (data - np.mean(data, axis=1, keepdims=True)) / sd
+
+    # 3. Scale to a "Safe" range for MNE/PyPREP (e.g., 1e-5 or 10 microvolts)
+    # MNE functions often perform better when data is around the 1e-5 to 1e-6 range
+    raw._data[mne.pick_types(raw.info, eeg=True)] = standardized_data * 1e-5
+
+    print(f"New SD: {np.std(raw.get_data(picks='eeg'), axis=1)[0]:.2e}")
+
+    # --- Save non-EEG channels before EEG-only cleaning ---
+    non_eeg_picks = mne.pick_types(
+        raw.info, eeg=False, ecg=True, emg=True, eog=True, misc=True, stim=True
+    )
+    if len(non_eeg_picks) > 0:
+        non_eeg_raw = raw.copy().pick(non_eeg_picks)
+        # Resample to match the EEG target sfreq (already 256 Hz at this point)
+        if non_eeg_raw.info['sfreq'] != 256.0:
+            non_eeg_raw.resample(256.0)
+        print(f"[clean_mne_raw] Preserving {len(non_eeg_picks)} non-EEG channel(s): {non_eeg_raw.ch_names}")
+    else:
+        non_eeg_raw = None
+
+    raw, _bad_channels = fix_bad_eeg_channels(raw)
+    # Now your pipeline should run without the "No appropriate channels found" error
     try:
+        # 1. Clear the bad channels list
+        raw.info['bads'] = []
+
+        # 2. (Crucial) Ensure names are standard strings to avoid the np.str_ issue
+        clean_names = [str(ch) for ch in raw.ch_names]
+        raw.rename_channels(dict(zip(raw.ch_names, clean_names)))
+
+        # 3. Setup params
+        prep_params = {
+            "ref_chs": clean_names,
+            "reref_chs": clean_names,
+            "line_freqs": np.arange(line_freq, nyquist_freq, line_freq),
+            "frac_bad": 0.5,
+        }
+
+        # 4. Run Prep
         prep = PrepPipeline(raw, prep_params, montage="standard_1020", ransac=False)
-        prep.fit()  # Run the pipeline without writing to console
+        prep.fit()
         plot_not_prod(prep.raw, is_prod, 'PrepPipeline4')
         raw = prep.raw  # Get cleaned data
-        
-        # Interpolate bad channels (only if digitization info is available)
-        try:
-            raw.interpolate_bads()
-        except RuntimeError as e:
-            if "digitization" in str(e).lower() or "headshape" in str(e).lower():
-                print(f'Cannot interpolate bad channels (no digitization info): {e}')
-                print('Dropping bad channels instead...')
-                # Drop bad channels instead of interpolating
-                if len(raw.info['bads']) > 0:
-                    raw.drop_channels(raw.info['bads'])
-            else:
-                raise_error(e, f"Unexpected interpolation error for {filename}")
-    except Exception as e:
-        print('--------------------------------------------------')
-        print(f'Error in PrepPipeline: {e} for file: {filename}')
-        print('Falling back to manual preprocessing...')
-        print('--------------------------------------------------')
-        
-        
-        # Fallback: Manual bad channel detection and standard referencing
-        data = raw.get_data()
-        ch_names = raw.ch_names
-        
-        # Define threshold factors
-        var_thresh_factor = 0.01  # Channels with variance < 10% of median are bad
-        corr_thresh_factor = 0.3  # Channels with correlation < 30% of median are bad
-        
-        # --- 1. Variance-based detection ---
-        variances = np.var(data, axis=1)
-        median_var = np.median(variances)
-        variance_threshold = var_thresh_factor * median_var
-        bad_var = [ch_names[i] for i, v in enumerate(variances) if v < variance_threshold]
+    except Exception as prep_err:
+        raise_error(f"PrepPipeline failed: {prep_err}")
+        print(f"[clean_mne_raw] PrepPipeline failed ({prep_err}), continuing without PREP re-referencing.")
+    
+    # Interpolate bad channels (only if digitization info is available)
+    raw.interpolate_bads()       
+    
+    # Fallback: Manual bad channel detection and standard referencing
+    data = raw.get_data()
+    cleaned_data, autoreject_msg = apply_autoreject_to_signal(data, raw)
 
-        # --- 2. Correlation-based detection ---
-        corr_matrix = np.corrcoef(data)
-        mean_corr = np.mean(np.abs(corr_matrix), axis=1)  # abs avoids sign issues
-        median_corr = np.median(mean_corr)
-        corr_threshold = corr_thresh_factor * median_corr
-        bad_corr = [ch_names[i] for i, c in enumerate(mean_corr) if c < corr_threshold]
-        
-        # Combine both methods
-        bad_channels = list(set(bad_var + bad_corr))
-        
-        # Mark bad channels
-        raw.info['bads'] = bad_channels
-        print(f'Detected {len(bad_channels)} bad channels: {bad_channels}')
-        
-        # Standard average reference (instead of robust reference)
-        raw.set_eeg_reference('average', projection=True)
-        raw.apply_proj()
-        
-        # Interpolate bad channels (only if digitization info is available)
-        if len(bad_channels) > 0:
-            try:
-                raw.interpolate_bads()
-            except RuntimeError as e:
-                if "digitization" in str(e).lower() or "headshape" in str(e).lower():
-                    print(f'Cannot interpolate bad channels (no digitization info): {e}')
-                    print('Dropping bad channels instead...')
-                    # Drop bad channels instead of interpolating
-                    raw.drop_channels(bad_channels)
-                else:
-                    raise_error(e, f"Unexpected interpolation error in fallback for {filename}")
-            # raw.preload
-    # Remove bad windows using autoreject
-    # raw.load_data()
-    epochs = mne.make_fixed_length_epochs(raw, duration=2, overlap=0.5, preload=True)
-    
-    # Try AutoReject first
-    try:
-        ar = AutoReject()
-        epochs_clean, reject_log = ar.fit_transform(epochs, return_log=True)
-        print(f'[{filename}] AutoReject successfully applied')
-    except Exception as e:
-        print('--------------------------------------------------')
-        print(f'Error in AutoReject: {e} for file: {filename}')
-        print('Falling back to manual epoch rejection...')
-        print('--------------------------------------------------')
-        
-        # Fallback: Manual epoch rejection using variance and amplitude criteria
-        epochs_clean = manual_epoch_rejection(epochs, filename)
-    # Assuming epochs_clean is an instance of mne.Epochs
-    epochs_data = epochs_clean.get_data()  # Shape: (n_epochs, n_channels, n_times)
-    
-    # Reshape the data to (n_channels, n_times_total)
-    n_epochs, n_channels, n_times = epochs_data.shape
-    reshaped_data = epochs_data.transpose(1, 0, 2).reshape(n_channels, -1)
-    # Create a new RawArray object
-    info = epochs_clean.info  # Use the info from the epochs
-    raw = mne.io.RawArray(reshaped_data, info)
+    print(f'[{filename}] {autoreject_msg}')
+    if cleaned_data.shape != data.shape:
+        raise ValueError(
+            f"AutoReject returned shape {cleaned_data.shape}, expected {data.shape}"
+        )
+
+    raw = mne.io.RawArray(cleaned_data, raw.info.copy())
+
+    # --- Re-attach non-EEG channels ---
+    if non_eeg_raw is not None:
+        # Crop/pad non-EEG to match the EEG raw duration (same number of samples)
+        n_times_eeg = raw.n_times
+        n_times_non_eeg = non_eeg_raw.n_times
+        if n_times_non_eeg > n_times_eeg:
+            non_eeg_raw.crop(tmax=(n_times_eeg - 1) / raw.info['sfreq'])
+        elif n_times_non_eeg < n_times_eeg:
+            # Pad with zeros to match EEG length
+            pad_len = n_times_eeg - non_eeg_raw.n_times
+            pad_data = np.zeros((len(non_eeg_raw.ch_names), pad_len))
+            existing_data = non_eeg_raw.get_data()
+            padded_data = np.concatenate([existing_data, pad_data], axis=1)
+            non_eeg_raw = mne.io.RawArray(padded_data, non_eeg_raw.info.copy())
+        raw.add_channels([non_eeg_raw], force_update_info=True)
+        print(f"[clean_mne_raw] Re-added non-EEG channels. Final channels: {raw.ch_names}")
+
     return raw
+    raw.ch_names
+
+def fix_bad_eeg_channels(
+    raw,
+    montage="standard_1020",
+    z_thresh=5,
+):
+    """
+    Detect and fix bad EEG channels generically.
+
+    Parameters
+    ----------
+    raw : mne.io.Raw
+        Input raw object (PSG or EEG).
+    montage : str
+        Montage name.
+    z_thresh : float
+        Robust z-score threshold for amplitude-based bad detection.
+    min_good_channels : int
+        Minimum number of good channels required to run PREP.
+    run_prep : bool
+        Whether to run PyPREP after fixing channels.
+    prep_params : dict or None
+        Parameters for PrepPipeline.
+
+    Returns
+    -------
+    raw_out : mne.io.Raw
+        Cleaned raw object (EEG only).
+    bad_channels : list
+        Detected bad channels.
+    """
+
+    from pyprep.find_noisy_channels import NoisyChannels
+
+    # =========================
+    # STEP 1: pick EEG only
+    # =========================
+    eeg_picks = mne.pick_types(
+        raw.info,
+        eeg=True,
+        eog=False,
+        ecg=False,
+        emg=False,
+        misc=False,
+        stim=False
+    )
+
+    if len(eeg_picks) == 0:
+        raise ValueError("No EEG channels found.")
+
+    raw_eeg = raw.copy().pick(eeg_picks)
+
+    # =========================
+    # STEP 2: set montage
+    # =========================
+    raw_eeg.set_montage(montage, on_missing="warn")
+
+    # =========================
+    # STEP 3: PyPREP bad detection
+    # =========================
+    nc = NoisyChannels(raw_eeg)
+    bad_channel_log = io.StringIO()
+    bad_pyprep = set()
+    try:
+        with redirect_stdout(bad_channel_log):
+            nc.find_all_bads()
+        bad_pyprep = set(nc.get_bads())
+    except ValueError as err:
+        err_msg = str(err)
+        if "Too many noisy channels" in err_msg and "need at least 5" in err_msg:
+            print(
+                "[fix_bad_eeg_channels] PyPREP RANSAC bad-channel detection skipped: "
+                f"{err_msg}. Continuing with non-RANSAC amplitude checks."
+            )
+        print(f"[fix_bad_eeg_channels] PyPREP bad-channel detection error: {err_msg}. Continuing with non-RANSAC amplitude checks.")
+        raise
+
+    bad_channel_summary = " | ".join(
+        line.strip() for line in bad_channel_log.getvalue().splitlines() if line.strip()
+    )
+    if bad_channel_summary:
+        print(bad_channel_summary)
+
+    # =========================
+    # STEP 4: amplitude-based detection
+    # =========================
+    data = raw_eeg.get_data()
+
+    stds = np.std(data, axis=1)
+    ptp = np.ptp(data, axis=1)
+
+    def robust_z(x):
+        med = np.median(x)
+        mad = np.median(np.abs(x - med)) + 1e-12
+        return 0.6745 * (x - med) / mad
+
+    z_std = robust_z(stds)
+    z_ptp = robust_z(ptp)
+
+    bad_stat = set()
+    for ch, z1, z2 in zip(raw_eeg.ch_names, z_std, z_ptp):
+        if abs(z1) > z_thresh or abs(z2) > z_thresh:
+            bad_stat.add(ch)
+
+    # =========================
+    # STEP 5: combine
+    # =========================
+    valid_channels = set(raw_eeg.ch_names)
+    bad_all = sorted(list((bad_pyprep.union(bad_stat)) & valid_channels))
+
+    # =========================
+    # STEP 6: interpolate
+    # =========================
+    raw_clean = raw_eeg.copy()
+    raw_clean.info["bads"] = bad_all
+    try:
+        raw_clean.interpolate_bads(reset_bads=False)
+    except Exception as interp_err:
+        print(
+            "[fix_bad_eeg_channels] Interpolation skipped: "
+            f"{interp_err}. Returning EEG with bad-channel labels only."
+        )
+    return raw_clean, bad_all
+
+
+def apply_autoreject_to_signal(signal_uv: np.ndarray, qc_raw):
+    if AutoReject is None:
+        raise RuntimeError("autoreject is not installed")
+
+    epochs = mne.make_fixed_length_epochs(qc_raw, duration=2.0, preload=True, reject_by_annotation=False)
+    if len(epochs) == 0:
+        raise RuntimeError("not enough data for AutoReject epochs")
+
+    ar = AutoReject(random_state=42, verbose=False)
+    ar.fit(epochs)
+    reject_log = ar.get_reject_log(epochs)
+
+    cleaned = signal_uv.copy()
+    samples_per_epoch = int(round(2.0 * float(qc_raw.info["sfreq"])))
+    n_times = cleaned.shape[-1] if cleaned.ndim == 2 else len(cleaned)
+    for epoch_idx, is_bad in enumerate(reject_log.bad_epochs):
+        if not is_bad:
+            continue
+        start = epoch_idx * samples_per_epoch
+        stop = min(n_times, start + samples_per_epoch)
+        if cleaned.ndim == 2:
+            cleaned[:, start:stop] = np.nan
+        else:
+            cleaned[start:stop] = np.nan
+
+    cleaned = interpolate_nans(cleaned)
+    bad_epochs = int(np.sum(reject_log.bad_epochs))
+    return cleaned, f"AutoReject marked {bad_epochs} bad epochs using {len(qc_raw.ch_names)} EEG channels."
+
+def interpolate_nans(signal_uv: np.ndarray) -> np.ndarray:
+    if not np.isnan(signal_uv).any():
+        return signal_uv
+
+    if signal_uv.ndim == 2:
+        # 2D case: (channels x times) — interpolate each channel independently
+        out = signal_uv.copy()
+        for ch_idx in range(out.shape[0]):
+            row = out[ch_idx]
+            if np.isnan(row).any():
+                x = np.arange(len(row))
+                valid = ~np.isnan(row)
+                if valid.sum() < 2:
+                    out[ch_idx] = np.nan_to_num(row, nan=0.0)
+                else:
+                    out[ch_idx] = np.interp(x, x[valid], row[valid])
+        return out
+
+    # 1D case
+    x = np.arange(len(signal_uv))
+    valid = ~np.isnan(signal_uv)
+    if valid.sum() < 2:
+        return np.nan_to_num(signal_uv, nan=0.0)
+    return np.interp(x, x[valid], signal_uv[valid])
 
 def analyze_eeg_data(raw,is_prod,filename):
     raw = clean_mne_raw(raw,filename)
