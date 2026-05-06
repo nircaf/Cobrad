@@ -4,10 +4,14 @@ PhD-grade analysis of heartbeat-evoked potential T-wave coupling across groups a
 """
 
 import io
+import hashlib
+import json
 import os
 import pickle
 import re
+import time
 from dataclasses import dataclass
+from itertools import combinations
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import mne
@@ -37,6 +41,10 @@ ICA_MAX_COMPONENTS = 20
 ICA_MAX_FIT_SAMPLES = 60000
 MAX_SPECTRAL_POWER_RATIO = 0.4
 NON_PATIENT_CACHE_PREFIXES = ("individuals_cache", "non_eeg_individuals_cache")
+PROCESSED_CACHE_VERSION = 1
+PROCESSED_CACHE_DIRNAME = ".hep_twave_processed_cache"
+EDF_FORMAT_DIRNAME = "EDF_Format"
+_DEMOGRAPHIC_SOURCE_CACHE: Dict[str, Tuple[pd.DataFrame, str]] = {}
 
 # Colorblind-friendly Okabe-Ito palette for scientific figures
 PALETTE = ["#0072B2", "#D55E00", "#009E73", "#CC79A7", "#F0E442", "#56B4E9", "#E69F00", "#000000"]
@@ -118,6 +126,10 @@ def patient_id_from_path(path: str, stage: str) -> str:
     return name[:m.start()] if m else name
 
 
+def _script_dir() -> str:
+    return os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd()
+
+
 def list_patient_files(base_path: str, group: str, stage: str, limit: Optional[int] = None) -> List[str]:
     stage_dir = os.path.join(base_path, group, stage)
     if not os.path.isdir(stage_dir):
@@ -127,6 +139,135 @@ def list_patient_files(base_path: str, group: str, stage: str, limit: Optional[i
         if f.endswith(".pkl") and not f.startswith(NON_PATIENT_CACHE_PREFIXES)
     )
     return files[:limit] if limit else files
+
+
+def processed_cache_dir() -> str:
+    return os.path.join(_script_dir(), PROCESSED_CACHE_DIRNAME)
+
+
+def cache_mode_label(kwargs: Dict[str, Any]) -> str:
+    return "ica" if kwargs.get("ica_ecg_clean", False) else "raw"
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in sorted(value.items(), key=lambda item: str(item[0]))}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    return value
+
+
+def source_file_fingerprint(base_path: str, groups: Sequence[str], stage: str,
+                            test_run_limit: int) -> List[Dict[str, Any]]:
+    limit = int(test_run_limit) if int(test_run_limit) > 0 else None
+    rows: List[Dict[str, Any]] = []
+    for group in groups:
+        for file_path in list_patient_files(base_path, group, stage, limit=limit):
+            try:
+                stat = os.stat(file_path)
+            except OSError:
+                rows.append({"group": group, "path": file_path, "missing": True})
+                continue
+            try:
+                rel_path = os.path.relpath(file_path, base_path)
+            except ValueError:
+                rel_path = file_path
+            rows.append({
+                "group": group,
+                "path": rel_path,
+                "size": int(stat.st_size),
+                "mtime_ns": int(stat.st_mtime_ns),
+            })
+    return rows
+
+
+def processed_cache_identity(kwargs: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+    base_path = str(kwargs["base_path"])
+    groups = tuple(kwargs["groups"])
+    stage = str(kwargs["stage"])
+    test_run_limit = int(kwargs["test_run_limit"])
+    payload = {
+        "cache_version": PROCESSED_CACHE_VERSION,
+        "mode": cache_mode_label(kwargs),
+        "base_path": os.path.abspath(base_path),
+        "params": _json_safe(kwargs),
+        "source_files": source_file_fingerprint(base_path, groups, stage, test_run_limit),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest(), payload
+
+
+def processed_cache_path(kwargs: Dict[str, Any]) -> Tuple[str, str, Dict[str, Any]]:
+    key, metadata = processed_cache_identity(kwargs)
+    stage = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(kwargs.get("stage", "stage")))
+    mode = cache_mode_label(kwargs)
+    filename = f"{stage}_{mode}_{key[:20]}.pkl"
+    return os.path.join(processed_cache_dir(), filename), key, metadata
+
+
+def load_processed_analysis_cache(kwargs: Dict[str, Any]) -> Optional[Tuple[List[PatientResult], pd.DataFrame, str]]:
+    path, key, _ = processed_cache_path(kwargs)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "rb") as f:
+            payload = pickle.load(f)
+    except Exception:
+        return None
+    if payload.get("cache_version") != PROCESSED_CACHE_VERSION or payload.get("key") != key:
+        return None
+    results = payload.get("results")
+    feature_df = payload.get("feature_df")
+    if not isinstance(results, list) or not isinstance(feature_df, pd.DataFrame):
+        return None
+    return results, feature_df, path
+
+
+def save_processed_analysis_cache(kwargs: Dict[str, Any], results: List[PatientResult],
+                                  feature_df: pd.DataFrame) -> Optional[str]:
+    path, key, metadata = processed_cache_path(kwargs)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    payload = {
+        "cache_version": PROCESSED_CACHE_VERSION,
+        "created_at": time.time(),
+        "key": key,
+        "metadata": metadata,
+        "results": results,
+        "feature_df": feature_df,
+    }
+    tmp_path = f"{path}.tmp-{os.getpid()}"
+    try:
+        with open(tmp_path, "wb") as f:
+            pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        return None
+    return path
+
+
+def clear_processed_analysis_cache() -> int:
+    cache_dir = processed_cache_dir()
+    if not os.path.isdir(cache_dir):
+        return 0
+    removed = 0
+    for name in os.listdir(cache_dir):
+        if not name.endswith(".pkl"):
+            continue
+        try:
+            os.remove(os.path.join(cache_dir, name))
+            removed += 1
+        except OSError:
+            pass
+    return removed
 
 
 # ── Channel classification ────────────────────────────────────────────────────
@@ -951,21 +1092,91 @@ def format_p(p: Optional[float]) -> str:
 
 def group_channel_stats(feature_df: pd.DataFrame, groups: Sequence[str],
                          metric: str = "distance_ms", boot_ci: bool = True) -> pd.DataFrame:
-    if feature_df.empty or len(groups) != 2:
+    if feature_df.empty or len(groups) < 2 or metric not in feature_df.columns:
         return pd.DataFrame()
-    g1, g2 = groups
     rows = []
     for channel, ch_df in feature_df.groupby("channel"):
-        a = ch_df.loc[ch_df["group"] == g1, metric].dropna().to_numpy()
-        b = ch_df.loc[ch_df["group"] == g2, metric].dropna().to_numpy()
+        for g1, g2 in combinations(groups, 2):
+            a = ch_df.loc[ch_df["group"] == g1, metric].dropna().to_numpy()
+            b = ch_df.loc[ch_df["group"] == g2, metric].dropna().to_numpy()
+            if len(a) < 2 or len(b) < 2:
+                continue
+            u_stat, p_val = stats.mannwhitneyu(a, b, alternative="two-sided")
+            t_stat, p_welch = stats.ttest_ind(a, b, equal_var=False)
+            ci_a = bootstrap_median_ci(a) if boot_ci else (np.nan, np.nan)
+            ci_b = bootstrap_median_ci(b) if boot_ci else (np.nan, np.nan)
+            rows.append({
+                "channel": channel,
+                "comparison": f"{g1} vs {g2}",
+                "group_a": g1,
+                "group_b": g2,
+                "group_a_n": int(len(a)),
+                "group_b_n": int(len(b)),
+                "group_a_median": float(np.median(a)),
+                "group_a_ci_lo": ci_a[0],
+                "group_a_ci_hi": ci_a[1],
+                "group_b_median": float(np.median(b)),
+                "group_b_ci_lo": ci_b[0],
+                "group_b_ci_hi": ci_b[1],
+                f"{g1}_n": int(len(a)),
+                f"{g2}_n": int(len(b)),
+                f"{g1}_median": float(np.median(a)),
+                f"{g1}_ci_lo": ci_a[0],
+                f"{g1}_ci_hi": ci_a[1],
+                f"{g2}_median": float(np.median(b)),
+                f"{g2}_ci_lo": ci_b[0],
+                f"{g2}_ci_hi": ci_b[1],
+                "median_delta": float(np.median(a) - np.median(b)),
+                "mann_whitney_u": float(u_stat),
+                "p_value": float(p_val),
+                "welch_t": float(t_stat),
+                "p_welch": float(p_welch),
+                "rank_biserial_r": rank_biserial_r(a, b),
+                "cohens_d": cohens_d(a, b),
+            })
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows).sort_values("p_value")
+    df["p_fdr_bh"] = benjamini_hochberg(df["p_value"].to_numpy())
+    df["p_bonferroni"] = np.minimum(df["p_value"].to_numpy() * len(df), 1.0)
+    return df
+
+
+def patient_median_stats(feature_df: pd.DataFrame, groups: Sequence[str],
+                          metric: str = "distance_ms") -> Tuple[pd.DataFrame, pd.DataFrame]:
+    patient_df = (
+        feature_df
+        .groupby(["group", "patient_id"], as_index=False)
+        .agg(
+            median_distance_ms=(metric, "median"),
+            median_signed_distance_ms=("signed_distance_ms", "median"),
+            n_channels=("channel", "nunique"),
+        )
+    )
+    if len(groups) < 2 or patient_df.empty:
+        return patient_df, pd.DataFrame()
+
+    rows = []
+    for g1, g2 in combinations(groups, 2):
+        a = patient_df.loc[patient_df["group"] == g1, "median_distance_ms"].dropna().to_numpy()
+        b = patient_df.loc[patient_df["group"] == g2, "median_distance_ms"].dropna().to_numpy()
         if len(a) < 2 or len(b) < 2:
             continue
+
         u_stat, p_val = stats.mannwhitneyu(a, b, alternative="two-sided")
-        t_stat, p_welch = stats.ttest_ind(a, b, equal_var=False)
-        ci_a = bootstrap_median_ci(a) if boot_ci else (np.nan, np.nan)
-        ci_b = bootstrap_median_ci(b) if boot_ci else (np.nan, np.nan)
+        ci_a, ci_b = bootstrap_median_ci(a), bootstrap_median_ci(b)
         rows.append({
-            "channel": channel,
+            "comparison": f"{g1} vs {g2}",
+            "group_a": g1,
+            "group_b": g2,
+            "group_a_n": int(len(a)),
+            "group_b_n": int(len(b)),
+            "group_a_median": float(np.median(a)),
+            "group_a_ci_lo": ci_a[0],
+            "group_a_ci_hi": ci_a[1],
+            "group_b_median": float(np.median(b)),
+            "group_b_ci_lo": ci_b[0],
+            "group_b_ci_hi": ci_b[1],
             f"{g1}_n": int(len(a)),
             f"{g2}_n": int(len(b)),
             f"{g1}_median": float(np.median(a)),
@@ -977,56 +1188,15 @@ def group_channel_stats(feature_df: pd.DataFrame, groups: Sequence[str],
             "median_delta": float(np.median(a) - np.median(b)),
             "mann_whitney_u": float(u_stat),
             "p_value": float(p_val),
-            "welch_t": float(t_stat),
-            "p_welch": float(p_welch),
             "rank_biserial_r": rank_biserial_r(a, b),
             "cohens_d": cohens_d(a, b),
         })
     if not rows:
-        return pd.DataFrame()
+        return patient_df, pd.DataFrame()
     df = pd.DataFrame(rows).sort_values("p_value")
     df["p_fdr_bh"] = benjamini_hochberg(df["p_value"].to_numpy())
     df["p_bonferroni"] = np.minimum(df["p_value"].to_numpy() * len(df), 1.0)
-    return df
-
-
-def patient_median_stats(feature_df: pd.DataFrame, groups: Sequence[str],
-                          metric: str = "distance_ms") -> Tuple[pd.DataFrame, Optional[Dict]]:
-    patient_df = (
-        feature_df
-        .groupby(["group", "patient_id"], as_index=False)
-        .agg(
-            median_distance_ms=(metric, "median"),
-            median_signed_distance_ms=("signed_distance_ms", "median"),
-            n_channels=("channel", "nunique"),
-        )
-    )
-    if len(groups) != 2 or patient_df.empty:
-        return patient_df, None
-
-    g1, g2 = groups
-    a = patient_df.loc[patient_df["group"] == g1, "median_distance_ms"].dropna().to_numpy()
-    b = patient_df.loc[patient_df["group"] == g2, "median_distance_ms"].dropna().to_numpy()
-    if len(a) < 2 or len(b) < 2:
-        return patient_df, None
-
-    u_stat, p_val = stats.mannwhitneyu(a, b, alternative="two-sided")
-    ci_a, ci_b = bootstrap_median_ci(a), bootstrap_median_ci(b)
-    return patient_df, {
-        "mann_whitney_u": float(u_stat),
-        "p_value": float(p_val),
-        "rank_biserial_r": rank_biserial_r(a, b),
-        "cohens_d": cohens_d(a, b),
-        f"{g1}_n": int(len(a)),
-        f"{g2}_n": int(len(b)),
-        f"{g1}_median": float(np.median(a)),
-        f"{g1}_ci_lo": ci_a[0],
-        f"{g1}_ci_hi": ci_a[1],
-        f"{g2}_median": float(np.median(b)),
-        f"{g2}_ci_lo": ci_b[0],
-        f"{g2}_ci_hi": ci_b[1],
-        "median_delta": float(np.median(a) - np.median(b)),
-    }
+    return patient_df, df
 
 
 def apply_spectral_quality_filter(
@@ -1037,6 +1207,341 @@ def apply_spectral_quality_filter(
         return feature_df.copy()
     ratio = pd.to_numeric(feature_df["spectral_power_ratio_hf_lf"], errors="coerce")
     return feature_df.loc[ratio.notna() & (ratio < max_ratio)].copy()
+
+
+# ── Demographics ─────────────────────────────────────────────────────────────
+
+def _norm_col_name(name: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(name).lower())
+
+
+def _first_matching_col(columns: Sequence[Any], candidates: Sequence[str]) -> Optional[str]:
+    norm_to_col = {_norm_col_name(col): col for col in columns}
+    for cand in candidates:
+        if _norm_col_name(cand) in norm_to_col:
+            return norm_to_col[_norm_col_name(cand)]
+    for col in columns:
+        norm = _norm_col_name(col)
+        if any(_norm_col_name(cand) in norm for cand in candidates):
+            return str(col)
+    return None
+
+
+def _demographic_id_keys(value: Any) -> List[str]:
+    if pd.isna(value):
+        return []
+    text = str(value).strip()
+    if not text:
+        return []
+    text = os.path.basename(text).replace(".pkl", "").replace(".edf", "")
+    upper = text.upper()
+    keys: List[str] = []
+
+    def add_key(key: str) -> None:
+        if key and key not in keys:
+            keys.append(key)
+
+    compact = re.sub(r"[^A-Z0-9]+", "", upper)
+    add_key(compact)
+    if compact.startswith("0"):
+        add_key(compact.lstrip("0"))
+
+    bids = re.search(r"SUB[-_]?I\d+", upper)
+    if bids:
+        add_key(re.sub(r"[^A-Z0-9]+", "", bids.group(0)))
+    site_patient = re.search(r"I\d{6,}", upper)
+    if site_patient:
+        add_key(site_patient.group(0))
+
+    digit_groups = re.findall(r"\d+", upper)
+    if digit_groups:
+        joined = "".join(digit_groups)
+        if len(joined) >= 3:
+            add_key(joined)
+            add_key(joined.lstrip("0") or "0")
+    if len(digit_groups) == 1 and re.search(r"[A-Z]", compact) and len(digit_groups[0]) >= 3:
+        add_key(digit_groups[0].lstrip("0") or "0")
+    return keys
+
+
+def _demographic_file_score(group: str, path: str) -> int:
+    name = os.path.basename(path).lower()
+    group_l = group.lower()
+    score = 0
+    hints = {
+        "young_the_human_sleep_project": ["psg_metadata"],
+        "the_human_sleep_project": ["psg_metadata"],
+        "edf": ["cobrad_clinical", "clinical"],
+        "berkeley_data": ["00_df_all_demographics_young", "demographics"],
+    }
+    for hint in hints.get(group_l, ["demographic", "clinical", "metadata", "age", "gender", "sex"]):
+        if hint in name:
+            score += 10
+    if name.endswith(".csv"):
+        score += 1
+    return score
+
+
+def find_demographic_files_for_group(group: str) -> List[str]:
+    group_dir = os.path.join(_script_dir(), EDF_FORMAT_DIRNAME, group)
+    if not os.path.isdir(group_dir):
+        return []
+    files = []
+    search_dirs = [group_dir]
+    try:
+        search_dirs.extend(
+            os.path.join(group_dir, name)
+            for name in os.listdir(group_dir)
+            if os.path.isdir(os.path.join(group_dir, name))
+        )
+    except OSError:
+        pass
+    for root in search_dirs:
+        try:
+            names = os.listdir(root)
+        except OSError:
+            continue
+        for name in names:
+            if name.lower().endswith((".csv", ".xlsx", ".xls")) and not name.startswith("~$"):
+                files.append(os.path.join(root, name))
+    return sorted(files, key=lambda p: (-_demographic_file_score(group, p), p))
+
+
+def _read_demographic_source(path: str) -> Tuple[pd.DataFrame, str]:
+    if path.lower().endswith(".csv"):
+        return pd.read_csv(path), os.path.basename(path)
+
+    excel = pd.ExcelFile(path)
+    preferred = next((sheet for sheet in excel.sheet_names if _norm_col_name(sheet) == "clinical"), None)
+    sheet = preferred or excel.sheet_names[0]
+    return pd.read_excel(path, sheet_name=sheet), f"{os.path.basename(path)}:{sheet}"
+
+
+def load_group_demographics(group: str) -> Tuple[pd.DataFrame, str]:
+    if group in _DEMOGRAPHIC_SOURCE_CACHE:
+        return _DEMOGRAPHIC_SOURCE_CACHE[group]
+    files = find_demographic_files_for_group(group)
+    if not files:
+        return pd.DataFrame(), ""
+
+    best_df = pd.DataFrame()
+    best_source = ""
+    best_score = -1
+    for path in files:
+        try:
+            df, source = _read_demographic_source(path)
+        except Exception:
+            continue
+        cols = list(df.columns)
+        score = _demographic_file_score(group, path)
+        if _first_matching_col(cols, ["age", "ageatvisit"]):
+            score += 5
+        if _first_matching_col(cols, ["sex", "gender", "sexdsc"]):
+            score += 5
+        if _first_matching_col(cols, ["patient_id", "record_id", "subj", "subject", "bidsfolder", "bdsppatientid"]):
+            score += 5
+        if score > best_score:
+            best_df, best_source, best_score = df, source, score
+    _DEMOGRAPHIC_SOURCE_CACHE[group] = (best_df, best_source)
+    return best_df, best_source
+
+
+def build_demographic_lookup(df: pd.DataFrame) -> Tuple[Dict[str, pd.Series], Dict[str, Optional[str]]]:
+    if df.empty:
+        return {}, {}
+    id_cols = [
+        col for col in df.columns
+        if _norm_col_name(col) in {
+            "patientid", "patient", "subject", "subjectid", "subj", "recordid",
+            "bidsfolder", "bdsppatientid", "file", "filename",
+        }
+        or any(token in _norm_col_name(col) for token in ["patient", "subject", "subj", "recordid", "bidsfolder"])
+    ]
+    age_col = _first_matching_col(df.columns, ["age", "ageatvisit"])
+    sex_col = _first_matching_col(df.columns, ["sex", "gender", "sexdsc"])
+    bmi_col = _first_matching_col(df.columns, ["bmi"])
+    education_col = _first_matching_col(df.columns, ["education", "education_by_diploma"])
+    handedness_col = _first_matching_col(df.columns, ["handedness"])
+
+    lookup: Dict[str, pd.Series] = {}
+    for _, row in df.iterrows():
+        for col in id_cols:
+            for key in _demographic_id_keys(row.get(col)):
+                lookup.setdefault(key, row)
+    cols = {
+        "age": age_col,
+        "sex": sex_col,
+        "bmi": bmi_col,
+        "education": education_col,
+        "handedness": handedness_col,
+    }
+    return lookup, cols
+
+
+def _standardize_sex(value: Any) -> str:
+    if pd.isna(value):
+        return ""
+    text = str(value).strip()
+    lower = text.lower()
+    if lower in {"1", "1.0", "m", "male"}:
+        return "Male"
+    if lower in {"2", "2.0", "f", "female"}:
+        return "Female"
+    return text
+
+
+def demographic_table_for_patients(patient_summary: pd.DataFrame, groups: Sequence[str]) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    if patient_summary.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    source_rows = []
+    group_payload = {}
+    for group in groups:
+        df, source = load_group_demographics(group)
+        lookup, cols = build_demographic_lookup(df)
+        group_payload[group] = (lookup, cols, source)
+        source_rows.append({
+            "group": group,
+            "source": source or "No .csv/.xlsx demographic file found",
+            "source_rows": len(df),
+            "matched_columns": ", ".join(f"{k}={v}" for k, v in cols.items() if v),
+        })
+
+    rows = []
+    for _, patient in patient_summary[["group", "patient_id"]].drop_duplicates().iterrows():
+        group = patient["group"]
+        patient_id = patient["patient_id"]
+        lookup, cols, source = group_payload.get(group, ({}, {}, ""))
+        match = None
+        matched_key = ""
+        for key in _demographic_id_keys(patient_id):
+            if key in lookup:
+                match = lookup[key]
+                matched_key = key
+                break
+
+        row = {
+            "group": group,
+            "patient_id": patient_id,
+            "demographics_matched": match is not None,
+            "matched_key": matched_key,
+            "demographics_source": source,
+        }
+        if match is not None:
+            age_col = cols.get("age")
+            sex_col = cols.get("sex")
+            bmi_col = cols.get("bmi")
+            education_col = cols.get("education")
+            handedness_col = cols.get("handedness")
+            row["age"] = pd.to_numeric(match.get(age_col), errors="coerce") if age_col else np.nan
+            row["sex"] = _standardize_sex(match.get(sex_col)) if sex_col else ""
+            row["bmi"] = pd.to_numeric(match.get(bmi_col), errors="coerce") if bmi_col else np.nan
+            row["education"] = match.get(education_col) if education_col else np.nan
+            row["handedness"] = match.get(handedness_col) if handedness_col else ""
+        else:
+            row.update({"age": np.nan, "sex": "", "bmi": np.nan, "education": np.nan, "handedness": ""})
+        rows.append(row)
+    return pd.DataFrame(rows), pd.DataFrame(source_rows)
+
+
+def demographic_summary_tables(demo_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    if demo_df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    age_rows = []
+    for group, sub in demo_df.groupby("group"):
+        ages = pd.to_numeric(sub["age"], errors="coerce").dropna()
+        age_rows.append({
+            "group": group,
+            "n_patients": int(sub["patient_id"].nunique()),
+            "n_with_demographics": int(sub["demographics_matched"].sum()),
+            "n_age": int(len(ages)),
+            "age_mean": float(ages.mean()) if len(ages) else np.nan,
+            "age_sd": float(ages.std(ddof=1)) if len(ages) > 1 else np.nan,
+            "age_median": float(ages.median()) if len(ages) else np.nan,
+            "age_iqr": float(ages.quantile(0.75) - ages.quantile(0.25)) if len(ages) else np.nan,
+            "age_min": float(ages.min()) if len(ages) else np.nan,
+            "age_max": float(ages.max()) if len(ages) else np.nan,
+        })
+    sex = demo_df.copy()
+    sex["sex"] = sex["sex"].replace("", np.nan).fillna("Unknown")
+    sex_counts = (
+        sex.groupby(["group", "sex"], as_index=False)
+        .agg(n=("patient_id", "nunique"))
+        .sort_values(["group", "sex"])
+    )
+    totals = sex.groupby("group")["patient_id"].nunique().to_dict()
+    sex_counts["percent"] = sex_counts.apply(lambda r: 100.0 * r["n"] / totals.get(r["group"], np.nan), axis=1)
+    return pd.DataFrame(age_rows).sort_values("group"), sex_counts
+
+
+def mpl_demographic_overview(demo_df: pd.DataFrame, groups: Sequence[str],
+                             stage: Optional[str] = None) -> Optional[Figure]:
+    if demo_df.empty:
+        return None
+    fig, axes = plt.subplots(1, 2, figsize=(10.6, 3.8), constrained_layout=True)
+
+    age_data = [
+        pd.to_numeric(demo_df.loc[demo_df["group"] == group, "age"], errors="coerce").dropna().to_numpy()
+        for group in groups
+    ]
+    positions = np.arange(1, len(groups) + 1)
+    valid_age = [(pos, group, vals) for pos, group, vals in zip(positions, groups, age_data) if len(vals)]
+    if valid_age:
+        bp = axes[0].boxplot(
+            [vals for _, _, vals in valid_age],
+            positions=[pos for pos, _, _ in valid_age],
+            widths=0.58,
+            patch_artist=True,
+            showfliers=False,
+        )
+        for i, patch in enumerate(bp["boxes"]):
+            patch.set_facecolor(PALETTE[i % len(PALETTE)])
+            patch.set_alpha(0.35)
+        rng = np.random.default_rng(101)
+        for i, (pos, _, vals) in enumerate(valid_age):
+            axes[0].scatter(
+                np.full(len(vals), pos) + rng.normal(0, 0.035, len(vals)),
+                vals,
+                color=PALETTE[i % len(PALETTE)],
+                s=18,
+                alpha=0.75,
+                edgecolors="white",
+                linewidths=0.25,
+            )
+    else:
+        axes[0].text(0.5, 0.5, "No matched ages", ha="center", va="center", transform=axes[0].transAxes)
+    axes[0].set_xticks(positions)
+    axes[0].set_xticklabels(groups, rotation=25, ha="right")
+    axes[0].set_ylabel("Age")
+    set_centered_title(axes[0], "Age Distribution", stage)
+    scientific_axes(axes[0])
+
+    sex_df = demo_df.copy()
+    sex_df["sex"] = sex_df["sex"].replace("", np.nan).fillna("Unknown")
+    sex_pivot = sex_df.pivot_table(index="group", columns="sex", values="patient_id", aggfunc="nunique", fill_value=0)
+    sex_pivot = sex_pivot.reindex(groups).fillna(0)
+    bottoms = np.zeros(len(sex_pivot))
+    for idx, sex in enumerate(sex_pivot.columns):
+        vals = sex_pivot[sex].to_numpy(dtype=float)
+        axes[1].bar(
+            np.arange(len(sex_pivot)),
+            vals,
+            bottom=bottoms,
+            label=sex,
+            color=PALETTE[idx % len(PALETTE)],
+            edgecolor="black",
+            linewidth=0.35,
+        )
+        bottoms += vals
+    axes[1].set_xticks(np.arange(len(sex_pivot)))
+    axes[1].set_xticklabels(sex_pivot.index, rotation=25, ha="right")
+    axes[1].set_ylabel("Patients")
+    set_centered_title(axes[1], "Sex Counts", stage)
+    axes[1].legend(frameon=False)
+    scientific_axes(axes[1])
+
+    set_centered_suptitle(fig, "Demographic Overview", stage)
+    return fig
 
 
 def channel_group_n_text(feature_df: pd.DataFrame, groups: Sequence[str], channel: str) -> str:
@@ -1314,29 +1819,27 @@ def topomap_channel_summary(feature_df: pd.DataFrame, groups: Sequence[str], met
 
 def mpl_group_topomaps(feature_df: pd.DataFrame, groups: Sequence[str], metric: str,
                        stage: Optional[str] = None) -> Tuple[Optional[Figure], pd.DataFrame]:
-    if feature_df.empty or metric not in feature_df.columns or len(groups) != 2:
+    if feature_df.empty or metric not in feature_df.columns or len(groups) < 1:
         return None, pd.DataFrame()
 
     summary = topomap_channel_summary(feature_df, groups, metric)
     if summary.empty:
         return None, summary
 
-    g1, g2 = groups
     metric_cols = [f"{g}_median_{metric}" for g in groups]
     group_values = {
         group: summary.set_index("channel")[f"{group}_median_{metric}"].dropna().to_dict()
         for group in groups
     }
-    diff_col = f"delta_{g1}_minus_{g2}"
-    diff_values = summary.dropna(subset=[diff_col]).set_index("channel")[diff_col].to_dict()
 
     group_vlim = _metric_topomap_limits(summary[metric_cols].to_numpy().ravel(), metric, difference=False)
-    diff_vlim = _metric_topomap_limits(summary[diff_col].to_numpy(), metric, difference=True)
     group_cmap = "RdBu_r" if (metric.startswith("signed_") or "corr" in metric or "amplitude" in metric) else "viridis"
     label = metric_label(metric)
 
-    fig, axes = plt.subplots(1, 3, figsize=(10.2, 3.7), constrained_layout=True)
-    for ax, group in zip(axes[:2], groups):
+    n_maps = len(groups) + (1 if len(groups) == 2 else 0)
+    fig, axes = plt.subplots(1, n_maps, figsize=(max(5.2, 3.4 * n_maps), 3.7), constrained_layout=True)
+    axes = np.atleast_1d(axes)
+    for ax, group in zip(axes[:len(groups)], groups):
         n_patients = int(feature_df[feature_df["group"] == group]["patient_id"].nunique())
         _render_topomap(
             group_values[group],
@@ -1346,14 +1849,19 @@ def mpl_group_topomaps(feature_df: pd.DataFrame, groups: Sequence[str], metric: 
             vlim=group_vlim,
             colorbar_label=label,
         )
-    _render_topomap(
-        diff_values,
-        axes[2],
-        f"Difference\n{g1} - {g2}",
-        cmap="RdBu_r",
-        vlim=diff_vlim,
-        colorbar_label=f"Delta {label}",
-    )
+    if len(groups) == 2:
+        g1, g2 = groups
+        diff_col = f"delta_{g1}_minus_{g2}"
+        diff_values = summary.dropna(subset=[diff_col]).set_index("channel")[diff_col].to_dict()
+        diff_vlim = _metric_topomap_limits(summary[diff_col].to_numpy(), metric, difference=True)
+        _render_topomap(
+            diff_values,
+            axes[-1],
+            f"Difference\n{g1} - {g2}",
+            cmap="RdBu_r",
+            vlim=diff_vlim,
+            colorbar_label=f"Delta {label}",
+        )
     set_centered_suptitle(fig, "Scalp Topography of Channel-Level Group Medians", stage)
     return fig, summary
 
@@ -1612,6 +2120,31 @@ def run_analysis_with_progress(**kwargs) -> Tuple[List[PatientResult], pd.DataFr
     return results, pd.DataFrame(rows)
 
 
+def run_analysis_with_processed_cache(**kwargs) -> Tuple[List[PatientResult], pd.DataFrame]:
+    """Load processed analysis results from disk when available, otherwise compute and cache them."""
+    mode = cache_mode_label(kwargs)
+    mode_text = "ICA-cleaned" if mode == "ica" else "raw"
+    cached = load_processed_analysis_cache(kwargs)
+    if cached is not None:
+        results, feature_df, cache_path = cached
+        st.caption(
+            f"Loaded cached {mode_text} processed data "
+            f"({len(results)} patients, {len(feature_df)} feature rows) from `{os.path.basename(cache_path)}`."
+        )
+        return results, feature_df
+
+    results, feature_df = run_analysis_with_progress(**kwargs)
+    cache_path = save_processed_analysis_cache(kwargs, results, feature_df)
+    if cache_path:
+        st.caption(
+            f"Cached {mode_text} processed data "
+            f"({len(results)} patients, {len(feature_df)} feature rows) to `{os.path.basename(cache_path)}`."
+        )
+    else:
+        st.warning(f"Could not write the {mode_text} processed-data cache.")
+    return results, feature_df
+
+
 # ── Download helpers ──────────────────────────────────────────────────────────
 
 def _df_to_excel_bytes(df: pd.DataFrame) -> bytes:
@@ -1858,8 +2391,16 @@ def mpl_distribution(feature_df: pd.DataFrame, channel: str, groups: Sequence[st
                        edgecolors="white", linewidths=0.25, zorder=3)
     p_text = ""
     if stats_df is not None and not stats_df.empty and channel in stats_df["channel"].values:
-        row = stats_df.loc[stats_df["channel"] == channel].iloc[0]
-        p_text = f"P={format_p(row['p_value'])}; FDR={format_p(row['p_fdr_bh'])}; r={row.get('rank_biserial_r', np.nan):.2f}"
+        ch_stats = stats_df.loc[stats_df["channel"] == channel]
+        if len(ch_stats) == 1:
+            row = ch_stats.iloc[0]
+            p_text = (
+                f"{row.get('comparison', 'group comparison')}: "
+                f"P={format_p(row['p_value'])}; FDR={format_p(row['p_fdr_bh'])}; "
+                f"r={row.get('rank_biserial_r', np.nan):.2f}"
+            )
+        else:
+            p_text = "Pairwise p-values below"
     ax.set_xticks(positions)
     ax.set_xticklabels([f"{group}\n(N={len(vals)})" for group, vals in zip(groups, data)])
     ax.set_ylabel(label)
@@ -1870,7 +2411,7 @@ def mpl_distribution(feature_df: pd.DataFrame, channel: str, groups: Sequence[st
 
 
 def mpl_patient_median_box(patient_df: pd.DataFrame, groups: Sequence[str],
-                           global_stats: Optional[Dict], plot_type: str = "Box",
+                           pairwise_stats: Optional[pd.DataFrame], plot_type: str = "Box",
                            height: int = 440, stage: Optional[str] = None) -> Optional[Figure]:
     if patient_df.empty:
         return None
@@ -1893,8 +2434,16 @@ def mpl_patient_median_box(patient_df: pd.DataFrame, groups: Sequence[str],
         ax.scatter(np.full(len(vals), pos) + rng.normal(0, 0.035, len(vals)), vals,
                    color=color, s=18, alpha=0.75, edgecolors="white", linewidths=0.25)
     p_text = ""
-    if global_stats:
-        p_text = f"P={format_p(global_stats['p_value'])}; r={global_stats.get('rank_biserial_r', np.nan):.2f}; d={global_stats.get('cohens_d', np.nan):.2f}"
+    if pairwise_stats is not None and not pairwise_stats.empty:
+        if len(pairwise_stats) == 1:
+            row = pairwise_stats.iloc[0]
+            p_text = (
+                f"{row.get('comparison', 'group comparison')}: "
+                f"P={format_p(row['p_value'])}; r={row.get('rank_biserial_r', np.nan):.2f}; "
+                f"d={row.get('cohens_d', np.nan):.2f}"
+            )
+        else:
+            p_text = "Pairwise p-values below"
     ax.set_xticks(positions)
     ax.set_xticklabels([f"{group}\n(N={len(vals)})" for group, vals in zip(groups, data)])
     ax.set_xlabel("Group")
@@ -1982,7 +2531,11 @@ def mpl_pvalue_bar(stats_df: pd.DataFrame, max_channels: int = 40,
     ax.barh(y, x, color=colors, edgecolor="black", linewidth=0.35)
     ax.axvline(-np.log10(0.05), color="black", linestyle="--", linewidth=0.9, label="p=0.05")
     ax.set_yticks(y)
-    ax.set_yticklabels(df["channel"])
+    labels = (
+        df["channel"].astype(str) + "\n" + df["comparison"].astype(str)
+        if "comparison" in df.columns else df["channel"].astype(str)
+    )
+    ax.set_yticklabels(labels)
     ax.invert_yaxis()
     ax.set_xlabel("-log10(P value)")
     ax.set_ylabel("EEG channel")
@@ -1998,11 +2551,12 @@ def mpl_effect_forest(stats_df: pd.DataFrame, groups: Sequence[str],
     if stats_df.empty or "rank_biserial_r" not in stats_df.columns:
         return None
     df = stats_df.sort_values("p_value").head(max_channels).copy()
-    g1, g2 = groups[0], groups[1]
     se_vals = []
     for _, row in df.iterrows():
-        n1 = row.get(f"{g1}_n", np.nan)
-        n2 = row.get(f"{g2}_n", np.nan)
+        g1 = row.get("group_a", groups[0] if groups else "")
+        g2 = row.get("group_b", groups[1] if len(groups) > 1 else "")
+        n1 = row.get("group_a_n", row.get(f"{g1}_n", np.nan))
+        n2 = row.get("group_b_n", row.get(f"{g2}_n", np.nan))
         se_vals.append(np.sqrt((n1 + n2 + 1) / (3 * n1 * n2)) if np.isfinite(n1) and np.isfinite(n2) and n1 > 0 and n2 > 0 else np.nan)
     r = df["rank_biserial_r"].to_numpy()
     se = np.asarray(se_vals)
@@ -2017,9 +2571,13 @@ def mpl_effect_forest(stats_df: pd.DataFrame, groups: Sequence[str],
         ax.scatter([ri], [yi], color=color, s=24, marker="D", zorder=3)
     ax.axvline(0, color="black", linewidth=0.8)
     ax.set_yticks(y)
-    ax.set_yticklabels(df["channel"])
+    labels = (
+        df["channel"].astype(str) + "\n" + df["comparison"].astype(str)
+        if "comparison" in df.columns else df["channel"].astype(str)
+    )
+    ax.set_yticklabels(labels)
     ax.invert_yaxis()
-    ax.set_xlabel(f"Rank-biserial r (positive = higher in {g1})")
+    ax.set_xlabel("Rank-biserial r (positive = higher in group A)")
     ax.set_ylabel("EEG channel")
     set_centered_title(ax, "Effect Sizes With Approximate 95% CI", stage)
     scientific_axes(ax, y_grid=False)
@@ -2728,8 +3286,7 @@ def main() -> None:
         base_path = st.text_input("Pickle base folder", value=BASE_PATH)
         groups_available = list_groups(base_path)
         default_groups = [g for g in ["Berkeley_data", "EDF"] if g in groups_available] or groups_available[:2]
-        selected_groups = st.multiselect("Groups (select exactly 2)", groups_available,
-                                          default=default_groups, max_selections=2)
+        selected_groups = st.multiselect("Groups", groups_available, default=default_groups)
         stages = list_stages(base_path, selected_groups or groups_available)
         if not stages:
             selected_stage = None
@@ -2823,8 +3380,8 @@ def main() -> None:
         st.divider()
         recompute = st.button("🔄 Recompute (clear cache)")
 
-    if len(selected_groups) != 2:
-        st.warning("Select exactly two groups in the sidebar.")
+    if len(selected_groups) < 1:
+        st.warning("Select at least one group in the sidebar.")
         return
     if not selected_stage:
         st.warning("No sleep-stage folders found.")
@@ -2844,6 +3401,10 @@ def main() -> None:
 
     if recompute and hasattr(run_analysis_cached, "clear"):
         run_analysis_cached.clear()
+    if recompute:
+        removed = clear_processed_analysis_cache()
+        st.session_state.pop("ica_ecg_cleanup_payload", None)
+        st.sidebar.caption(f"Cleared {removed} processed-data cache file(s).")
 
     analysis_kwargs = dict(
         base_path=base_path,
@@ -2880,7 +3441,7 @@ def main() -> None:
         ecg_low_ptp_percentile=float(ecg_low_ptp_percentile),
     )
 
-    results, feature_df = run_analysis_with_progress(**analysis_kwargs)
+    results, feature_df = run_analysis_with_processed_cache(**analysis_kwargs)
 
     if not results or feature_df.empty:
         st.error("No valid patient data produced. Check folders, ECG channels, and stage selection.")
@@ -2923,15 +3484,14 @@ def main() -> None:
 
     with st.spinner("Computing statistics…"):
         stats_df = group_channel_stats(feature_df, selected_groups, metric=stat_metric, boot_ci=bool(boot_ci))
-        patient_median_df, global_stats = patient_median_stats(feature_df, selected_groups, metric=stat_metric)
+        patient_median_df, patient_pairwise_stats = patient_median_stats(feature_df, selected_groups, metric=stat_metric)
 
     common_channels = sorted(
         set.intersection(*[set(feature_df.loc[feature_df["group"] == g, "channel"]) for g in selected_groups])
-    ) if len(selected_groups) == 2 else sorted(feature_df["channel"].unique())
+    ) if selected_groups else sorted(feature_df["channel"].unique())
     if not common_channels:
         st.error(f"No common EEG channels remained after spectral_power_ratio_hf_lf < {MAX_SPECTRAL_POWER_RATIO}.")
         return
-    g1, g2 = selected_groups[0], selected_groups[1]
 
     # ── Tabs ─────────────────────────────────────────────────────────────────
     tabs = st.tabs(["Overview", "EEG Traces", "Per-Channel Stats",
@@ -2940,33 +3500,30 @@ def main() -> None:
 
     # ── Tab 0: Overview ───────────────────────────────────────────────────────
     with tabs[0]:
-        c1, c2, c3, c4, c5 = st.columns(5)
+        c1, c2, c3 = st.columns(3)
         c1.metric("Retained patients", len(patient_summary))
-        c2.metric(f"{g1} patients", int((patient_summary["group"] == g1).sum()))
-        c3.metric(f"{g2} patients", int((patient_summary["group"] == g2).sum()))
-        c4.metric("Channels tested", feature_df["channel"].nunique())
-        c5.metric("Feature rows", len(feature_df))
+        c2.metric("Channels tested", feature_df["channel"].nunique())
+        c3.metric("Feature rows", len(feature_df))
+        group_metric_cols = st.columns(min(len(selected_groups), 4))
+        for idx, group in enumerate(selected_groups):
+            group_metric_cols[idx % len(group_metric_cols)].metric(
+                f"{group} patients",
+                int((patient_summary["group"] == group).sum()),
+            )
         st.caption(
             f"All statistics and group comparisons below use only patient-channel rows with "
             f"`spectral_power_ratio_hf_lf < {MAX_SPECTRAL_POWER_RATIO}` "
             f"({len(feature_df)}/{len(feature_df_all)} rows retained)."
         )
 
-        if global_stats:
-            r_val = global_stats.get("rank_biserial_r", np.nan)
-            d_val = global_stats.get("cohens_d", np.nan)
-            ci1_lo = global_stats.get(f"{g1}_ci_lo", np.nan)
-            ci1_hi = global_stats.get(f"{g1}_ci_hi", np.nan)
-            ci2_lo = global_stats.get(f"{g2}_ci_lo", np.nan)
-            ci2_hi = global_stats.get(f"{g2}_ci_hi", np.nan)
+        if not patient_pairwise_stats.empty:
+            best = patient_pairwise_stats.iloc[0]
             st.info(
-                f"**Patient-median modulation** — "
-                f"{g1}: {global_stats.get(f'{g1}_median', np.nan):.1f} ms "
-                f"[{ci1_lo:.1f}, {ci1_hi:.1f}], "
-                f"{g2}: {global_stats.get(f'{g2}_median', np.nan):.1f} ms "
-                f"[{ci2_lo:.1f}, {ci2_hi:.1f}] | "
-                f"P={format_p(global_stats['p_value'])} | "
-                f"rank-biserial r={r_val:.3f} | Cohen's d={d_val:.2f}"
+                f"**Patient-median modulation** - strongest pairwise difference: "
+                f"{best['comparison']} | P={format_p(best['p_value'])} | "
+                f"FDR={format_p(best['p_fdr_bh'])} | "
+                f"rank-biserial r={best.get('rank_biserial_r', np.nan):.3f} | "
+                f"Cohen's d={best.get('cohens_d', np.nan):.2f}"
             )
 
         st.subheader("Retained patient summary")
@@ -2978,9 +3535,42 @@ def main() -> None:
         download_block(df=patient_summary, stem=f"{selected_stage}_patient_summary",
                        label="Download patient summary")
 
+        st.subheader("Demographic Analysis")
+        with st.spinner("Matching demographic files to retained patients..."):
+            demographics_df, demographic_sources_df = demographic_table_for_patients(patient_summary, selected_groups)
+            age_summary_df, sex_counts_df = demographic_summary_tables(demographics_df)
+        if demographics_df.empty:
+            st.warning("No retained patients were available for demographic matching.")
+        else:
+            matched = int(demographics_df["demographics_matched"].sum())
+            total = int(len(demographics_df))
+            st.caption(
+                f"Matched demographics for {matched}/{total} retained patients. "
+                f"Files are loaded from `{EDF_FORMAT_DIRNAME}/<group>/` and matched using normalized patient IDs."
+            )
+            demo_fig = mpl_demographic_overview(demographics_df, selected_groups, stage=selected_stage)
+            if demo_fig:
+                st.pyplot(demo_fig, clear_figure=False)
+            c1, c2 = st.columns(2)
+            c1.markdown("Age summary")
+            c1.dataframe(age_summary_df, use_container_width=True, hide_index=True)
+            c2.markdown("Sex counts")
+            c2.dataframe(sex_counts_df, use_container_width=True, hide_index=True)
+            with st.expander("Demographic sources and matched patient table", expanded=False):
+                st.markdown("Sources")
+                st.dataframe(demographic_sources_df, use_container_width=True, hide_index=True)
+                st.markdown("Matched patients")
+                st.dataframe(demographics_df.sort_values(["group", "patient_id"]), use_container_width=True, hide_index=True)
+            download_block(
+                df=demographics_df,
+                fig=demo_fig,
+                stem=f"{selected_stage}_demographics",
+                label="Download demographics",
+            )
+
         settings_df = pd.DataFrame([{
             "stage": selected_stage,
-            "groups": " vs ".join(selected_groups),
+            "groups": ", ".join(selected_groups),
             "epoch_window_s": f"{-float(win_pre):.3f} to {float(win_post):.3f}",
             "ecg_t_window_s": f"{float(t_start):.3f} to {float(t_end):.3f}",
             "primary_metric": stat_metric,
@@ -3105,7 +3695,7 @@ def main() -> None:
             )
 
             # Also show individual groups side-by-side below
-            cols = st.columns(2)
+            cols = st.columns(len(selected_groups))
             for col_i, grp in enumerate(selected_groups):
                 single_fig = mpl_group_overlay([r for r in results if r.group == grp],
                                                    [grp], ch_sel,
@@ -3142,14 +3732,14 @@ def main() -> None:
                                      stage=selected_stage)
             if sig_fig:
                 st.pyplot(sig_fig, clear_figure=False)
-                st.caption("Figure note: Bars show -log10 uncorrected P values by channel. Red bars pass the selected correction threshold at alpha=0.05.")
+                st.caption("Figure note: Bars show -log10 uncorrected P values by channel and pairwise group comparison. Red bars pass the selected correction threshold at alpha=0.05.")
 
             # Forest plot of effect sizes
             forest_fig = mpl_effect_forest(stats_df, selected_groups, max_channels=n_top,
                                            stage=selected_stage)
             if forest_fig:
                 st.pyplot(forest_fig, clear_figure=False)
-                st.caption(f"Figure note: Rank-biserial r is positive when {g1} has larger values than {g2}. Intervals are normal approximations and should be interpreted as descriptive.")
+                st.caption("Figure note: Rank-biserial r is positive when group A has larger values than group B in that comparison. Intervals are normal approximations and should be interpreted as descriptive.")
 
             # Channel-level distance distribution for selected channel
             st.subheader("Per-channel distance distribution")
@@ -3174,6 +3764,10 @@ def main() -> None:
                     f"Used for {ch_box}: {channel_group_n_text(feature_df, selected_groups, ch_box)}. "
                     "Each point is one patient-channel measurement; boxes/violins summarize the selected metric distribution by group."
                 )
+                ch_pairwise = stats_df[stats_df["channel"] == ch_box].copy()
+                if not ch_pairwise.empty:
+                    st.markdown("Pairwise p-values")
+                    st.dataframe(ch_pairwise, use_container_width=True, hide_index=True)
 
             st.subheader("Topographic maps")
             topo_metric = st.selectbox(
@@ -3213,7 +3807,7 @@ def main() -> None:
                 st.pyplot(topo_fig, clear_figure=False)
                 st.caption(
                     f"Figure note: Topomaps use channel medians after spectral_power_ratio_hf_lf < {MAX_SPECTRAL_POWER_RATIO}. "
-                    f"The first two maps show each group separately; the third map is {g1} minus {g2}. "
+                    "Maps show each selected group separately; when exactly two groups are selected, a difference map is also shown. "
                     "Electrode positions use the standard 10-20 montage, with T3/T4/T5/T6 mapped to T7/T8/P7/P8."
                 )
                 st.dataframe(topo_table, use_container_width=True, hide_index=True)
@@ -3237,7 +3831,7 @@ def main() -> None:
         with st.expander("Plot options", expanded=False):
             pt_plot_type = st.radio("Plot type", ["Box", "Violin"], horizontal=True, key="pt_plot_t")
 
-        pt_fig = mpl_patient_median_box(patient_median_df, selected_groups, global_stats,
+        pt_fig = mpl_patient_median_box(patient_median_df, selected_groups, patient_pairwise_stats,
                                             plot_type=pt_plot_type, stage=selected_stage)
         if pt_fig:
             st.pyplot(pt_fig, clear_figure=False)
@@ -3250,8 +3844,9 @@ def main() -> None:
                 f"Used patients: {pt_n_text}. Each point is one patient after median aggregation across retained EEG channels."
             )
 
-        if global_stats:
-            st.dataframe(pd.DataFrame([global_stats]), use_container_width=True, hide_index=True)
+        if not patient_pairwise_stats.empty:
+            st.markdown("Pairwise patient-level p-values")
+            st.dataframe(patient_pairwise_stats, use_container_width=True, hide_index=True)
 
         st.subheader("Patient-median table")
         st.dataframe(patient_median_df.sort_values(["group", "patient_id"]),
@@ -3319,26 +3914,37 @@ def main() -> None:
 
         st.markdown("### ICA ECG Artifact Cleanup")
         st.caption(
-            "ICA cleanup is calculated only when this button is pressed. The cleaned run removes the two "
-            "ICA components with the strongest ECG correlation, then recomputes the heartbeat averages, "
-            "correlations, box plots, and topomaps."
+            "ICA cleanup is calculated when this button is pressed, then reused from the processed-data "
+            "cache on later reruns. The cleaned run removes the two ICA components with the strongest "
+            "ECG correlation, then recomputes the heartbeat averages, correlations, box plots, and topomaps."
         )
-        ica_key = repr((
-            tuple(sorted(analysis_kwargs.items(), key=lambda item: item[0])),
-            ICA_COMPONENTS_TO_REMOVE,
-            ICA_MAX_COMPONENTS,
-            ICA_MAX_FIT_SAMPLES,
-        ))
-        if st.button("Run ICA ECG-artifact cleanup", type="primary", key="run_ica_ecg_cleanup"):
-            ica_kwargs = {
-                **analysis_kwargs,
-                "ica_ecg_clean": True,
-                "ica_components_to_remove": ICA_COMPONENTS_TO_REMOVE,
-                "ica_max_components": ICA_MAX_COMPONENTS,
-                "ica_max_fit_samples": ICA_MAX_FIT_SAMPLES,
-            }
-            with st.spinner("Running ICA ECG-artifact cleanup and recomputing HEP features..."):
-                ica_results_run, ica_feature_df_run = run_analysis_with_progress(**ica_kwargs)
+        ica_kwargs = {
+            **analysis_kwargs,
+            "ica_ecg_clean": True,
+            "ica_components_to_remove": ICA_COMPONENTS_TO_REMOVE,
+            "ica_max_components": ICA_MAX_COMPONENTS,
+            "ica_max_fit_samples": ICA_MAX_FIT_SAMPLES,
+        }
+        ica_key, _ = processed_cache_identity(ica_kwargs)
+
+        ica_payload = st.session_state.get("ica_ecg_cleanup_payload")
+        if not ica_payload or ica_payload.get("key") != ica_key:
+            cached_ica = load_processed_analysis_cache(ica_kwargs)
+            if cached_ica is not None:
+                cached_results, cached_feature_df, cached_path = cached_ica
+                st.session_state["ica_ecg_cleanup_payload"] = {
+                    "key": ica_key,
+                    "results": cached_results,
+                    "feature_df_all": cached_feature_df,
+                }
+                ica_payload = st.session_state["ica_ecg_cleanup_payload"]
+                st.caption(
+                    f"Loaded cached ICA-cleaned processed data from `{os.path.basename(cached_path)}`."
+                )
+
+        if st.button("Run / refresh ICA ECG-artifact cleanup", type="primary", key="run_ica_ecg_cleanup"):
+            with st.spinner("Loading cached ICA cleanup or recomputing HEP features..."):
+                ica_results_run, ica_feature_df_run = run_analysis_with_processed_cache(**ica_kwargs)
             st.session_state["ica_ecg_cleanup_payload"] = {
                 "key": ica_key,
                 "results": ica_results_run,
@@ -3347,7 +3953,7 @@ def main() -> None:
 
         ica_payload = st.session_state.get("ica_ecg_cleanup_payload")
         if not ica_payload or ica_payload.get("key") != ica_key:
-            st.info("Press the ICA cleanup button to calculate and display cleaned-data comparisons.")
+            st.info("Press the ICA cleanup button to calculate and cache cleaned-data comparisons.")
         else:
             ica_results = ica_payload["results"]
             ica_feature_df_all = ica_payload["feature_df_all"]
@@ -3491,6 +4097,24 @@ def main() -> None:
                     if fd_after_box:
                         c2.pyplot(fd_after_box, clear_figure=False)
                         c2.caption("ICA-clean EEG")
+                    raw_before_stats = raw_stats_compare[raw_stats_compare["channel"] == compare_channel].copy()
+                    raw_after_stats = clean_raw_stats[clean_raw_stats["channel"] == compare_channel].copy()
+                    fd_before_stats = raw_fd_stats_compare[raw_fd_stats_compare["channel"] == compare_channel].copy()
+                    fd_after_stats = clean_fd_stats[clean_fd_stats["channel"] == compare_channel].copy()
+                    if not raw_before_stats.empty or not raw_after_stats.empty:
+                        st.markdown("Pairwise raw-correlation p-values: raw vs ICA-clean")
+                        c1, c2 = st.columns(2)
+                        if not raw_before_stats.empty:
+                            c1.dataframe(raw_before_stats, use_container_width=True, hide_index=True)
+                        if not raw_after_stats.empty:
+                            c2.dataframe(raw_after_stats, use_container_width=True, hide_index=True)
+                    if not fd_before_stats.empty or not fd_after_stats.empty:
+                        st.markdown("Pairwise first-difference p-values: raw vs ICA-clean")
+                        c1, c2 = st.columns(2)
+                        if not fd_before_stats.empty:
+                            c1.dataframe(fd_before_stats, use_container_width=True, hide_index=True)
+                        if not fd_after_stats.empty:
+                            c2.dataframe(fd_after_stats, use_container_width=True, hide_index=True)
 
                     st.markdown("#### Brain Maps: Raw vs ICA-Clean")
                     topo_metric_ica = st.selectbox(
@@ -3602,6 +4226,10 @@ def main() -> None:
                 f"Box plot compares raw nonlinear correlation by group for {fd_channel}. "
                 f"Used: {channel_group_n_text(feature_df, selected_groups, fd_channel)}."
             )
+            raw_ch_stats = raw_stats[raw_stats["channel"] == fd_channel].copy()
+            if not raw_ch_stats.empty:
+                st.markdown("Pairwise raw-correlation p-values")
+                st.dataframe(raw_ch_stats, use_container_width=True, hide_index=True)
 
         st.markdown("#### Group Difference: First-Difference Correlation")
         fd_stats = group_channel_stats(feature_df, selected_groups, metric=fd_metric, boot_ci=bool(boot_ci))
@@ -3613,6 +4241,27 @@ def main() -> None:
                 f"Box plot compares first-difference correlation by group for {fd_channel}. "
                 f"Used: {channel_group_n_text(feature_df, selected_groups, fd_channel)}."
             )
+            fd_ch_stats = fd_stats[fd_stats["channel"] == fd_channel].copy()
+            if not fd_ch_stats.empty:
+                st.markdown("Pairwise first-difference p-values")
+                st.dataframe(fd_ch_stats, use_container_width=True, hide_index=True)
+
+        topomap_raw_stats = raw_stats
+        topomap_fd_stats = fd_stats
+        selected_pair_label = None
+        if len(selected_groups) > 2 and ("comparison" in raw_stats.columns or "comparison" in fd_stats.columns):
+            pair_labels = sorted(set(raw_stats.get("comparison", pd.Series(dtype=str)).dropna()) |
+                                 set(fd_stats.get("comparison", pd.Series(dtype=str)).dropna()))
+            if pair_labels:
+                selected_pair_label = st.selectbox(
+                    "Pair for correlation p-value/difference topomaps",
+                    pair_labels,
+                    key="corr_topomap_pair",
+                )
+                if "comparison" in raw_stats.columns:
+                    topomap_raw_stats = raw_stats[raw_stats["comparison"] == selected_pair_label].copy()
+                if "comparison" in fd_stats.columns:
+                    topomap_fd_stats = fd_stats[fd_stats["comparison"] == selected_pair_label].copy()
 
         st.markdown("#### Group Difference P-Value Topomaps")
         p_topo_col = st.selectbox(
@@ -3626,7 +4275,7 @@ def main() -> None:
             key="corr_p_topomap_col",
         )
         raw_p_topo_fig, fd_p_topo_fig, p_topo_table = mpl_correlation_pvalue_topomaps(
-            raw_stats, fd_stats, raw_metric, fd_metric, p_col=p_topo_col,
+            topomap_raw_stats, topomap_fd_stats, raw_metric, fd_metric, p_col=p_topo_col,
             stage=selected_stage
         )
         if raw_p_topo_fig or fd_p_topo_fig:
@@ -3658,15 +4307,16 @@ def main() -> None:
 
         st.markdown("#### Group Difference Correlation-Value Topomaps")
         delta_topo_fig, delta_topo_table = mpl_correlation_delta_topomaps(
-            raw_stats, fd_stats, selected_groups, raw_metric, fd_metric,
+            topomap_raw_stats, topomap_fd_stats, selected_groups, raw_metric, fd_metric,
             stage=selected_stage
         )
         if delta_topo_fig:
             st.pyplot(delta_topo_fig, clear_figure=False)
+            group_text = selected_pair_label.replace(" vs ", " minus ") if selected_pair_label else "the selected pair"
             st.caption(
                 f"Figure note: These maps show the channel-wise median correlation difference "
-                f"({g1} minus {g2}) from the same Mann-Whitney input table. Red means higher values in {g1}; "
-                f"blue means higher values in {g2}; white is no median difference."
+                f"({group_text}) from the same Mann-Whitney input table. Red means higher values in group A; "
+                f"blue means higher values in group B; white is no median difference."
             )
             download_block(
                 df=delta_topo_table,
@@ -3803,6 +4453,10 @@ def main() -> None:
                         f"Box plot uses one row per retained patient-channel average. Used for {tr_channel}: "
                         f"{channel_group_n_text(tr_summary, selected_groups, tr_channel)}."
                     )
+                    tr_ch_stats = tr_stats[tr_stats["channel"] == tr_channel].copy()
+                    if not tr_ch_stats.empty:
+                        st.markdown("Pairwise time-resolved p-values")
+                        st.dataframe(tr_ch_stats, use_container_width=True, hide_index=True)
 
                 ranking_df = time_resolved_peak_ranking(tr_summary, selected_groups, bin_ms=float(tr_bin_ms))
                 st.markdown("Peak-time ranking")
