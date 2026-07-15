@@ -16,7 +16,7 @@ done
 
 SESSION="hep_parquet"
 STAGES=("N3" "R" "W" "light_sleep")
-EDF_ROOTS=("EDF_Format/Berkeley_data" "EDF_Format/EDF")
+EDF_ROOTS=("EDF_Format/The_Human_Sleep_Project" "EDF_Format/EDF")
 
 tmux new-session -d -s "$SESSION"
 

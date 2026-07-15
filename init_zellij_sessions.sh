@@ -19,6 +19,9 @@ elif [[ "$1" == "4" || "$1" == "CAP_Sleep_Database" ]]; then
 elif [[ "$1" == "5" ]]; then
     TMUX_SESSION="PSG_IPA"
     shift
+elif [[ "$1" == "6" || "$1" == "The_Human_Sleep_Project" ]]; then
+    TMUX_SESSION="The_Human_Sleep_Project"
+    shift
 elif [[ -n "$1" && "$1" != -* ]]; then
     TMUX_SESSION="$1"
     shift
@@ -45,10 +48,15 @@ for arg in "$@"; do
 done
 
 REVERSE_FLAG=""
-[[ "$REVERSE" == "1" ]] && REVERSE_FLAG="--reverse"
+TMUX_SESSION_NAME="$TMUX_SESSION"
+if [[ "$REVERSE" == "1" ]]; then
+    REVERSE_FLAG="--reverse"
+    TMUX_SESSION_NAME="${TMUX_SESSION}_rev"
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EDF_ROOT="EDF_Format/$TMUX_SESSION"
+TMUX_SESSION="$TMUX_SESSION_NAME"
 STAGE_ORDER=(light_sleep W N3 R)
 
 cd "$SCRIPT_DIR"

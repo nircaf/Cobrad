@@ -41,10 +41,18 @@ ICA_MAX_COMPONENTS = 20
 ICA_MAX_FIT_SAMPLES = 60000
 MAX_SPECTRAL_POWER_RATIO = 0.4
 NON_PATIENT_CACHE_PREFIXES = ("individuals_cache", "non_eeg_individuals_cache")
-PROCESSED_CACHE_VERSION = 1
+PROCESSED_CACHE_VERSION = 3
 PROCESSED_CACHE_DIRNAME = ".hep_twave_processed_cache"
 EDF_FORMAT_DIRNAME = "EDF_Format"
 _DEMOGRAPHIC_SOURCE_CACHE: Dict[str, Tuple[pd.DataFrame, str]] = {}
+EEG_SIGNAL_MIN_FINITE_FRACTION = 0.95
+EEG_SIGNAL_MIN_PTP_UV = 0.05
+EEG_SIGNAL_MIN_STD_UV = 0.01
+EEG_SIGNAL_MAX_ABS_UV = 500.0
+EEG_SIGNAL_MAX_ROUGHNESS = 2.2
+RAW_EEG_SIGNAL_MIN_PTP_UV = 0.10
+RAW_EEG_SIGNAL_MIN_STD_UV = 0.01
+RAW_EEG_SIGNAL_MAX_ABS_UV = 5000.0
 
 # Colorblind-friendly Okabe-Ito palette for scientific figures
 PALETTE = ["#0072B2", "#D55E00", "#009E73", "#CC79A7", "#F0E442", "#56B4E9", "#E69F00", "#000000"]
@@ -378,9 +386,11 @@ def build_epochs(data: np.ndarray, rpeaks: np.ndarray, sfreq: float,
 
 
 def robust_epoch_mask(ecg_epochs: np.ndarray, eeg_epochs: np.ndarray,
+                       sfreq: Optional[float] = None,
                        max_bad_channel_fraction: float = 0.35,
                        artifact_mad_multiplier: float = 7.5,
-                       ecg_low_ptp_percentile: float = 5.0) -> Tuple[np.ndarray, List[str]]:
+                       ecg_low_ptp_percentile: float = 5.0,
+                       max_spectral_power_ratio: float = MAX_SPECTRAL_POWER_RATIO) -> Tuple[np.ndarray, List[str]]:
     notes = []
     if len(ecg_epochs) == 0:
         return np.zeros(0, dtype=bool), ["no complete heartbeat windows"]
@@ -388,6 +398,7 @@ def robust_epoch_mask(ecg_epochs: np.ndarray, eeg_epochs: np.ndarray,
     ecg_ptp = np.ptp(ecg_epochs, axis=1)
     ecg_diff = np.nanstd(np.diff(ecg_epochs, axis=1), axis=1)
     eeg_ptp = np.ptp(eeg_epochs, axis=2) if eeg_epochs.size else np.empty((len(ecg_epochs), 0))
+    eeg_std = np.nanstd(eeg_epochs, axis=2) if eeg_epochs.size else np.empty((len(ecg_epochs), 0))
     eeg_diff = np.nanstd(np.diff(eeg_epochs, axis=2), axis=2) if eeg_epochs.size else np.empty((len(ecg_epochs), 0))
 
     def robust_upper(values: np.ndarray, mult: float) -> float:
@@ -406,6 +417,16 @@ def robust_epoch_mask(ecg_epochs: np.ndarray, eeg_epochs: np.ndarray,
         ch_diff_upper = (np.nanmedian(eeg_diff, axis=0) + artifact_mad_multiplier * 1.4826 *
                          (np.nanmedian(np.abs(eeg_diff - np.nanmedian(eeg_diff, axis=0)), axis=0) + 1e-12))
         bad_by_ch = (eeg_ptp > ch_ptp_upper) | (eeg_diff > ch_diff_upper) | ~np.isfinite(eeg_ptp) | ~np.isfinite(eeg_diff)
+        flat_by_ch = (eeg_ptp * 1e6 < EEG_SIGNAL_MIN_PTP_UV) | (eeg_std * 1e6 < EEG_SIGNAL_MIN_STD_UV)
+        bad_by_ch |= flat_by_ch
+        if sfreq is not None:
+            spectral_ratio = compute_epoch_spectral_power_ratios(eeg_epochs, float(sfreq))
+            spectral_bad_by_ch = ~np.isfinite(spectral_ratio) | (spectral_ratio >= max_spectral_power_ratio)
+            bad_by_ch |= spectral_bad_by_ch
+            notes.append(
+                f"dropped windows where too many EEG channels had spectral_power_ratio_hf_lf>={max_spectral_power_ratio}"
+            )
+        notes.append("dropped windows where too many EEG channels were flat/almost flat")
         eeg_ok = np.mean(bad_by_ch, axis=1) <= max_bad_channel_fraction
     else:
         eeg_ok = np.ones(len(ecg_epochs), dtype=bool)
@@ -712,6 +733,110 @@ def compute_spectral_power_ratios(
     return ratios
 
 
+def compute_epoch_spectral_power_ratios(
+    eeg_epochs: np.ndarray,
+    sfreq: float,
+    low_band: Tuple[float, float] = (1.0, 30.0),
+    high_band: Tuple[float, float] = (30.0, 80.0),
+) -> np.ndarray:
+    """High-frequency/low-frequency power ratio per epoch and EEG channel."""
+    epochs = np.asarray(eeg_epochs, dtype=float)
+    if epochs.ndim != 3 or epochs.size == 0:
+        return np.empty((0, 0), dtype=float)
+    n_times = epochs.shape[-1]
+    if n_times < 4:
+        return np.full(epochs.shape[:2], np.nan, dtype=float)
+
+    nperseg = int(min(max(8, round(sfreq * 0.5)), n_times))
+    freqs, psd = signal.welch(epochs, fs=sfreq, axis=-1, nperseg=nperseg)
+    low_mask = (freqs >= low_band[0]) & (freqs <= min(low_band[1], sfreq / 2.0))
+    high_mask = (freqs >= high_band[0]) & (freqs <= min(high_band[1], sfreq / 2.0))
+    ratios = np.full(epochs.shape[:2], np.nan, dtype=float)
+    if not np.any(low_mask) or not np.any(high_mask):
+        return ratios
+    low_power = np.trapz(psd[..., low_mask], freqs[low_mask], axis=-1)
+    high_power = np.trapz(psd[..., high_mask], freqs[high_mask], axis=-1)
+    valid_low = np.isfinite(low_power) & (low_power > 0)
+    ratios[valid_low] = high_power[valid_low] / (low_power[valid_low] + 1e-18)
+    return ratios
+
+
+def assess_signal_quality(
+    trace: np.ndarray,
+    scale: float = 1.0,
+    min_finite_fraction: float = EEG_SIGNAL_MIN_FINITE_FRACTION,
+    min_ptp: Optional[float] = None,
+    min_std: Optional[float] = None,
+    max_abs: Optional[float] = None,
+    max_roughness: Optional[float] = None,
+) -> Tuple[bool, Dict[str, Any]]:
+    """Return whether a trace is usable plus flat-line/noise diagnostics."""
+    x = np.asarray(trace, dtype=float).ravel() * float(scale)
+    total_n = int(len(x))
+    finite = np.isfinite(x)
+    finite_fraction = float(np.mean(finite)) if total_n else 0.0
+    values = x[finite]
+    info: Dict[str, Any] = {
+        "quality_ok": False,
+        "quality_reason": "",
+        "finite_fraction": finite_fraction,
+        "ptp": np.nan,
+        "std": np.nan,
+        "max_abs": np.nan,
+        "roughness": np.nan,
+    }
+    if total_n == 0 or finite_fraction < min_finite_fraction or len(values) < 4:
+        info["quality_reason"] = "too_few_finite_samples"
+        return False, info
+
+    ptp = float(np.nanmax(values) - np.nanmin(values))
+    std = float(np.nanstd(values))
+    max_abs_val = float(np.nanmax(np.abs(values)))
+    diffs = np.diff(values)
+    diff_std = float(np.nanstd(diffs)) if len(diffs) else np.nan
+    roughness = diff_std / (std + 1e-12) if np.isfinite(diff_std) else np.nan
+    info.update({"ptp": ptp, "std": std, "max_abs": max_abs_val, "roughness": roughness})
+
+    reasons = []
+    if min_ptp is not None and ptp < min_ptp:
+        reasons.append("flat_low_ptp")
+    if min_std is not None and std < min_std:
+        reasons.append("flat_low_std")
+    if max_abs is not None and max_abs_val > max_abs:
+        reasons.append("excessive_amplitude")
+    if max_roughness is not None and np.isfinite(roughness) and roughness > max_roughness:
+        reasons.append("rough_high_frequency_noise")
+
+    ok = not reasons
+    info["quality_ok"] = ok
+    info["quality_reason"] = "ok" if ok else ";".join(reasons)
+    return ok, info
+
+
+def assess_eeg_average_quality(trace: np.ndarray) -> Tuple[bool, Dict[str, Any]]:
+    ok, info = assess_signal_quality(
+        trace,
+        scale=1e6,
+        min_ptp=EEG_SIGNAL_MIN_PTP_UV,
+        min_std=EEG_SIGNAL_MIN_STD_UV,
+        max_abs=EEG_SIGNAL_MAX_ABS_UV,
+        max_roughness=EEG_SIGNAL_MAX_ROUGHNESS,
+    )
+    return ok, {f"eeg_signal_{k}": v for k, v in info.items()}
+
+
+def assess_raw_eeg_quality(trace: np.ndarray) -> Tuple[bool, Dict[str, Any]]:
+    ok, info = assess_signal_quality(
+        trace,
+        scale=1e6,
+        min_ptp=RAW_EEG_SIGNAL_MIN_PTP_UV,
+        min_std=RAW_EEG_SIGNAL_MIN_STD_UV,
+        max_abs=RAW_EEG_SIGNAL_MAX_ABS_UV,
+        max_roughness=None,
+    )
+    return ok, info
+
+
 def ica_clean_eeg_ecg_artifact(
     eeg_data: np.ndarray,
     ecg_clean: np.ndarray,
@@ -863,8 +988,26 @@ def process_patient_file(
         return None
 
     ecg_channel = ch_names[ecg_indices[0]]
-    eeg_channels = [ch_names[i] for i in eeg_indices]
     data = raw.get_data()
+    eeg_channels_all = [ch_names[i] for i in eeg_indices]
+    eeg_data_all = data[eeg_indices].astype(float, copy=True)
+    raw_quality_notes: List[str] = []
+    keep_eeg = []
+    dropped_eeg = []
+    for idx, ch_name in enumerate(eeg_channels_all):
+        ok, qinfo = assess_raw_eeg_quality(eeg_data_all[idx])
+        if ok:
+            keep_eeg.append(idx)
+        else:
+            dropped_eeg.append(f"{ch_name}:{qinfo.get('quality_reason', 'bad_signal')}")
+    if not keep_eeg:
+        return None
+    if dropped_eeg:
+        raw_quality_notes.append(
+            "dropped flat/artifact EEG channel(s) before averaging: " + ", ".join(dropped_eeg[:12])
+            + (f", +{len(dropped_eeg) - 12} more" if len(dropped_eeg) > 12 else "")
+        )
+    eeg_channels = [eeg_channels_all[i] for i in keep_eeg]
 
     ecg_clean = clean_ecg(data[ecg_indices[0]], sfreq, ecg_filter_low_hz, ecg_filter_high_hz,
                            ecg_median_ms, ecg_clip_sd)
@@ -877,7 +1020,7 @@ def process_patient_file(
     if len(rpeaks) < min_kept_epochs:
         return None
 
-    eeg_data = data[eeg_indices].astype(float, copy=True)
+    eeg_data = eeg_data_all[keep_eeg]
     ica_details: Optional[Dict[str, Any]] = None
     if ica_ecg_clean:
         eeg_data, ica_details = ica_clean_eeg_ecg_artifact(
@@ -895,10 +1038,13 @@ def process_patient_file(
     eeg_epochs, _, _ = build_epochs(eeg_data, rpeaks, sfreq, window)
     mask, quality_notes = robust_epoch_mask(
         ecg_epochs, eeg_epochs,
+        sfreq=sfreq,
         max_bad_channel_fraction=max_bad_epoch_channel_fraction,
         artifact_mad_multiplier=artifact_mad_multiplier,
         ecg_low_ptp_percentile=ecg_low_ptp_percentile,
+        max_spectral_power_ratio=MAX_SPECTRAL_POWER_RATIO,
     )
+    quality_notes = raw_quality_notes + quality_notes
     if ica_details is not None:
         removed = ica_details.get("components_removed", [])
         quality_notes.append(
@@ -909,6 +1055,19 @@ def process_patient_file(
 
     ecg_avg = np.nanmedian(ecg_epochs[mask], axis=0)
     eeg_avg = np.nanmedian(eeg_epochs[mask], axis=0)
+    ecg_ok, ecg_quality = assess_signal_quality(
+        ecg_avg,
+        scale=1.0,
+        min_ptp=1e-12,
+        min_std=1e-13,
+        max_abs=None,
+        max_roughness=None,
+    )
+    quality_notes.append(
+        f"ECG average quality: {ecg_quality.get('quality_reason', 'unknown')}"
+    )
+    if not ecg_ok:
+        return None
     ecg_t = peak_time(ecg_avg, times, t_window, mode="max")
     if ecg_t is None:
         return None
@@ -1002,9 +1161,60 @@ def patient_to_feature_rows(result: PatientResult, t_window: Tuple[float, float]
     )
     for idx, channel in enumerate(result.eeg_channels):
         trace = result.eeg_average[idx]
+        signal_ok, signal_quality = assess_eeg_average_quality(trace)
+        ratio = result.spectral_power_ratios.get(channel, np.nan)
+        spectral_ok = bool(np.isfinite(ratio) and ratio < MAX_SPECTRAL_POWER_RATIO)
+        base_row = {
+            "group": result.group,
+            "stage": result.stage,
+            "patient_id": result.patient_id,
+            "channel": channel,
+            "ecg_t_peak_ms": result.ecg_t_peak_s * 1000.0,
+            "spectral_power_ratio_hf_lf": ratio,
+            "signal_quality_rejected": not (signal_ok and spectral_ok),
+            "signal_quality_reject_reason": (
+                signal_quality.get("eeg_signal_quality_reason", "bad_signal")
+                if not signal_ok else
+                f"spectral_power_ratio_hf_lf>={MAX_SPECTRAL_POWER_RATIO}"
+                if not spectral_ok else "ok"
+            ),
+            "n_epochs_kept": result.n_epochs_kept,
+            "n_epochs_total": result.n_epochs_total,
+            "flipped_eeg": channel in result.flipped_eeg_channels,
+            "flipped_ecg": result.flipped_ecg,
+            **signal_quality,
+        }
+        if not signal_ok or not spectral_ok:
+            rows.append({
+                **base_row,
+                "eeg_t_peak_ms": np.nan,
+                "eeg_positive_t_peak_ms": np.nan,
+                "eeg_t_peak_amplitude_uv": np.nan,
+                "ecg_eeg_distance_corr_epoch": np.nan,
+                "ecg_eeg_distance_corr_twave": np.nan,
+                "ecg_eeg_firstdiff_corr_epoch": np.nan,
+                "ecg_eeg_firstdiff_corr_twave": np.nan,
+                "distance_ms": np.nan,
+                "signed_distance_ms": np.nan,
+            })
+            continue
         eeg_t_abs = peak_time(trace, result.times, eeg_window, mode="max_abs")
         eeg_t_pos = peak_time(trace, result.times, eeg_window, mode="max")
         if eeg_t_abs is None:
+            rows.append({
+                **base_row,
+                "signal_quality_rejected": True,
+                "signal_quality_reject_reason": "no_eeg_t_peak_in_window",
+                "eeg_t_peak_ms": np.nan,
+                "eeg_positive_t_peak_ms": np.nan,
+                "eeg_t_peak_amplitude_uv": np.nan,
+                "ecg_eeg_distance_corr_epoch": np.nan,
+                "ecg_eeg_distance_corr_twave": np.nan,
+                "ecg_eeg_firstdiff_corr_epoch": np.nan,
+                "ecg_eeg_firstdiff_corr_twave": np.nan,
+                "distance_ms": np.nan,
+                "signed_distance_ms": np.nan,
+            })
             continue
         # Amplitude at the detected EEG T-peak (µV)
         t_mask = (result.times >= eeg_window[0]) & (result.times <= eeg_window[1])
@@ -1016,25 +1226,18 @@ def patient_to_feature_rows(result: PatientResult, t_window: Tuple[float, float]
         ecg_eeg_firstdiff_corr_epoch = first_difference_corr(ecg_trace, eeg_trace)
         ecg_eeg_firstdiff_corr_twave = first_difference_corr(ecg_trace[t_mask], eeg_trace[t_mask]) if np.any(t_mask) else np.nan
         rows.append({
-            "group": result.group,
-            "stage": result.stage,
-            "patient_id": result.patient_id,
-            "channel": channel,
-            "ecg_t_peak_ms": result.ecg_t_peak_s * 1000.0,
+            **base_row,
+            "signal_quality_rejected": False,
+            "signal_quality_reject_reason": "ok",
             "eeg_t_peak_ms": eeg_t_abs * 1000.0,
             "eeg_positive_t_peak_ms": np.nan if eeg_t_pos is None else eeg_t_pos * 1000.0,
             "eeg_t_peak_amplitude_uv": eeg_amp_uv,
-            "spectral_power_ratio_hf_lf": result.spectral_power_ratios.get(channel, np.nan),
             "ecg_eeg_distance_corr_epoch": ecg_eeg_dcor_epoch,
             "ecg_eeg_distance_corr_twave": ecg_eeg_dcor_twave,
             "ecg_eeg_firstdiff_corr_epoch": ecg_eeg_firstdiff_corr_epoch,
             "ecg_eeg_firstdiff_corr_twave": ecg_eeg_firstdiff_corr_twave,
             "distance_ms": abs(eeg_t_abs - result.ecg_t_peak_s) * 1000.0,
             "signed_distance_ms": (eeg_t_abs - result.ecg_t_peak_s) * 1000.0,
-            "n_epochs_kept": result.n_epochs_kept,
-            "n_epochs_total": result.n_epochs_total,
-            "flipped_eeg": channel in result.flipped_eeg_channels,
-            "flipped_ecg": result.flipped_ecg,
         })
     return rows
 
@@ -1206,7 +1409,15 @@ def apply_spectral_quality_filter(
     if feature_df.empty or "spectral_power_ratio_hf_lf" not in feature_df.columns:
         return feature_df.copy()
     ratio = pd.to_numeric(feature_df["spectral_power_ratio_hf_lf"], errors="coerce")
-    return feature_df.loc[ratio.notna() & (ratio < max_ratio)].copy()
+    keep = ratio.notna() & (ratio < max_ratio)
+    if "signal_quality_rejected" in feature_df.columns:
+        keep &= ~feature_df["signal_quality_rejected"].fillna(True).astype(bool)
+    if "eeg_signal_quality_ok" in feature_df.columns:
+        keep &= feature_df["eeg_signal_quality_ok"].fillna(False).astype(bool)
+    if "eeg_signal_max_abs" in feature_df.columns:
+        max_abs = pd.to_numeric(feature_df["eeg_signal_max_abs"], errors="coerce")
+        keep &= max_abs.notna() & (max_abs <= EEG_SIGNAL_MAX_ABS_UV)
+    return feature_df.loc[keep].copy()
 
 
 # ── Demographics ─────────────────────────────────────────────────────────────
@@ -2303,11 +2514,30 @@ def _group_channel_matrix(
         ratio = r.spectral_power_ratios.get(channel, np.nan)
         if not np.isfinite(ratio) or ratio >= max_spectral_power_ratio:
             continue
-        traces.append(r.eeg_average[r.eeg_channels.index(channel)] * 1e6)
+        trace = r.eeg_average[r.eeg_channels.index(channel)]
+        trace_ok, _ = assess_eeg_average_quality(trace)
+        if not trace_ok:
+            continue
+        traces.append(trace * 1e6)
         times = r.times
     if not traces or times is None:
         return None, None, 0, total_available
     return np.vstack(traces), times, len(traces), total_available
+
+
+def patient_channel_signal_ok(
+    result: PatientResult,
+    channel: str,
+    max_spectral_power_ratio: float = MAX_SPECTRAL_POWER_RATIO,
+) -> bool:
+    if channel not in result.eeg_channels:
+        return False
+    ratio = result.spectral_power_ratios.get(channel, np.nan)
+    if not np.isfinite(ratio) or ratio >= max_spectral_power_ratio:
+        return False
+    trace = result.eeg_average[result.eeg_channels.index(channel)]
+    trace_ok, _ = assess_eeg_average_quality(trace)
+    return trace_ok
 
 
 def mpl_group_overlay(results: Sequence[PatientResult], groups: Sequence[str], channel: str,
@@ -2402,7 +2632,9 @@ def mpl_distribution(feature_df: pd.DataFrame, channel: str, groups: Sequence[st
         else:
             p_text = "Pairwise p-values below"
     ax.set_xticks(positions)
-    ax.set_xticklabels([f"{group}\n(N={len(vals)})" for group, vals in zip(groups, data)])
+    # df has multiple rows per patient (per-epoch/per-channel), so use unique patient_id count
+    n_patients_by_group = df.groupby("group")["patient_id"].nunique()
+    ax.set_xticklabels([f"{group}\n(N={n_patients_by_group.get(group, 0)})" for group in groups])
     ax.set_ylabel(label)
     ax.set_xlabel("Group")
     set_centered_title(ax, f"{channel}: {label}", stage, p_text or None)
@@ -2625,8 +2857,10 @@ def mpl_correlation_scatter(feature_df: pd.DataFrame, groups: Sequence[str],
     fig, ax = plt.subplots(figsize=(5.8, max(3.4, height / 130.0)), constrained_layout=True)
     for g_idx, group in enumerate(groups):
         sub = df[df["group"] == group]
+        # rows may repeat per patient (e.g. multiple windows), so count unique patients
+        n_sub_patients = sub["patient_id"].nunique() if "patient_id" in sub.columns else len(sub)
         ax.scatter(sub["ecg_t_peak_ms"], sub["eeg_t_peak_ms"], s=24, alpha=0.75,
-                   color=PALETTE[g_idx % len(PALETTE)], label=f"{group} (n={len(sub)})",
+                   color=PALETTE[g_idx % len(PALETTE)], label=f"{group} (n={n_sub_patients})",
                    edgecolors="white", linewidths=0.25)
         if len(sub) >= 3:
             coef = np.polyfit(sub["ecg_t_peak_ms"], sub["eeg_t_peak_ms"], deg=1)
@@ -2708,10 +2942,8 @@ def mpl_raw_corr_group_average(results: Sequence[PatientResult], groups: Sequenc
             continue
         ecg_traces = []
         for r in results:
-            if r.group == group and channel in r.eeg_channels:
-                ratio = r.spectral_power_ratios.get(channel, np.nan)
-                if np.isfinite(ratio) and ratio < max_spectral_power_ratio:
-                    ecg_traces.append(r.ecg_average)
+            if r.group == group and patient_channel_signal_ok(r, channel, max_spectral_power_ratio):
+                ecg_traces.append(r.ecg_average)
         if not ecg_traces:
             continue
         color = PALETTE[g_idx % len(PALETTE)]
@@ -2748,10 +2980,8 @@ def mpl_firstdiff_group_average(results: Sequence[PatientResult], groups: Sequen
             continue
         ecg_traces = []
         for r in results:
-            if r.group == group and channel in r.eeg_channels:
-                ratio = r.spectral_power_ratios.get(channel, np.nan)
-                if np.isfinite(ratio) and ratio < max_spectral_power_ratio:
-                    ecg_traces.append(r.ecg_average)
+            if r.group == group and patient_channel_signal_ok(r, channel, max_spectral_power_ratio):
+                ecg_traces.append(r.ecg_average)
         if not ecg_traces:
             continue
         color = PALETTE[g_idx % len(PALETTE)]
@@ -2852,6 +3082,8 @@ def mpl_raw_clean_patient_side_by_side(
 ) -> Optional[Figure]:
     if channel not in raw_result.eeg_channels or channel not in clean_result.eeg_channels:
         return None
+    if not patient_channel_signal_ok(raw_result, channel) or not patient_channel_signal_ok(clean_result, channel):
+        return None
     raw_idx = raw_result.eeg_channels.index(channel)
     clean_idx = clean_result.eeg_channels.index(channel)
     panels = [
@@ -2915,9 +3147,7 @@ def mpl_raw_clean_group_average_side_by_side(
             ecg_traces = [
                 r.ecg_average for r in source_results
                 if r.group == group
-                and channel in r.eeg_channels
-                and np.isfinite(r.spectral_power_ratios.get(channel, np.nan))
-                and r.spectral_power_ratios.get(channel, np.nan) < max_spectral_power_ratio
+                and patient_channel_signal_ok(r, channel, max_spectral_power_ratio)
             ]
             if not ecg_traces:
                 continue
@@ -3450,7 +3680,10 @@ def main() -> None:
     feature_df_all = feature_df.copy()
     feature_df = apply_spectral_quality_filter(feature_df_all, MAX_SPECTRAL_POWER_RATIO)
     if feature_df.empty:
-        st.error(f"No patient-channel rows remained after spectral_power_ratio_hf_lf < {MAX_SPECTRAL_POWER_RATIO}.")
+        st.error(
+            f"No patient-channel rows remained after flat-line/noise rejection and "
+            f"spectral_power_ratio_hf_lf < {MAX_SPECTRAL_POWER_RATIO}."
+        )
         return
     retained_patient_keys = set(
         feature_df[["group", "patient_id"]].drop_duplicates().itertuples(index=False, name=None)
@@ -3490,7 +3723,10 @@ def main() -> None:
         set.intersection(*[set(feature_df.loc[feature_df["group"] == g, "channel"]) for g in selected_groups])
     ) if selected_groups else sorted(feature_df["channel"].unique())
     if not common_channels:
-        st.error(f"No common EEG channels remained after spectral_power_ratio_hf_lf < {MAX_SPECTRAL_POWER_RATIO}.")
+        st.error(
+            f"No common EEG channels remained after flat-line/noise rejection and "
+            f"spectral_power_ratio_hf_lf < {MAX_SPECTRAL_POWER_RATIO}."
+        )
         return
 
     # ── Tabs ─────────────────────────────────────────────────────────────────
@@ -3512,6 +3748,7 @@ def main() -> None:
             )
         st.caption(
             f"All statistics and group comparisons below use only patient-channel rows with "
+            f"non-flat averaged EEG traces, bounded amplitude/roughness, and "
             f"`spectral_power_ratio_hf_lf < {MAX_SPECTRAL_POWER_RATIO}` "
             f"({len(feature_df)}/{len(feature_df_all)} rows retained)."
         )
@@ -3529,7 +3766,7 @@ def main() -> None:
         st.subheader("Retained patient summary")
         st.caption(
             f"This table includes only patients with at least one retained EEG channel after "
-            f"spectral_power_ratio_hf_lf < {MAX_SPECTRAL_POWER_RATIO}."
+            f"flat-line/noise rejection and spectral_power_ratio_hf_lf < {MAX_SPECTRAL_POWER_RATIO}."
         )
         st.dataframe(patient_summary, use_container_width=True, hide_index=True)
         download_block(df=patient_summary, stem=f"{selected_stage}_patient_summary",
@@ -3581,6 +3818,11 @@ def main() -> None:
             ),
             "r_peak_curvature_threshold_uv_per_ms2": r_peak_curvature_threshold,
             "max_noisy_channel_fraction": bad_fraction,
+            "eeg_avg_min_ptp_uv": EEG_SIGNAL_MIN_PTP_UV,
+            "eeg_avg_min_std_uv": EEG_SIGNAL_MIN_STD_UV,
+            "eeg_avg_max_abs_uv": EEG_SIGNAL_MAX_ABS_UV,
+            "eeg_avg_max_roughness": EEG_SIGNAL_MAX_ROUGHNESS,
+            "max_spectral_power_ratio_hf_lf": MAX_SPECTRAL_POWER_RATIO,
             "min_kept_epochs": min_kept_epochs,
             "ecg_filter_hz": f"{ecg_filter_low_hz}-{ecg_filter_high_hz}",
             "qrs_filter_hz": f"{qrs_filter_low_hz}-{qrs_filter_high_hz}",
@@ -3603,11 +3845,16 @@ def main() -> None:
             height_per_row = c2.slider("Row height (px)", 100, 300, 150, 10, key="row_h")
 
         if trace_mode == "Per patient":
-            patient_labels = [f"{r.group} — {r.patient_id}" for r in results]
+            patient_labels = [f"{r.group} — {r.patient_id}" for r in retained_results]
             sel_label = st.selectbox("Patient", patient_labels, key="pt_sel")
-            result = results[patient_labels.index(sel_label)]
-            ch_default = result.eeg_channels
-            patient_chs = st.multiselect("EEG channels", result.eeg_channels,
+            result = retained_results[patient_labels.index(sel_label)]
+            retained_patient_channels = sorted(feature_df.loc[
+                (feature_df["group"] == result.group)
+                & (feature_df["patient_id"] == result.patient_id),
+                "channel"
+            ].unique())
+            ch_default = retained_patient_channels
+            patient_chs = st.multiselect("EEG channels", retained_patient_channels,
                                           default=ch_default, key="pt_chs")
             fig = mpl_patient_traces(result, patient_chs, height_per_row=height_per_row)
             st.pyplot(fig, clear_figure=False)
@@ -3636,16 +3883,16 @@ def main() -> None:
             max_patients = st.number_input(
                 "Maximum patients to render (0 = all)",
                 min_value=0,
-                max_value=max(1, len(results)),
+                max_value=max(1, len(retained_results)),
                 value=0,
                 step=5,
                 key="all_pt_max",
             )
 
             selected_results = [
-                r for r in results
+                r for r in retained_results
                 if r.group in all_patient_groups
-                and any(ch in r.eeg_channels for ch in all_patient_channels)
+                and any((r.group, r.patient_id, ch) in retained_channel_keys for ch in all_patient_channels)
             ]
             if max_patients:
                 selected_results = selected_results[: int(max_patients)]
@@ -3655,7 +3902,10 @@ def main() -> None:
             )
 
             for result in selected_results:
-                patient_channels = [ch for ch in all_patient_channels if ch in result.eeg_channels]
+                patient_channels = [
+                    ch for ch in all_patient_channels
+                    if (result.group, result.patient_id, ch) in retained_channel_keys
+                ]
                 if not patient_channels:
                     continue
                 with st.expander(f"{result.group} - {result.patient_id}", expanded=False):
@@ -3677,7 +3927,7 @@ def main() -> None:
 
         else:  # Group comparison
             ch_sel = st.selectbox("Channel", common_channels, key="grp_ch")
-            fig = mpl_group_overlay(results, selected_groups, ch_sel,
+            fig = mpl_group_overlay(retained_results, selected_groups, ch_sel,
                                         show_individual=show_individual,
                                         feature_df=feature_df, height=height_per_row * 4,
                                         stage=selected_stage)
@@ -3685,11 +3935,11 @@ def main() -> None:
             n_text = []
             for grp in selected_groups:
                 _, _, n_used, n_available = _group_channel_matrix(
-                    results, grp, ch_sel, max_spectral_power_ratio=MAX_SPECTRAL_POWER_RATIO
+                    retained_results, grp, ch_sel, max_spectral_power_ratio=MAX_SPECTRAL_POWER_RATIO
                 )
                 n_text.append(f"{grp}: N={n_used}/{n_available}")
             st.caption(
-                f"Figure note: Group averages include only EEG signals with spectral_power_ratio_hf_lf < {MAX_SPECTRAL_POWER_RATIO}. "
+                f"Figure note: Group averages include only EEG signals passing flat-line/noise checks and spectral_power_ratio_hf_lf < {MAX_SPECTRAL_POWER_RATIO}. "
                 f"Used for {ch_sel}: " + "; ".join(n_text) + ". "
                 "Thick traces are group means and shaded bands are SEM across included patients. Faint lines are included individual HEP traces when enabled."
             )
@@ -3697,7 +3947,7 @@ def main() -> None:
             # Also show individual groups side-by-side below
             cols = st.columns(len(selected_groups))
             for col_i, grp in enumerate(selected_groups):
-                single_fig = mpl_group_overlay([r for r in results if r.group == grp],
+                single_fig = mpl_group_overlay([r for r in retained_results if r.group == grp],
                                                    [grp], ch_sel,
                                                    show_individual=show_individual,
                                                    feature_df=feature_df, height=300,
@@ -4195,7 +4445,7 @@ def main() -> None:
                 )
 
         st.markdown("#### Group Average Raw Data")
-        raw_group_fig = mpl_raw_corr_group_average(results, selected_groups, fd_channel,
+        raw_group_fig = mpl_raw_corr_group_average(retained_results, selected_groups, fd_channel,
                                                    stage=selected_stage)
         if raw_group_fig:
             st.pyplot(raw_group_fig, clear_figure=False)
@@ -4206,7 +4456,7 @@ def main() -> None:
             )
 
         st.markdown("#### Group Average First Differences")
-        fd_group_fig = mpl_firstdiff_group_average(results, selected_groups, fd_channel,
+        fd_group_fig = mpl_firstdiff_group_average(retained_results, selected_groups, fd_channel,
                                                    stage=selected_stage)
         if fd_group_fig:
             st.pyplot(fd_group_fig, clear_figure=False)
@@ -4526,7 +4776,7 @@ def main() -> None:
         if heat_fig:
             st.pyplot(heat_fig, clear_figure=False)
             st.caption(
-                f"Figure note: Cell values are group medians after spectral_power_ratio_hf_lf < {MAX_SPECTRAL_POWER_RATIO}. "
+                f"Figure note: Cell values are group medians after flat-line/noise checks and spectral_power_ratio_hf_lf < {MAX_SPECTRAL_POWER_RATIO}. "
                 "Rows are EEG channels and columns are groups; cell annotations show medians."
             )
             download_block(fig=heat_fig, stem=f"{selected_stage}_heatmap_{heat_metric}",
@@ -4540,7 +4790,7 @@ def main() -> None:
         if corr_fig:
             st.pyplot(corr_fig, clear_figure=False)
             st.caption(
-                f"Figure note: Only rows with spectral_power_ratio_hf_lf < {MAX_SPECTRAL_POWER_RATIO} are included. "
+                f"Figure note: Only rows passing flat-line/noise checks and spectral_power_ratio_hf_lf < {MAX_SPECTRAL_POWER_RATIO} are included. "
                 f"Used for {corr_ch}: {channel_group_n_text(feature_df, selected_groups, corr_ch)}. "
                 "Patient-channel latencies are plotted to inspect whether EEG T-wave timing follows ECG T-wave timing within each group."
             )
@@ -4554,9 +4804,33 @@ def main() -> None:
         st.pyplot(qual_fig, clear_figure=False)
         st.caption(
             "Figure note: Epoch retention summarizes retained patients only after complete-window, artifact, "
+            "flat-line/noise, "
             f"and spectral_power_ratio_hf_lf < {MAX_SPECTRAL_POWER_RATIO} filtering. "
             "Low-retention patients should be inspected before final inference."
         )
+
+        if "signal_quality_rejected" in feature_df_all.columns:
+            st.subheader("Rejected patient-channel signals")
+            reject_df = feature_df_all[feature_df_all["signal_quality_rejected"].fillna(False)].copy()
+            if reject_df.empty:
+                st.caption("No patient-channel rows were rejected by the flat-line/noise quality gate.")
+            else:
+                reject_summary = (
+                    reject_df.groupby(["group", "signal_quality_reject_reason"], dropna=False)
+                    .size()
+                    .reset_index(name="n_patient_channels")
+                    .sort_values(["group", "n_patient_channels"], ascending=[True, False])
+                )
+                st.dataframe(reject_summary, use_container_width=True, hide_index=True)
+                reject_cols = [
+                    c for c in [
+                        "group", "patient_id", "channel", "signal_quality_reject_reason",
+                        "spectral_power_ratio_hf_lf", "eeg_signal_ptp", "eeg_signal_std",
+                        "eeg_signal_max_abs", "eeg_signal_roughness",
+                    ]
+                    if c in reject_df.columns
+                ]
+                st.dataframe(reject_df[reject_cols], use_container_width=True, hide_index=True)
 
         # Per-channel flip detail table
         flip_rows = []
@@ -4585,7 +4859,7 @@ def main() -> None:
             "ECG trace is negated. EEG channels are flipped only from the averaged HEP trace in the "
             "fixed -10 ms to +100 ms ECG R-window; the detected EEG R shape must be a positive, "
             "downward-facing parabola. This table shows only retained EEG channels "
-            f"with spectral_power_ratio_hf_lf < {MAX_SPECTRAL_POWER_RATIO}."
+            f"passing flat-line/noise checks and spectral_power_ratio_hf_lf < {MAX_SPECTRAL_POWER_RATIO}."
         )
         st.dataframe(flip_df, use_container_width=True, hide_index=True)
         download_block(df=flip_df, stem=f"{selected_stage}_flip_details",

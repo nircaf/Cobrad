@@ -21,6 +21,7 @@ __pycache__/
 # Folders starting with dot
 .claude/
 .downloads/
+.hep_twave_processed_cache/
 .pytest_cache/
 .ruff_cache/
 

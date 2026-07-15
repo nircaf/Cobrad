@@ -43,6 +43,8 @@ def read_edf_with_mne(file_path):
     for i, params in enumerate(read_attempts):
         try:
             raw = mne.io.read_raw_edf(file_path, **params)
+            print('------------------------------------------------------------------------------------------')
+            print(f"Successfully read EDF file with parameters: {params} i = {i+1}/{len(read_attempts)} i: {i}")
             if not params.get('preload', True):
                 raw.load_data()
             break
@@ -92,7 +94,7 @@ def read_edf_with_mne(file_path):
     return metadata, raw
 
 def main():
-    edf_path = "EDF_Format/CAP_Sleep_Database/BRUX1.EDF"
+    edf_path = "EDF_Format/The_Human_Sleep_Project/sub-I0006179000263/ses-1/eeg/SUB-I0006179000263_SES-1_TASK-PSG_EEG.EDF"
     
     print(f"Reading EDF file: {edf_path}")
     print("=" * 80)

@@ -237,9 +237,12 @@ def _plot_metric_vs_hrv(t, arrs, labels, save_plot, edf_name, save_dir, is_strea
     # If exactly two arrays, use dabest for paired estimation
     if len(arrs) == 2:
         # Prepare data for dabest: long-form DataFrame
+        # no patient_id is tracked at this point (arrs are per-epoch arrays), so
+        # group size is reported as an epoch count rather than a unique-patient count
+        group_labels = [f"{labels[0]} (n_epochs={len(arrs[0])})", f"{labels[1]} (n_epochs={len(arrs[1])})"]
         df = pd.DataFrame({
             'value': np.concatenate([arrs[0], arrs[1]]),
-            'group': [labels[0]] * len(arrs[0]) + [labels[1]] * len(arrs[1]),
+            'group': [group_labels[0]] * len(arrs[0]) + [group_labels[1]] * len(arrs[1]),
             'pair_id': list(range(len(arrs[0]))) + list(range(len(arrs[1])))
         })
         # Paired estimation plot
@@ -272,9 +275,12 @@ def _plot_metric_vs_hrv(t, arrs, labels, save_plot, edf_name, save_dir, is_strea
     elif len(arrs) > 2:
         # For more than two arrays, plot all as swarm plots (no dabest)
         n = len(arrs[0])
+        # no patient_id is tracked at this point (arrs are per-epoch arrays), so
+        # group size is reported as an epoch count rather than a unique-patient count
+        group_labels = [f"{label} (n_epochs={len(arr)})" for label, arr in zip(labels, arrs)]
         df = pd.DataFrame({
             'value': np.concatenate(arrs),
-            'group': np.concatenate([[label]*n for label in labels]),
+            'group': np.concatenate([[glabel]*len(arr) for glabel, arr in zip(group_labels, arrs)]),
             'pair_id': np.tile(np.arange(n), len(arrs))
         })
         fig, ax = plt.subplots(figsize=(10, 6))

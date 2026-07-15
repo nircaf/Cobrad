@@ -248,15 +248,19 @@ def create_topomap_comparison(pre_data, post_data, feature, montage, p_value=Non
     else:
         title_suffix = ''
     
+    # per-group unique-subject counts (Subject_ID identifies patients here)
+    n_pre = pre_data['Subject_ID'].nunique() if 'Subject_ID' in pre_data.columns else len(pre_data)
+    n_post = post_data['Subject_ID'].nunique() if 'Subject_ID' in post_data.columns else len(post_data)
+
     # PRE topomap
-    im1, _ = mne.viz.plot_topomap(pre_evoked.data[:, 0], pre_evoked.info, 
+    im1, _ = mne.viz.plot_topomap(pre_evoked.data[:, 0], pre_evoked.info,
                                   axes=axes[0], show=False, vlim=(vmin, vmax))
-    axes[0].set_title('PRE')
-    
+    axes[0].set_title(f'PRE (n={n_pre})')
+
     # POST topomap
-    im2, _ = mne.viz.plot_topomap(post_evoked.data[:, 0], post_evoked.info, 
+    im2, _ = mne.viz.plot_topomap(post_evoked.data[:, 0], post_evoked.info,
                                   axes=axes[1], show=False, vlim=(vmin, vmax))
-    axes[1].set_title('POST')
+    axes[1].set_title(f'POST (n={n_post})')
     
     # Difference topomap
     im3, _ = mne.viz.plot_topomap(diff_evoked.data[:, 0], diff_evoked.info, 

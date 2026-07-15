@@ -484,7 +484,6 @@ def clean_mne_raw(raw,filename):
         plot_not_prod(prep.raw, is_prod, 'PrepPipeline4')
         raw = prep.raw  # Get cleaned data
     except Exception as prep_err:
-        raise_error(f"PrepPipeline failed: {prep_err}")
         print(f"[clean_mne_raw] PrepPipeline failed ({prep_err}), continuing without PREP re-referencing.")
     
     # Interpolate bad channels (only if digitization info is available)
@@ -581,21 +580,23 @@ def fix_bad_eeg_channels(
     # =========================
     # STEP 3: PyPREP bad detection
     # =========================
+    _RANSAC_MIN_CHANNELS = 16
+    _use_ransac = len(raw_eeg.ch_names) >= _RANSAC_MIN_CHANNELS
+    if not _use_ransac:
+        print(
+            f"[fix_bad_eeg_channels] Only {len(raw_eeg.ch_names)} EEG channels — "
+            f"RANSAC disabled (requires {_RANSAC_MIN_CHANNELS}+). Using non-RANSAC detection."
+        )
     nc = NoisyChannels(raw_eeg)
     bad_channel_log = io.StringIO()
     bad_pyprep = set()
     try:
         with redirect_stdout(bad_channel_log):
-            nc.find_all_bads()
+            nc.find_all_bads(ransac=_use_ransac)
         bad_pyprep = set(nc.get_bads())
     except ValueError as err:
         err_msg = str(err)
-        if "Too many noisy channels" in err_msg and "need at least 5" in err_msg:
-            print(
-                "[fix_bad_eeg_channels] PyPREP RANSAC bad-channel detection skipped: "
-                f"{err_msg}. Continuing with non-RANSAC amplitude checks."
-            )
-        print(f"[fix_bad_eeg_channels] PyPREP bad-channel detection error: {err_msg}. Continuing with non-RANSAC amplitude checks.")
+        print(f"[fix_bad_eeg_channels] PyPREP bad-channel detection error: {err_msg}. Continuing with amplitude checks only.")
         raise
 
     bad_channel_summary = " | ".join(

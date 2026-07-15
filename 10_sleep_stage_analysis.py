@@ -278,7 +278,11 @@ def main():
             st.write(f"#### Top Feature Distribution: {top_feat}")
             fig, ax = plt.subplots(figsize=(8, 5))
             import seaborn as sns
-            sns.boxplot(data=df, x="Group", y=top_feat, ax=ax, palette="Set2")
+            # no patient_id column in group_df (one row per recording), fall back to row count
+            group_counts = df["Group"].value_counts()
+            df_plot = df.copy()
+            df_plot["Group"] = df_plot["Group"].map(lambda g: f"{g} (n={group_counts.get(g, 0)})")
+            sns.boxplot(data=df_plot, x="Group", y=top_feat, ax=ax, palette="Set2")
             st.pyplot(fig)
                         
     with tab3:

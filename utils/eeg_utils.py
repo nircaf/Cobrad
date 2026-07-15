@@ -364,7 +364,7 @@ def rename_channels(raw):
         valid_channels = set(raw.info['ch_names'])
         valid_rename_dict = {k: v for k, v in eeg_dict_convertion.items() if k in valid_channels}
         # if less than 10 valid_rename_dict, raise an error
-        if len(valid_rename_dict) < 10:
+        if len(valid_rename_dict) < 6:
             print(f"Warning: Only {len(valid_rename_dict)} valid channel renames found. Check eeg_dict_convertion and raw channel names.")
             raise ValueError("Not enough valid channel renames found.")
         # if valid_rename_dict == {}, use the first .split('-')[0] as the channel name if it already exists, use .split('-')[1]
@@ -420,11 +420,13 @@ def rename_channels(raw):
             if channel_name.lower().endswith('z'):
                 # lower the last letter
                 raw.rename_channels({channel_name: channel_name[:-1] + channel_name[-1].lower()})
-        elif channel.lower() in ('eog', 'ecg', 'emg'):
+        elif channel.lower() in ('eog', 'ecg', 'ekg', 'emg'):
             if channel.lower() == 'eog':
                 ch_type = 'eog'
-            elif channel.lower() == 'ecg':
-                # rename channel name to ECG
+            elif channel.lower() in ('ecg', 'ekg'):
+                if channel.lower() == 'ekg':
+                    raw.rename_channels({channel: 'ECG'})
+                    channel = 'ECG'
                 ch_type = 'ecg'
             else:
                 ch_type = 'emg'
@@ -555,6 +557,14 @@ def plot_tsne_by_group(
     tsne = TSNE(n_components=2, perplexity=perplexity, random_state=random_state)
     X_embedded = tsne.fit_transform(X)
 
+    # per-group patient counts for legend labels; fall back to row count if no
+    # patient identifier column exists in df
+    id_col = next((c for c in ("patient_id", "Subject_ID") if c in df.columns), None)
+    if id_col is not None:
+        group_counts = df.groupby(group_col)[id_col].nunique()
+    else:
+        group_counts = df[group_col].value_counts()
+
     plt.figure(figsize=(16, 9))
     unique_groups = np.unique(groups)
     colors = plt.cm.get_cmap('Set1', len(unique_groups))
@@ -579,7 +589,7 @@ def plot_tsne_by_group(
                         ax.add_patch(polygon)
                     except Exception:
                         pass  # Skip degenerate clusters
-        plt.scatter(points[:, 0], points[:, 1], label=str(group), alpha=0.8, s=60, color=colors(i))
+        plt.scatter(points[:, 0], points[:, 1], label=f"{group} (n={group_counts.get(group, 0)})", alpha=0.8, s=60, color=colors(i))
     plt.xlabel("t-SNE 1")
     plt.ylabel("t-SNE 2")
     plt.title("t-SNE by Group")
@@ -741,7 +751,14 @@ def boxplot_plot_dabest(results_df, combined_df, col, output_dir,figures_dir=Non
             pval_str = f"p = {min_pval:.3e}"
         else:
             pval_str = ""
-        plt_title = f"{title_text} - Comparison between Groups\n{pval_str}"
+        # per-group patient counts (unique patient_id/Subject_ID if present, else row count)
+        _id_col = next((c for c in ("patient_id", "Subject_ID") if c in cleaned_df.columns), None)
+        if _id_col is not None:
+            _counts = cleaned_df.groupby('Group')[_id_col].nunique()
+        else:
+            _counts = cleaned_df['Group'].value_counts()
+        group_n_str = ", ".join(f"{g} (n={_counts.get(g, 0)})" for g in unique_groups)
+        plt_title = f"{title_text} - Comparison between Groups\n{group_n_str}\n{pval_str}"
         # suptitle
         est = dabest_obj.mean_diff.plot(raw_marker_size=3, raw_label=col,float_contrast=True,fig_size=(8,8),dpi=300)
         plt.suptitle(plt_title, fontsize=14)
@@ -1641,7 +1658,9 @@ def topomap_group_data( band, montage,control_data,wnv_data,output_dir,figures_d
         vlim_max = min(0.05, df_p_values['pvals_corrected'].max())
         im, cm = mne.viz.plot_topomap(p_evoked.data[:, 0], p_evoked.info, axes=ax, show=False, cmap='jet_r', vlim=[0, vlim_max])
         fig.colorbar(im, ax=ax)
-        plt.title(f"{band} {output_dir} P-Value Topomap")
+        # control_data/wnv_data are per-band power tables with no patient_id column,
+        # so fall back to row count (one row per patient) for group sizes
+        plt.title(f"{band} {output_dir} P-Value Topomap\nGroup1 (n={len(control_data)}), Group2 (n={len(wnv_data)})")
         # if any value in pvals_corrected is less than 0.05
         # make folder {figures_dir}/boxplots/{output_dir}
         # Save the figure

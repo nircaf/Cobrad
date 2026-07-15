@@ -1141,7 +1141,11 @@ def plot_comparison(df, stats_results, save_path=None):
     
     # Create figure with subplots
     fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-    fig.suptitle('HEP Comparison: Systole vs Diastole', fontsize=16, fontweight='bold')
+    # unique patients present in both phases (paired comparison)
+    common_patients = set(df[df['phase'] == 'systole']['patient_id']).intersection(
+        set(df[df['phase'] == 'diastole']['patient_id'])
+    )
+    fig.suptitle(f'HEP Comparison: Systole vs Diastole (n={len(common_patients)})', fontsize=16, fontweight='bold')
     
     metrics = ['mean_amplitude', 'peak_amplitude', 'rms', 'std_amplitude']
     metric_labels = ['Mean Amplitude (V)', 'Peak Amplitude (V)', 'RMS (V)', 'Std Amplitude (V)']

@@ -175,9 +175,13 @@ def perform_statistical_tests(patients_df, controls_df, measurement):
 
 def create_distribution_plot(df, measurement, group_col='Group'):
     """Create distribution plot for a measurement"""
+    # one row per patient in this df, so row count == patient count
+    counts = df[group_col].value_counts()
+    df = df.copy()
+    df[group_col] = df[group_col].map(lambda g: f"{g} (n={counts.get(g, 0)})")
     fig = px.histogram(
-        df, 
-        x=measurement, 
+        df,
+        x=measurement,
         color=group_col,
         marginal="box",
         title=f"Distribution of {measurement}",
@@ -193,9 +197,13 @@ def create_distribution_plot(df, measurement, group_col='Group'):
 
 def create_comparison_plot(df, measurement, group_col='Group'):
     """Create comparison box plot for a measurement"""
+    # one row per patient in this df, so row count == patient count
+    counts = df[group_col].value_counts()
+    df = df.copy()
+    df[group_col] = df[group_col].map(lambda g: f"{g} (n={counts.get(g, 0)})")
     fig = px.box(
-        df, 
-        x=group_col, 
+        df,
+        x=group_col,
         y=measurement,
         title=f"Comparison of {measurement} between Groups",
         color=group_col

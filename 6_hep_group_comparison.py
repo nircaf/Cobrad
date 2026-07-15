@@ -23,7 +23,36 @@ import re
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import math
+import threading
+import time
 from mne_icalabel import label_components
+
+DEFAULT_PATIENT_WORKERS = max(1, min(8, os.cpu_count() or 1))
+MIN_COMPLETE_PATIENT_PICKLE_BYTES = 64 * 1024
+STANDARD_1020_EEG_CHANNELS = (
+    "Fp1", "Fp2", "F7", "F3", "Fz", "F4", "F8",
+    "T3", "T7", "C3", "Cz", "C4", "T4", "T8",
+    "T5", "P7", "P3", "Pz", "P4", "T6", "P8",
+    "O1", "Oz", "O2",
+)
+STANDARD_1020_EEG_CHANNEL_KEYS = {
+    channel.lower() for channel in STANDARD_1020_EEG_CHANNELS
+}
+DEFAULT_HEP_GROUPS = [
+    'The_Human_Sleep_Project',
+    'Young_The_Human_Sleep_Project',
+    'Harvard_Electroencephalography',
+]
+MAX_SPECTRAL_POWER_RATIO = 0.4
+HEP_WINDOW_MIN_PTP_UV = 0.05
+HEP_WINDOW_MIN_STD_UV = 0.01
+HEP_WINDOW_MAX_ABS_UV = 5000.0
+HEP_WINDOW_MAX_ROUGHNESS = 2.2
+HEP_WINDOW_MAX_BAD_CHANNEL_FRACTION = 0.35
+
+def default_hep_groups(available_groups, fallback_count=2):
+    groups = [g for g in DEFAULT_HEP_GROUPS if g in available_groups]
+    return groups or available_groups[:fallback_count]
 
 def _parse_mode_arg():
     """Parse --mode argument from sys.argv (Streamlit strips the -- separator)."""
@@ -98,17 +127,59 @@ _original_st_pyplot = st.pyplot
 _original_st_plotly_chart = getattr(st, "plotly_chart", None)
 
 ICA_CLEANED_TITLE_SUFFIX = " (ICA cleaned)"
+ICA_CLEANED_FIGURE_NOTE = "This plot uses ICA-cleaned data."
 REPETITIVE_RPEAK_EXCLUDE_PERC = 20.0
+HEP_FLIP_CACHE_SUFFIX = "_rpeak_shape_v1"
 
 def _append_ica_cleaned_to_title(title):
     if not title or ICA_CLEANED_TITLE_SUFFIX in title:
         return title
     return f"{title}{ICA_CLEANED_TITLE_SUFFIX}"
 
+def _append_variability_label_to_title(title, labels):
+    if not title:
+        return title
+    title_upper = str(title).upper()
+    label_text = " ".join(str(label) for label in (labels or [])).upper()
+    if "MAD" in label_text and "MAD" not in title_upper:
+        return f"{title} | Median +/- MAD"
+    if ("SEM" in label_text or "STANDARD ERROR" in label_text) and "SEM" not in title_upper:
+        return f"{title} | Mean +/- SEM"
+    if (
+        "STD" in label_text
+        or " SD" in label_text
+        or "± 1 SD" in label_text
+        or "+/- 1 SD" in label_text
+        or "STANDARD DEVIATION" in label_text
+    ) and not any(token in title_upper for token in ("STD", " SD", "STANDARD DEVIATION")):
+        return f"{title} | Mean +/- STD"
+    return title
+
+def _mark_matplotlib_titles_with_variability_label(fig):
+    if fig is None:
+        return
+    try:
+        all_labels = []
+        for ax in fig.axes:
+            _, labels = ax.get_legend_handles_labels()
+            all_labels.extend(labels)
+            title = ax.get_title()
+            if title:
+                ax.set_title(_append_variability_label_to_title(title, labels))
+        if fig._suptitle:
+            fig._suptitle.set_text(
+                _append_variability_label_to_title(fig._suptitle.get_text(), all_labels)
+            )
+    except Exception:
+        pass
+
 def _mark_matplotlib_titles_ica_cleaned(fig):
     if fig is None:
         return
     try:
+        _mark_matplotlib_titles_with_variability_label(fig)
+        if getattr(fig, "_skip_ica_cleaned_title", False):
+            return
         if fig._suptitle:
             fig._suptitle.set_text(_append_ica_cleaned_to_title(fig._suptitle.get_text()))
         for ax in fig.axes:
@@ -122,9 +193,11 @@ def _mark_plotly_titles_ica_cleaned(fig):
     if fig is None:
         return
     try:
+        labels = [getattr(trace, "name", "") for trace in getattr(fig, "data", []) or []]
         title = getattr(getattr(fig, "layout", None), "title", None)
         if title is not None and getattr(title, "text", None):
-            fig.update_layout(title_text=_append_ica_cleaned_to_title(title.text))
+            labeled_title = _append_variability_label_to_title(title.text, labels)
+            fig.update_layout(title_text=_append_ica_cleaned_to_title(labeled_title))
         for annotation in getattr(getattr(fig, "layout", None), "annotations", []) or []:
             if getattr(annotation, "text", None):
                 annotation.text = _append_ica_cleaned_to_title(annotation.text)
@@ -146,7 +219,9 @@ def _get_matplotlib_title(fig):
     return title
 
 def _get_matplotlib_description(_fig, _title):
-    return "This plot uses ICA-cleaned data."
+    if getattr(_fig, "_skip_ica_cleaned_title", False):
+        return ""
+    return ICA_CLEANED_FIGURE_NOTE
 
 def _get_plotly_title(fig):
     title = "Interactive Figure"
@@ -164,7 +239,7 @@ def _get_plotly_title(fig):
     return title
 
 def _get_plotly_description(fig, title):
-    description = "This interactive plot uses ICA-cleaned data."
+    description = ICA_CLEANED_FIGURE_NOTE
     try:
         subplot_titles = [
             annotation.text
@@ -179,6 +254,9 @@ def _get_plotly_description(fig, title):
     except Exception:
         pass
     return description
+
+def _is_generic_figure_title(title):
+    return not title or str(title).strip() in {"Figure", "Interactive Figure"}
 
 def _clear_matplotlib_rendered_title(fig, title):
     try:
@@ -201,8 +279,14 @@ def _clear_plotly_rendered_title(fig):
         pass
 
 def _write_plot_description(description):
-    if description.strip():
-        st.caption(description)
+    if not description.strip():
+        return
+    note_key = "_ica_cleaned_figure_note_written"
+    if description.strip() == ICA_CLEANED_FIGURE_NOTE:
+        if st.session_state.get(note_key, False):
+            return
+        st.session_state[note_key] = True
+    st.caption(description)
 
 def custom_st_pyplot(fig=None, clear_figure=None, **kwargs):
     if fig is None:
@@ -212,16 +296,15 @@ def custom_st_pyplot(fig=None, clear_figure=None, **kwargs):
 
     title = _get_matplotlib_title(fig)
     description = _get_matplotlib_description(fig, title)
-    _clear_matplotlib_rendered_title(fig, title)
         
 
     if 'pptx_figures_data' not in st.session_state:
         st.session_state.pptx_figures_data = []
 
-    st.subtitle(title)
+    if not _is_generic_figure_title(title):
+        st.subtitle(title)
     _original_st_pyplot(fig, clear_figure=clear_figure, **kwargs)
     _write_plot_description(description)
-    st.divide()
 
     if PPTX_AVAILABLE:
         buf = io.BytesIO()
@@ -240,11 +323,10 @@ def custom_st_plotly_chart(fig=None, **kwargs):
     _mark_plotly_titles_ica_cleaned(fig)
     title = _get_plotly_title(fig)
     description = _get_plotly_description(fig, title)
-    _clear_plotly_rendered_title(fig)
-    st.subtitle(title)
+    if not _is_generic_figure_title(title):
+        st.subtitle(title)
     chart = _original_st_plotly_chart(fig, **kwargs)
-    st.write(description)
-    st.divide()
+    _write_plot_description(description)
     return chart
 
 if _original_st_plotly_chart is not None:
@@ -592,9 +674,61 @@ def process_file_data(raw, patient_id):
     return raw, sfreq, rpeak_ts, rpeaks, minmax, log_msg
 
 
+def _epoch_spectral_power_ratio_hf_lf(epochs, sfreq, low_band=(1.0, 30.0), high_band=(30.0, 80.0)):
+    """Return high/low spectral power ratio for epochs shaped (n_epochs, n_channels, n_times)."""
+    epochs = np.asarray(epochs, dtype=float)
+    if epochs.ndim != 3 or epochs.size == 0:
+        return np.empty((0, 0), dtype=float)
+    n_times = epochs.shape[-1]
+    if n_times < 4:
+        return np.full(epochs.shape[:2], np.nan, dtype=float)
+    nperseg = int(min(max(8, round(float(sfreq) * 0.5)), n_times))
+    freqs, psd = signal.welch(epochs, fs=float(sfreq), axis=-1, nperseg=nperseg)
+    low_mask = (freqs >= low_band[0]) & (freqs <= min(low_band[1], float(sfreq) / 2.0))
+    high_mask = (freqs >= high_band[0]) & (freqs <= min(high_band[1], float(sfreq) / 2.0))
+    ratios = np.full(epochs.shape[:2], np.nan, dtype=float)
+    if not np.any(low_mask) or not np.any(high_mask):
+        return ratios
+    low_power = np.trapz(psd[..., low_mask], freqs[low_mask], axis=-1)
+    high_power = np.trapz(psd[..., high_mask], freqs[high_mask], axis=-1)
+    valid_low = np.isfinite(low_power) & (low_power > 0)
+    ratios[valid_low] = high_power[valid_low] / (low_power[valid_low] + 1e-18)
+    return ratios
+
+
+def _valid_hep_window_mask(epochs, sfreq):
+    """Return per-window keep mask after flat-line, artifact, and spectral checks."""
+    epochs = np.asarray(epochs, dtype=float)
+    if epochs.ndim != 3 or epochs.shape[0] == 0:
+        return np.zeros(0, dtype=bool)
+
+    ptp_uv = np.ptp(epochs, axis=2) * 1e6
+    std_uv = np.nanstd(epochs, axis=2) * 1e6
+    max_abs_uv = np.nanmax(np.abs(epochs), axis=2) * 1e6
+    diff_std = np.nanstd(np.diff(epochs, axis=2), axis=2)
+    trace_std = np.nanstd(epochs, axis=2)
+    roughness = diff_std / (trace_std + 1e-12)
+
+    bad_by_ch = (
+        ~np.isfinite(ptp_uv)
+        | ~np.isfinite(std_uv)
+        | (ptp_uv < HEP_WINDOW_MIN_PTP_UV)
+        | (std_uv < HEP_WINDOW_MIN_STD_UV)
+        | (max_abs_uv > HEP_WINDOW_MAX_ABS_UV)
+        | (np.isfinite(roughness) & (roughness > HEP_WINDOW_MAX_ROUGHNESS))
+    )
+
+    spectral_ratio = _epoch_spectral_power_ratio_hf_lf(epochs, sfreq)
+    bad_by_ch |= ~np.isfinite(spectral_ratio) | (spectral_ratio >= MAX_SPECTRAL_POWER_RATIO)
+
+    bad_fraction = np.mean(bad_by_ch, axis=1)
+    return bad_fraction <= HEP_WINDOW_MAX_BAD_CHANNEL_FRACTION
+
+
 def compute_hep_avg(raw, rpeaks, sfreq, minmax=(-0.5, 1.0), rpeak_ts=None):
     """
     Computes HEP (Heartbeat Evoked Potential) for all EEG channels.
+    Only complete, non-flat, not-too-noisy heartbeat windows are averaged.
     """
     tmin, tmax = minmax
     
@@ -608,14 +742,32 @@ def compute_hep_avg(raw, rpeaks, sfreq, minmax=(-0.5, 1.0), rpeak_ts=None):
         
     # Pick EEG channels
     eeg_ch_names = [ch_names[i] for i in eeg_indices]
-    
-    # Pynapple implementation
-    data = raw.get_data(picks=eeg_indices).T # (n_times, n_channels)
-    tsd_frame = nap.TsdFrame(t=raw.times, d=data, columns=eeg_ch_names)
-    perievent = nap.compute_perievent_continuous(tsd_frame, rpeak_ts, minmax=minmax)
-    # Average across trials (axis 1)
-    mean_data = perievent.nanmean(axis=1).values.T # (n_channels, n_times)
-    return mean_data, perievent.t, eeg_ch_names
+
+    pre = int(round(abs(tmin) * sfreq))
+    post = int(round(tmax * sfreq))
+    offsets = np.arange(-pre, post + 1)
+    valid_rpeaks = np.asarray(rpeaks, dtype=int)
+    valid_rpeaks = valid_rpeaks[
+        (valid_rpeaks - pre >= 0) & (valid_rpeaks + post < raw.n_times)
+    ]
+    if len(valid_rpeaks) == 0:
+        return None, offsets / sfreq, eeg_ch_names
+
+    data = raw.get_data(picks=eeg_indices)
+    epochs = np.asarray([data[:, peak + offsets] for peak in valid_rpeaks], dtype=float)
+    keep_mask = _valid_hep_window_mask(epochs, sfreq)
+    if int(np.sum(keep_mask)) == 0:
+        try:
+            st.warning(
+                "No valid HEP windows remained after flat/noise and "
+                f"spectral_power_ratio_hf_lf < {MAX_SPECTRAL_POWER_RATIO} filtering."
+            )
+        except Exception:
+            pass
+        return None, offsets / sfreq, eeg_ch_names
+
+    mean_data = np.nanmean(epochs[keep_mask], axis=0)
+    return mean_data, offsets / sfreq, eeg_ch_names
 
 
 
@@ -891,17 +1043,136 @@ def should_invert_eeg_from_t_wave(eeg_trace, times, ecg_t_peak_time, pre_window=
     return invert, info
 
 
+def _smooth_rpeak_window(values, times, smooth_ms=25.0):
+    """Smooth the R-peak window enough to ignore single-sample derivative zeros."""
+    values = np.asarray(values, dtype=float)
+    times = np.asarray(times, dtype=float)
+    if len(values) < 5:
+        return values.copy()
+
+    dt = float(np.nanmedian(np.diff(times))) if len(times) > 1 else 0.0
+    if not np.isfinite(dt) or dt <= 0:
+        return median_filter(values, size=min(3, len(values)))
+
+    win = int(round((smooth_ms / 1000.0) / dt))
+    win = max(5, win)
+    if win % 2 == 0:
+        win += 1
+    if win >= len(values):
+        win = len(values) - 1 if len(values) % 2 == 0 else len(values)
+    if win < 5:
+        return median_filter(values, size=min(3, len(values)))
+
+    try:
+        return signal.savgol_filter(values, window_length=win, polyorder=2, mode="interp")
+    except Exception:
+        return median_filter(values, size=min(3, len(values)))
+
+
+def _linear_slope(x, y):
+    """Least-squares slope for a short trend segment."""
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    finite = np.isfinite(x) & np.isfinite(y)
+    if np.sum(finite) < 2:
+        return np.nan
+    x = x[finite]
+    y = y[finite]
+    x = x - np.nanmean(x)
+    denom = float(np.dot(x, x))
+    if denom <= 1e-18:
+        return np.nan
+    return float(np.dot(x, y - np.nanmean(y)) / denom)
+
+
+def _evaluate_rpeak_extremum_shape(times, values, idx, kind, flank_ms=35.0):
+    """
+    Score whether idx is a clear valley or peak with a trend on both sides.
+    A real valley has negative left slope and positive right slope; a real peak
+    has positive left slope and negative right slope.
+    """
+    n = len(values)
+    if idx <= 1 or idx >= n - 2:
+        return {
+            "is_clear": False,
+            "reason": "edge_candidate",
+            "prominence": 0.0,
+            "left_slope": np.nan,
+            "right_slope": np.nan,
+        }
+
+    center_t = float(times[idx])
+    flank_sec = flank_ms / 1000.0
+    left_mask = (times >= center_t - flank_sec) & (times < center_t)
+    right_mask = (times > center_t) & (times <= center_t + flank_sec)
+
+    if np.sum(left_mask) < 2:
+        left_mask = np.zeros(n, dtype=bool)
+        left_mask[max(0, idx - 3):idx] = True
+    if np.sum(right_mask) < 2:
+        right_mask = np.zeros(n, dtype=bool)
+        right_mask[idx + 1:min(n, idx + 4)] = True
+
+    if np.sum(left_mask) < 2 or np.sum(right_mask) < 2:
+        return {
+            "is_clear": False,
+            "reason": "insufficient_flank_points",
+            "prominence": 0.0,
+            "left_slope": np.nan,
+            "right_slope": np.nan,
+        }
+
+    left_slope = _linear_slope(times[left_mask], values[left_mask])
+    right_slope = _linear_slope(times[right_mask], values[right_mask])
+    center_amp = float(values[idx])
+    left_level = float(np.nanmedian(values[left_mask]))
+    right_level = float(np.nanmedian(values[right_mask]))
+    local_range = float(np.nanmax(values) - np.nanmin(values))
+    noise = float(np.nanmedian(np.abs(np.diff(values) - np.nanmedian(np.diff(values))))) if len(values) > 3 else 0.0
+    prominence_threshold = max(2.5 * noise, 0.12 * local_range, 1e-12)
+    slope_threshold = prominence_threshold / max(flank_sec, 1e-6) * 0.20
+
+    if kind == "valley":
+        prominence = min(left_level - center_amp, right_level - center_amp)
+        has_shape = (
+            np.isfinite(left_slope) and np.isfinite(right_slope)
+            and left_slope < -slope_threshold
+            and right_slope > slope_threshold
+        )
+    else:
+        prominence = min(center_amp - left_level, center_amp - right_level)
+        has_shape = (
+            np.isfinite(left_slope) and np.isfinite(right_slope)
+            and left_slope > slope_threshold
+            and right_slope < -slope_threshold
+        )
+
+    is_clear = bool(has_shape and prominence >= prominence_threshold)
+    reason = "clear_shape" if is_clear else "weak_or_noisy_shape"
+    return {
+        "is_clear": is_clear,
+        "reason": reason,
+        "prominence": float(max(prominence, 0.0)),
+        "prominence_threshold": float(prominence_threshold),
+        "slope_threshold": float(slope_threshold),
+        "left_slope": float(left_slope) if np.isfinite(left_slope) else np.nan,
+        "right_slope": float(right_slope) if np.isfinite(right_slope) else np.nan,
+        "left_level": left_level,
+        "right_level": right_level,
+        "center_amp": center_amp,
+        "center_time": center_t,
+    }
+
+
 def should_flip_eeg_around_r_peak(eeg_trace, times, pre_window=0.10, post_window=0.10):
     """
-    Decide whether a non-Berkeley EEG HEP channel is inverted at the R-peak.
+    Decide whether an EEG HEP channel is inverted around the R-peak.
 
-    Two conditions must both hold to flip:
-    1. The EEG value at t=0 (R-peak) is negative (signal is "down").
-    2. t=0 is a local minimum in the [-pre_window, +post_window] window —
-       i.e., the sample closest to t=0 has a smaller value than its neighbours
-       (derivative goes from negative to positive there).
-
-    Only when both are true is the channel considered inverted and worth flipping.
+    The decision uses only the ±100 ms R-peak window. A channel is flipped only
+    when the smoothed global minimum forms a clear valley: values trend downward
+    into the minimum and upward away from it. A clear peak/parabola shape means
+    the polarity is kept. This avoids flipping on single noisy samples where the
+    derivative is briefly zero.
     """
     if eeg_trace is None or times is None:
         return False, {}
@@ -923,33 +1194,45 @@ def should_flip_eeg_around_r_peak(eeg_trace, times, pre_window=0.10, post_window
 
     window_times = window_times[finite_mask]
     window_values = window_values[finite_mask]
+    if len(window_values) < 5:
+        return False, {}
 
-    # Find the sample closest to t=0 within the window
+    smooth_values = _smooth_rpeak_window(window_values, window_times)
+    min_idx = int(np.nanargmin(smooth_values))
+    max_idx = int(np.nanargmax(smooth_values))
+    min_amp = float(smooth_values[min_idx])
+    max_amp = float(smooth_values[max_idx])
+
+    valley = _evaluate_rpeak_extremum_shape(window_times, smooth_values, min_idx, "valley")
+    peak = _evaluate_rpeak_extremum_shape(window_times, smooth_values, max_idx, "peak")
+
+    if valley["is_clear"] and not peak["is_clear"]:
+        flip = True
+        flip_reason = "clear_r_peak_valley"
+    elif peak["is_clear"] and not valley["is_clear"]:
+        flip = False
+        flip_reason = "clear_r_peak_peak"
+    elif valley["is_clear"] and peak["is_clear"]:
+        flip = bool(valley["prominence"] > peak["prominence"])
+        flip_reason = "valley_stronger_than_peak" if flip else "peak_stronger_than_valley"
+    else:
+        flip = False
+        flip_reason = "no_clear_r_peak_extremum"
+
     t0_idx = int(np.argmin(np.abs(window_times)))
-    t0_amp = float(window_values[t0_idx])
-
-    # Condition 1: signal at t=0 must be negative (down)
-    if t0_amp >= 0:
-        return False, {
-            "method": "r_peak_t0",
-            "t0_amp": t0_amp,
-            "flip_reason": "t0_not_negative",
-        }
-
-    # Condition 2: t=0 must be a local minimum — smaller than both neighbours
-    left_amp = float(window_values[t0_idx - 1]) if t0_idx > 0 else float('inf')
-    right_amp = float(window_values[t0_idx + 1]) if t0_idx < len(window_values) - 1 else float('inf')
-    is_local_min = (t0_amp <= left_amp) and (t0_amp <= right_amp)
-
-    flip = is_local_min
+    t0_amp = float(smooth_values[t0_idx])
 
     return flip, {
-        "method": "r_peak_t0",
+        "method": "r_peak_smoothed_extremum_shape",
         "t0_amp": t0_amp,
         "t0_time": float(window_times[t0_idx]),
-        "left_amp": left_amp,
-        "right_amp": right_amp,
-        "is_local_min": is_local_min,
+        "window_min_amp": min_amp,
+        "window_min_time": float(window_times[min_idx]),
+        "window_max_amp": max_amp,
+        "window_max_time": float(window_times[max_idx]),
+        "valley": valley,
+        "peak": peak,
+        "flip_reason": flip_reason,
         "pre_window": float(pre_window),
         "post_window": float(post_window),
     }
@@ -999,8 +1282,7 @@ def should_flip_eeg_swing_percentage(eeg_trace, times, pre_window=0.10, post_win
 
 def flip_eeg_channels_around_r_peak(raw, hep_data, times, ch_names, eeg_indices):
     """
-    Flip EEG channels whose HEP is dominated by a negative peak around t=0
-    (the R-peak window, ±100 ms).  Used for Berkeley data.
+    Flip EEG channels whose R-peak window contains a clear negative valley.
     """
     valid_eeg_indices = [
         idx for idx in eeg_indices
@@ -1115,11 +1397,9 @@ def process_and_invert_hep(_raw, rpeaks, sfreq, minmax, _rpeak_ts, patient_id, g
     """
     Computes HEP and ECG HEP, then fixes EEG polarity when needed.
 
-    Berkeley data: per-channel flip based on the R-peak signal at t=0 —
-    flip when the EEG is negative and forms a local minimum at the R-peak.
-    All other groups (EDF, etc.): per-channel flip using the Swing Percentage
-    formula (Drop% ≥ 50 % in ±100 ms window); channels that do not qualify
-    fall back to the EEG T-wave inversion check.
+    Per-channel flip is based only on the R-peak window: invert when the
+    smoothed ±100 ms window has a clear negative valley, and keep polarity
+    when it has a clear positive peak/parabola.
     """
     hep_data, times, ch_names = compute_hep_avg(_raw, rpeaks, sfreq, minmax, rpeak_ts=_rpeak_ts)
     ecg_hep_data, _, ecg_ch_names = compute_ecg_hep_avg(_raw, rpeaks, sfreq, minmax, rpeak_ts=_rpeak_ts)
@@ -1136,61 +1416,30 @@ def process_and_invert_hep(_raw, rpeaks, sfreq, minmax, _rpeak_ts, patient_id, g
     eeg_indices = [i for i, ch in enumerate(ch_names)
                   if re.match(r'^[A-Za-z]{1,3}[0-9]+$', ch) or re.match(r'^[A-Za-z]{1,2}z$', ch, re.IGNORECASE)]
 
-    is_berkeley = 'berkeley' in group_name.lower()
-
-    if is_berkeley:
-        flipped_channels, flip_info = flip_eeg_channels_around_r_peak(
-            _raw, hep_data, times, ch_names, eeg_indices
+    flipped_channels, flip_info = flip_eeg_channels_around_r_peak(
+        _raw, hep_data, times, ch_names, eeg_indices
+    )
+    if flipped_channels:
+        flipped_details = []
+        for ch in flipped_channels:
+            ch_info = flip_info.get("per_channel", {}).get(ch, {})
+            min_amp_uv = ch_info.get("window_min_amp", np.nan) * 1e6
+            max_amp_uv = ch_info.get("window_max_amp", np.nan) * 1e6
+            flipped_details.append((ch, min_amp_uv, max_amp_uv))
+        detail_text = ", ".join(
+            f"{ch} (min {mn:.2f} uV, max {mx:.2f} uV)"
+            for ch, mn, mx in flipped_details[:8]
         )
-        if flipped_channels:
-            flipped_details = []
-            for ch in flipped_channels:
-                ch_info = flip_info.get("per_channel", {}).get(ch, {})
-                t0_amp_uv = ch_info.get("t0_amp", np.nan) * 1e6
-                flipped_details.append((ch, t0_amp_uv))
-            detail_text = ", ".join(
-                f"{ch} ({a:.2f} uV at t=0)"
-                for ch, a in flipped_details[:8]
-            )
-            if len(flipped_details) > 8:
-                detail_text += f", +{len(flipped_details) - 8} more"
-            flip_msg = (
-                f"[Berkeley] Flipped {len(flipped_channels)} inverted EEG channel(s) for {patient_id} "
-                f"(negative local minimum at R-peak t=0): {detail_text}"
-            )
-            try:
-                st.info(flip_msg)
-            except Exception:
-                print(flip_msg)
-    else:
-        flipped_channels, flip_info = flip_eeg_channels_swing_pct_then_t_wave(
-            _raw, hep_data, times, ch_names, eeg_indices, ecg_hep_data
+        if len(flipped_details) > 8:
+            detail_text += f", +{len(flipped_details) - 8} more"
+        flip_msg = (
+            f"Flipped {len(flipped_channels)} inverted EEG channel(s) for {patient_id} "
+            f"(R-peak ±100 ms clear valley shape): {detail_text}"
         )
-        if flipped_channels:
-            flipped_details = []
-            for ch in flipped_channels:
-                ch_info = flip_info.get("per_channel", {}).get(ch, {})
-                if not ch_info.get("used_t_wave_fallback"):
-                    drop_pct = ch_info.get("drop_pct", np.nan)
-                    flipped_details.append((ch, f"swing {drop_pct:.0f}%"))
-                else:
-                    tw = ch_info.get("t_wave_fallback", {})
-                    eeg_t_ms = tw.get("eeg_t_peak_time", np.nan) * 1000
-                    flipped_details.append((ch, f"T-wave {eeg_t_ms:.1f} ms"))
-            detail_text = ", ".join(
-                f"{ch} ({info})"
-                for ch, info in flipped_details[:8]
-            )
-            if len(flipped_details) > 8:
-                detail_text += f", +{len(flipped_details) - 8} more"
-            flip_msg = (
-                f"[EDF] Flipped {len(flipped_channels)} inverted EEG channel(s) for {patient_id} "
-                f"(Swing% ≥50 % or T-wave fallback): {detail_text}"
-            )
-            try:
-                st.info(flip_msg)
-            except Exception:
-                print(flip_msg)
+        try:
+            st.info(flip_msg)
+        except Exception:
+            print(flip_msg)
 
     if flipped_channels:
         hep_data, times, ch_names = compute_hep_avg(_raw, rpeaks, sfreq, minmax, rpeak_ts=_rpeak_ts)
@@ -1348,10 +1597,203 @@ def _process_non_eeg_patient_worker(args):
 
 def _individuals_have_flip_metadata(individuals):
     """Return True when cached individual tuples include flipped-channel metadata."""
+    if not individuals:
+        return False
     return all(len(ind) > 8 for ind in individuals)
 
 
-def get_group_individuals(group_name, sleep_stage, base_path, test_run=False, recompute_cache=False, apply_ica=False):
+def _patient_id_from_pickle_name(filename):
+    return filename.replace('.pkl', '').replace('.edf', '')
+
+
+def _cache_filename_for_individuals(test_run=False, apply_ica=False, min_eeg_channels=None):
+    ica_suffix = '_ica' if apply_ica else ''
+    channel_suffix = (
+        f'_min{int(min_eeg_channels)}_1020eeg'
+        if min_eeg_channels else ''
+    )
+    cache_filename = (
+        f'individuals_cache_test{ica_suffix}{channel_suffix}.pkl'
+        if test_run else f'individuals_cache{ica_suffix}{channel_suffix}.pkl'
+    )
+    return cache_filename.replace('.pkl', f'{HEP_FLIP_CACHE_SUFFIX}.pkl')
+
+
+def _individuals_cache_meta_path(cache_path):
+    return cache_path.replace('.pkl', '_meta.pkl')
+
+
+def _standard_1020_channel_count(channel_names):
+    """Count distinct channels from the dashboard's canonical 10-20 list."""
+    return len({
+        str(channel).strip().lower()
+        for channel in (channel_names or [])
+        if str(channel).strip().lower() in STANDARD_1020_EEG_CHANNEL_KEYS
+    })
+
+
+def _dump_pickle_atomic_with_heartbeat(payload, destination):
+    """Atomically write a cache while reporting disk-I/O progress every 10 seconds."""
+    temp_path = f"{destination}.tmp.{os.getpid()}"
+    stop_event = threading.Event()
+    started = time.monotonic()
+
+    def report_progress():
+        while not stop_event.wait(10):
+            try:
+                size_mb = os.path.getsize(temp_path) / (1024 * 1024)
+            except OSError:
+                size_mb = 0.0
+            elapsed = int(time.monotonic() - started)
+            print(
+                f"[cache write] {os.path.basename(destination)}: "
+                f"{size_mb:.1f} MiB written, {elapsed}s elapsed",
+                flush=True,
+            )
+
+    reporter = threading.Thread(target=report_progress, daemon=True)
+    reporter.start()
+    try:
+        with open(temp_path, 'wb') as f:
+            pickle.dump(payload, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, destination)
+        elapsed = int(time.monotonic() - started)
+        size_mb = os.path.getsize(destination) / (1024 * 1024)
+        print(
+            f"[cache write] {os.path.basename(destination)} complete: "
+            f"{size_mb:.1f} MiB in {elapsed}s",
+            flush=True,
+        )
+    finally:
+        stop_event.set()
+        reporter.join(timeout=1)
+        try:
+            os.remove(temp_path)
+        except FileNotFoundError:
+            pass
+
+
+def _load_fresh_individuals_cache(cache_path, patient_file_paths, expected_pids, group_name, sleep_stage):
+    """Return cached individuals when source pickle files and patient IDs match."""
+    if not os.path.exists(cache_path):
+        return None, "missing"
+
+    cache_mtime = os.path.getmtime(cache_path)
+    newer_pickles = [
+        os.path.basename(path)
+        for path in patient_file_paths
+        if os.path.getmtime(path) > cache_mtime
+    ]
+    if newer_pickles:
+        return None, f"{len(newer_pickles)} source pickle(s) newer than cache"
+
+    try:
+        with open(cache_path, 'rb') as f:
+            individuals = pickle.load(f)
+    except Exception as e:
+        return None, f"failed to load cache: {e}"
+
+    cached_pids = {ind[0] for ind in individuals if ind is not None and len(ind) > 0}
+    expected_pids = set(expected_pids)
+    comparison_pids = cached_pids
+    cache_version_valid = False
+    meta_path = _individuals_cache_meta_path(cache_path)
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path, 'rb') as f:
+                meta = pickle.load(f)
+            comparison_pids = set(meta.get('attempted_pids', cached_pids))
+            cache_version_valid = meta.get('cache_version') == HEP_FLIP_CACHE_SUFFIX
+        except Exception:
+            comparison_pids = cached_pids
+
+    if comparison_pids != expected_pids:
+        added = sorted(expected_pids - comparison_pids)
+        removed = sorted(comparison_pids - expected_pids)
+        details = []
+        if added:
+            details.append(f"{len(added)} new patient(s)")
+        if removed:
+            details.append(f"{len(removed)} removed/excluded patient(s)")
+        return None, ", ".join(details) or "patient set changed"
+
+    if individuals and not _individuals_have_flip_metadata(individuals):
+        return None, "cache version missing R-peak flip metadata"
+    if not individuals and not cache_version_valid:
+        return None, "empty cache version could not be verified"
+
+    print(f"Using cache for {group_name}/{sleep_stage}: {os.path.basename(cache_path)}")
+    return individuals, "fresh"
+
+
+def _load_incremental_individuals_cache(cache_path, args_list):
+    """Load reusable cached results and return only patient jobs needing work."""
+    if not os.path.exists(cache_path):
+        return [], args_list, set(), True
+
+    try:
+        with open(cache_path, 'rb') as f:
+            cached_individuals = pickle.load(f)
+    except Exception as e:
+        print(f"Could not reuse incremental cache {os.path.basename(cache_path)}: {e}")
+        return [], args_list, set(), True
+
+    # Old tuple formats cannot be mixed with results produced by the current
+    # R-peak/channel-flipping implementation.
+    if not _individuals_have_flip_metadata(cached_individuals):
+        return [], args_list, set(), True
+
+    cached_by_pid = {
+        ind[0]: ind for ind in cached_individuals
+        if ind is not None and len(ind) > 0
+    }
+    attempted_pids = set(cached_by_pid)
+    recorded_sources = {}
+    meta_path = _individuals_cache_meta_path(cache_path)
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path, 'rb') as f:
+                meta = pickle.load(f)
+            if meta.get('cache_version') == HEP_FLIP_CACHE_SUFFIX:
+                attempted_pids = set(meta.get('attempted_pids', attempted_pids))
+                recorded_sources = meta.get('source_files', {}) or {}
+        except Exception as e:
+            print(f"Could not read incremental cache metadata: {e}")
+
+    expected_pids = {args[1] for args in args_list}
+    reusable_by_pid = {
+        pid: ind for pid, ind in cached_by_pid.items() if pid in expected_pids
+    }
+    cache_data_changed = set(reusable_by_pid) != set(cached_by_pid)
+    pending_args = []
+    changed_pids = set()
+    for args in args_list:
+        path, pid = args[0], args[1]
+        source_name = os.path.basename(path)
+        recorded_mtime = recorded_sources.get(source_name)
+        source_changed = (
+            recorded_mtime is not None
+            and os.path.getmtime(path) != recorded_mtime
+        )
+        if pid not in attempted_pids or source_changed:
+            pending_args.append(args)
+            if source_changed:
+                changed_pids.add(pid)
+                reusable_by_pid.pop(pid, None)
+                cache_data_changed = True
+
+    if pending_args:
+        cache_data_changed = True
+    return list(reusable_by_pid.values()), pending_args, changed_pids, cache_data_changed
+
+
+def get_group_individuals(
+    group_name, sleep_stage, base_path, test_run=False, recompute_cache=False,
+    apply_ica=False, parallel_workers=DEFAULT_PATIENT_WORKERS,
+    min_eeg_channels=None,
+):
     """
     Loads all files for a group/sleep_stage and returns individual HEPs.
     Returns: list of (patient_id, hep_data, times, ch_names)
@@ -1360,61 +1802,28 @@ def get_group_individuals(group_name, sleep_stage, base_path, test_run=False, re
     if not os.path.exists(group_dir):
         return []
 
-    # Exclude cache files when looking for patient pkl files
-    patient_files = [
+    # Exclude cache files when looking for patient pkl files.
+    all_patient_files = sorted([
         f for f in os.listdir(group_dir)
         if f.endswith('.pkl')
         and not f.startswith('individuals_cache')
         and not f.startswith('non_eeg_individuals_cache')
+    ])
+    patient_files = [
+        f for f in all_patient_files
+        if os.path.getsize(os.path.join(group_dir, f)) >= MIN_COMPLETE_PATIENT_PICKLE_BYTES
     ]
+    incomplete_count = len(all_patient_files) - len(patient_files)
+    if incomplete_count:
+        print(
+            f"Skipping {incomplete_count} incomplete patient pickle(s) smaller than "
+            f"{MIN_COMPLETE_PATIENT_PICKLE_BYTES // 1024} KiB in {group_name}/{sleep_stage}"
+        )
     if not patient_files:
         return []
-        
-    ica_suffix = '_ica' if apply_ica else ''
-    cache_filename = f'individuals_cache_test{ica_suffix}.pkl' if test_run else f'individuals_cache{ica_suffix}.pkl'
-    cache_path = os.path.join(group_dir, cache_filename)
-    
-    # Check if cache exists and is newer than all patient files. Disable cache reading for test runs or if recompute is forced.
-    if os.path.exists(cache_path) and not test_run and not recompute_cache:
-        cache_mtime = os.path.getmtime(cache_path)
-        is_cache_valid = True
-        for f in patient_files:
-            if os.path.getmtime(os.path.join(group_dir, f)) > cache_mtime:
-                is_cache_valid = False
-                break
-                
-        if is_cache_valid:
-            try:
-                with open(cache_path, 'rb') as f:
-                    individuals = pickle.load(f)
-                
-                # Check for deleted files: if a patient is in cache but their file is gone, invalidate
-                current_pids = set(f.replace('.pkl', '').replace('.edf', '') for f in patient_files)
-                cache_invalid = False
-                for ind in individuals:
-                    if ind[0] not in current_pids:
-                        cache_invalid = True
-                        break
-                if not _individuals_have_flip_metadata(individuals):
-                    cache_invalid = True
-                
-                if not cache_invalid:
-                    return individuals
-                else:
-                    if 'st' in globals():
-                        print(f"Cache for {group_name}/{sleep_stage} is stale. Recomputing...")
-            except Exception as e:
-                if 'st' in globals():
-                    st.warning(f"Failed to load cache: {e}. Recomputing...")
 
     if test_run:
         patient_files = patient_files[:10]
-
-    individuals = []
-
-    progress_bar = st.progress(0, text=f"Loading {group_name} / {sleep_stage} patients...")
-    status_text = st.empty()
-    n_files = len(patient_files)
 
     excluded_pids = set()
     excluded_csv = os.path.join(base_path, "excluded_patients.csv")
@@ -1427,35 +1836,193 @@ def get_group_individuals(group_name, sleep_stage, base_path, test_run=False, re
 
     args_list = []
     for f in patient_files:
-        pid = f.replace('.pkl', '').replace('.edf', '')
+        pid = _patient_id_from_pickle_name(f)
         base_pid = pid.split('_')[0]
         if pid not in excluded_pids and base_pid not in excluded_pids:
             args_list.append((os.path.join(group_dir, f), pid, apply_ica, group_name))
 
-    completed = 0
-    max_workers = min(4, os.cpu_count() or 4)  # cap workers to avoid OOM on large pickles
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(_process_patient_worker, a): a[1] for a in args_list}
-        for future in as_completed(futures, timeout=30000):
-            patient_id = futures[future]
-            completed += 1
-            status_text.text(f"Processing {completed}/{n_files}: {patient_id}")
-            progress_bar.progress(completed / n_files, text=f"Loading patients ({completed}/{n_files})")
+    n_jobs = len(args_list)
+    if n_jobs == 0:
+        return []
+
+    cache_filename = _cache_filename_for_individuals(
+        test_run=test_run,
+        apply_ica=apply_ica,
+        min_eeg_channels=min_eeg_channels,
+    )
+    cache_path = os.path.join(group_dir, cache_filename)
+    patient_file_paths = [args[0] for args in args_list]
+    expected_pids = [args[1] for args in args_list]
+    if not recompute_cache:
+        individuals, cache_reason = _load_fresh_individuals_cache(
+            cache_path,
+            patient_file_paths,
+            expected_pids,
+            group_name,
+            sleep_stage,
+        )
+        if individuals is not None:
+            return individuals
+        if min_eeg_channels:
+            print(
+                f"Filtered cache (at least {int(min_eeg_channels)} canonical "
+                "10-20 EEG channels) "
+                f"for {group_name}/{sleep_stage} is {cache_reason}; "
+                "refreshing it from the full cache"
+            )
+        else:
+            print(f"Cache for {group_name}/{sleep_stage} needs recompute: {cache_reason}")
+
+    if min_eeg_channels:
+        # Build the channel-filtered cache from the normal cache. That cache is
+        # itself incremental, so only newly added/changed raw patients need
+        # expensive processing before this inexpensive filtering step.
+        all_individuals = get_group_individuals(
+            group_name,
+            sleep_stage,
+            base_path,
+            test_run=test_run,
+            recompute_cache=False,
+            apply_ica=apply_ica,
+            parallel_workers=parallel_workers,
+            min_eeg_channels=None,
+        )
+        individuals = [
+            ind for ind in all_individuals
+            if ind is not None
+            and len(ind) > 3
+            and ind[3] is not None
+            and _standard_1020_channel_count(ind[3]) >= int(min_eeg_channels)
+        ]
+        filtered_data_needs_write = True
+        if os.path.exists(cache_path):
             try:
-                result = future.result(timeout=12000)
-            except Exception as e:
-                print(f"[Worker] Timeout or error for {patient_id}: {e}")
-                result = None
-            if result is not None:
-                individuals.append(result)
+                with open(cache_path, 'rb') as f:
+                    previous_filtered = pickle.load(f)
+                previous_pids = {ind[0] for ind in previous_filtered if ind is not None}
+                current_pids = {ind[0] for ind in individuals if ind is not None}
+                with open(_individuals_cache_meta_path(cache_path), 'rb') as f:
+                    previous_meta = pickle.load(f)
+                recorded_sources = previous_meta.get('source_files', {}) or {}
+                current_sources_unchanged = all(
+                    recorded_sources.get(os.path.basename(path)) == os.path.getmtime(path)
+                    for path in patient_file_paths
+                )
+                filtered_data_needs_write = not (
+                    previous_pids == current_pids and current_sources_unchanged
+                )
+            except Exception:
+                filtered_data_needs_write = True
+        try:
+            if filtered_data_needs_write:
+                print(
+                    f"Writing {len(individuals)} filtered patient result(s) to "
+                    f"{os.path.basename(cache_path)}..."
+                )
+                _dump_pickle_atomic_with_heartbeat(individuals, cache_path)
+            else:
+                print(
+                    f"Filtered patient data is unchanged; keeping existing "
+                    f"{os.path.basename(cache_path)}"
+                )
+            with open(_individuals_cache_meta_path(cache_path), 'wb') as f:
+                pickle.dump({
+                    'attempted_pids': expected_pids,
+                    'successful_pids': [ind[0] for ind in individuals],
+                    'source_files': {
+                        os.path.basename(path): os.path.getmtime(path)
+                        for path in patient_file_paths
+                    },
+                    'apply_ica': apply_ica,
+                    'test_run': test_run,
+                    'min_eeg_channels': int(min_eeg_channels),
+                    'channel_filter': 'canonical_1020_v1',
+                    'cache_version': HEP_FLIP_CACHE_SUFFIX,
+                }, f)
+            print(
+                f"Saved {len(individuals)} patient(s) with at least "
+                f"{int(min_eeg_channels)} canonical 10-20 EEG channels to "
+                f"{os.path.basename(cache_path)}"
+            )
+        except Exception as e:
+            if 'st' in globals():
+                st.warning(
+                    f"Failed to save channel-filtered cache for "
+                    f"{group_name} / {sleep_stage}: {e}"
+                )
+        return individuals
+
+    individuals = []
+    jobs_to_run = args_list
+    cache_data_changed = True
+    if not recompute_cache:
+        individuals, jobs_to_run, changed_pids, cache_data_changed = _load_incremental_individuals_cache(
+            cache_path, args_list
+        )
+        if individuals or len(jobs_to_run) < n_jobs:
+            new_count = len(jobs_to_run) - len(changed_pids)
+            print(
+                f"Reusing {len(individuals)} cached patient(s) for "
+                f"{group_name}/{sleep_stage}; processing {new_count} new and "
+                f"{len(changed_pids)} changed patient(s)"
+            )
+
+    n_pending = len(jobs_to_run)
+    if n_pending == 0:
+        # The patient set may only have shrunk, so persist the pruned cache and
+        # refreshed metadata below without launching a worker pool.
+        print(f"No new or changed patients to process for {group_name}/{sleep_stage}")
+
+    progress_bar = st.progress(0, text=f"Loading {group_name} / {sleep_stage} patients...")
+    status_text = st.empty()
+
+    completed = 0
+    if n_pending:
+        max_workers = max(1, min(int(parallel_workers), n_pending, os.cpu_count() or 1))
+        status_text.text(f"Starting {n_pending} patient jobs with {max_workers} worker(s)")
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(_process_patient_worker, a): a[1] for a in jobs_to_run}
+            for future in as_completed(futures, timeout=30000):
+                patient_id = futures[future]
+                completed += 1
+                status_text.text(f"Finished {completed}/{n_pending}: {patient_id}")
+                progress_bar.progress(completed / n_pending, text=f"Loading new patients ({completed}/{n_pending})")
+                try:
+                    result = future.result(timeout=12000)
+                except Exception as e:
+                    print(f"[Worker] Timeout or error for {patient_id}: {e}")
+                    result = None
+                if result is not None:
+                    individuals.append(result)
+
+    expected_order = {pid: index for index, pid in enumerate(expected_pids)}
+    individuals.sort(key=lambda ind: expected_order.get(ind[0], len(expected_order)))
 
     progress_bar.empty()
     status_text.empty()
     
     # Save to local cache
     try:
-        with open(cache_path, 'wb') as f:
-            pickle.dump(individuals, f)
+        if cache_data_changed:
+            print(
+                f"Writing {len(individuals)} patient result(s) to "
+                f"{os.path.basename(cache_path)}..."
+            )
+            _dump_pickle_atomic_with_heartbeat(individuals, cache_path)
+        else:
+            print(f"Patient data unchanged; keeping existing {os.path.basename(cache_path)}")
+        with open(_individuals_cache_meta_path(cache_path), 'wb') as f:
+            pickle.dump({
+                'attempted_pids': expected_pids,
+                'successful_pids': [ind[0] for ind in individuals if ind is not None and len(ind) > 0],
+                'source_files': {
+                    os.path.basename(path): os.path.getmtime(path)
+                    for path in patient_file_paths
+                },
+                'apply_ica': apply_ica,
+                'test_run': test_run,
+                'cache_version': HEP_FLIP_CACHE_SUFFIX,
+            }, f)
     except Exception as e:
         if 'st' in globals():
             st.warning(f"Failed to save cache for {group_name} / {sleep_stage}: {e}")
@@ -1463,7 +2030,10 @@ def get_group_individuals(group_name, sleep_stage, base_path, test_run=False, re
     return individuals
 
 
-def get_group_non_eeg_individuals(group_name, sleep_stage, base_path, test_run=False, recompute_cache=False, apply_ica=False):
+def get_group_non_eeg_individuals(
+    group_name, sleep_stage, base_path, test_run=False, recompute_cache=False,
+    apply_ica=False, parallel_workers=DEFAULT_PATIENT_WORKERS,
+):
     """
     Loads all files for a group/sleep_stage and returns ECG-aligned averages
     for non-EEG channels.
@@ -1529,15 +2099,22 @@ def get_group_non_eeg_individuals(group_name, sleep_stage, base_path, test_run=F
         if pid not in excluded_pids and base_pid not in excluded_pids:
             args_list.append((os.path.join(group_dir, f), pid, apply_ica))
 
+    n_jobs = len(args_list)
+    if n_jobs == 0:
+        progress_bar.empty()
+        status_text.empty()
+        return []
+
     completed = 0
-    max_workers = min(4, os.cpu_count() or 4)
+    max_workers = max(1, min(int(parallel_workers), n_jobs, os.cpu_count() or 1))
+    status_text.text(f"Starting {n_jobs} non-EEG patient jobs with {max_workers} worker(s)")
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(_process_non_eeg_patient_worker, a): a[1] for a in args_list}
         for future in as_completed(futures, timeout=30000):
             patient_id = futures[future]
             completed += 1
-            status_text.text(f"Processing {completed}/{n_files}: {patient_id}")
-            progress_bar.progress(completed / n_files, text=f"Loading patients ({completed}/{n_files})")
+            status_text.text(f"Finished {completed}/{n_jobs}: {patient_id}")
+            progress_bar.progress(completed / n_jobs, text=f"Loading patients ({completed}/{n_jobs})")
             try:
                 result = future.result(timeout=12000)
             except Exception as e:
@@ -1803,7 +2380,8 @@ _perm_test_call_count = 0
 
 
 def permutation_two_group_cluster_test(hep_a, hep_b, times, n_permutations=100, p_threshold=0.05, jitter_sec=None,
-                                        label_a="Group A", label_b="Group B", channel_label=None, button_key=None):
+                                        label_a="Group A", label_b="Group B", channel_label=None, button_key=None,
+                                        show_explanation=True):
     """
     Cluster-based permutation test using Pynapple's independent subject jitter.
 
@@ -1811,6 +2389,7 @@ def permutation_two_group_cluster_test(hep_a, hep_b, times, n_permutations=100, 
     times: np.ndarray (n_times)
     label_a, label_b: display names shown in the explanation UI
     button_key: unique Streamlit widget key for the explain button (auto-generated if None)
+    show_explanation: set False for batch calls that should not render Streamlit explanation buttons
     """
     global _perm_test_call_count
     _perm_test_call_count += 1
@@ -1841,12 +2420,13 @@ def permutation_two_group_cluster_test(hep_a, hep_b, times, n_permutations=100, 
     obs_labels, n_clusters = label(obs_mask)
     
     if n_clusters == 0:
-        explain_permutation_test(
-            hep_a, hep_b, times, [], t_obs, cohens_d,
-            label_a=label_a, label_b=label_b,
-            p_threshold=p_threshold, jitter_sec=jitter_sec,
-            null_dist=np.zeros(n_permutations), channel_label=channel_label, button_key=button_key,
-        )
+        if show_explanation:
+            explain_permutation_test(
+                hep_a, hep_b, times, [], t_obs, cohens_d,
+                label_a=label_a, label_b=label_b,
+                p_threshold=p_threshold, jitter_sec=jitter_sec,
+                null_dist=np.zeros(n_permutations), channel_label=channel_label, button_key=button_key,
+            )
         return [], t_obs, cohens_d
 
     obs_cluster_masses = [np.sum(np.abs(t_obs[obs_labels == i + 1])) for i in range(n_clusters)]
@@ -1889,12 +2469,13 @@ def permutation_two_group_cluster_test(hep_a, hep_b, times, n_permutations=100, 
                 'direction': 'A>B' if np.mean(t_obs[indices]) > 0 else 'B>A'
             })
 
-    explain_permutation_test(
-        hep_a, hep_b, times, significant_windows, t_obs, cohens_d,
-        label_a=label_a, label_b=label_b,
-        p_threshold=p_threshold, jitter_sec=jitter_sec,
-        null_dist=null_dist, channel_label=channel_label, button_key=button_key,
-    )
+    if show_explanation:
+        explain_permutation_test(
+            hep_a, hep_b, times, significant_windows, t_obs, cohens_d,
+            label_a=label_a, label_b=label_b,
+            p_threshold=p_threshold, jitter_sec=jitter_sec,
+            null_dist=null_dist, channel_label=channel_label, button_key=button_key,
+        )
     return significant_windows, t_obs, cohens_d
 
 
@@ -1940,36 +2521,35 @@ def explain_permutation_test(
         jitter_sec=jitter_sec,
     )
 
-    # ── Figure 1: Group A spaghetti ──────────────────────────────────────────
-    st.markdown(f"**{label_a}** — individual subject waveforms")
+    # ── Figure 1: Group A median ± MAD ───────────────────────────────────────
+    st.markdown(f"**{label_a}** — median ± MAD")
     fig_a, ax_a = plt.subplots(figsize=(14, 5))
     _render_hep_spaghetti(ax_a, hep_a, times, label_a, "#1f77b4")
     _annotate_sig_windows(ax_a, sig_windows_a)
-    ax_a.set_title(f"{label_a} — HEP (n={hep_a.shape[0]}){ch_suffix}")
+    ax_a.set_title(f"{label_a} - HEP Median +/- MAD (n={hep_a.shape[0]}){ch_suffix}")
     ax_a.legend(loc='upper right', fontsize=7, ncol=3)
     fig_a.tight_layout()
     st.pyplot(fig_a, use_container_width=False)
     plt.close(fig_a)
 
-    # ── Figure 2: Group B spaghetti ──────────────────────────────────────────
-    st.markdown(f"**{label_b}** — individual subject waveforms")
+    # ── Figure 2: Group B median ± MAD ───────────────────────────────────────
+    st.markdown(f"**{label_b}** — median ± MAD")
     fig_b, ax_b = plt.subplots(figsize=(14, 5))
     _render_hep_spaghetti(ax_b, hep_b, times, label_b, "#d62728")
     _annotate_sig_windows(ax_b, sig_windows_b)
-    ax_b.set_title(f"{label_b} — HEP (n={hep_b.shape[0]}){ch_suffix}")
+    ax_b.set_title(f"{label_b} - HEP Median +/- MAD (n={hep_b.shape[0]}){ch_suffix}")
     ax_b.legend(loc='upper right', fontsize=7, ncol=3)
     fig_b.tight_layout()
     st.pyplot(fig_b, use_container_width=False)
     plt.close(fig_b)
 
-    # ── Figure 3: Combined — mean ± SEM for both groups ──────────────────────
-    st.markdown("**Both groups combined** — mean ± SEM")
+    # ── Figure 3: Combined — median ± MAD for both groups ────────────────────
+    st.markdown("**Both groups combined** — median ± MAD")
     fig_c, ax_c = plt.subplots(figsize=(14, 5))
     for _data, _lbl, _col in [(hep_a, label_a, "#1f77b4"), (hep_b, label_b, "#d62728")]:
-        _mu = np.nanmean(_data, axis=0) * 1e6
-        _sem = stats.sem(_data, axis=0) * 1e6
-        ax_c.plot(times, _mu, color=_col, linewidth=2.5, label=f"{_lbl} (n={_data.shape[0]})")
-        ax_c.fill_between(times, _mu - _sem, _mu + _sem, color=_col, alpha=0.2)
+        _med, _mad = median_and_mad(_data * 1e6, axis=0)
+        ax_c.plot(times, _med, color=_col, linewidth=2.5, label=f"{_lbl} (n={_data.shape[0]})")
+        ax_c.fill_between(times, _med - _mad, _med + _mad, color=_col, alpha=0.2)
     for _win in (significant_windows or []):
         ax_c.axvspan(_win['start'], _win['end'], color='orange', alpha=0.28,
                      label=f"p={_win['p_value']:.3f}")
@@ -1977,7 +2557,7 @@ def explain_permutation_test(
     ax_c.axvline(0, color='gray', linewidth=0.6, linestyle=':')
     ax_c.set_ylabel('Amplitude (µV)')
     ax_c.set_xlabel('Time (s)')
-    ax_c.set_title(f"Both groups — mean ± SEM{ch_suffix}")
+    ax_c.set_title(f"Both groups - HEP Median +/- MAD{ch_suffix}")
     ax_c.legend(loc='upper right', fontsize=9)
     fig_c.tight_layout()
     st.pyplot(fig_c, use_container_width=False)
@@ -2076,8 +2656,10 @@ def finalize_plot(fig, ax, title, avg_hep=None, times=None, n_subjects=None, sig
             pass
 
     full_title = title
+    if mad_hep is not None and "MAD" not in full_title.upper():
+        full_title = f"{full_title} | Median +/- MAD"
     if stats_parts:
-        full_title = f"{title}\n({', '.join(stats_parts)})"
+        full_title = f"{full_title}\n({', '.join(stats_parts)})"
 
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Amplitude (μV)")
@@ -2124,6 +2706,14 @@ def scale_matrix(matrix, use_zscore):
     if use_zscore:
         return zscore_per_subject(matrix)
     return matrix * 1e6
+
+
+def median_and_mad(matrix, axis=0):
+    """Return nan-median and median absolute deviation along axis."""
+    arr = np.asarray(matrix, dtype=float)
+    med = np.nanmedian(arr, axis=axis)
+    mad = np.nanmedian(np.abs(arr - np.expand_dims(med, axis=axis)), axis=axis)
+    return med, mad
 
 
 def summarize_channels_without_reference_cancellation(channel_matrix, cancellation_ratio=0.05):
@@ -2285,6 +2875,90 @@ def _render_pval_topomap(p_vals, ax_t, title):
     _cb.set_label("p-value")
     ax_t.set_title(title)
     return _im
+
+
+def _to_montage_channel_name(ch_name, montage):
+    """Return the montage spelling for a channel name, including old temporal aliases."""
+    if ch_name is None:
+        return None
+
+    aliases = {
+        'T3': 'T7',
+        'T4': 'T8',
+        'T5': 'P7',
+        'T6': 'P8',
+    }
+    mont_upper = {ch.upper(): ch for ch in montage.ch_names}
+    ch_upper = str(ch_name).upper()
+    ch_upper = aliases.get(ch_upper, ch_upper)
+    return mont_upper.get(ch_upper)
+
+
+def _render_existing_channel_pval_topomap(
+    p_vals, ax_t, title, p_threshold=0.05, show_names=True
+):
+    """
+    Plot a p-value topomap using only channels supplied in p_vals.
+    Unlike _render_pval_topomap, this does not pad missing electrodes, so labels
+    are shown only for electrodes that actually exist in that group.
+    """
+    montage = mne.channels.make_standard_montage('standard_1020')
+    plotted_names = []
+    display_names = []
+    plotted_pvals = []
+
+    for ch, p_val in p_vals.items():
+        mont_name = _to_montage_channel_name(ch, montage)
+        if mont_name is None or mont_name in plotted_names:
+            continue
+        plotted_names.append(mont_name)
+        display_names.append(str(ch))
+        plotted_pvals.append(float(p_val) if np.isfinite(p_val) else 1.0)
+
+    if len(plotted_names) < 4:
+        ax_t.set_title(title)
+        ax_t.text(
+            0.5, 0.5, "Too few montage electrodes",
+            ha='center', va='center', transform=ax_t.transAxes, color='gray'
+        )
+        ax_t.axis('off')
+        return None
+
+    info = mne.create_info(ch_names=plotted_names, sfreq=250., ch_types='eeg')
+    info.set_montage(montage, on_missing='ignore')
+    valid = np.array([
+        not np.any(np.isnan(ch['loc'][:3])) and np.any(ch['loc'][:3] != 0)
+        for ch in info['chs']
+    ])
+    if np.sum(valid) < 4:
+        ax_t.set_title(title)
+        ax_t.text(
+            0.5, 0.5, "Too few valid montage positions",
+            ha='center', va='center', transform=ax_t.transAxes, color='gray'
+        )
+        ax_t.axis('off')
+        return None
+
+    names_valid = [display_names[i] for i in np.where(valid)[0]]
+    data = np.clip(np.asarray(plotted_pvals, dtype=float)[valid], 0, p_threshold)
+    info = mne.pick_info(info, np.where(valid)[0])
+    names_arg = names_valid if show_names else None
+
+    res = mne.viz.plot_topomap(
+        data,
+        info,
+        axes=ax_t,
+        cmap='Reds_r',
+        names=names_arg,
+        vlim=(0, p_threshold),
+        extrapolate='head',
+        show=False,
+    )
+    im = res[0] if isinstance(res, tuple) else res
+    cb = plt.colorbar(im, ax=ax_t)
+    cb.set_label("p-value")
+    ax_t.set_title(title)
+    return im
 
 
 def _get_common_channels(individuals):
@@ -2459,7 +3133,7 @@ def _compute_two_group_channel_pvals(individuals_a, individuals_b, n_permutation
 
 
 def _render_hep_spaghetti(ax, hep_matrix, times, label, color, pids=None):
-    """Plot per-subject HEP spaghetti traces + group mean on ax.
+    """Plot group median ± MAD HEP trace on ax.
 
     Parameters
     ----------
@@ -2471,15 +3145,11 @@ def _render_hep_spaghetti(ax, hep_matrix, times, label, color, pids=None):
     pids       : list[str] | None — optional per-subject labels (used for legends)
     """
     n_subj = hep_matrix.shape[0]
-    _cmap = plt.get_cmap('tab20' if n_subj <= 20 else 'hsv', max(n_subj, 1))
-    _subj_colors = [_cmap(i / max(n_subj - 1, 1)) for i in range(n_subj)]
-    for i, _hep in enumerate(hep_matrix):
-        _pid = pids[i] if pids is not None and i < len(pids) else None
-        ax.plot(times, _hep * 1e6, color=_subj_colors[i], alpha=0.4, linewidth=1,
-                label=_pid if _pid else '_nolegend_')
-    _mean_hep = np.nanmean(hep_matrix, axis=0) * 1e6
-    ax.plot(times, _mean_hep, color=color, linewidth=2.5,
-            label=f'Mean {label} (n={n_subj})', zorder=5)
+    med_hep, mad_hep = median_and_mad(hep_matrix * 1e6, axis=0)
+    ax.plot(times, med_hep, color=color, linewidth=2.5,
+            label=f'Median {label} (n={n_subj})', zorder=5)
+    ax.fill_between(times, med_hep - mad_hep, med_hep + mad_hep,
+                    color=color, alpha=0.20, label='± MAD')
     ax.axhline(0, color='black', linewidth=0.6, linestyle='--')
     ax.axvline(0, color='gray', linewidth=0.6, linestyle=':')
     ax.set_ylabel('Amplitude (µV)')
@@ -2658,9 +3328,9 @@ def _plot_per_electrode_circular_summary(
         t_el = np.array([])
         if channel_data and ch in channel_data:
             ca, cb, t_el = channel_data[ch]
-            mean_a = np.nanmean(ca, axis=0)
-            mean_b = np.nanmean(cb, axis=0)
-            diff = mean_a - mean_b
+            med_a = np.nanmedian(ca, axis=0)
+            med_b = np.nanmedian(cb, axis=0)
+            diff = med_a - med_b
 
         sig_wins = (sig_windows_per_ch or {}).get(ch, [])
 
@@ -2778,7 +3448,7 @@ def run_compare_groups_analysis(base_path, selected_stage):
     Logic for Comparing Groups mode.
     Plots a publication-ready, statistically annotated comparison of the HEP
     (Heartbeat-Evoked Potential) between all available groups, showing:
-      1. Grand average waveforms + SEM ribbons per group
+      1. Group median waveforms + MAD ribbons per group
       2. Difference waveform + cluster-permutation significance + Cohen's d (if 2 groups)
       3. Channel x time heatmap of mean group difference
       4. Summary statistics table
@@ -2789,7 +3459,7 @@ def run_compare_groups_analysis(base_path, selected_stage):
         return
 
     # ── Group selection ──────────────────────────────────────────────────────
-    default_groups = [g for g in ['EDF', 'Berkeley_data'] if g in available_groups] or available_groups[:2]
+    default_groups = default_hep_groups(available_groups)
     selected_groups = st.multiselect(
         "Select Groups to Compare",
         options=available_groups,
@@ -2802,7 +3472,7 @@ def run_compare_groups_analysis(base_path, selected_stage):
 
     # ── UI controls ─────────────────────────────────────────────────────────
     with st.expander("⚙️ Group Comparison Settings", expanded=True):
-        col1, col2, col3, col4, col5, col6 = st.columns(6)
+        col1, col2, col3, col4, col5, col6, col7 = st.columns(7)
         with col1:
             if st.runtime.exists():
                 test_run = st.checkbox("Test Run (5 files/group)", value=False, key="cmp_test_run")
@@ -2819,6 +3489,16 @@ def run_compare_groups_analysis(base_path, selected_stage):
             apply_ica = st.checkbox("Apply ICA", value=True, key="cmp_apply_ica",
                                     help="Apply ICA to remove ECG artifact components from EEG channels.")
         with col6:
+            parallel_workers = st.number_input(
+                "Patient workers",
+                min_value=1,
+                max_value=max(1, os.cpu_count() or 1),
+                value=DEFAULT_PATIENT_WORKERS,
+                step=1,
+                key="cmp_patient_workers",
+                help="Number of patients processed in parallel. Lower this if memory runs out.",
+            )
+        with col7:
             recompute_cache = st.button("Recompute Cache", key="cmp_recompute_cache",
                                         help="Force reprocessing of all patient data, ignoring disk cache.")
     amp_ylabel = "Amplitude (Z-score)" if use_zscore else "Amplitude (µV)"
@@ -2832,7 +3512,12 @@ def run_compare_groups_analysis(base_path, selected_stage):
     group_individuals = {}   # group -> list of individual tuples
     for group in selected_groups:
         with st.spinner(f"Loading {group}…"):
-            inds = get_group_individuals(group, selected_stage, base_path, test_run=test_run, apply_ica=apply_ica, recompute_cache=recompute_cache)
+            inds = get_group_individuals(
+                group, selected_stage, base_path,
+                test_run=test_run, apply_ica=apply_ica,
+                recompute_cache=recompute_cache,
+                parallel_workers=parallel_workers,
+            )
             
         if inds:
             # Filter out globally excluded patients by checking if the base patient ID is in the excluded list
@@ -2851,6 +3536,52 @@ def run_compare_groups_analysis(base_path, selected_stage):
 
     groups_with_data = list(group_individuals.keys())
     n_groups = len(groups_with_data)
+    # unique patient ids per group (each individual tuple is (patient_id, ...))
+    _group_n_labels = {
+        g: f"{g} (n={len(set(ind[0] for ind in inds))})"
+        for g, inds in group_individuals.items()
+    }
+    groups_label = " vs ".join(_group_n_labels[g] for g in groups_with_data) if len(groups_with_data) == 2 \
+        else ", ".join(_group_n_labels[g] for g in groups_with_data)
+
+    def _comparison_title(plot_name, extra=None):
+        parts = [plot_name, f"Stage: {selected_stage}", f"Groups: {groups_label}"]
+        if extra:
+            parts.append(extra)
+        return " | ".join(parts)
+
+    def _safe_csv_filename(name):
+        safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(name)).strip("_")
+        return f"{safe}.csv"
+
+    def _append_median_trace_row(rows, plot_name, scope, group, matrix, times_vec):
+        if matrix is None or times_vec is None:
+            return
+        arr = np.asarray(matrix, dtype=float)
+        t = np.asarray(times_vec, dtype=float)
+        if arr.ndim != 2 or arr.shape[0] == 0 or len(t) == 0:
+            return
+        min_len = min(arr.shape[1], len(t))
+        if min_len == 0:
+            return
+        median_trace, _ = median_and_mad(arr[:, :min_len], axis=0)
+        row = {
+            "plot": plot_name,
+            "scope": scope,
+            "stage": selected_stage,
+            "groups": groups_label,
+            "group": group,
+            "statistic": "median",
+            "shaded_band": "MAD",
+            "n": arr.shape[0],
+            "unit": "Z-score" if use_zscore else "uV",
+        }
+        for time_val, amp_val in zip(t[:min_len], median_trace):
+            row[f"t={time_val:.6f}s"] = amp_val
+        rows.append(row)
+
+    def _median_trace_rows_to_csv(rows):
+        return pd.DataFrame(rows).to_csv(index=False).encode("utf-8")
 
     # ── Identify common EEG channels across all groups ───────────────────────
     # Same logic as Per-Channel Analysis: ≥50% of subjects, 1-2 letter prefix
@@ -2949,23 +3680,17 @@ def run_compare_groups_analysis(base_path, selected_stage):
             min_len = min(len(tr) for tr in traces)
             t_ecg = ecg_times_ref[:min_len]
             traces_arr = np.array([tr[:min_len] for tr in traces])   # (n_subj, n_times)
-            avg_ecg = np.nanmean(traces_arr, axis=0)
-            sem_ecg = np.nanstd(traces_arr, axis=0, ddof=1) / np.sqrt(len(traces))
+            med_ecg, mad_ecg = median_and_mad(traces_arr, axis=0)
 
-            # Faint individual lines
-            for tr in traces_arr:
-                ax_ecg_cmp.plot(t_ecg, tr, color=color, linewidth=0.6, alpha=0.18)
-
-            # Bold group average + SEM ribbon
-            ax_ecg_cmp.plot(t_ecg, avg_ecg, color=color, linewidth=2.5,
+            ax_ecg_cmp.plot(t_ecg, med_ecg, color=color, linewidth=2.5,
                             label=f"{group}  (n={len(traces)})")
-            ax_ecg_cmp.fill_between(t_ecg, avg_ecg - sem_ecg, avg_ecg + sem_ecg,
+            ax_ecg_cmp.fill_between(t_ecg, med_ecg - mad_ecg, med_ecg + mad_ecg,
                                     color=color, alpha=0.22)
 
         ax_ecg_cmp.set_xlabel("Time relative to R-peak (s)", fontsize=12)
         ax_ecg_cmp.set_ylabel("Amplitude (µV)", fontsize=12)
         ax_ecg_cmp.set_title(
-            f"ECG Grand Average Comparison — Sleep Stage: {selected_stage}",
+            _comparison_title("ECG Median +/- MAD Comparison"),
             fontsize=14, fontweight='bold'
         )
         ax_ecg_cmp.legend(fontsize=11)
@@ -2979,11 +3704,11 @@ def run_compare_groups_analysis(base_path, selected_stage):
 
     st.markdown("---")
     # ═══════════════════════════════════════════════════════════════════════
-    # PLOT 1b — Grand Average + Individual Subject Lines (Spaghetti Plot)
+    # PLOT 1b — Group Median + Median Absolute Deviation
     # Shows two figures: before and after ECG regression (matching the
     # "Group HEP Analysis > Per-Channel Analysis > Average" method).
     # ═══════════════════════════════════════════════════════════════════════
-    st.subheader("📈 Grand Average HEP per Group — with Individual Subjects")
+    st.subheader("📈 Median HEP per Group")
 
     # Always use non-ICA individuals for these plots; ECG regression (the
     # same method as Per-Channel Analysis) is applied post-hoc on epochs.
@@ -2996,6 +3721,7 @@ def run_compare_groups_analysis(base_path, selected_stage):
                 inds_raw = get_group_individuals(
                     group, selected_stage, base_path,
                     test_run=test_run, apply_ica=False, recompute_cache=recompute_cache,
+                    parallel_workers=parallel_workers,
                 )
             filtered = filter_excluded(inds_raw, global_excluded_pids) if inds_raw else []
             if filtered:
@@ -3102,9 +3828,134 @@ def run_compare_groups_analysis(base_path, selected_stage):
         if g in active_group_hep_matrix and g in active_group_times
     ]
 
+    # ── Per-selected-group significant topomaps ──────────────────────────
+    # These maps intentionally use each group's own electrode set, not the
+    # cross-group common_channels list, so groups with different montages keep
+    # only their real electrode labels.
+    st.markdown("---")
+    st.subheader("Significant Brain Maps per Selected Group")
+    st.caption(
+        "Each figure is computed against zero for one selected group using the same ECG-regressed "
+        "per-channel traces and full-epoch minimum cluster p-value logic as the Significant Channels Topomap. "
+        "Only electrodes that exist in that group are labeled."
+    )
+
+    def _build_group_specific_channel_matrix(inds):
+        candidate_channels = identify_common_eeg_channels(inds or [])
+        montage = mne.channels.make_standard_montage('standard_1020')
+        candidate_channels = [
+            ch for ch in candidate_channels
+            if _to_montage_channel_name(ch, montage) is not None
+            and not any(x in str(ch).lower() for x in ['ecg', 'ekg', 'eog', 'emg', 'resp'])
+        ]
+        channel_rows = {ch: [] for ch in candidate_channels}
+        times_ref = None
+        for ind in inds or []:
+            hep_data, ind_times, ch_names = ind[1], ind[2], ind[3]
+            ecg_hep = ind[5] if len(ind) > 5 else None
+            if hep_data is None or ind_times is None or ch_names is None:
+                continue
+            if times_ref is None:
+                times_ref = np.asarray(ind_times, dtype=float)
+            hep_clean = apply_ecg_regression(np.asarray(hep_data, dtype=float), ecg_hep)
+            for ch in candidate_channels:
+                if ch in ch_names:
+                    channel_rows[ch].append(np.asarray(hep_clean[ch_names.index(ch)], dtype=float))
+
+        channel_matrix = {}
+        for ch, rows in channel_rows.items():
+            if len(rows) < 3:
+                continue
+            min_len = min(len(row) for row in rows)
+            if min_len <= 1:
+                continue
+            channel_matrix[ch] = scale_matrix(
+                np.asarray([row[:min_len] for row in rows], dtype=float),
+                use_zscore,
+            )
+        return channel_matrix, times_ref
+
+    with st.spinner("Computing per-group significant brain maps..."):
+        group_topomap_results = {}
+        for group in groups_with_data:
+            group_inds_for_map = group_individuals_for_1b.get(group, group_individuals.get(group, []))
+            n_group_patients = len(group_inds_for_map)
+            ch_matrix, t_ref = _build_group_specific_channel_matrix(group_inds_for_map)
+            if not ch_matrix or t_ref is None:
+                group_topomap_results[group] = None
+                continue
+
+            pvals = {}
+            n_by_ch = {}
+            for ch, mat in ch_matrix.items():
+                min_len = min(mat.shape[1], len(t_ref))
+                t_use = t_ref[:min_len]
+                mat_use = mat[:, :min_len]
+                if mat_use.shape[0] < 3 or mat_use.shape[1] < 2:
+                    continue
+                try:
+                    sig_windows, _, _ = permutation_cluster_jitter_test(
+                        mat_use,
+                        t_use,
+                        n_permutations=100,
+                        p_threshold=0.05,
+                        jitter_sec=jitter_sec,
+                    )
+                    pvals[ch] = min((w['p_value'] for w in sig_windows), default=1.0)
+                    n_by_ch[ch] = mat_use.shape[0]
+                except Exception:
+                    pvals[ch] = 1.0
+                    n_by_ch[ch] = mat_use.shape[0]
+            group_topomap_results[group] = (pvals, n_by_ch, n_group_patients)
+
+    for group in groups_with_data:
+        result = group_topomap_results.get(group)
+        if not result:
+            st.info(f"{group}: no montage-compatible common electrodes with at least 3 subjects.")
+            continue
+        pvals, n_by_ch, n_group_patients = result
+        if not pvals:
+            st.info(f"{group}: no electrodes available for full-epoch cluster testing.")
+            continue
+
+        sig_channels = [ch for ch, p_val in pvals.items() if p_val < 0.05]
+        title = (
+            f"{group} | {selected_stage} | full epoch minimum cluster p-value | "
+            f"{len(sig_channels)}/{len(pvals)} sig. electrodes | N={n_group_patients}"
+        )
+        fig_group_topo, ax_group_topo = plt.subplots(figsize=(5.5, 4.5))
+        ok_group_topo = _render_existing_channel_pval_topomap(
+            pvals,
+            ax_group_topo,
+            title,
+            p_threshold=0.05,
+            show_names=True,
+        )
+        if ok_group_topo is not None:
+            fig_group_topo.tight_layout()
+            st.pyplot(fig_group_topo, use_container_width=False)
+        else:
+            st.warning(f"{group}: could not match channels to standard 10-20 montage.")
+        plt.close(fig_group_topo)
+
+        if sig_channels:
+            sig_rows = [
+                {
+                    "Electrode": ch,
+                    "N": n_by_ch.get(ch, ""),
+                    "p-value": "<0.001" if pvals[ch] < 0.001 else f"{pvals[ch]:.3f}",
+                }
+                for ch in sorted(sig_channels, key=lambda c: pvals[c])
+            ]
+            with st.expander(f"{group}: significant electrodes", expanded=False):
+                st.dataframe(pd.DataFrame(sig_rows), use_container_width=True)
+        else:
+            st.info(f"{group}: no significant electrodes across the full epoch (p < 0.05).")
+
     # ── Render helper ────────────────────────────────────────────────────
-    def _render_spaghetti(mat_dict, times_dict, title_suffix):
+    def _render_spaghetti(mat_dict, times_dict, title_suffix, mark_ica_cleaned=True):
         fig, ax = plt.subplots(figsize=(14, 5))
+        fig._skip_ica_cleaned_title = not mark_ica_cleaned
         ax.axvline(0, color='red', linestyle='--', alpha=0.6, label='R-peak (t=0)')
         ax.axhline(0, color='black', linewidth=0.5, alpha=0.3)
         for grp in groups_with_data:
@@ -3113,15 +3964,15 @@ def run_compare_groups_analysis(base_path, selected_stage):
             mat = mat_dict[grp]
             t = times_dict[grp]
             n_subj = mat.shape[0]
-            grand_avg = np.nanmean(mat, axis=0)
+            median_hep, mad_hep = median_and_mad(mat, axis=0)
             color = group_color[grp]
-            for i in range(n_subj):
-                ax.plot(t, mat[i], color=color, linewidth=0.6, alpha=0.2)
-            ax.plot(t, grand_avg, color=color, linewidth=2.5, label=f"{grp}  (n={n_subj})")
+            ax.plot(t, median_hep, color=color, linewidth=2.5, label=f"{grp}  (n={n_subj})")
+            ax.fill_between(t, median_hep - mad_hep, median_hep + mad_hep,
+                            color=color, alpha=0.20)
         ax.set_xlabel("Time relative to R-peak (s)", fontsize=12)
         ax.set_ylabel(amp_ylabel, fontsize=12)
         ax.set_title(
-            f"HEP Grand Average + Individual Subjects {title_suffix} — Sleep Stage: {selected_stage}",
+            _comparison_title("HEP Median +/- MAD", title_suffix),
             fontsize=14, fontweight='bold',
         )
         ax.legend(fontsize=11)
@@ -3136,8 +3987,8 @@ def run_compare_groups_analysis(base_path, selected_stage):
         st.pyplot(fig, use_container_width=True)
         plt.close(fig)
 
-    _render_spaghetti(group_hep_matrix_raw, group_times_raw, "(Raw / loaded data)")
-    _render_spaghetti(group_hep_matrix_ica, group_times_ica, "(ECG regression comparison)")
+    _render_spaghetti(group_hep_matrix_raw, group_times_raw, "(Raw / loaded data)", mark_ica_cleaned=False)
+    _render_spaghetti(group_hep_matrix_ica, group_times_ica, "(ECG regression comparison)", mark_ica_cleaned=True)
 
     # ═══════════════════════════════════════════════════════════════════════
     # PLOT 1c — Hemisphere Comparison: Left vs Right electrodes
@@ -3168,15 +4019,14 @@ def run_compare_groups_analysis(base_path, selected_stage):
                     side_avg = side_mat_dict[group]
                     t = side_times_dict[group]
                     n_subj = side_avg.shape[0]
-                    grand = np.nanmean(side_avg, axis=0)
-                    sem = np.nanstd(side_avg, axis=0, ddof=1) / np.sqrt(n_subj)
+                    grand, mad = median_and_mad(side_avg, axis=0)
                     color = group_color[group]
                     ax.plot(t, grand, color=color, linewidth=2.5,
                             label=f"{group}  (n={n_subj})")
-                    ax.fill_between(t, grand - sem, grand + sem,
+                    ax.fill_between(t, grand - mad, grand + mad,
                                     color=color, alpha=0.18)
 
-                ax.set_title(f"{side_label}\n({', '.join(side_chs)})",
+                ax.set_title(f"{side_label} - Median +/- MAD\n({', '.join(side_chs)})",
                              fontsize=12, fontweight='bold')
                 ax.set_xlabel("Time relative to R-peak (s)", fontsize=11)
                 ax.grid(True, alpha=0.25)
@@ -3190,7 +4040,7 @@ def run_compare_groups_analysis(base_path, selected_stage):
 
             ax_L.set_ylabel(amp_ylabel, fontsize=11)
             fig1c.suptitle(
-                f"Left vs Right Hemisphere HEP — Sleep Stage: {selected_stage}",
+                _comparison_title("Left vs Right Hemisphere HEP Median +/- MAD"),
                 fontsize=14, fontweight='bold'
             )
             fig1c.tight_layout()
@@ -3235,18 +4085,15 @@ def run_compare_groups_analysis(base_path, selected_stage):
             sharex=True
         )
 
-        # -- Top panel: group means + difference curve ----------------------
-        mean_a = np.nanmean(hep_a, 0)
-        mean_b = np.nanmean(hep_b, 0)
-        diff   = mean_a - mean_b
+        # -- Top panel: group medians + difference curve --------------------
+        med_a, mad_a = median_and_mad(hep_a, axis=0)
+        med_b, mad_b = median_and_mad(hep_b, axis=0)
+        diff = med_a - med_b
 
-        sem_a = np.nanstd(hep_a, 0, ddof=1) / np.sqrt(hep_a.shape[0])
-        sem_b = np.nanstd(hep_b, 0, ddof=1) / np.sqrt(hep_b.shape[0])
-
-        ax_diff.plot(t_common, mean_a, color=group_color[g_a], linewidth=2, label=f"{g_a} mean")
-        ax_diff.fill_between(t_common, mean_a - sem_a, mean_a + sem_a, color=group_color[g_a], alpha=0.15)
-        ax_diff.plot(t_common, mean_b, color=group_color[g_b], linewidth=2, label=f"{g_b} mean")
-        ax_diff.fill_between(t_common, mean_b - sem_b, mean_b + sem_b, color=group_color[g_b], alpha=0.15)
+        ax_diff.plot(t_common, med_a, color=group_color[g_a], linewidth=2, label=f"{g_a} median")
+        ax_diff.fill_between(t_common, med_a - mad_a, med_a + mad_a, color=group_color[g_a], alpha=0.15)
+        ax_diff.plot(t_common, med_b, color=group_color[g_b], linewidth=2, label=f"{g_b} median")
+        ax_diff.fill_between(t_common, med_b - mad_b, med_b + mad_b, color=group_color[g_b], alpha=0.15)
         ax_diff.plot(t_common, diff, color='black', linewidth=1.5, linestyle='--', label=f"{g_a}−{g_b} diff")
         ax_diff.axhline(0, color='black', linewidth=0.4, alpha=0.3)
         ax_diff.axvline(0, color='red', linestyle='--', alpha=0.5)
@@ -3273,7 +4120,10 @@ def run_compare_groups_analysis(base_path, selected_stage):
         else:
             p_tag = 'p=n.s.'
         ax_diff.set_title(
-            f"{g_a} vs {g_b}  |  n={hep_a.shape[0]}+{hep_b.shape[0]}  |  {p_tag}  |  permutations={n_permutations}",
+            _comparison_title(
+                "Average HEP Group Difference - Median +/- MAD",
+                f"n={hep_a.shape[0]}+{hep_b.shape[0]} | {p_tag} | permutations={n_permutations}",
+            ),
             fontsize=13, fontweight='bold'
         )
         ax_diff.legend(fontsize=10)
@@ -3375,18 +4225,16 @@ def run_compare_groups_analysis(base_path, selected_stage):
                     sharex=True
                 )
 
-                mean_ha = np.nanmean(hem_a, 0)
-                mean_hb = np.nanmean(hem_b, 0)
-                diff_h  = mean_ha - mean_hb
-                sem_ha = np.nanstd(hem_a, 0, ddof=1) / np.sqrt(hem_a.shape[0])
-                sem_hb = np.nanstd(hem_b, 0, ddof=1) / np.sqrt(hem_b.shape[0])
+                med_ha, mad_ha = median_and_mad(hem_a, axis=0)
+                med_hb, mad_hb = median_and_mad(hem_b, axis=0)
+                diff_h = med_ha - med_hb
 
                 ax_hem_diff.axvline(0, color='red', linestyle='--', alpha=0.5)
                 ax_hem_diff.axhline(0, color='black', linewidth=0.4, alpha=0.3)
-                ax_hem_diff.plot(t_h, mean_ha, color=group_color[g_a], linewidth=2, label=f"{g_a} mean")
-                ax_hem_diff.fill_between(t_h, mean_ha - sem_ha, mean_ha + sem_ha, color=group_color[g_a], alpha=0.15)
-                ax_hem_diff.plot(t_h, mean_hb, color=group_color[g_b], linewidth=2, label=f"{g_b} mean")
-                ax_hem_diff.fill_between(t_h, mean_hb - sem_hb, mean_hb + sem_hb, color=group_color[g_b], alpha=0.15)
+                ax_hem_diff.plot(t_h, med_ha, color=group_color[g_a], linewidth=2, label=f"{g_a} median")
+                ax_hem_diff.fill_between(t_h, med_ha - mad_ha, med_ha + mad_ha, color=group_color[g_a], alpha=0.15)
+                ax_hem_diff.plot(t_h, med_hb, color=group_color[g_b], linewidth=2, label=f"{g_b} median")
+                ax_hem_diff.fill_between(t_h, med_hb - mad_hb, med_hb + mad_hb, color=group_color[g_b], alpha=0.15)
                 ax_hem_diff.plot(t_h, diff_h, color='black', linewidth=1.5, linestyle='--', label=f"{g_a}−{g_b} diff")
 
                 for win in sig_hem:
@@ -3405,7 +4253,10 @@ def run_compare_groups_analysis(base_path, selected_stage):
                 p_tag_h = ('p<0.001' if min(w['p_value'] for w in sig_hem) < 0.001
                            else f"p={min(w['p_value'] for w in sig_hem):.3f}") if sig_hem else 'p=n.s.'
                 ax_hem_diff.set_title(
-                    f"{side_label} — {g_a} vs {g_b}  |  n={hem_a.shape[0]}+{hem_b.shape[0]}  |  {p_tag_h}",
+                    _comparison_title(
+                        f"{side_label} Group Difference - Median +/- MAD",
+                        f"n={hem_a.shape[0]}+{hem_b.shape[0]} | {p_tag_h}",
+                    ),
                     fontsize=13, fontweight='bold'
                 )
                 ax_hem_diff.set_ylabel(amp_ylabel, fontsize=11)
@@ -3431,6 +4282,35 @@ def run_compare_groups_analysis(base_path, selected_stage):
                 st.pyplot(fig_hem, use_container_width=True)
                 plt.close(fig_hem)
 
+                side_key = side_label.lower().replace(" ", "_")
+                hem_csv_rows = []
+                _append_median_trace_row(
+                    hem_csv_rows,
+                    "Hemisphere Group Difference",
+                    side_label,
+                    g_a,
+                    hem_a,
+                    t_h,
+                )
+                _append_median_trace_row(
+                    hem_csv_rows,
+                    "Hemisphere Group Difference",
+                    side_label,
+                    g_b,
+                    hem_b,
+                    t_h,
+                )
+                if hem_csv_rows:
+                    st.download_button(
+                        label=f"Download {side_label} median traces CSV",
+                        data=_median_trace_rows_to_csv(hem_csv_rows),
+                        file_name=_safe_csv_filename(
+                            f"hemisphere_group_difference_{selected_stage}_{side_key}_{g_a}_vs_{g_b}"
+                        ),
+                        mime="text/csv",
+                        key=f"download_hemisphere_median_{selected_stage}_{side_key}_{g_a}_{g_b}",
+                    )
+
                 if sig_hem:
                     rows_h = []
                     for win in sig_hem:
@@ -3445,8 +4325,6 @@ def run_compare_groups_analysis(base_path, selected_stage):
                     st.dataframe(pd.DataFrame(rows_h), use_container_width=True)
                 else:
                     st.info(f"No significant windows in {side_label} (p > 0.05).")
-
-                side_key = side_label.lower().replace(" ", "_")
         else:
             st.info("Per-hemisphere analysis requires per-channel data.")
 
@@ -3455,7 +4333,7 @@ def run_compare_groups_analysis(base_path, selected_stage):
         st.subheader(f"📡 Per-Electrode Statistical Comparison: {g_a} vs {g_b}")
         with st.expander("ℹ️ About Per-Electrode Comparison", expanded=False):
             st.markdown(
-                "Each subplot shows group means ± SEM for one EEG channel. "
+                "Each subplot shows group medians ± MAD for one EEG channel. "
                 "Orange spans mark cluster-permutation significant windows."
             )
 
@@ -3501,20 +4379,18 @@ def run_compare_groups_analysis(base_path, selected_stage):
 
                 per_ch_save[ch] = (ca, cb, t_el)
 
-                mean_ca = np.nanmean(ca, 0)
-                mean_cb = np.nanmean(cb, 0)
-                sem_ca  = np.nanstd(ca, 0, ddof=1) / np.sqrt(ca.shape[0])
-                sem_cb  = np.nanstd(cb, 0, ddof=1) / np.sqrt(cb.shape[0])
+                med_ca, mad_ca = median_and_mad(ca, axis=0)
+                med_cb, mad_cb = median_and_mad(cb, axis=0)
 
                 ax_el.axvline(0, color='red', linestyle='--', alpha=0.5, linewidth=0.8)
                 ax_el.axhline(0, color='black', linewidth=0.3, alpha=0.3)
-                ax_el.plot(t_el, mean_ca, color=group_color[g_a], linewidth=1.5,
+                ax_el.plot(t_el, med_ca, color=group_color[g_a], linewidth=1.5,
                            label=f"{g_a} (n={ca.shape[0]})")
-                ax_el.fill_between(t_el, mean_ca - sem_ca, mean_ca + sem_ca,
+                ax_el.fill_between(t_el, med_ca - mad_ca, med_ca + mad_ca,
                                    color=group_color[g_a], alpha=0.18)
-                ax_el.plot(t_el, mean_cb, color=group_color[g_b], linewidth=1.5,
+                ax_el.plot(t_el, med_cb, color=group_color[g_b], linewidth=1.5,
                            label=f"{g_b} (n={cb.shape[0]})")
-                ax_el.fill_between(t_el, mean_cb - sem_cb, mean_cb + sem_cb,
+                ax_el.fill_between(t_el, med_cb - mad_cb, med_cb + mad_cb,
                                    color=group_color[g_b], alpha=0.18)
 
                 # Quick permutation test for this channel (fewer perms for speed)
@@ -3564,18 +4440,47 @@ def run_compare_groups_analysis(base_path, selected_stage):
 
             # Single legend outside
             handles_el = [
-                plt.Line2D([0], [0], color=group_color[g_a], linewidth=2, label=f"{g_a} (N={n_a})"),
-                plt.Line2D([0], [0], color=group_color[g_b], linewidth=2, label=f"{g_b} (N={n_b})"),
+                plt.Line2D([0], [0], color=group_color[g_a], linewidth=2, label=f"{g_a} median (N={n_a})"),
+                plt.Line2D([0], [0], color=group_color[g_b], linewidth=2, label=f"{g_b} median (N={n_b})"),
             ]
             fig_el.legend(handles=handles_el, loc='upper right', fontsize=10,
                           bbox_to_anchor=(1.0, 1.0))
             fig_el.suptitle(
-                f"Per-Electrode HEP Comparison: {g_a} vs {g_b} — Stage: {selected_stage}",
+                _comparison_title("Per-Electrode HEP Comparison | Statistic: Median | Shaded band: MAD"),
                 fontsize=14, fontweight='bold', y=1.01
             )
             fig_el.tight_layout()
             st.pyplot(fig_el, use_container_width=True)
             plt.close(fig_el)
+
+            per_electrode_csv_rows = []
+            for ch, (ca, cb, t_el) in per_ch_save.items():
+                _append_median_trace_row(
+                    per_electrode_csv_rows,
+                    "Per-Electrode HEP Comparison",
+                    ch,
+                    g_a,
+                    ca,
+                    t_el,
+                )
+                _append_median_trace_row(
+                    per_electrode_csv_rows,
+                    "Per-Electrode HEP Comparison",
+                    ch,
+                    g_b,
+                    cb,
+                    t_el,
+                )
+            if per_electrode_csv_rows:
+                st.download_button(
+                    label="Download per-electrode median traces CSV",
+                    data=_median_trace_rows_to_csv(per_electrode_csv_rows),
+                    file_name=_safe_csv_filename(
+                        f"per_electrode_hep_comparison_{selected_stage}_{g_a}_vs_{g_b}"
+                    ),
+                    mime="text/csv",
+                    key=f"download_per_electrode_median_{selected_stage}_{g_a}_{g_b}",
+                )
 
             fig_circular = _plot_per_electrode_circular_summary(
                 circular_channel_stats, g_a, g_b, selected_stage,
@@ -3626,7 +4531,7 @@ def run_compare_groups_analysis(base_path, selected_stage):
             ch_b = active_group_hep_per_channel.get(g_b, {}).get(ch)
             if ch_a is not None and ch_b is not None and len(ch_a) > 0 and len(ch_b) > 0:
                 min_t = min(ch_a.shape[1], ch_b.shape[1])
-                diff_row = np.nanmean(ch_a[:, :min_t], 0) - np.nanmean(ch_b[:, :min_t], 0)
+                diff_row = np.nanmedian(ch_a[:, :min_t], 0) - np.nanmedian(ch_b[:, :min_t], 0)
                 diff_matrix.append(diff_row)
                 valid_chs.append(ch)
 
@@ -3654,12 +4559,12 @@ def run_compare_groups_analysis(base_path, selected_stage):
                 ax3.axvspan(win['start'], win['end'], color='yellow', alpha=0.18)
 
             cbar = fig3.colorbar(im, ax=ax3, pad=0.01, fraction=0.025)
-            cbar.set_label(f"Mean diff {'Z-score' if use_zscore else 'µV'} ({g_a}−{g_b})", fontsize=10)
+            cbar.set_label(f"Median diff {'Z-score' if use_zscore else 'µV'} ({g_a}−{g_b})", fontsize=10)
 
             ax3.set_xlabel("Time relative to R-peak (s)", fontsize=11)
             ax3.set_ylabel("EEG Channel", fontsize=11)
             ax3.set_title(
-                f"Mean HEP Difference per Channel  |  {g_a} − {g_b}  |  Stage: {selected_stage}",
+                _comparison_title("Median HEP Difference per Channel - Median +/- MAD"),
                 fontsize=13, fontweight='bold'
             )
             fig3.tight_layout()
@@ -3742,10 +4647,11 @@ def run_compare_groups_analysis(base_path, selected_stage):
                                     ch_a_win = ch_a_full[:, t_mask_min]
                                     ch_b_win = ch_b_full[:, t_mask_min]
                                     
-                                    # Mean amplitudes in window
-                                    amp_a = np.nanmean(ch_a_win) * 1e6
-                                    amp_b = np.nanmean(ch_b_win) * 1e6
-                                    diff_mean_uv = amp_a - amp_b
+                                    # Median amplitudes in window. Data is already scaled
+                                    # to either Z-score or microvolts upstream.
+                                    amp_a = np.nanmedian(ch_a_win)
+                                    amp_b = np.nanmedian(ch_b_win)
+                                    diff_median = amp_a - amp_b
                                     
                                     # P-value calculation for Difference (A vs B)
                                     sig_windows_diff, _, _ = permutation_two_group_cluster_test(
@@ -3807,7 +4713,7 @@ def run_compare_groups_analysis(base_path, selected_stage):
                                     _pmod_per_ch_b.append(per_pt_b_full)
 
                                     plot_ch_names.append(standard_name)
-                                    plot_data_diff.append(diff_mean_uv)
+                                    plot_data_diff.append(diff_median)
                                     plot_data_pval_diff.append(p_val_diff)
                                     
                                     plot_data_amp_a.append(amp_a)
@@ -3848,14 +4754,21 @@ def run_compare_groups_analysis(base_path, selected_stage):
                             ch_pval_d  = dict(zip(plot_ch_names, plot_data_pval_diff))
 
                             amp_label = f"Amplitude ({'Z-score' if use_zscore else 'µV'})"
-                            diff_label = f"Mean Diff ({'Z-score' if use_zscore else 'µV'})"
+                            diff_label = f"Median Diff ({'Z-score' if use_zscore else 'µV'})"
 
-                            st.markdown("#### 1. Mean Amplitude in Time Window")
+                            st.markdown("#### 1. Median Amplitude in Time Window")
                             fig_amp, axes_amp = plt.subplots(1, 2, figsize=(10, 4))
                             _render_topomap(ch_amp_a, axes_amp[0], f"{g_a} Amplitude",
                                             cmap='RdBu_r', colorbar_label=amp_label)
                             _render_topomap(ch_amp_b, axes_amp[1], f"{g_b} Amplitude",
                                             cmap='RdBu_r', colorbar_label=amp_label)
+                            fig_amp.suptitle(
+                                _comparison_title(
+                                    "Spatial Median Amplitude",
+                                    f"{topo_diff_tmin}-{topo_diff_tmax} ms",
+                                ),
+                                fontsize=13, fontweight='bold'
+                            )
                             fig_amp.tight_layout()
                             st.pyplot(fig_amp, use_container_width=False)
                             plt.close(fig_amp)
@@ -3864,6 +4777,13 @@ def run_compare_groups_analysis(base_path, selected_stage):
                             fig_pval_ind, axes_pval_ind = plt.subplots(1, 2, figsize=(10, 4))
                             _render_pval_topomap(ch_pval_a, axes_pval_ind[0], f"{g_a} P-value (vs 0)")
                             _render_pval_topomap(ch_pval_b, axes_pval_ind[1], f"{g_b} P-value (vs 0)")
+                            fig_pval_ind.suptitle(
+                                _comparison_title(
+                                    "Spatial Significance vs Baseline",
+                                    f"{topo_diff_tmin}-{topo_diff_tmax} ms",
+                                ),
+                                fontsize=13, fontweight='bold'
+                            )
                             fig_pval_ind.tight_layout()
                             st.pyplot(fig_pval_ind, use_container_width=False)
                             plt.close(fig_pval_ind)
@@ -3874,6 +4794,13 @@ def run_compare_groups_analysis(base_path, selected_stage):
                                             cmap='RdBu_r', colorbar_label=diff_label)
                             _render_topomap(ch_pval_d, axes_diff_topo[1], "P-value (Diff)",
                                             cmap='Reds_r', vlim=(0, 0.05), colorbar_label='p-value')
+                            fig_diff_topo.suptitle(
+                                _comparison_title(
+                                    "Spatial Group Difference and Significance",
+                                    f"{topo_diff_tmin}-{topo_diff_tmax} ms",
+                                ),
+                                fontsize=13, fontweight='bold'
+                            )
                             fig_diff_topo.tight_layout()
                             st.pyplot(fig_diff_topo, use_container_width=False)
                             plt.close(fig_diff_topo)
@@ -3939,7 +4866,7 @@ def run_compare_groups_analysis(base_path, selected_stage):
                                             ha='center', va='bottom', fontsize=10)
                                 ax_hbci.set_ylabel("HBCI score")
                                 ax_hbci.set_title(
-                                    f"Per-Patient HBCI -- {g_a} vs {g_b}\n"
+                                    f"Per-Patient HBCI | Stage: {selected_stage} | Groups: {g_a} vs {g_b}\n"
                                     "(channel_fraction x duration x -log10(p))"
                                 )
                                 ax_hbci.set_ylim(bottom=0, top=_y_max_h * 1.18)
@@ -3974,19 +4901,19 @@ def run_compare_groups_analysis(base_path, selected_stage):
     summary_rows = []
     for group in groups_with_data:
         mat = active_group_hep_matrix[group]  # already normalised (Z-scored or µV)
-        grand = np.nanmean(mat, 0)
+        grand, grand_mad = median_and_mad(mat, axis=0)
         n_subj = mat.shape[0]
         peak_idx = np.argmax(np.abs(grand))
         peak_amp = grand[peak_idx]
         peak_t = active_group_times[group][peak_idx]
-        mean_amp = np.nanmean(grand)
-        sd_amp = np.nanstd(grand)
+        median_amp = np.nanmedian(grand)
+        mad_amp = np.nanmedian(np.abs(grand - median_amp))
         unit_lbl = "Z" if use_zscore else "µV"
         row = {
             "Group": group,
             "N": n_subj,
-            f"Mean amplitude ({unit_lbl})": f"{mean_amp:.4f}",
-            f"SD amplitude ({unit_lbl})": f"{sd_amp:.4f}",
+            f"Median amplitude ({unit_lbl})": f"{median_amp:.4f}",
+            f"MAD amplitude ({unit_lbl})": f"{mad_amp:.4f}",
             f"Peak amplitude ({unit_lbl})": f"{peak_amp:.4f}",
             "Peak latency (s)": f"{peak_t:.3f}",
         }
@@ -4574,7 +5501,7 @@ def handle_ecg_noise_detection(base_path, selected_group, selected_stage):
         ax_avg.fill_between(avg_times, avg_template - std_template, avg_template + std_template,
                            color='blue', alpha=0.2, label='± 1 SD')
         
-        ax_avg.set_title(f"Average Repetitive Pattern - {selected_group} {selected_stage}", 
+        ax_avg.set_title(f"Average Repetitive Pattern - Mean +/- STD - {selected_group} {selected_stage}",
                         fontsize=14, fontweight='bold')
         ax_avg.set_xlabel('Time (ms)', fontsize=11)
         ax_avg.set_ylabel('Amplitude (μV)', fontsize=11)
@@ -5945,12 +6872,12 @@ def plot_bhi_analysis(filtered_individuals, selected_group, selected_stage, base
         ax.set_xticklabels(band_names, fontsize=11)
         ax.set_xlabel("EEG Frequency Band")
         ax.set_ylabel("Granger Causality Index")
-        ax.set_title(direction, fontsize=13)
+        ax.set_title(f"{direction} - Mean +/- SEM", fontsize=13)
         ax.grid(True, alpha=0.3, axis='y')
         ax.set_ylim(bottom=0)
 
     fig.suptitle(
-        f"BHI — {selected_group} / {selected_stage}  (n={len(patient_results)} patients)",
+        f"BHI - Mean +/- SEM — {selected_group} / {selected_stage}  (n={len(patient_results)} patients)",
         fontsize=14
     )
     plt.tight_layout()
@@ -5995,7 +6922,7 @@ def plot_group_ecg_analysis(individuals, selected_group, selected_stage):
         sem_ecg = std_ecg / np.sqrt(len(all_ecg_heps))
         ax_avg.fill_between(times, (avg_ecg - sem_ecg) * 1e6, (avg_ecg + sem_ecg) * 1e6, color='gray', alpha=0.3, label='SEM')
 
-        ax_avg.set_title(f"Group Average ECG (n={len(all_ecg_heps)})")
+        ax_avg.set_title(f"Group Average ECG - Mean +/- SEM (n={len(all_ecg_heps)})")
         ax_avg.set_xlabel("Time (s)")
         ax_avg.set_ylabel("Amplitude (μV)")
         ax_avg.axvline(0, color='r', linestyle='--', alpha=0.5)
@@ -9172,7 +10099,7 @@ def run_compare_groups_all_stages_analysis(base_path):
         st.error("No groups found in the data directory.")
         return
 
-    default_groups = [g for g in ['EDF', 'Berkeley_data'] if g in available_groups] or available_groups[:2]
+    default_groups = default_hep_groups(available_groups)
     selected_groups = st.multiselect(
         "Select Groups to Compare",
         options=available_groups,
@@ -9182,6 +10109,7 @@ def run_compare_groups_all_stages_analysis(base_path):
     if not selected_groups:
         st.warning("Please select at least one group.")
         return
+    groups_label = " vs ".join(selected_groups) if len(selected_groups) == 2 else ", ".join(selected_groups)
 
     with st.expander("⚙️ All-Stages Analysis Settings", expanded=True):
         col1, col2, col3, col4, col5, col6 = st.columns(6)
@@ -9235,6 +10163,31 @@ def run_compare_groups_all_stages_analysis(base_path):
     # Load globally excluded patients
     global_excluded_pids = load_excluded_pids(base_path)
 
+    def _valid_hep_individuals(individuals, label):
+        """Keep only individuals with usable HEP arrays for this all-stages view."""
+        valid = []
+        skipped = 0
+        for ind in individuals or []:
+            if ind is None or len(ind) < 4:
+                skipped += 1
+                continue
+            hep_data, times, ch_names = ind[1], ind[2], ind[3]
+            if hep_data is None or times is None or ch_names is None:
+                skipped += 1
+                continue
+            try:
+                hep_arr = np.asarray(hep_data)
+            except Exception:
+                skipped += 1
+                continue
+            if hep_arr.ndim < 2 or len(ch_names) == 0 or hep_arr.shape[0] < len(ch_names):
+                skipped += 1
+                continue
+            valid.append(ind)
+        if skipped:
+            st.caption(f"Skipped {skipped} patient(s) without usable HEP data for {label}.")
+        return valid
+
     # ── Load data for all stages and groups ─────────────────────────────────
     _load_status = st.empty()
     _load_status.info("Loading data for all sleep stages...")
@@ -9247,7 +10200,13 @@ def run_compare_groups_all_stages_analysis(base_path):
             needs_recompute = (group, stage) in recompute_combos
             with st.spinner(f"Loading {group} / {stage}…"):
                 inds = get_group_individuals(group, stage, base_path, test_run=test_run, apply_ica=apply_ica, recompute_cache=needs_recompute)
-            inds_filtered = filter_excluded(inds, global_excluded_pids)
+            inds_filtered = filter_excluded(
+                _valid_hep_individuals(
+                    inds,
+                    f"{group} / {stage}",
+                ),
+                global_excluded_pids,
+            )
             if inds_filtered:
                 all_stage_data[stage][group] = inds_filtered
         progress.progress((s_idx + 1) / len(SLEEP_STAGES))
@@ -9276,10 +10235,36 @@ def run_compare_groups_all_stages_analysis(base_path):
                         apply_ica=method_apply_ica,
                         recompute_cache=needs_recompute,
                     )
-                inds_filtered = filter_excluded(inds, global_excluded_pids)
+                inds_filtered = filter_excluded(
+                    _valid_hep_individuals(
+                        inds,
+                        f"{method_name.upper()} {group} / {stage}",
+                    ),
+                    global_excluded_pids,
+                )
                 if inds_filtered:
                     method_stage_data[stage][group] = inds_filtered
         topomap_sources[method_name] = method_stage_data
+
+    line_stat_caption = (
+        "Solid colored lines show the group median HEP at each time point, not the mean/average. "
+        "The shaded region is median absolute deviation (MAD) around the median, not standard deviation. "
+        f"Amplitude values are {'per-subject z-scores' if use_zscore else 'microvolts (µV)'}."
+    )
+
+    def _prepare_all_stages_trace(waveform):
+        waveform = np.asarray(waveform, dtype=float)
+        if use_zscore and np.std(waveform) > 0:
+            return (waveform - np.mean(waveform)) / np.std(waveform)
+        if not use_zscore:
+            return waveform * 1e6
+        return waveform
+
+    def _show_plot_count_table(rows, label):
+        if rows:
+            st.dataframe(pd.DataFrame(rows), use_container_width=True)
+        else:
+            st.caption(f"No patient-count rows available for {label}.")
 
     # ── Combined multi-stage plot ────────────────────────────────────────────
     if show_combined:
@@ -9320,7 +10305,11 @@ def run_compare_groups_all_stages_analysis(base_path):
                 squeeze=False,
                 sharey='row'
             )
-            fig_combined.suptitle("HEP Group Comparison — All Sleep Stages", fontsize=14, fontweight='bold')
+            fig_combined.suptitle(
+                f"HEP Group Comparison - Median +/- MAD | Stages: All Sleep Stages | Groups: {groups_label}",
+                fontsize=14, fontweight='bold'
+            )
+            combined_count_rows = []
 
             for s_idx, stage in enumerate(SLEEP_STAGES):
                 for ch_idx, ch_name in enumerate(plot_channels):
@@ -9340,21 +10329,26 @@ def run_compare_groups_all_stages_analysis(base_path):
                             if ch_name not in ch_names_ind:
                                 continue
                             ch_idx_ind = list(ch_names_ind).index(ch_name)
-                            w = hep_data[ch_idx_ind]
-                            if use_zscore and np.std(w) > 0:
-                                w = (w - np.mean(w)) / np.std(w)
+                            w = _prepare_all_stages_trace(hep_data[ch_idx_ind])
                             waveforms.append(w)
                             if times_arr is None:
                                 times_arr = times
                         if not waveforms or times_arr is None:
                             continue
                         waveforms = np.array(waveforms)
-                        mean_wave = np.mean(waveforms, axis=0)
-                        sem_wave = np.std(waveforms, axis=0) / np.sqrt(len(waveforms))
+                        median_wave, mad_wave = median_and_mad(waveforms, axis=0)
                         color = plt.cm.Set1(g_idx / max(len(selected_groups), 1))
-                        ax.plot(times_arr * 1000, mean_wave, color=color, lw=1.5, label=f"{group} (n={len(waveforms)})")
-                        ax.fill_between(times_arr * 1000, mean_wave - sem_wave, mean_wave + sem_wave,
+                        ax.plot(times_arr * 1000, median_wave, color=color, lw=1.5, label=f"{group} (n={len(waveforms)})")
+                        ax.fill_between(times_arr * 1000, median_wave - mad_wave, median_wave + mad_wave,
                                         color=color, alpha=0.2)
+                        combined_count_rows.append({
+                            "Stage": stage,
+                            "Subplot channel": ch_name,
+                            "Group": group,
+                            "Patients plotted": len(waveforms),
+                            "Line statistic": "Median",
+                            "Shaded band": "MAD",
+                        })
                         has_data = True
 
                     if ch_idx == 0:
@@ -9370,6 +10364,8 @@ def run_compare_groups_all_stages_analysis(base_path):
             fig_combined.tight_layout()
             st.pyplot(fig_combined, use_container_width=True)
             plt.close(fig_combined)
+            st.caption(line_stat_caption)
+            _show_plot_count_table(combined_count_rows, "the combined all-stages plot")
 
     # ── Per-stage individual plots ───────────────────────────────────────────
     st.subheader("Per-Stage Group Comparisons")
@@ -9399,9 +10395,18 @@ def run_compare_groups_all_stages_analysis(base_path):
             n_ch = len(ch_names_stage)
             n_cols = min(4, n_ch)
             n_rows = int(np.ceil(n_ch / n_cols))
+            # unique patient ids per group for this stage (each individual tuple is (patient_id, ...))
+            stage_groups_label = ", ".join(
+                f"{group} (n={len(set(ind[0] for ind in stage_data.get(group, [])))})"
+                for group in selected_groups
+            )
             fig_stage, axes_stage = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 3 * n_rows), squeeze=False)
-            fig_stage.suptitle(f"HEP Group Comparison — Stage {stage}", fontsize=13, fontweight='bold',
-                               color=STAGE_COLORS.get(stage, 'black'))
+            fig_stage.suptitle(
+                f"HEP Group Comparison - Median +/- MAD | Stage: {stage} | Groups: {stage_groups_label}",
+                fontsize=13, fontweight='bold',
+                color=STAGE_COLORS.get(stage, 'black')
+            )
+            stage_count_rows = []
 
             for ch_i, ch_name in enumerate(ch_names_stage):
                 row_i, col_i = divmod(ch_i, n_cols)
@@ -9419,21 +10424,26 @@ def run_compare_groups_all_stages_analysis(base_path):
                         if ch_name not in ch_names_ind:
                             continue
                         ch_idx_ind = list(ch_names_ind).index(ch_name)
-                        w = hep_data[ch_idx_ind]
-                        if use_zscore and np.std(w) > 0:
-                            w = (w - np.mean(w)) / np.std(w)
+                        w = _prepare_all_stages_trace(hep_data[ch_idx_ind])
                         waveforms.append(w)
                         if times_arr is None:
                             times_arr = times
                     if not waveforms or times_arr is None:
                         continue
                     waveforms = np.array(waveforms)
-                    mean_wave = np.mean(waveforms, axis=0)
-                    sem_wave = np.std(waveforms, axis=0) / np.sqrt(len(waveforms))
+                    median_wave, mad_wave = median_and_mad(waveforms, axis=0)
                     color = plt.cm.Set1(g_idx / max(len(selected_groups), 1))
-                    ax.plot(times_arr * 1000, mean_wave, color=color, lw=1.5, label=f"{group} (n={len(waveforms)})")
-                    ax.fill_between(times_arr * 1000, mean_wave - sem_wave, mean_wave + sem_wave,
+                    ax.plot(times_arr * 1000, median_wave, color=color, lw=1.5, label=f"{group} (n={len(waveforms)})")
+                    ax.fill_between(times_arr * 1000, median_wave - mad_wave, median_wave + mad_wave,
                                     color=color, alpha=0.2)
+                    stage_count_rows.append({
+                        "Stage": stage,
+                        "Subplot channel": ch_name,
+                        "Group": group,
+                        "Patients plotted": len(waveforms),
+                        "Line statistic": "Median",
+                        "Shaded band": "MAD",
+                    })
 
                 ax.tick_params(labelsize=7)
                 if ch_i == 0:
@@ -9449,6 +10459,8 @@ def run_compare_groups_all_stages_analysis(base_path):
             fig_stage.tight_layout()
             st.pyplot(fig_stage, use_container_width=True)
             plt.close(fig_stage)
+            st.caption(line_stat_caption)
+            _show_plot_count_table(stage_count_rows, f"stage {stage}")
 
     # ── Significant-channel topomaps across all sleep stages ────────────────
     st.divider()
@@ -9527,7 +10539,10 @@ def run_compare_groups_all_stages_analysis(base_path):
         fig_stage_topo, axes_stage_topo = plt.subplots(1, len(SLEEP_STAGES), figsize=(4 * len(SLEEP_STAGES), 4))
         if len(SLEEP_STAGES) == 1:
             axes_stage_topo = [axes_stage_topo]
-        fig_stage_topo.suptitle(f"{method_label}: {group_a} vs {group_b} by Sleep Stage", fontsize=13, fontweight='bold')
+        fig_stage_topo.suptitle(
+            f"{method_label}: Group Difference Topomaps | Stages: All Sleep Stages | Groups: {group_a} vs {group_b}",
+            fontsize=13, fontweight='bold'
+        )
         for idx, stage in enumerate(SLEEP_STAGES):
             p_map = stage_diff_maps.get(stage, {})
             if p_map:
@@ -9542,7 +10557,10 @@ def run_compare_groups_all_stages_analysis(base_path):
         fig_group_topo, axes_group_topo = plt.subplots(1, len(selected_groups), figsize=(5 * len(selected_groups), 4))
         if len(selected_groups) == 1:
             axes_group_topo = [axes_group_topo]
-        fig_group_topo.suptitle(f"{method_label}: All Sleep Stages Average per Group", fontsize=13, fontweight='bold')
+        fig_group_topo.suptitle(
+            f"{method_label}: Average per Group | Stages: All Sleep Stages | Groups: {group_a} vs {group_b}",
+            fontsize=13, fontweight='bold'
+        )
         for idx, group in enumerate(selected_groups):
             p_map = pooled_group_maps.get(group, {})
             if p_map:
@@ -9555,7 +10573,10 @@ def run_compare_groups_all_stages_analysis(base_path):
         plt.close(fig_group_topo)
 
         fig_diff_topo, ax_diff_topo = plt.subplots(figsize=(5, 4.5))
-        fig_diff_topo.suptitle(f"{method_label}: {group_a} vs {group_b} Across All Sleep Stages", fontsize=13, fontweight='bold')
+        fig_diff_topo.suptitle(
+            f"{method_label}: Group Difference | Stages: All Sleep Stages | Groups: {group_a} vs {group_b}",
+            fontsize=13, fontweight='bold'
+        )
         if pooled_diff_map:
             _render_pval_topomap(pooled_diff_map, ax_diff_topo, "All sleep stages")
         else:
@@ -9683,7 +10704,16 @@ def run_compare_sleep_stages_analysis(base_path):
             st.dataframe(df_availability.style.apply(color_rows, axis=1), use_container_width=True)
 
     if not all_patients:
-        st.warning(f"No patients found in group {selected_group} with valid data in ALL stages.")
+        stage_counts = {
+            stage: len(stage_patients)
+            for stage, stage_patients in zip(sleep_stages, valid_patients_per_stage)
+        }
+        counts_text = ", ".join(f"{stage}: {count}" for stage, count in stage_counts.items())
+        st.warning(
+            f"No patients found in group {selected_group} with valid data in ALL stages. "
+            f"Valid patient counts by stage: {counts_text}. "
+            f"Unique patients with at least one valid stage: {len(union_all_patients)}."
+        )
         return
 
     # 3. Choose Mode
@@ -9714,10 +10744,24 @@ def run_compare_sleep_stages_analysis(base_path):
                 pid_full = ind[0]
                 pid_base = pid_full.split('_')[0]
                 if pid_base == selected_pid:
+                    ecg_hep = ind[5]
+                    eeg_hep = ind[1]
+                    times = ind[2]
+                    if times is not None:
+                        common_len = len(times)
+                        if ecg_hep is not None:
+                            common_len = min(common_len, np.asarray(ecg_hep).shape[-1])
+                        if eeg_hep is not None:
+                            common_len = min(common_len, np.asarray(eeg_hep).shape[-1])
+                        times = np.asarray(times)[:common_len]
+                        if ecg_hep is not None:
+                            ecg_hep = np.asarray(ecg_hep)[..., :common_len]
+                        if eeg_hep is not None:
+                            eeg_hep = np.asarray(eeg_hep)[..., :common_len]
                     stage_data[stage] = {
-                        'ecg_hep': ind[5],
-                        'eeg_hep': ind[1],
-                        'times': ind[2],
+                        'ecg_hep': ecg_hep,
+                        'eeg_hep': eeg_hep,
+                        'times': times,
                         'ch_names': ind[3],
                         'n_epochs': len(ind[4]),
                         'n_subjects': 1
@@ -9757,7 +10801,7 @@ def run_compare_sleep_stages_analysis(base_path):
                 if ind[5] is not None:
                     ecg_heps.append(ind[5])
                 if ind[1] is not None:
-                    eeg_data = ind[1]
+                    eeg_data = apply_ecg_regression(ind[1], ind[5] if len(ind) > 5 else None)
                     ch_names_ind = ind[3]
                     aligned_eeg = []
                     for ch in common_channels_stage:
@@ -9769,7 +10813,7 @@ def run_compare_sleep_stages_analysis(base_path):
                 if times is None:
                     times = ind[2]
                     
-            if ecg_heps and eeg_heps_list:
+            if ecg_heps and eeg_heps_list and times is not None:
                 # Ensure all arrays in ecg_heps have the same shape
                 # Sometimes different sampling rates cause slight length mismatches
                 min_len_ecg = min(len(x[0]) if len(x.shape) > 1 else len(x) for x in ecg_heps)
@@ -9778,10 +10822,19 @@ def run_compare_sleep_stages_analysis(base_path):
                 min_len_eeg = min(len(x[0]) for x in eeg_heps_list)
                 eeg_heps_aligned = [[ch_arr[:min_len_eeg] for ch_arr in patient_eeg] for patient_eeg in eeg_heps_list]
                 
-                times = times[:min_len_eeg]
+                common_len = min(len(times), min_len_ecg, min_len_eeg)
+                ecg_heps_aligned = [
+                    x[:, :common_len] if len(x.shape) > 1 else x[:common_len]
+                    for x in ecg_heps_aligned
+                ]
+                eeg_heps_aligned = [
+                    [ch_arr[:common_len] for ch_arr in patient_eeg]
+                    for patient_eeg in eeg_heps_aligned
+                ]
+                times = times[:common_len]
 
-                avg_ecg = np.nanmean(ecg_heps_aligned, axis=0)
-                avg_eeg = np.nanmean(eeg_heps_aligned, axis=0)
+                avg_ecg = np.nanmedian(ecg_heps_aligned, axis=0)
+                avg_eeg = np.nanmedian(eeg_heps_aligned, axis=0)
                 avg_epochs = int(np.mean(n_epochs_list))
                 
                 stage_data[stage] = {
@@ -9807,11 +10860,13 @@ def run_compare_sleep_stages_analysis(base_path):
         ecg_hep = data['ecg_hep']
         times = data['times']
         
-        if ecg_hep is not None:
+        if ecg_hep is not None and times is not None:
              # ecg_hep is (1, n_times)
              n_epochs = data['n_epochs']
              label_str = f"{stage} (n={n_epochs})" if analysis_mode == "Single Patient" else f"{stage} (N={data['n_subjects']}, avg epochs={n_epochs})"
-             ax_ecg.plot(times, ecg_hep[0] * 1e6, label=label_str, color=stage_colors.get(stage, 'gray'), linewidth=2, alpha=0.8)
+             ecg_trace = np.asarray(ecg_hep, dtype=float).squeeze()
+             min_len = min(len(times), len(ecg_trace))
+             ax_ecg.plot(np.asarray(times)[:min_len], ecg_trace[:min_len] * 1e6, label=label_str, color=stage_colors.get(stage, 'gray'), linewidth=2, alpha=0.8)
              has_ecg_data = True
              
     if has_ecg_data:
@@ -9965,170 +11020,207 @@ def run_compare_sleep_stages_analysis(base_path):
     else:
         st.write("No ECG data available.")
 
-    # --- Plot EEG by Regions ---
-    # Determine all unique channels available (use first stage as reference, or intersection?)
-    # Usually montage is constant. Let's use the first available stage.
-    first_stage = next(iter(stage_data))
-    all_channels = stage_data[first_stage]['ch_names']
-    
-    if not all_channels:
+    # --- Plot EEG using the same channel flow as Single Group Analysis ---
+    st.divider()
+    st.title("Group HEP Analysis Across Sleep Stages")
+    st.subheader("Per-Channel Analysis")
+
+    available_stage_channels = [
+        set(data.get('ch_names', []))
+        for data in stage_data.values()
+        if data.get('ch_names')
+    ]
+    if not available_stage_channels:
         st.warning("No EEG channels found.")
         return
 
-    regions = ['Average of All Electrodes', 'F', 'C', 'T', 'P']
-    region_map = {r: [] for r in regions}
-    
-    # All channels belong to the average
-    region_map['Average of All Electrodes'] = all_channels
+    common_channels_all_stages = sorted(set.intersection(*available_stage_channels))
+    common_channels_all_stages = [
+        ch for ch in common_channels_all_stages
+        if re.match(r'^[A-Za-z]{1,3}[0-9]+$', ch) or re.match(r'^[A-Za-z]{1,2}z$', ch, re.IGNORECASE)
+    ]
+    if not common_channels_all_stages:
+        st.warning("No common EEG channels found across the displayed sleep stages.")
+        return
 
-    for ch in all_channels:
-        name = ch.upper()
-        # Simple categorization heuristic
-        if name.startswith('F'):
-            region_map['F'].append(ch)
-        elif name.startswith('C'):
-            region_map['C'].append(ch)
-        elif name.startswith('T'):
-            region_map['T'].append(ch)
-        elif name.startswith('P'):
-            region_map['P'].append(ch)
-            
-    for region in regions:
-        channels = region_map[region]
-        if not channels:
-            continue
-            
-        st.subheader(f"Region: {region} ({len(channels)} channels)")
-        
-        # Calculate Average for the entire region if it's the 'Average of All Electrodes'
-        if region == 'Average of All Electrodes':
-            fig, ax = plt.subplots(figsize=(8, 4))
-            
-            # Determine symmetric limits for the average across all stages
-            max_abs_val = 0
-            for stage, data in stage_data.items():
-                if data['eeg_hep'] is None:
-                    continue
-                try:
-                    indices = [data['ch_names'].index(ch) for ch in channels if ch in data['ch_names']]
-                    if indices:
-                        # calculate average across these channels
-                        region_avg = np.nanmean(data['eeg_hep'][indices], axis=0) * 1e6
-                        curr_max = np.nanmax(np.abs(region_avg))
-                        if curr_max > max_abs_val:
-                            max_abs_val = curr_max
-                except Exception:
+    display_channels = ['Average', 'Median', 'ECG', 'Left', 'Right', 'Middle'] + common_channels_all_stages
+
+    def _stage_channel_matrix(stage, data, ch_name):
+        times = data.get('times')
+        if times is None:
+            return None, None
+
+        if ch_name == 'ECG':
+            if analysis_mode == "Group Average" and data.get('ecg_heps_aligned') is not None:
+                ecg_arr = np.asarray(data['ecg_heps_aligned'], dtype=float)
+                if ecg_arr.ndim == 3:
+                    ecg_arr = ecg_arr[:, 0, :]
+                elif ecg_arr.ndim == 2:
                     pass
-            ylim = (-max_abs_val * 1.1, max_abs_val * 1.1) if max_abs_val > 0 else None
-            
-            for stage, data in stage_data.items():
-                if data['eeg_hep'] is None:
+                else:
+                    return None, None
+                return ecg_arr, times[:ecg_arr.shape[1]]
+
+            ecg_hep = data.get('ecg_hep')
+            if ecg_hep is None:
+                return None, None
+            ecg_trace = np.asarray(ecg_hep, dtype=float).squeeze()
+            if ecg_trace.ndim != 1:
+                return None, None
+            return ecg_trace[None, :], times[:len(ecg_trace)]
+
+        ch_names = list(data.get('ch_names', []))
+        if analysis_mode == "Group Average" and data.get('eeg_heps_aligned') is not None:
+            eeg_arr = np.asarray(data['eeg_heps_aligned'], dtype=float)
+            if eeg_arr.ndim != 3:
+                return None, None
+
+            if ch_name in ('Average', 'Median', 'Left', 'Right', 'Middle'):
+                if ch_name in ('Average', 'Median'):
+                    selected_chs = [ch for ch in common_channels_all_stages if ch in ch_names]
+                else:
+                    left_chs, right_chs, mid_chs = get_hemisphere_channels(
+                        [ch for ch in common_channels_all_stages if ch in ch_names]
+                    )
+                    selected_chs = {'Left': left_chs, 'Right': right_chs, 'Middle': mid_chs}[ch_name]
+                idx = [ch_names.index(ch) for ch in selected_chs if ch in ch_names]
+                if not idx:
+                    return None, None
+                if ch_name == 'Median':
+                    mat = np.nanmedian(eeg_arr[:, idx, :], axis=1)
+                else:
+                    mat = np.array([
+                        summarize_channels_without_reference_cancellation(row[idx, :])
+                        for row in eeg_arr
+                    ])
+                return mat, times[:mat.shape[1]]
+
+            if ch_name not in ch_names:
+                return None, None
+            ch_idx = ch_names.index(ch_name)
+            mat = eeg_arr[:, ch_idx, :]
+            return mat, times[:mat.shape[1]]
+
+        eeg_hep = data.get('eeg_hep')
+        ecg_hep = data.get('ecg_hep')
+        if eeg_hep is None or not ch_names:
+            return None, None
+        eeg_clean = apply_ecg_regression(np.asarray(eeg_hep, dtype=float), ecg_hep)
+
+        if ch_name in ('Average', 'Median', 'Left', 'Right', 'Middle'):
+            if ch_name in ('Average', 'Median'):
+                selected_chs = [ch for ch in common_channels_all_stages if ch in ch_names]
+            else:
+                left_chs, right_chs, mid_chs = get_hemisphere_channels(
+                    [ch for ch in common_channels_all_stages if ch in ch_names]
+                )
+                selected_chs = {'Left': left_chs, 'Right': right_chs, 'Middle': mid_chs}[ch_name]
+            idx = [ch_names.index(ch) for ch in selected_chs if ch in ch_names]
+            if not idx:
+                return None, None
+            if ch_name == 'Median':
+                trace = np.nanmedian(eeg_clean[idx, :], axis=0)
+            else:
+                trace = summarize_channels_without_reference_cancellation(eeg_clean[idx, :])
+            return trace[None, :], times[:len(trace)]
+
+        if ch_name not in ch_names:
+            return None, None
+        trace = eeg_clean[ch_names.index(ch_name)]
+        return trace[None, :], times[:len(trace)]
+
+    channel_stage_p_values = {}
+    for ch_name in display_channels:
+        with st.expander(f"Channel: {ch_name}", expanded=(ch_name in ('Average', 'Median'))):
+            fig, ax = plt.subplots(figsize=(16, 9))
+            plotted_any = False
+            channel_stage_p_values[ch_name] = {}
+
+            for stage in sleep_stages:
+                data = stage_data.get(stage)
+                if not data:
                     continue
-                indices = [data['ch_names'].index(ch) for ch in channels if ch in data['ch_names']]
-                if indices:
-                    times = data['times']
-                    if analysis_mode == "Group Average" and 'eeg_heps_aligned' in data and data['eeg_heps_aligned'] is not None:
-                        subj_data = np.nanmean(data['eeg_heps_aligned'][:, indices, :], axis=1) * 1e6
-                        mad = np.nanmedian(np.abs(subj_data - np.nanmedian(subj_data, axis=0)), axis=0)
-                        color = stage_colors.get(stage, 'gray')
-                        region_avg = np.nanmean(data['eeg_hep'][indices], axis=0) * 1e6
-                        ax.fill_between(times, region_avg - mad, region_avg + mad, color=color, alpha=0.2)
-                        ax.plot(times, region_avg, label=stage, color=color, linewidth=2, alpha=0.9)
-                    else:
-                        region_avg = np.nanmean(data['eeg_hep'][indices], axis=0) * 1e6
-                        ax.plot(times, region_avg, label=stage, color=stage_colors.get(stage, 'gray'), linewidth=2, alpha=0.9)
-            
-            ax.set_title("Average of All Electrodes")
-            ax.grid(True, alpha=0.3)
-            ax.axvline(0, color='r', linestyle='--', alpha=0.5)
-            if ylim:
-                ax.set_ylim(ylim)
-            ax.set_ylabel("Amplitude (µV)")
+                mat, times = _stage_channel_matrix(stage, data, ch_name)
+                if mat is None or times is None or mat.size == 0:
+                    continue
+
+                min_len = min(mat.shape[1], len(times))
+                mat = mat[:, :min_len]
+                times = np.asarray(times[:min_len], dtype=float)
+                mat_uv = mat * 1e6
+                median_trace, mad_trace = median_and_mad(mat_uv, axis=0)
+                color = stage_colors.get(stage, 'gray')
+
+                stage_label = (
+                    f"{stage} (N={mat.shape[0]})"
+                    if analysis_mode == "Group Average"
+                    else f"{stage} (epochs={data.get('n_epochs', 'n/a')})"
+                )
+                ax.plot(times, median_trace, color=color, linewidth=2.2, label=stage_label)
+                if mat.shape[0] > 1:
+                    ax.fill_between(times, median_trace - mad_trace, median_trace + mad_trace,
+                                    color=color, alpha=0.18)
+
+                if analysis_mode == "Group Average" and mat.shape[0] >= 3:
+                    try:
+                        sig_windows, _, per_pt_info = permutation_cluster_jitter_test(
+                            mat,
+                            times,
+                            n_permutations=100,
+                            p_threshold=0.05,
+                            jitter_sec=0.1,
+                        )
+                    except Exception:
+                        sig_windows, per_pt_info = [], {}
+                    min_p = min((w['p_value'] for w in sig_windows), default=1.0)
+                    channel_stage_p_values[ch_name][stage] = min_p
+                    if sig_windows:
+                        for win in sig_windows:
+                            ax.axvspan(win['start'], win['end'], color=color, alpha=0.10)
+                    n_sig_pt = per_pt_info.get('n_significant', 0)
+                    fisher_p = per_pt_info.get('fisher_p', 1.0)
+                    ax.text(
+                        0.01,
+                        0.98 - 0.05 * len(channel_stage_p_values[ch_name]),
+                        f"{stage}: p={min_p:.3f}, {n_sig_pt}/{mat.shape[0]} pts sig, Fisher={fisher_p:.3f}",
+                        transform=ax.transAxes,
+                        color=color,
+                        fontsize=8,
+                        va='top',
+                    )
+                plotted_any = True
+
+            ax.axvline(0, color='red', linestyle='--', alpha=0.5)
+            ax.axhline(0, color='black', linewidth=0.5, alpha=0.35)
             ax.set_xlabel("Time (s)")
-            ax.legend(fontsize='small')
-            
-            fig.tight_layout()
-            st.pyplot(fig, use_container_width=True)
-            plt.close(fig)
-            continue
+            ax.set_ylabel("Amplitude (µV)")
+            ax.grid(True, alpha=0.25)
+            ax.legend(fontsize=9, loc='upper right')
+            ax.set_title(
+                f"Channel: {ch_name} - Median +/- MAD - Group: {selected_group} - All Sleep Stages - {analysis_mode}",
+                fontsize=12,
+                fontweight='bold',
+            )
 
-        
-        # Create subplots
-        n_channels = len(channels)
-        n_cols = 4
-        n_rows = int(np.ceil(n_channels / n_cols))
-        
-        fig, axes = plt.subplots(n_rows, n_cols, figsize=(20, 4 * n_rows), sharex=True, sharey=True)
-        if n_channels == 1:
-            axes = [axes]
-        else:
-            axes = axes.flatten()
-            
-        # Determine symmetric limits for this region across all stages
-        max_abs_val = 0
-        for stage, data in stage_data.items():
-            if data['eeg_hep'] is None:
+            if plotted_any:
+                fig.tight_layout()
+                st.pyplot(fig, use_container_width=True)
+                plt.close(fig)
+            else:
+                plt.close(fig)
+                st.info(f"No data available for {ch_name}.")
+
+    if analysis_mode == "Group Average" and channel_stage_p_values:
+        pval_rows = []
+        for ch_name, stage_map in channel_stage_p_values.items():
+            if not stage_map:
                 continue
-            
-            # Get indices for these channels
-            # Note: ch_names in stage_data might differ if montage changed? Assuming constant for now.
-            try:
-                indices = [data['ch_names'].index(ch) for ch in channels if ch in data['ch_names']]
-                if indices:
-                    region_data = data['eeg_hep'][indices]
-                    curr_max = np.nanmax(np.abs(region_data * 1e6))
-                    if curr_max > max_abs_val:
-                        max_abs_val = curr_max
-            except Exception:
-                pass
-                
-        ylim = (-max_abs_val * 1.1, max_abs_val * 1.1) if max_abs_val > 0 else None
-
-        for i, ch_name in enumerate(channels):
-            ax = axes[i]
-            
-            for stage, data in stage_data.items():
-                if data['eeg_hep'] is None:
-                    continue
-                
-                if ch_name in data['ch_names']:
-                    ch_idx = data['ch_names'].index(ch_name)
-                    times = data['times']
-                    
-                    if analysis_mode == "Group Average" and 'eeg_heps_aligned' in data and data['eeg_heps_aligned'] is not None:
-                        subj_data = data['eeg_heps_aligned'][:, ch_idx, :] * 1e6
-                        mad = np.nanmedian(np.abs(subj_data - np.nanmedian(subj_data, axis=0)), axis=0)
-                        color = stage_colors.get(stage, 'gray')
-                        hep = data['eeg_hep'][ch_idx] * 1e6
-                        ax.fill_between(times, hep - mad, hep + mad, color=color, alpha=0.2)
-                        ax.plot(times, hep, label=stage, color=color, linewidth=1.5, alpha=0.8)
-                    else:
-                        hep = data['eeg_hep'][ch_idx]
-                        ax.plot(times, hep * 1e6, label=stage, color=stage_colors.get(stage, 'gray'), linewidth=1.5, alpha=0.8)
-            
-            ax.set_title(ch_name)
-            ax.grid(True, alpha=0.3)
-            ax.axvline(0, color='r', linestyle='--', alpha=0.5)
-            if ylim:
-                ax.set_ylim(ylim)
-            
-            # Y-axis label on the leftmost column
-            if i % n_cols == 0:
-                ax.set_ylabel("Amplitude (µV)")
-            # X-axis label on the bottom row
-            if i >= n_channels - n_cols:
-                ax.set_xlabel("Time (s)")
-            
-            # Only legend on first plot to avoid clutter
-            if i == 0:
-                ax.legend(fontsize='small')
-                
-        # Hide unused
-        for j in range(i + 1, len(axes)):
-            axes[j].axis('off')
-            
-        fig.tight_layout()
-        st.pyplot(fig, use_container_width=True)
+            row = {"Channel": ch_name}
+            row.update({stage: stage_map.get(stage, np.nan) for stage in sleep_stages})
+            pval_rows.append(row)
+        if pval_rows:
+            with st.expander("Per-channel minimum p-values by sleep stage", expanded=False):
+                st.dataframe(pd.DataFrame(pval_rows).style.format(precision=4), use_container_width=True)
 
     # --- Plot Spatial Topomaps ---
     st.divider()
@@ -10163,8 +11255,8 @@ def run_compare_sleep_stages_analysis(base_path):
                 continue
             valid_times = True
             
-            # 1. Mean Amplitude
-            mean_amps = np.nanmean(data['eeg_hep'][:, t_mask], axis=1) * 1e6
+            # 1. Median Amplitude
+            mean_amps = np.nanmedian(data['eeg_hep'][:, t_mask], axis=1) * 1e6
             
             # 2. PSD (Total Power)
             hep_windowed = data['eeg_hep'][:, t_mask]
@@ -10272,8 +11364,8 @@ def run_compare_sleep_stages_analysis(base_path):
                 info = mne.pick_info(info, np.where(valid)[0])
                 return info, valid
 
-            # ── Figure 1: Mean Amplitude per stage ──────────────────────
-            st.markdown("#### Mean HEP Amplitude")
+            # ── Figure 1: Median Amplitude per stage ─────────────────────
+            st.markdown("#### Median HEP Amplitude")
             fig_amp, axes_amp = plt.subplots(1, n_stages, figsize=(4 * n_stages + 1, 4))
             if n_stages == 1: axes_amp = [axes_amp]
             im_amp = None
@@ -10304,7 +11396,7 @@ def run_compare_sleep_stages_analysis(base_path):
             fig_amp.subplots_adjust(right=0.88)
             if im_amp is not None:
                 cbar_ax = fig_amp.add_axes([0.91, 0.15, 0.02, 0.7])
-                fig_amp.colorbar(im_amp, cax=cbar_ax).set_label("Mean Amplitude (µV)")
+                fig_amp.colorbar(im_amp, cax=cbar_ax).set_label("Median Amplitude (µV)")
             st.pyplot(fig_amp, use_container_width=False)
             plt.close(fig_amp)
             
@@ -10372,7 +11464,7 @@ def run_compare_sleep_stages_analysis(base_path):
                      for j in range(i + 1, len(stages_list))]
 
             if pairs:
-                st.markdown("#### Pairwise Stage Difference (Mean Amplitude, µV)")
+                st.markdown("#### Pairwise Stage Difference (Median Amplitude, µV)")
                 n_pairs = len(pairs)
                 n_cols = min(3, n_pairs)
                 n_rows = int(np.ceil(n_pairs / n_cols))
@@ -10453,7 +11545,7 @@ def run_compare_groups_non_eeg_analysis(base_path, selected_stage):
         st.error("At least two groups are required for non-EEG comparison.")
         return
 
-    default_groups = [g for g in ['EDF', 'Berkeley_data'] if g in available_groups]
+    default_groups = default_hep_groups(available_groups)
     if len(default_groups) < 2:
         default_groups = available_groups[:2]
 
@@ -10612,11 +11704,9 @@ def run_compare_groups_non_eeg_analysis(base_path, selected_stage):
             button_key=f"non_eeg_explain_{selected_stage}_{ch}",
         )
 
-        mean_a = np.nanmean(mat_a, axis=0)
-        mean_b = np.nanmean(mat_b, axis=0)
-        sem_a = np.nanstd(mat_a, axis=0, ddof=1) / np.sqrt(n_a)
-        sem_b = np.nanstd(mat_b, axis=0, ddof=1) / np.sqrt(n_b)
-        diff = mean_a - mean_b
+        med_a, mad_a = median_and_mad(mat_a, axis=0)
+        med_b, mad_b = median_and_mad(mat_b, axis=0)
+        diff = med_a - med_b
         _, point_p = stats.ttest_ind(mat_a, mat_b, axis=0, equal_var=False, nan_policy='omit')
         peak_idx = int(np.nanargmax(np.abs(diff)))
         min_cluster_p = min((w['p_value'] for w in sig_windows), default=np.nan)
@@ -10626,8 +11716,8 @@ def run_compare_groups_non_eeg_analysis(base_path, selected_stage):
             f"{group_a}_n": n_a,
             f"{group_b}_n": n_b,
             "peak_diff_time_ms": times[peak_idx] * 1000.0,
-            f"{group_a}_mean_at_peak": mean_a[peak_idx],
-            f"{group_b}_mean_at_peak": mean_b[peak_idx],
+            f"{group_a}_median_at_peak": med_a[peak_idx],
+            f"{group_b}_median_at_peak": med_b[peak_idx],
             "peak_diff": diff[peak_idx],
             "peak_t": t_obs[peak_idx],
             "peak_uncorrected_p": point_p[peak_idx],
@@ -10655,44 +11745,44 @@ def run_compare_groups_non_eeg_analysis(base_path, selected_stage):
         fig.add_trace(
             go.Scatter(
                 x=np.concatenate([times, times[::-1]]),
-                y=np.concatenate([mean_a + sem_a, (mean_a - sem_a)[::-1]]),
+                y=np.concatenate([med_a + mad_a, (med_a - mad_a)[::-1]]),
                 fill="toself",
                 fillcolor=fill_a,
                 line=dict(color="rgba(0,0,0,0)"),
                 hoverinfo="skip",
-                name=f"{group_a} ± SEM",
+                name=f"{group_a} ± MAD",
             ),
             row=1, col=1,
         )
         fig.add_trace(
             go.Scatter(
                 x=times,
-                y=mean_a,
+                y=med_a,
                 mode="lines",
                 line=dict(color=color_a, width=3),
-                name=f"{group_a} mean (n={n_a})",
+                name=f"{group_a} median (n={n_a})",
             ),
             row=1, col=1,
         )
         fig.add_trace(
             go.Scatter(
                 x=np.concatenate([times, times[::-1]]),
-                y=np.concatenate([mean_b + sem_b, (mean_b - sem_b)[::-1]]),
+                y=np.concatenate([med_b + mad_b, (med_b - mad_b)[::-1]]),
                 fill="toself",
                 fillcolor=fill_b,
                 line=dict(color="rgba(0,0,0,0)"),
                 hoverinfo="skip",
-                name=f"{group_b} ± SEM",
+                name=f"{group_b} ± MAD",
             ),
             row=1, col=1,
         )
         fig.add_trace(
             go.Scatter(
                 x=times,
-                y=mean_b,
+                y=med_b,
                 mode="lines",
                 line=dict(color=color_b, width=3),
-                name=f"{group_b} mean (n={n_b})",
+                name=f"{group_b} median (n={n_b})",
             ),
             row=1, col=1,
         )
@@ -10743,10 +11833,10 @@ def run_compare_groups_non_eeg_analysis(base_path, selected_stage):
         fig.add_hline(y=0, line_color="gray", line_width=1, row=2, col=1)
 
         title_text = (
-            f"ECG-Aligned Non-EEG Comparison | {ch} | {group_a} vs {group_b} | {selected_stage} | "
+            f"ECG-Aligned Non-EEG Comparison - Median +/- MAD | {ch} | {group_a} vs {group_b} | {selected_stage} | "
             f"min cluster p={min_cluster_p:.3g}"
             if np.isfinite(min_cluster_p) else
-            f"ECG-Aligned Non-EEG Comparison | {ch} | {group_a} vs {group_b} | {selected_stage} | no significant clusters"
+            f"ECG-Aligned Non-EEG Comparison - Median +/- MAD | {ch} | {group_a} vs {group_b} | {selected_stage} | no significant clusters"
         )
         fig.update_layout(
             height=650,
@@ -10781,8 +11871,8 @@ def run_compare_groups_non_eeg_analysis(base_path, selected_stage):
         )
         formatters = {
             "peak_diff_time_ms": "{:.1f}",
-            f"{group_a}_mean_at_peak": "{:.3f}",
-            f"{group_b}_mean_at_peak": "{:.3f}",
+            f"{group_a}_median_at_peak": "{:.3f}",
+            f"{group_b}_median_at_peak": "{:.3f}",
             "peak_diff": "{:.3f}",
             "peak_t": "{:.3f}",
             "peak_uncorrected_p": "{:.4g}",
@@ -10793,6 +11883,2770 @@ def run_compare_groups_non_eeg_analysis(base_path, selected_stage):
             "Cluster p-values come from the same jittered cluster-permutation test used elsewhere in this dashboard. "
             "Peak uncorrected p-values are provided as descriptive point-wise Welch tests."
         )
+
+
+def _run_waveform_autoencoder_embedding(matrix, latent_dim=2, max_epochs=120, random_state=42):
+    """Return 2D latent coordinates, reconstruction error, and method label for waveform rows."""
+    X = np.asarray(matrix, dtype=float)
+    if X.ndim != 2 or X.shape[0] < 2 or X.shape[1] < 2:
+        return None, None, "Unavailable"
+
+    X = np.nan_to_num(X, nan=np.nanmedian(X), posinf=0.0, neginf=0.0)
+    row_mu = np.mean(X, axis=1, keepdims=True)
+    row_sd = np.std(X, axis=1, keepdims=True)
+    Xn = (X - row_mu) / np.where(row_sd <= 1e-12, 1.0, row_sd)
+
+    latent_dim = int(max(1, min(latent_dim, Xn.shape[0] - 1, Xn.shape[1])))
+    if TORCH_AVAILABLE and Xn.shape[0] >= 4:
+        try:
+            torch.manual_seed(random_state)
+            device = torch.device("cpu")
+            xt = torch.tensor(Xn, dtype=torch.float32, device=device)
+            hidden = int(min(64, max(8, Xn.shape[1] // 4)))
+            model = nn.Sequential(
+                nn.Linear(Xn.shape[1], hidden),
+                nn.ReLU(),
+                nn.Linear(hidden, latent_dim),
+                nn.Linear(latent_dim, hidden),
+                nn.ReLU(),
+                nn.Linear(hidden, Xn.shape[1]),
+            ).to(device)
+            opt = torch.optim.Adam(model.parameters(), lr=0.01, weight_decay=1e-4)
+            for _ in range(int(max_epochs)):
+                opt.zero_grad()
+                recon = model(xt)
+                loss = torch.mean((recon - xt) ** 2)
+                loss.backward()
+                opt.step()
+
+            encoder = model[:3]
+            with torch.no_grad():
+                z = encoder(xt).cpu().numpy()
+                recon = model(xt).cpu().numpy()
+            err = np.mean((recon - Xn) ** 2, axis=1)
+            if z.shape[1] == 1:
+                z = np.column_stack([z[:, 0], np.zeros(z.shape[0])])
+            return z[:, :2], err, "Neural autoencoder"
+        except Exception:
+            pass
+
+    # Linear autoencoder fallback: rank-2 SVD reconstruction.
+    Xc = Xn - np.mean(Xn, axis=0, keepdims=True)
+    u, s, vt = np.linalg.svd(Xc, full_matrices=False)
+    z = u[:, :latent_dim] * s[:latent_dim]
+    recon = (u[:, :latent_dim] * s[:latent_dim]) @ vt[:latent_dim, :] + np.mean(Xn, axis=0, keepdims=True)
+    err = np.mean((recon - Xn) ** 2, axis=1)
+    if z.shape[1] == 1:
+        z = np.column_stack([z[:, 0], np.zeros(z.shape[0])])
+    return z[:, :2], err, "Linear autoencoder (SVD)"
+
+
+def _latent_group_permutation_test(z, labels, n_permutations=1000, random_state=42):
+    """Permutation test for group separation in autoencoder latent space."""
+    z = np.asarray(z, dtype=float)
+    labels = np.asarray(labels)
+    if z.ndim != 2 or z.shape[0] != len(labels) or z.shape[0] < 4:
+        return np.nan, np.nan
+
+    finite = np.all(np.isfinite(z), axis=1)
+    z = z[finite]
+    labels = labels[finite]
+    groups = np.unique(labels)
+    if len(groups) < 2 or any(np.sum(labels == g) < 2 for g in groups):
+        return np.nan, np.nan
+
+    def _between_group_stat(curr_labels):
+        grand = np.mean(z, axis=0)
+        stat = 0.0
+        for group in groups:
+            group_z = z[curr_labels == group]
+            if len(group_z) == 0:
+                continue
+            diff = np.mean(group_z, axis=0) - grand
+            stat += len(group_z) * float(np.dot(diff, diff))
+        return stat
+
+    obs = _between_group_stat(labels)
+    rng = np.random.default_rng(random_state)
+    null = np.zeros(int(n_permutations), dtype=float)
+    for i in range(int(n_permutations)):
+        null[i] = _between_group_stat(rng.permutation(labels))
+    p_val = (np.sum(null >= obs) + 1) / (len(null) + 1)
+    return float(obs), float(p_val)
+
+
+def _permanova_latent_test(z, labels, n_permutations=1000, random_state=42):
+    """One-way PERMANOVA on Euclidean distances in autoencoder latent space."""
+    z = np.asarray(z, dtype=float)
+    labels = np.asarray(labels)
+    if z.ndim != 2 or z.shape[0] != len(labels) or z.shape[0] < 4:
+        return np.nan, np.nan, {}
+
+    finite = np.all(np.isfinite(z), axis=1)
+    z = z[finite]
+    labels = labels[finite]
+    groups = np.unique(labels)
+    n = len(labels)
+    k = len(groups)
+    if k < 2 or n <= k or any(np.sum(labels == g) < 2 for g in groups):
+        return np.nan, np.nan, {}
+
+    def _pseudo_f(curr_labels):
+        grand = np.mean(z, axis=0)
+        ss_between = 0.0
+        ss_within = 0.0
+        for group in groups:
+            group_z = z[curr_labels == group]
+            if len(group_z) == 0:
+                continue
+            centroid = np.mean(group_z, axis=0)
+            ss_between += len(group_z) * float(np.sum((centroid - grand) ** 2))
+            ss_within += float(np.sum((group_z - centroid) ** 2))
+        if ss_within <= 1e-18:
+            return np.inf
+        return (ss_between / (k - 1)) / (ss_within / (n - k))
+
+    obs_f = _pseudo_f(labels)
+    rng = np.random.default_rng(random_state)
+    null = np.zeros(int(n_permutations), dtype=float)
+    for i in range(int(n_permutations)):
+        null[i] = _pseudo_f(rng.permutation(labels))
+    p_val = (np.sum(null >= obs_f) + 1) / (len(null) + 1)
+
+    centroids = {group: np.mean(z[labels == group], axis=0) for group in groups}
+    dist_to_centroid = np.array([
+        float(np.linalg.norm(point - centroids[label]))
+        for point, label in zip(z, labels)
+    ])
+    info = {
+        "labels": labels,
+        "z": z,
+        "centroids": centroids,
+        "dist_to_centroid": dist_to_centroid,
+    }
+    return float(obs_f), float(p_val), info
+
+
+def _permdisp_latent_test(z, labels, n_permutations=1000, random_state=42):
+    """Permutation test for equal group dispersion in autoencoder latent space."""
+    z = np.asarray(z, dtype=float)
+    labels = np.asarray(labels)
+    if z.ndim != 2 or z.shape[0] != len(labels) or z.shape[0] < 4:
+        return np.nan, np.nan
+
+    finite = np.all(np.isfinite(z), axis=1)
+    z = z[finite]
+    labels = labels[finite]
+    groups = np.unique(labels)
+    n = len(labels)
+    k = len(groups)
+    if k < 2 or n <= k or any(np.sum(labels == g) < 2 for g in groups):
+        return np.nan, np.nan
+
+    def _dispersion_f(curr_labels):
+        dists = []
+        dist_labels = []
+        for group in groups:
+            group_z = z[curr_labels == group]
+            if len(group_z) < 2:
+                continue
+            centroid = np.mean(group_z, axis=0)
+            group_dist = np.linalg.norm(group_z - centroid, axis=1)
+            dists.append(group_dist)
+            dist_labels.extend([group] * len(group_dist))
+        if len(dists) < 2:
+            return np.nan
+
+        dists = np.concatenate(dists)
+        dist_labels = np.asarray(dist_labels)
+        grand = np.mean(dists)
+        ss_between = 0.0
+        ss_within = 0.0
+        for group in groups:
+            group_dist = dists[dist_labels == group]
+            if len(group_dist) == 0:
+                continue
+            group_mean = np.mean(group_dist)
+            ss_between += len(group_dist) * float((group_mean - grand) ** 2)
+            ss_within += float(np.sum((group_dist - group_mean) ** 2))
+        if ss_within <= 1e-18:
+            return np.inf if ss_between > 1e-18 else 0.0
+        return (ss_between / (k - 1)) / (ss_within / (n - k))
+
+    obs_f = _dispersion_f(labels)
+    if not np.isfinite(obs_f):
+        return float(obs_f), np.nan
+
+    rng = np.random.default_rng(random_state)
+    null = np.zeros(int(n_permutations), dtype=float)
+    for i in range(int(n_permutations)):
+        null[i] = _dispersion_f(rng.permutation(labels))
+    null = null[np.isfinite(null)]
+    if len(null) == 0:
+        return float(obs_f), np.nan
+    p_val = (np.sum(null >= obs_f) + 1) / (len(null) + 1)
+    return float(obs_f), float(p_val)
+
+
+def _format_p_value(p_val):
+    if p_val is None or not np.isfinite(p_val):
+        return "n/a"
+    return "p < 0.001" if p_val < 0.001 else f"p = {p_val:.3f}"
+
+
+def _format_sig_windows(sig_windows):
+    if not sig_windows:
+        return "No cluster-corrected significant time window was found."
+    return "Significant time window(s): " + ", ".join(
+        f"{win['start'] * 1000:.0f}-{win['end'] * 1000:.0f} ms ({_format_p_value(win['p_value'])}, {win.get('direction', '')})"
+        for win in sig_windows
+    )
+
+
+def _pcgc_figure_explanation(
+    *,
+    groups,
+    unit,
+    latent_p,
+    min_cluster_p=None,
+    sig_windows=None,
+    include_ecg=False,
+    all_channels=False,
+):
+    line_text = (
+        "Solid colored lines show the group median HEP waveform; the translucent band around each line is median absolute deviation (MAD). "
+        "The vertical dashed line marks the R-peak at t=0."
+    )
+    if include_ecg:
+        line_text += " In the HEP + ECG panel, dotted colored lines show the median ECG waveform on the right y-axis."
+
+    stat_text = (
+        f"Autoencoder latent feature separation across {', '.join(groups)}: {_format_p_value(latent_p)}. "
+        "This p-value is from a permutation test of between-group centroid separation in the 2D latent space."
+    )
+    if all_channels:
+        return f"{line_text} {stat_text}"
+
+    cluster_text = (
+        f"Waveform group-difference cluster p-value: {_format_p_value(min_cluster_p)}. "
+        f"{_format_sig_windows(sig_windows)}"
+    )
+    return f"{line_text} The purple line is the median waveform difference for the first two groups, and the dotted gray line is the Welch t-statistic. {cluster_text} {stat_text}"
+
+
+def _pcgc_permanova_explanation(permanova_f, permanova_p, permdisp_f=None, permdisp_p=None):
+    permdisp_text = ""
+    if permdisp_f is not None:
+        permdisp_text = (
+            f" PERMDISP: F = {permdisp_f:.3f}, {_format_p_value(permdisp_p)}; "
+            "this tests whether groups differ in spread around their own centroid."
+            if np.isfinite(permdisp_f)
+            else " PERMDISP could not be computed for this channel."
+        )
+    return (
+        f"PERMANOVA on autoencoder latent features: pseudo-F = {permanova_f:.3f}, {_format_p_value(permanova_p)}. "
+        "This tests whether the groups occupy different regions of the latent feature space using Euclidean distances. "
+        "Each point is one subject-channel waveform; the y-axis shows that point's distance from its own group centroid."
+        f"{permdisp_text}"
+        if np.isfinite(permanova_f)
+        else "PERMANOVA could not be computed for this channel because the latent feature data were insufficient."
+    )
+
+
+def _plotly_group_trace_with_mad(fig, times, matrix, group, color, row=1, col=1, secondary_y=False, name_suffix=""):
+    import plotly.graph_objects as go
+
+    med, mad = median_and_mad(matrix, axis=0)
+    fig.add_trace(
+        go.Scatter(
+            x=np.concatenate([times, times[::-1]]),
+            y=np.concatenate([med + mad, (med - mad)[::-1]]),
+            fill="toself",
+            fillcolor=_hex_to_rgba(color, 0.16),
+            line=dict(color="rgba(0,0,0,0)"),
+            hoverinfo="skip",
+            name=f"{group} MAD{name_suffix}",
+            showlegend=False,
+        ),
+        row=row,
+        col=col,
+        secondary_y=secondary_y,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=times,
+            y=med,
+            mode="lines",
+            line=dict(color=color, width=2.7),
+            name=f"{group} median (n={matrix.shape[0]}){name_suffix}",
+        ),
+        row=row,
+        col=col,
+        secondary_y=secondary_y,
+    )
+
+
+def _hex_to_rgba(hex_color, alpha):
+    rgba = mcolors.to_rgba(hex_color, alpha=alpha)
+    return f"rgba({int(rgba[0]*255)},{int(rgba[1]*255)},{int(rgba[2]*255)},{rgba[3]:.3f})"
+
+
+def _is_pcgc_scalp_channel(ch_name):
+    """Keep EEG channel labels for per-channel group comparison."""
+    ch = str(ch_name).strip()
+    if not ch or _is_ecg_channel(ch):
+        return False
+    return _is_eeg_channel(ch)
+
+
+def _compute_nn_distances(z, labels):
+    """Per-sample within-group and cross-group nearest-neighbor distances in latent space.
+
+    For each sample computes:
+      - within-group NN distance: distance to nearest neighbour in the same group
+      - cross-group NN distance: distance to nearest neighbour in the other group
+    Returns (nn_within, nn_cross, p_value) where p_value is a one-sided Mann-Whitney U
+    test that within-group distances are less than cross-group distances.
+    """
+    if z is None or len(z) < 4:
+        return None, None, np.nan
+    from scipy.spatial.distance import cdist
+    unique_groups = np.unique(labels)
+    if len(unique_groups) < 2:
+        return None, None, np.nan
+    nn_within = np.full(len(z), np.nan)
+    nn_cross = np.full(len(z), np.nan)
+    dist_matrix = cdist(z, z, metric='euclidean')
+    np.fill_diagonal(dist_matrix, np.inf)
+    for i, lbl in enumerate(labels):
+        same_mask = labels == lbl
+        same_mask = same_mask.copy()
+        same_mask[i] = False
+        diff_mask = labels != lbl
+        if np.any(same_mask):
+            nn_within[i] = float(np.min(dist_matrix[i][same_mask]))
+        if np.any(diff_mask):
+            nn_cross[i] = float(np.min(dist_matrix[i][diff_mask]))
+    valid = ~(np.isnan(nn_within) | np.isnan(nn_cross))
+    if valid.sum() < 4:
+        return nn_within, nn_cross, np.nan
+    try:
+        _, p = stats.mannwhitneyu(nn_within[valid], nn_cross[valid], alternative='less')
+    except Exception:
+        p = np.nan
+    return nn_within, nn_cross, float(p)
+
+
+def run_per_channel_group_comparison_analysis(base_path, selected_stage):
+    """Plotly per-channel EEG HEP group comparison with ECG overlay and autoencoder features."""
+    available_groups = sorted([g for g in os.listdir(base_path) if os.path.isdir(os.path.join(base_path, g))])
+    if len(available_groups) < 2:
+        st.error("At least two groups are required for per-channel group comparison.")
+        return
+
+    default_groups = default_hep_groups(available_groups)
+    selected_groups = st.multiselect(
+        "Select Groups to Compare",
+        options=available_groups,
+        default=default_groups,
+        key="pcgc_selected_groups",
+    )
+    if len(selected_groups) < 2:
+        st.warning("Please select at least two groups.")
+        return
+
+    with st.expander("Per-Channel Group Comparison Settings", expanded=True):
+        col1, col2, col3, col4, col5, col6, col7 = st.columns(7)
+        with col1:
+            test_run = st.checkbox("Test Run (5 files/group)", value=False, key="pcgc_test_run")
+        with col2:
+            n_permutations = st.slider("Permutations", 50, 500, 200, 50, key="pcgc_n_perm")
+        with col3:
+            jitter_sec = st.number_input("Jitter (s)", 0.01, 0.5, 0.1, 0.05, key="pcgc_jitter")
+        with col4:
+            use_zscore = st.checkbox("Z-score subjects", value=True, key="pcgc_zscore")
+        with col5:
+            apply_ica = st.checkbox("Apply ICA", value=True, key="pcgc_apply_ica")
+        with col6:
+            clean_ecg = st.checkbox("ECG-regress EEG", value=True, key="pcgc_clean_ecg")
+        with col7:
+            parallel_workers = st.number_input(
+                "Patient workers",
+                min_value=1,
+                max_value=max(1, os.cpu_count() or 1),
+                value=DEFAULT_PATIENT_WORKERS,
+                step=1,
+                key="pcgc_patient_workers",
+            )
+
+    recompute_cache = st.button("Recompute Cache", key="pcgc_recompute_cache")
+    if recompute_cache and hasattr(get_group_individuals, "clear"):
+        get_group_individuals.clear()
+
+    global_excluded_pids = load_excluded_pids(base_path)
+    group_individuals = {}
+    for group in selected_groups:
+        with st.spinner(f"Loading {group}…"):
+            inds = get_group_individuals(
+                group,
+                selected_stage,
+                base_path,
+                test_run=test_run,
+                apply_ica=apply_ica,
+                recompute_cache=recompute_cache,
+                parallel_workers=parallel_workers,
+            )
+        inds = filter_excluded(inds, global_excluded_pids) if inds else []
+        if inds:
+            group_individuals[group] = inds
+        else:
+            st.warning(f"No valid HEP data for **{group}** in {selected_stage}.")
+
+    groups_with_data = [g for g in selected_groups if g in group_individuals]
+    if len(groups_with_data) < 2:
+        st.error("At least two selected groups need valid data.")
+        return
+
+    group_channel_sets = []
+    for group in groups_with_data:
+        counts = Counter()
+        inds = group_individuals[group]
+        for ind in inds:
+            ch_names = ind[3] if len(ind) > 3 else None
+            if ch_names is not None:
+                counts.update(set(ch_names))
+        min_count = max(1, math.ceil(0.5 * len(inds)))
+        group_channel_sets.append({
+            ch for ch, count in counts.items()
+            if count >= min_count and _is_pcgc_scalp_channel(ch)
+        })
+    common_channels = sorted(set.intersection(*group_channel_sets)) if group_channel_sets else []
+    has_common_ecg = all(
+        sum(
+            len(ind) > 5
+            and ind[5] is not None
+            and np.asarray(ind[5]).squeeze().ndim == 1
+            and len(np.asarray(ind[5]).squeeze()) > 1
+            for ind in group_individuals[g]
+        ) >= max(1, math.ceil(0.5 * len(group_individuals[g])))
+        for g in groups_with_data
+    )
+    selectable_channels = common_channels + (["ECG"] if has_common_ecg else [])
+    if not selectable_channels:
+        st.error("No EEG channels or ECG/EKG HEP data exist in every selected group.")
+        return
+
+    selected_channels = st.multiselect(
+        "Select Common EEG / ECG Channels",
+        options=selectable_channels,
+        default=selectable_channels[:min(12, len(selectable_channels))],
+        key="pcgc_channels",
+    )
+    if not selected_channels:
+        st.warning("Please select at least one channel.")
+        return
+    if len(groups_with_data) > 2:
+        st.info(
+            "Waveform and autoencoder plots include all selected groups. "
+            f"Cluster-permutation statistics are shown for the first two groups: {groups_with_data[0]} vs {groups_with_data[1]}."
+        )
+
+    try:
+        from plotly.subplots import make_subplots
+        import plotly.graph_objects as go
+    except ImportError:
+        st.error("Plotly is required for this mode. Please install `plotly`.")
+        return
+
+    palette = ['#1f77b4', '#d62728', '#2ca02c', '#9467bd', '#ff7f0e', '#17becf']
+    group_color = {g: palette[i % len(palette)] for i, g in enumerate(groups_with_data)}
+    unit = "Z-score" if use_zscore else "µV"
+    group_channel_data = {g: {} for g in groups_with_data}
+    group_ecg_data = {g: [] for g in groups_with_data}
+    patient_channel_data = {g: {} for g in groups_with_data}
+    times_ref = None
+
+    for group in groups_with_data:
+        for ind in group_individuals[group]:
+            pid, hep_data, times, ch_names, _, ecg_hep, _ = ind[:7]
+            if hep_data is None or times is None or ch_names is None:
+                continue
+            if times_ref is None:
+                times_ref = np.asarray(times, dtype=float)
+            eeg_data = apply_ecg_regression(np.asarray(hep_data, dtype=float), ecg_hep) if clean_ecg else np.asarray(hep_data, dtype=float)
+            for ch in selected_channels:
+                if ch == "ECG":
+                    continue
+                if ch in ch_names:
+                    trace_1d = eeg_data[ch_names.index(ch)]
+                    group_channel_data[group].setdefault(ch, []).append(trace_1d)
+                    patient_channel_data[group].setdefault(pid, {})[ch] = trace_1d
+            if ecg_hep is not None:
+                ecg_trace = np.asarray(ecg_hep, dtype=float).squeeze()
+                if ecg_trace.ndim == 1 and len(ecg_trace) > 1:
+                    group_ecg_data[group].append(ecg_trace * 1e6)
+
+    if times_ref is None:
+        st.error("No valid time axis found.")
+        return
+
+    for group in groups_with_data:
+        if "ECG" in selected_channels and group_ecg_data[group]:
+            ecg_stacked, _, _ = _stack_traces_with_common_length(group_ecg_data[group], times=times_ref)
+            if ecg_stacked is not None:
+                group_channel_data[group]["ECG"] = scale_matrix(ecg_stacked, use_zscore)
+        for ch in list(group_channel_data[group]):
+            traces = group_channel_data[group][ch]
+            if ch == "ECG" and isinstance(traces, np.ndarray):
+                continue
+            stacked, _, times_use = _stack_traces_with_common_length(traces, times=times_ref)
+            if stacked is None:
+                del group_channel_data[group][ch]
+                continue
+            group_channel_data[group][ch] = scale_matrix(stacked, use_zscore)
+
+    valid_channels = [
+        ch for ch in selected_channels
+        if all(ch in group_channel_data[g] and group_channel_data[g][ch].shape[0] >= 2 for g in groups_with_data)
+    ]
+    if not valid_channels:
+        st.error("No selected channel had at least two subjects in every selected group.")
+        return
+
+    st.subheader("All Selected Channels Together")
+
+    # Per-patient encoding: one row per patient with all channels hstacked.
+    min_ch_len = min(
+        group_channel_data[g][ch].shape[1]
+        for g in groups_with_data
+        for ch in valid_channels
+    )
+    aggregate_by_group = {}       # (n_patients, n_times) channel-averaged — for waveform
+    multivariate_by_group = {}    # (n_patients, n_channels * n_times) — for autoencoder
+    patient_ids_by_group = {}
+
+    for group in groups_with_data:
+        common_pids = sorted([
+            pid for pid, ch_dict in patient_channel_data[group].items()
+            if all(ch in ch_dict for ch in valid_channels)
+        ])
+        if not common_pids:
+            mats = [group_channel_data[group][ch][:, :min_ch_len] for ch in valid_channels]
+            n_pat = min(m.shape[0] for m in mats)
+            aggregate_by_group[group] = np.mean(
+                np.stack([m[:n_pat] for m in mats], axis=0), axis=0
+            )
+            multivariate_by_group[group] = np.hstack([m[:n_pat] for m in mats])
+            patient_ids_by_group[group] = list(range(n_pat))
+        else:
+            ch_mats = [
+                np.vstack([patient_channel_data[group][pid][ch][:min_ch_len] for pid in common_pids])
+                for ch in valid_channels
+            ]
+            aggregate_by_group[group] = np.mean(np.stack(ch_mats, axis=0), axis=0)
+            multivariate_by_group[group] = np.hstack(ch_mats)
+            patient_ids_by_group[group] = common_pids
+
+    times_all = times_ref[:min_ch_len]
+    for group in groups_with_data:
+        aggregate_by_group[group] = aggregate_by_group[group][:, :len(times_all)]
+
+    fig_all = make_subplots(
+        rows=1,
+        cols=2,
+        subplot_titles=("All selected channels: HEP median +/- MAD", "Autoencoder latent features"),
+    )
+    for group in groups_with_data:
+        _plotly_group_trace_with_mad(fig_all, times_all, aggregate_by_group[group], group, group_color[group], row=1, col=1)
+
+    X_all = np.vstack([multivariate_by_group[g] for g in groups_with_data])
+    labels_all = np.concatenate([[g] * multivariate_by_group[g].shape[0] for g in groups_with_data])
+    z_all, err_all, ae_method_all = _run_waveform_autoencoder_embedding(X_all)
+    _, latent_p_all = _latent_group_permutation_test(
+        z_all,
+        labels_all,
+        n_permutations=max(200, n_permutations),
+        random_state=42,
+    ) if z_all is not None else (np.nan, np.nan)
+    if z_all is not None:
+        for group in groups_with_data:
+            mask = labels_all == group
+            fig_all.add_trace(
+                go.Scatter(
+                    x=z_all[mask, 0],
+                    y=z_all[mask, 1],
+                    mode="markers",
+                    marker=dict(color=group_color[group], size=8, opacity=0.75),
+                    name=f"{group} latent",
+                    text=[f"{group}<br>recon MSE={e:.4f}" for e in err_all[mask]],
+                ),
+                row=1,
+                col=2,
+            )
+    fig_all.add_vline(x=0, line_dash="dash", line_color="gray", row=1, col=1)
+    fig_all.add_hline(y=0, line_color="gray", line_width=1, row=1, col=1)
+    fig_all.update_layout(
+        height=520,
+        hovermode="x unified",
+        title=(
+            f"Per-Channel Group Comparison | {selected_stage} | {len(valid_channels)} channels | "
+            f"{ae_method_all} | latent {_format_p_value(latent_p_all)}"
+        ),
+    )
+    fig_all.update_xaxes(title_text="Time relative to R-peak (s)", row=1, col=1)
+    fig_all.update_yaxes(title_text=f"Amplitude ({unit})", row=1, col=1)
+    fig_all.update_xaxes(title_text="Latent 1", row=1, col=2)
+    fig_all.update_yaxes(title_text="Latent 2", row=1, col=2)
+    st.plotly_chart(fig_all, use_container_width=True)
+    st.caption(
+        _pcgc_figure_explanation(
+            groups=groups_with_data,
+            unit=unit,
+            latent_p=latent_p_all,
+            all_channels=True,
+        )
+    )
+
+    summary_rows = []
+    group_a, group_b = groups_with_data[:2]
+    st.subheader("Per-Channel Plots")
+    for ch in valid_channels:
+        min_len = min(group_channel_data[g][ch].shape[1] for g in groups_with_data)
+        times = times_ref[:min_len]
+        channel_mats = {g: group_channel_data[g][ch][:, :min_len] for g in groups_with_data}
+
+        X = np.vstack([channel_mats[g] for g in groups_with_data])
+        labels = np.concatenate([[g] * channel_mats[g].shape[0] for g in groups_with_data])
+        z, recon_err, ae_method = _run_waveform_autoencoder_embedding(X)
+        _, latent_p = _latent_group_permutation_test(
+            z,
+            labels,
+            n_permutations=max(200, n_permutations),
+            random_state=42,
+        ) if z is not None else (np.nan, np.nan)
+        permanova_f, permanova_p, permanova_info = _permanova_latent_test(
+            z,
+            labels,
+            n_permutations=max(200, n_permutations),
+            random_state=42,
+        ) if z is not None else (np.nan, np.nan, {})
+        permdisp_f, permdisp_p = _permdisp_latent_test(
+            z,
+            labels,
+            n_permutations=max(200, n_permutations),
+            random_state=42,
+        ) if z is not None else (np.nan, np.nan)
+
+        sig_windows, t_obs, cohens_d = permutation_two_group_cluster_test(
+            channel_mats[group_a],
+            channel_mats[group_b],
+            times,
+            n_permutations=n_permutations,
+            p_threshold=0.05,
+            jitter_sec=jitter_sec,
+            label_a=group_a,
+            label_b=group_b,
+            channel_label=ch,
+            button_key=f"pcgc_perm_{selected_stage}_{ch}",
+        )
+        med_a, _ = median_and_mad(channel_mats[group_a], axis=0)
+        med_b, _ = median_and_mad(channel_mats[group_b], axis=0)
+        diff = med_a - med_b
+        point_t, point_p = stats.ttest_ind(channel_mats[group_a], channel_mats[group_b], axis=0, equal_var=False, nan_policy="omit")
+        peak_idx = int(np.nanargmax(np.abs(diff)))
+        min_cluster_p = min((w["p_value"] for w in sig_windows), default=np.nan)
+        summary_rows.append({
+            "channel": ch,
+            f"{group_a}_n": channel_mats[group_a].shape[0],
+            f"{group_b}_n": channel_mats[group_b].shape[0],
+            "peak_diff_time_ms": times[peak_idx] * 1000.0,
+            "peak_diff": diff[peak_idx],
+            "peak_t": point_t[peak_idx],
+            "peak_uncorrected_p": point_p[peak_idx],
+            "min_cluster_p": min_cluster_p,
+            "autoencoder_method": ae_method,
+            "autoencoder_latent_p": latent_p,
+            "autoencoder_permanova_F": permanova_f,
+            "autoencoder_permanova_p": permanova_p,
+            "autoencoder_permdisp_F": permdisp_f,
+            "autoencoder_permdisp_p": permdisp_p,
+            "autoencoder_error_p": (
+                stats.ttest_ind(
+                    recon_err[labels == group_a],
+                    recon_err[labels == group_b],
+                    equal_var=False,
+                    nan_policy="omit",
+                ).pvalue
+                if recon_err is not None and group_a in labels and group_b in labels else np.nan
+            ),
+        })
+
+        fig = make_subplots(
+            rows=2,
+            cols=2,
+            specs=[[{}, {}], [{"secondary_y": True}, {}]],
+            subplot_titles=(
+                f"{ch}: HEP median +/- MAD",
+                f"{ch}: autoencoder latent features",
+                f"{ch}: HEP + ECG median",
+                "Difference, t-statistic, and significant windows",
+            ),
+            vertical_spacing=0.12,
+            horizontal_spacing=0.08,
+        )
+        for group in groups_with_data:
+            _plotly_group_trace_with_mad(fig, times, channel_mats[group], group, group_color[group], row=1, col=1)
+            _plotly_group_trace_with_mad(fig, times, channel_mats[group], group, group_color[group], row=2, col=1)
+            ecg_stack, _, _ = _stack_traces_with_common_length(group_ecg_data.get(group, []), times=times_ref)
+            if ecg_stack is not None:
+                ecg_len = min(min_len, ecg_stack.shape[1], len(times))
+                ecg_stack = ecg_stack[:, :ecg_len]
+                ecg_med, _ = median_and_mad(ecg_stack, axis=0)
+                fig.add_trace(
+                    go.Scatter(
+                        x=times[:ecg_len],
+                        y=ecg_med,
+                        mode="lines",
+                        line=dict(color=group_color[group], width=1.6, dash="dot"),
+                        name=f"{group} ECG median",
+                    ),
+                    row=2,
+                    col=1,
+                    secondary_y=True,
+                )
+        if z is not None:
+            for group in groups_with_data:
+                mask = labels == group
+                fig.add_trace(
+                    go.Scatter(
+                        x=z[mask, 0],
+                        y=z[mask, 1],
+                        mode="markers",
+                        marker=dict(color=group_color[group], size=9, opacity=0.78),
+                        name=f"{group} AE latent",
+                        text=[f"{group}<br>{ch}<br>recon MSE={e:.4f}" for e in recon_err[mask]],
+                    ),
+                    row=1,
+                    col=2,
+                )
+
+        fig.add_trace(
+            go.Scatter(x=times, y=diff, mode="lines", line=dict(color="#6a3d9a", width=2.5), name=f"{group_a} - {group_b}"),
+            row=2,
+            col=2,
+        )
+        fig.add_trace(
+            go.Scatter(x=times, y=t_obs, mode="lines", line=dict(color="#444", width=1.4, dash="dot"), name="Welch t"),
+            row=2,
+            col=2,
+        )
+        for win in sig_windows:
+            for row, col in [(1, 1), (2, 1), (2, 2)]:
+                fig.add_vrect(
+                    x0=win["start"],
+                    x1=win["end"],
+                    fillcolor="rgba(255,165,0,0.18)",
+                    line_width=0,
+                    row=row,
+                    col=col,
+                )
+        for row, col in [(1, 1), (2, 1), (2, 2)]:
+            fig.add_vline(x=0, line_dash="dash", line_color="gray", row=row, col=col)
+            fig.add_hline(y=0, line_color="gray", line_width=1, row=row, col=col)
+
+        fig.update_layout(
+            height=820,
+            hovermode="x unified",
+            title=f"Per-Channel Group Comparison | {ch} | {selected_stage} | {ae_method} | latent {_format_p_value(latent_p)}",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        )
+        fig.update_xaxes(title_text="Time relative to R-peak (s)", row=2, col=1)
+        fig.update_xaxes(title_text="Time relative to R-peak (s)", row=2, col=2)
+        fig.update_yaxes(title_text=f"HEP ({unit})", row=1, col=1)
+        fig.update_yaxes(title_text=f"HEP ({unit})", row=2, col=1, secondary_y=False)
+        fig.update_yaxes(title_text="ECG (µV)", row=2, col=1, secondary_y=True)
+        fig.update_yaxes(title_text=f"Difference ({unit}) / t", row=2, col=2)
+        fig.update_xaxes(title_text="Latent 1", row=1, col=2)
+        fig.update_yaxes(title_text="Latent 2", row=1, col=2)
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption(
+            _pcgc_figure_explanation(
+                groups=groups_with_data,
+                unit=unit,
+                latent_p=latent_p,
+                min_cluster_p=min_cluster_p,
+                sig_windows=sig_windows,
+                include_ecg=True,
+            )
+        )
+
+        if permanova_info:
+            fig_perm = go.Figure()
+            perm_labels = permanova_info["labels"]
+            perm_dist = permanova_info["dist_to_centroid"]
+            perm_z = permanova_info["z"]
+            for group in groups_with_data:
+                mask = perm_labels == group
+                if not np.any(mask):
+                    continue
+                fig_perm.add_trace(
+                    go.Box(
+                        y=perm_dist[mask],
+                        name=group,
+                        marker_color=group_color[group],
+                        boxpoints="all",
+                        jitter=0.35,
+                        pointpos=0,
+                        customdata=np.column_stack([perm_z[mask, 0], perm_z[mask, 1]]),
+                        hovertemplate=(
+                            f"{group}<br>"
+                            "distance to centroid=%{y:.4f}<br>"
+                            "latent 1=%{customdata[0]:.4f}<br>"
+                            "latent 2=%{customdata[1]:.4f}<extra></extra>"
+                        ),
+                    )
+                )
+            fig_perm.update_layout(
+                height=420,
+                title=(
+                    f"{ch}: Autoencoder Latent Features PERMANOVA / PERMDISP | "
+                    f"PERMANOVA pseudo-F={permanova_f:.3f}, {_format_p_value(permanova_p)} | "
+                    f"PERMDISP F={permdisp_f:.3f}, {_format_p_value(permdisp_p)}"
+                ),
+                yaxis_title="Distance to group centroid in latent space",
+                xaxis_title="Group",
+                showlegend=False,
+            )
+            st.plotly_chart(fig_perm, use_container_width=True)
+            st.caption(_pcgc_permanova_explanation(permanova_f, permanova_p, permdisp_f, permdisp_p))
+
+        # ── Nearest Neighbor Distance Distribution ───────────────────────────
+        if z is not None and len(groups_with_data) >= 2:
+            nn_within, nn_cross, nn_p = _compute_nn_distances(z, labels)
+            if nn_within is not None and nn_cross is not None:
+                fig_nn = go.Figure()
+                for grp in groups_with_data:
+                    grp_mask = labels == grp
+                    if not np.any(grp_mask):
+                        continue
+                    color = group_color[grp]
+                    fig_nn.add_trace(
+                        go.Violin(
+                            y=nn_within[grp_mask],
+                            name=f"{grp} within-group",
+                            box_visible=True,
+                            meanline_visible=True,
+                            points="all",
+                            jitter=0.3,
+                            marker_color=color,
+                            line_color=color,
+                            opacity=0.85,
+                            legendgroup=grp,
+                            hovertemplate=f"{grp} within-group<br>distance=%{{y:.4f}}<extra></extra>",
+                        )
+                    )
+                    fig_nn.add_trace(
+                        go.Violin(
+                            y=nn_cross[grp_mask],
+                            name=f"{grp} cross-group",
+                            box_visible=True,
+                            meanline_visible=True,
+                            points="all",
+                            jitter=0.3,
+                            marker_color=color,
+                            line_color=color,
+                            fillcolor=_hex_to_rgba(color, 0.12),
+                            opacity=0.55,
+                            legendgroup=grp,
+                            hovertemplate=f"{grp} cross-group<br>distance=%{{y:.4f}}<extra></extra>",
+                        )
+                    )
+                nn_p_str = _format_p_value(nn_p) if not (isinstance(nn_p, float) and np.isnan(nn_p)) else "n/a"
+                fig_nn.update_layout(
+                    height=420,
+                    title=(
+                        f"{ch}: Nearest Neighbor Distance Distribution | "
+                        f"Within vs Cross-Group | Mann-Whitney {nn_p_str}"
+                    ),
+                    yaxis_title="NN distance in latent space",
+                    xaxis_title="Group / type",
+                    violinmode="group",
+                )
+                st.plotly_chart(fig_nn, use_container_width=True)
+                st.caption(
+                    "Within-group: each subject's distance to its nearest neighbour in the same group "
+                    "in autoencoder latent space. "
+                    "Cross-group: distance to nearest neighbour in the other group. "
+                    "If groups are well-separated, within-group distances should be smaller than cross-group distances. "
+                    f"Mann-Whitney U p-value ({nn_p_str}): one-sided test that within-group distances < cross-group distances."
+                )
+
+    if summary_rows:
+        st.subheader("Per-Channel Statistical Summary")
+        summary_df = pd.DataFrame(summary_rows).sort_values(["min_cluster_p", "peak_uncorrected_p"], na_position="last")
+        st.dataframe(
+            summary_df.style.format({
+                "peak_diff_time_ms": "{:.1f}",
+                "peak_diff": "{:.3f}",
+                "peak_t": "{:.3f}",
+                "peak_uncorrected_p": "{:.4g}",
+                "min_cluster_p": "{:.4g}",
+                "autoencoder_latent_p": "{:.4g}",
+                "autoencoder_permanova_F": "{:.3f}",
+                "autoencoder_permanova_p": "{:.4g}",
+                "autoencoder_permdisp_F": "{:.3f}",
+                "autoencoder_permdisp_p": "{:.4g}",
+                "autoencoder_error_p": "{:.4g}",
+            }),
+            use_container_width=True,
+        )
+        st.caption(
+            "autoencoder_latent_p tests whether groups separate in the 2D autoencoder feature space. "
+            "autoencoder_permanova_p is a PERMANOVA test on Euclidean distances in that same latent space. "
+            "autoencoder_permdisp_p tests whether the groups have different dispersion around their latent-space centroids. "
+            "autoencoder_error_p tests whether reconstruction error differs between the first two groups."
+        )
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DIAGNOSIS GROUP COMPARISON — helpers
+# ═══════════════════════════════════════════════════════════════════════════
+
+_DIAG_BASE = "/storage/pblab_shared_data/Nir/Cobrad/EDF_Format/Harvard_Electroencephalography/ECG/I0001"
+
+def _load_12sl_diagnosis_map():
+    """Load 12SL ECG diagnoses → {patient_id_str: category_name}."""
+    import os as _os2
+    diag_acq_path = _os2.path.join(_DIAG_BASE, "12SL_diagnoses", "diagnoses_acquisition.csv")
+    diag_dict_path = _os2.path.join(_DIAG_BASE, "12SL_diagnoses", "diagnoses_dictionary.csv")
+    if not _os2.path.exists(diag_acq_path):
+        return {}, {}
+    code_to_name = {}
+    if _os2.path.exists(diag_dict_path):
+        dd = pd.read_csv(diag_dict_path)
+        for _, row in dd.iterrows():
+            try:
+                code_to_name[int(row['codes'])] = str(row['diagnoses']).strip()
+            except Exception:
+                pass
+
+    def _code_to_category(codes_list):
+        afib_codes = set(range(180, 230))
+        if set(codes_list) & afib_codes:
+            return "Atrial Fibrillation/Flutter"
+        if any(300 <= c <= 399 for c in codes_list):
+            return "Bundle Branch Block / WPW"
+        if any(400 <= c <= 499 for c in codes_list):
+            return "ST-T Changes / Ischemia"
+        if any(500 <= c <= 599 for c in codes_list):
+            return "Hypertrophy"
+        if any(700 <= c <= 799 for c in codes_list):
+            return "Pacemaker Rhythm"
+        if any(101 <= c <= 179 for c in codes_list):
+            return "Conduction Disorder"
+        if any(30 <= c <= 99 for c in codes_list):
+            return "Rhythm Disorder"
+        if any(c >= 1670 for c in codes_list):
+            return "Normal Sinus Rhythm"
+        return "Other"
+
+    patient_categories = {}
+    try:
+        chunks = pd.read_csv(diag_acq_path, chunksize=200000, low_memory=False)
+        for chunk in chunks:
+            chunk['bdsp_id'] = chunk['FileName'].str.extract(r'/de_(\d+)_')
+            chunk = chunk.dropna(subset=['bdsp_id'])
+            for _, row in chunk.iterrows():
+                bdsp_str = str(row['bdsp_id'])
+                if bdsp_str in patient_categories:
+                    continue
+                codes_raw = row.get('codes_physician', '') or row.get('codes_software', '')
+                if not codes_raw or str(codes_raw) == 'nan':
+                    codes_raw = row.get('codes_software', '') or ''
+                try:
+                    codes_list = [int(c.strip()) for c in str(codes_raw).split(',') if c.strip().isdigit()]
+                except Exception:
+                    codes_list = []
+                if codes_list:
+                    patient_categories[bdsp_str] = _code_to_category(codes_list)
+    except Exception as e:
+        pass
+    return patient_categories, code_to_name
+
+
+def _match_pid_to_bdsp(pid_str):
+    """Extract candidate BDSPPatientID strings from a pickle patient ID string."""
+    import re as _re2
+    candidates = []
+    nums = _re2.findall(r'\d+', pid_str)
+    for n in nums:
+        if len(n) >= 9:
+            candidates.append(n[-9:])
+            candidates.append(n)
+            stripped = n.lstrip('0')
+            if len(stripped) >= 9:
+                candidates.append(stripped[-9:])
+    return list(dict.fromkeys(candidates))
+
+
+_EHR_BASE = "/storage/pblab_shared_data/Nir/Cobrad/EDF_Format/Harvard_Electroencephalography/EHR"
+_EHR_DIAG_BASE = os.path.join(
+    _EHR_BASE,
+    "data_Structured",
+    "Parquet",
+    "Parquet",
+    "bdsp_i0006_diagnosis",
+)
+_EHR_I0002_ICD10_BASE = os.path.join(
+    _EHR_BASE,
+    "I0002-EHR",
+    "I0002_structured",
+    "icd10_codes_nax_2024_parquet",
+)
+_DXGC_EHR_SOURCE_VERSION = "i0006_i0002_exclusive_auto_v2"
+
+_DIAG_CATEGORIES = {
+    "Obstructive Sleep Apnea": lambda n: "sleep apnea" in n.lower(),
+    "Hypertension": lambda n: "hypertension" in n.lower(),
+    "Diabetes": lambda n: "diabetes" in n.lower(),
+    "Heart Failure": lambda n: "heart failure" in n.lower(),
+    "Coronary Artery Disease": lambda n: "coronary" in n.lower() or "atherosclerotic heart" in n.lower(),
+    "Heart Transplant": lambda n: "heart transplant" in n.lower() or "transplant status" in n.lower(),
+    "Atrial Fibrillation": lambda n: "atrial fibrillation" in n.lower() or "atrial flutter" in n.lower(),
+    "COPD": lambda n: "chronic obstructive" in n.lower(),
+    "Obesity": lambda n: "obesity" in n.lower() or "obese" in n.lower(),
+    "Depression": lambda n: "depressive" in n.lower() or "depression" in n.lower(),
+    "Anxiety": lambda n: "anxiety" in n.lower(),
+    "Cognitive Impairment / Dementia": lambda n: "cognitive" in n.lower() or "alzheimer" in n.lower() or "dementia" in n.lower(),
+    "Stroke / Cerebrovascular": lambda n: "infarction" in n.lower() or "cerebrovascular" in n.lower() or "stroke" in n.lower() or "hemorrhage" in n.lower(),
+    "Kidney Disease": lambda n: "kidney" in n.lower() or "renal" in n.lower(),
+    "Anemia": lambda n: "anemia" in n.lower(),
+}
+
+
+def _add_dx_rows_to_patient_map(patient_map, df, pid_col, dx_col, target_ids=None):
+    """Merge diagnosis rows into {bdsp_patient_id: set(dx_name, ...)}."""
+    if df is None or df.empty or pid_col not in df.columns or dx_col not in df.columns:
+        return
+    work = df[[pid_col, dx_col]].copy()
+    work = work[work[pid_col].notna() & work[dx_col].notna()]
+    if work.empty:
+        return
+    work[pid_col] = pd.to_numeric(work[pid_col], errors="coerce")
+    work = work.dropna(subset=[pid_col])
+    work[pid_col] = work[pid_col].astype(int)
+    if target_ids is not None:
+        work = work[work[pid_col].isin(target_ids)]
+    work[dx_col] = work[dx_col].astype(str).str.strip()
+    work = work[(work[dx_col] != "") & (work[dx_col].str.lower() != "not recorded")]
+    for pid_val, grp in work.groupby(pid_col):
+        patient_map.setdefault(int(pid_val), set()).update(grp[dx_col].dropna().unique().tolist())
+
+
+def _read_ehr_parquet(path, columns, pid_col, target_ids=None):
+    """Read an EHR parquet chunk, using patient-ID filters when the parquet engine supports them."""
+    if target_ids:
+        try:
+            return pd.read_parquet(
+                path,
+                columns=columns,
+                filters=[(pid_col, "in", list(target_ids))],
+            )
+        except Exception:
+            pass
+    return pd.read_parquet(path, columns=columns)
+
+
+def _load_ehr_diagnosis_map(target_ids=None):
+    """Load I0006 and I0002 diagnosis parquet chunks -> {bdsp_patient_id: [dx_name, ...]}."""
+    import glob as _glob
+    target_ids = set(int(x) for x in target_ids) if target_ids is not None else None
+    patient_map = {}
+
+    chunks = sorted(_glob.glob(os.path.join(_EHR_DIAG_BASE, "*.parquet")))
+    for ch in chunks:
+        try:
+            df_ch = _read_ehr_parquet(
+                ch,
+                columns=['bdsp_patient_id', 'dx_name', 'dx_code_icd_10'],
+                pid_col='bdsp_patient_id',
+                target_ids=target_ids,
+            )
+            _add_dx_rows_to_patient_map(patient_map, df_ch, 'bdsp_patient_id', 'dx_name', target_ids)
+        except Exception:
+            pass
+
+    i0002_chunks = sorted(_glob.glob(os.path.join(_EHR_I0002_ICD10_BASE, "*.parquet")))
+    for ch in i0002_chunks:
+        try:
+            df_ch = _read_ehr_parquet(
+                ch,
+                columns=['BDSPPatientID', 'LongDescription'],
+                pid_col='BDSPPatientID',
+                target_ids=target_ids,
+            )
+            _add_dx_rows_to_patient_map(patient_map, df_ch, 'BDSPPatientID', 'LongDescription', target_ids)
+        except Exception:
+            pass
+
+    return {pid: sorted(dx_names) for pid, dx_names in patient_map.items()}
+
+
+def _pid_to_bdsp_ehr(pid_str):
+    """SUB-I0006179000017_... or SUB-I0002150000096_... -> 9-digit BDSPPatientID."""
+    import re as _re_dxg
+    m = _re_dxg.search(r'I\d{4}(\d{9})', str(pid_str))
+    if m:
+        return int(m.group(1))
+    return None
+
+
+def _assign_categories(dx_names_list):
+    """Map list of dx_names to set of broad category names."""
+    cats = set()
+    for dx in dx_names_list:
+        for cat_name, test_fn in _DIAG_CATEGORIES.items():
+            if test_fn(dx):
+                cats.add(cat_name)
+    return cats
+
+
+def _dxgc_cache_key(hep_groups, stage, grouping_mode, min_group_size, apply_ecg_reg, extra=None):
+    """Compute cache key from analysis settings."""
+    import hashlib as _hl, json as _js
+    key = {"g": sorted(hep_groups), "s": stage, "gm": grouping_mode,
+           "mg": int(min_group_size), "ecg": bool(apply_ecg_reg),
+           "ehr": _DXGC_EHR_SOURCE_VERSION}
+    if extra:
+        key["extra"] = extra
+    return _hl.md5(_js.dumps(key, sort_keys=True).encode()).hexdigest()[:12]
+
+
+def _dxgc_cache_path(base_path, key):
+    """Return path to cache pickle for given key."""
+    cache_dir = os.path.join(base_path, ".dxgc_cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    return os.path.join(cache_dir, f"dxgc_{key}.pkl")
+
+
+def _dxgc_count_on_disk(base_path, hep_groups, stage):
+    """Count patient pkl files on disk (fast, no loading) for cache invalidation."""
+    total = 0
+    for grp in hep_groups:
+        d = os.path.join(base_path, grp, stage)
+        if os.path.isdir(d):
+            total += len([f for f in os.listdir(d)
+                          if f.endswith('.pkl')
+                          and not f.startswith('individuals_cache')
+                          and not f.startswith('non_eeg_individuals_cache')])
+    return total
+
+
+def run_diagnosis_group_comparison_analysis(base_path, selected_stage):
+    """Cluster patients by EHR diagnosis from I0006 and I0002 parquet data."""
+    EEG_DISPLAY_SCALE = 1e6
+    EEG_DISPLAY_UNIT = "µV"
+
+    def _eeg_display_matrix(matrix):
+        return np.asarray(matrix, dtype=float) * EEG_DISPLAY_SCALE
+
+    def _show_non_ica_figure(fig, **kwargs):
+        fig._skip_ica_cleaned_title = True
+        st.pyplot(fig, **kwargs)
+
+    def _filter_diagnosis_category_groups(group_data, cat_counts):
+        if grouping_mode != "By Diagnosis Category" or not group_data:
+            return group_data, None
+
+        options = sorted(
+            group_data.keys(),
+            key=lambda g: (-int(cat_counts.get(g, group_data[g].get("n", 0))), str(g)),
+        )
+        default = options[:min(4, len(options))]
+        selected = st.multiselect(
+            "Select diagnosis categories to plot",
+            options=options,
+            default=default,
+            key="dxgc_plot_cats_v2",
+        )
+        if not selected:
+            st.warning("Select at least one diagnosis category to plot.")
+            return {}, None
+        return {g: group_data[g] for g in selected if g in group_data}, selected
+
+    def _show_diagnosis_category_venn(patient_info, cat_counts, key_suffix):
+        """Show exact patient intersections for two or three broad diagnosis categories."""
+        available = [
+            cat for cat, _ in sorted(cat_counts.items(), key=lambda item: (-item[1], item[0]))
+            if int(cat_counts.get(cat, 0)) > 0
+        ]
+        if len(available) < 2:
+            st.info("At least two populated diagnosis categories are needed for an overlap diagram.")
+            return
+
+        st.markdown("**Diagnosis Category Overlap (Venn Diagram)**")
+        selected = st.multiselect(
+            "Choose 2 or 3 diagnosis categories",
+            options=available,
+            default=available[:min(3, len(available))],
+            max_selections=3,
+            key=f"dxgc_table_venn_categories_{key_suffix}",
+        )
+        if len(selected) not in (2, 3):
+            st.caption("Select exactly 2 or 3 categories to draw the Venn diagram.")
+            return
+
+        pid_sets = {
+            cat: {
+                str(pid) for pid, info in patient_info.items()
+                if cat in set(info.get("categories", []))
+            }
+            for cat in selected
+        }
+        colors = ['#4C78A8', '#F58518', '#54A24B']
+        fig, ax = plt.subplots(figsize=(9, 6))
+        ax.set_aspect('equal')
+        ax.axis('off')
+
+        from matplotlib.patches import Circle as _VennCircle
+        if len(selected) == 2:
+            a, b = selected
+            only_a = len(pid_sets[a] - pid_sets[b])
+            only_b = len(pid_sets[b] - pid_sets[a])
+            both = len(pid_sets[a] & pid_sets[b])
+            for center, color in [((-0.7, 0), colors[0]), ((0.7, 0), colors[1])]:
+                ax.add_patch(_VennCircle(center, 1.45, facecolor=color, edgecolor=color,
+                                         alpha=0.35, linewidth=2))
+            ax.text(-1.25, 0, str(only_a), ha='center', va='center', fontsize=15, fontweight='bold')
+            ax.text(1.25, 0, str(only_b), ha='center', va='center', fontsize=15, fontweight='bold')
+            ax.text(0, 0, str(both), ha='center', va='center', fontsize=15, fontweight='bold')
+            ax.text(-1.0, 1.65, f"{a}\nN={len(pid_sets[a])}", ha='center', va='bottom', fontsize=10)
+            ax.text(1.0, 1.65, f"{b}\nN={len(pid_sets[b])}", ha='center', va='bottom', fontsize=10)
+            ax.set_xlim(-2.4, 2.4); ax.set_ylim(-1.7, 2.25)
+        else:
+            a, b, c = selected
+            sa, sb, sc = pid_sets[a], pid_sets[b], pid_sets[c]
+            counts = {
+                "a": len(sa - sb - sc), "b": len(sb - sa - sc), "c": len(sc - sa - sb),
+                "ab": len((sa & sb) - sc), "ac": len((sa & sc) - sb),
+                "bc": len((sb & sc) - sa), "abc": len(sa & sb & sc),
+            }
+            centers = [(-0.75, 0.45), (0.75, 0.45), (0, -0.65)]
+            for center, color in zip(centers, colors):
+                ax.add_patch(_VennCircle(center, 1.5, facecolor=color, edgecolor=color,
+                                         alpha=0.30, linewidth=2))
+            positions = {
+                "a": (-1.25, 0.65), "b": (1.25, 0.65), "c": (0, -1.25),
+                "ab": (0, 0.85), "ac": (-0.62, -0.42), "bc": (0.62, -0.42),
+                "abc": (0, 0.0),
+            }
+            for region, pos in positions.items():
+                ax.text(*pos, str(counts[region]), ha='center', va='center',
+                        fontsize=14, fontweight='bold')
+            label_positions = [(-1.55, 1.85), (1.55, 1.85), (0, -2.25)]
+            for cat, pos in zip(selected, label_positions):
+                ax.text(*pos, f"{cat}\nN={len(pid_sets[cat])}", ha='center', va='center', fontsize=10)
+            ax.set_xlim(-2.6, 2.6); ax.set_ylim(-2.6, 2.4)
+
+        ax.set_title("Patient Intersections Between Diagnosis Categories",
+                     fontsize=13, fontweight='bold', pad=12)
+        fig.tight_layout()
+        _show_non_ica_figure(fig, use_container_width=True)
+        plt.close(fig)
+        st.caption(
+            "Numbers in non-overlapping regions are category-only counts; overlapping regions show "
+            "patients assigned to every category covering that region. Circle areas are illustrative."
+        )
+
+    st.header("\U0001fac0\U0001f9e0 Diagnosis Group Comparison")
+    st.markdown(
+        """
+        Groups patients by their clinical diagnoses from the **BDSP EHR databases**
+        (`bdsp_i0006_diagnosis` and I0002 ICD10 parquet files).
+
+        **Grouping modes include:**
+        - **By Diagnosis Category**: broad ICD categories (OSA, Hypertension, Diabetes, etc.).
+          Each patient may appear in multiple categories. Compare patients *with* vs *without* a diagnosis,
+          or compare multiple diagnosis groups head-to-head.
+        - **By Specific Diagnosis**: search and select exact diagnosis names (e.g. "Obstructive sleep apnea").
+        - **Diagnosis Comorbidity Subgroups**: pick one index diagnosis, then compare large mutually exclusive
+          subgroups such as OSA only, OSA + hypertension, OSA + hypertension + obesity, and so on.
+
+        Only groups with >= min_patients shown.
+        """
+    )
+
+    available_groups = sorted([g for g in os.listdir(base_path) if os.path.isdir(os.path.join(base_path, g))])
+    selected_hep_groups = st.multiselect(
+        "HEP groups to load",
+        options=available_groups,
+        default=default_hep_groups(available_groups),
+        key="dxgc_hep_groups",
+    )
+    if not selected_hep_groups:
+        st.warning("Select at least one HEP group.")
+        return
+
+    grouping_mode = st.radio(
+        "Grouping mode",
+        [
+            "By Diagnosis Category",
+            "By Specific Diagnosis",
+            "Diagnosis Comorbidity Subgroups",
+            "By Age Group",
+            "By Sex",
+            "Exclusive Diagnosis Category",
+        ],
+        horizontal=True,
+        index=5,
+        key="dxgc_grouping_mode",
+    )
+
+    comorbidity_base_category = None
+    comorbidity_categories = []
+    comorbidity_max_subgroups = 12
+    comorbidity_min_disease_count = 10
+    if grouping_mode == "Diagnosis Comorbidity Subgroups":
+        category_options = list(_DIAG_CATEGORIES.keys())
+        default_base = "Obstructive Sleep Apnea" if "Obstructive Sleep Apnea" in category_options else category_options[0]
+        st.markdown("**Comorbidity subgroup setup**")
+        cbase, cmax = st.columns(2)
+        with cbase:
+            comorbidity_base_category = st.selectbox(
+                "Index diagnosis",
+                options=category_options,
+                index=category_options.index(default_base),
+                key="dxgc_comorb_base_cat",
+                help="Patients must have this broad diagnosis category before comorbidity subgroups are formed.",
+            )
+        preferred_comorbidities = [
+            "Hypertension",
+            "Obesity",
+            "Diabetes",
+            "Heart Failure",
+            "Atrial Fibrillation",
+            "Coronary Artery Disease",
+            "COPD",
+            "Kidney Disease",
+        ]
+        default_comorbidities = [
+            cat for cat in preferred_comorbidities
+            if cat in category_options and cat != comorbidity_base_category
+        ]
+        available_comorbidities = [cat for cat in category_options if cat != comorbidity_base_category]
+        with cmax:
+            comorbidity_max_subgroups = st.number_input(
+                "Max displayed subgroups",
+                min_value=2,
+                max_value=50,
+                value=12,
+                step=1,
+                key="dxgc_comorb_max_subgroups",
+                help="Keeps plots and pairwise tests readable by using the largest valid subgroups.",
+            )
+        comorbidity_categories = st.multiselect(
+            "Major comorbidity categories to combine",
+            options=available_comorbidities,
+            default=default_comorbidities,
+            key="dxgc_comorb_cats",
+            help="Exact combinations of these categories define the subgroups. Categories not selected here are ignored for subgroup labels.",
+        )
+        if not comorbidity_categories:
+            st.warning("Select at least one comorbidity category.")
+            return
+        comorbidity_min_disease_count = st.number_input(
+            "Ignore comorbidities below N patients",
+            min_value=1,
+            value=10,
+            step=1,
+            key="dxgc_comorb_min_disease_count",
+            help="Rare comorbidity categories are removed from subgroup labels, but their patients remain in the broader subgroup.",
+        )
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        if grouping_mode == "Diagnosis Comorbidity Subgroups":
+            min_group_size = st.number_input(
+                "Min patients per subgroup",
+                min_value=1,
+                value=500,
+                step=1,
+                key="dxgc_mingroup_comorb",
+                help="Minimum subgroup size to include in plots and statistics.",
+            )
+        else:
+            min_group_size = st.number_input(
+                "Min patients per group",
+                min_value=2,
+                value=3,
+                step=1,
+                key="dxgc_mingroup",
+            )
+    with col2:
+        n_permutations = st.number_input("Permutations", 50, 500, 200, 50, key="dxgc_nperms")
+    with col3:
+        apply_ecg_reg = st.checkbox("Regress out ECG from EEG", True, key="dxgc_ecgreg")
+
+    # ── Cache management ────────────────────────────────────────────────────
+    import pickle as _pkl_dxgc
+    from datetime import datetime as _dt_dxgc
+
+    cache_extra = None
+    if grouping_mode == "Diagnosis Comorbidity Subgroups":
+        cache_extra = {
+            "base_category": comorbidity_base_category,
+            "comorbidity_categories": list(comorbidity_categories),
+            "max_subgroups": int(comorbidity_max_subgroups),
+            "min_disease_count": int(comorbidity_min_disease_count),
+        }
+    cache_key = _dxgc_cache_key(
+        selected_hep_groups,
+        selected_stage,
+        grouping_mode,
+        min_group_size,
+        apply_ecg_reg,
+        extra=cache_extra,
+    )
+    cache_path = _dxgc_cache_path(base_path, cache_key)
+
+    cached_data = None
+    cache_status = "missing"
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, "rb") as _cf:
+                cached_data = _pkl_dxgc.load(_cf)
+            current_n = _dxgc_count_on_disk(base_path, selected_hep_groups, selected_stage)
+            cached_n = cached_data.get("n_individuals_on_disk", -1)
+            if current_n != cached_n:
+                cache_status = "stale"
+                st.warning(
+                    f"Patient count changed on disk ({cached_n} → {current_n}). "
+                    "Cache will be recomputed automatically."
+                )
+            else:
+                cache_status = "fresh"
+                st.success(
+                    f"✅ Cached results from {cached_data.get('created_at', '?')} | "
+                    f"N={cached_data.get('n_individuals', '?')} patients | "
+                    f"Grouping: {grouping_mode}. Showing cached data."
+                )
+        except Exception:
+            cached_data = None
+            cache_status = "missing"
+
+    btn_label = "🔄 Reload & Recompute" if cache_status == "fresh" else "🚀 Load & Analyse"
+    force_recompute = st.button(btn_label, key="dxgc_load")
+
+    use_cache = (cache_status == "fresh") and not force_recompute
+    run_full = force_recompute or cache_status != "fresh"
+
+    if use_cache and cached_data is not None:
+        group_data = cached_data["group_data"]
+        for _gd in group_data.values():
+            _gd.setdefault("eeg_per_ch", {})
+            _gd.setdefault("eeg_mv", None)
+        patient_info = cached_data["patient_info"]
+        cat_counts = cached_data["cat_counts"]
+        all_individuals_n = cached_data["n_individuals"]
+        st.caption(f"Loaded from cache: {len(group_data)} groups, {all_individuals_n} total patients.")
+        # Show patient table from cache
+        st.subheader("\U0001f4cb Patient Diagnosis Table (Sample)")
+        if cached_data.get("patient_table"):
+            st.dataframe(pd.DataFrame(cached_data["patient_table"]), use_container_width=True)
+        _show_diagnosis_category_venn(patient_info, cat_counts, "cached")
+        # Show prevalence table from cache
+        st.subheader("\U0001f4ca Diagnosis Category Prevalence")
+        if cat_counts:
+            all_ind_n = cached_data.get("n_individuals", 1)
+            st.dataframe(pd.DataFrame([
+                {"Diagnosis Category": c, "N Patients with diagnosis": n,
+                 "% of loaded patients": f"{100*n/max(all_ind_n,1):.1f}%"}
+                for c, n in sorted(cat_counts.items(), key=lambda x: -x[1])
+            ]), use_container_width=True)
+        # Group size table from cache
+        st.subheader("\U0001f4ca Group Distribution")
+        if cached_data.get("group_sizes"):
+            st.dataframe(pd.DataFrame(cached_data["group_sizes"]), use_container_width=True)
+        valid_groups = {k: [] for k in group_data.keys()}  # empty in cache path — no patient-level iteration
+        palette = ['#1f77b4', '#d62728', '#2ca02c', '#9467bd', '#ff7f0e', '#17becf', '#8c564b', '#e377c2', '#bcbd22', '#7f7f7f']
+        group_color = {g: palette[i % len(palette)] for i, g in enumerate(sorted(group_data))}
+    elif not run_full:
+        return
+    else:
+        pass  # fall through to full computation below
+
+    if not use_cache:
+        # Load psg_metadata for age/sex
+        meta_paths = [
+            "/storage/pblab_shared_data/Nir/Cobrad/EDF_Format/The_Human_Sleep_Project/psg_metadata.csv",
+            "/storage/pblab_shared_data/Nir/Cobrad/EDF_Format/Young_The_Human_Sleep_Project/psg_metadata.csv",
+        ]
+        meta_frames = []
+        for mp in meta_paths:
+            if os.path.exists(mp):
+                try:
+                    meta_frames.append(pd.read_csv(mp, low_memory=False))
+                except Exception:
+                    pass
+        meta_df = None
+        if meta_frames:
+            meta_df = pd.concat(meta_frames, ignore_index=True)
+            meta_df['BDSPPatientID'] = pd.to_numeric(meta_df['BDSPPatientID'], errors='coerce')
+            meta_df = meta_df.dropna(subset=['BDSPPatientID'])
+            meta_df['BDSPPatientID'] = meta_df['BDSPPatientID'].astype(int)
+            meta_df = meta_df.drop_duplicates(subset=['BDSPPatientID'])
+
+        # Load HEP individuals
+        all_individuals = []
+        for grp in selected_hep_groups:
+            with st.spinner(f"Loading {grp} / {selected_stage}..."):
+                inds = get_group_individuals(grp, selected_stage, base_path)
+                all_individuals.extend(inds or [])
+        st.caption(f"Total patient records loaded: {len(all_individuals)}")
+        if not all_individuals:
+            st.error("No patient data loaded.")
+            return
+
+        selected_bdsp_ids = sorted({
+            bdsp_id for bdsp_id in (_pid_to_bdsp_ehr(str(ind[0])) for ind in all_individuals)
+            if bdsp_id is not None
+        })
+        with st.spinner("Loading EHR diagnosis data for selected patients..."):
+            ehr_map = _load_ehr_diagnosis_map(target_ids=selected_bdsp_ids)
+        st.caption(
+            f"EHR diagnosis map loaded from I0006 + I0002: "
+            f"{len(ehr_map)}/{len(selected_bdsp_ids)} selected patients with diagnosis records."
+        )
+
+        # Match each patient to EHR and meta
+        patient_info = {}  # pid_str -> {bdsp_id, dx_names, categories, age, sex, age_group}
+        for ind in all_individuals:
+            pid = str(ind[0])
+            bdsp_id = _pid_to_bdsp_ehr(pid)
+            dx_names = ehr_map.get(bdsp_id, []) if bdsp_id is not None else []
+            cats = _assign_categories(dx_names)
+            age, sex, age_group = None, None, "Unknown"
+            if meta_df is not None and bdsp_id is not None and bdsp_id in meta_df['BDSPPatientID'].values:
+                row = meta_df[meta_df['BDSPPatientID'] == bdsp_id].iloc[0]
+                age = row.get('AgeAtVisit', None)
+                sex = row.get('SexDSC', None)
+                age_group = ("<40" if pd.notna(age) and age < 40 else
+                             "40-59" if pd.notna(age) and age < 60 else
+                             "60-79" if pd.notna(age) and age < 80 else
+                             "80+" if pd.notna(age) else "Unknown")
+            patient_info[pid] = {
+                "bdsp_id": bdsp_id,
+                "dx_names": dx_names,
+                "categories": cats,
+                "age": age,
+                "sex": sex,
+                "age_group": age_group,
+            }
+
+        ehr_matched = sum(1 for v in patient_info.values() if v["dx_names"])
+        st.caption(f"EHR-matched: {ehr_matched}/{len(all_individuals)} patients have diagnosis records.")
+
+        # Patient-diagnosis sample table
+        st.subheader("\U0001f4cb Patient Diagnosis Table (Sample)")
+        st.caption("Shows each patient's EHR diagnoses. Categories are broad ICD groupings.")
+        table_rows = []
+        for pid, info in list(patient_info.items())[:50]:
+            table_rows.append({
+                "PID": pid,
+                "BDSPPatientID": str(info["bdsp_id"]) if info["bdsp_id"] else "—",
+                "Age": info["age"] if info["age"] is not None else "—",
+                "Sex": info["sex"] or "—",
+                "Diagnosis Categories": ", ".join(sorted(info["categories"])) or "None matched",
+                "N specific diagnoses": len(info["dx_names"]),
+                "Sample diagnoses": "; ".join(info["dx_names"][:3]) + ("..." if len(info["dx_names"]) > 3 else ""),
+            })
+        st.dataframe(pd.DataFrame(table_rows), use_container_width=True)
+
+        # Diagnosis category counts table
+        cat_counts = Counter()
+        for info in patient_info.values():
+            for c in info["categories"]:
+                cat_counts[c] += 1
+        _show_diagnosis_category_venn(patient_info, cat_counts, "loaded")
+        cat_df = pd.DataFrame([
+            {"Diagnosis Category": c, "N Patients with diagnosis": n,
+             "% of loaded patients": f"{100*n/len(all_individuals):.1f}%"}
+            for c, n in sorted(cat_counts.items(), key=lambda x: -x[1])
+        ])
+        st.subheader("\U0001f4ca Diagnosis Category Prevalence")
+        st.dataframe(cat_df, use_container_width=True)
+
+        # Build groups based on mode
+        group_to_inds = {}
+
+        if grouping_mode == "By Diagnosis Category":
+            all_cats = sorted(cat_counts.keys(), key=lambda c: -cat_counts[c])
+            if not all_cats:
+                st.warning("No diagnosis categories found for loaded patients.")
+                return
+            for cat in all_cats:
+                group_to_inds[cat] = [
+                    ind for ind in all_individuals
+                    if cat in patient_info[str(ind[0])]["categories"]
+                ]
+            no_diag = [ind for ind in all_individuals if not patient_info[str(ind[0])]["categories"]]
+            if no_diag:
+                group_to_inds["No Matched Diagnosis"] = no_diag
+
+        elif grouping_mode == "By Specific Diagnosis":
+            all_dx_names = sorted(set(dx for info in patient_info.values() for dx in info["dx_names"]))
+            all_cats_for_filter = sorted(cat_counts.keys(), key=lambda c: -cat_counts[c])
+            cat_filter = st.multiselect(
+                "Filter by diagnosis category (optional):",
+                options=all_cats_for_filter,
+                default=[],
+                key="dxgc_spec_cat_filter",
+                help="Narrow the list below to diagnoses associated with these categories.",
+            )
+            if cat_filter:
+                cat_filter_set = set(cat_filter)
+                filtered_by_cat = sorted(set(
+                    dx for info in patient_info.values()
+                    if info["categories"] & cat_filter_set
+                    for dx in info["dx_names"]
+                ))
+            else:
+                filtered_by_cat = all_dx_names
+            search_term = st.text_input("Search diagnosis names (filter):", key="dxgc_search")
+            filtered_dx = [d for d in filtered_by_cat if search_term.lower() in d.lower()] if search_term else filtered_by_cat[:100]
+            selected_dx = st.multiselect(
+                "Select specific diagnoses (each = one group: patients WITH that diagnosis)",
+                options=filtered_dx,
+                default=[],
+                key="dxgc_spec_dx",
+            )
+            if not selected_dx:
+                st.info("Select specific diagnoses above to start comparison.")
+                return
+            exclusive_spec = st.checkbox(
+                "Exclusive groups — exclude patients belonging to multiple selected groups",
+                value=True,
+                key="dxgc_spec_exclusive",
+                help="When checked, a patient who has more than one of the selected diagnoses is excluded from all groups.",
+            )
+            selected_dx_set = set(selected_dx)
+            for dx in selected_dx:
+                if exclusive_spec:
+                    group_to_inds[dx] = [
+                        ind for ind in all_individuals
+                        if dx in patient_info[str(ind[0])]["dx_names"]
+                        and not (set(patient_info[str(ind[0])]["dx_names"]) & (selected_dx_set - {dx}))
+                    ]
+                else:
+                    group_to_inds[dx] = [
+                        ind for ind in all_individuals
+                        if dx in patient_info[str(ind[0])]["dx_names"]
+                    ]
+
+        elif grouping_mode == "Diagnosis Comorbidity Subgroups":
+            base_cat = comorbidity_base_category
+            comorb_cats = [cat for cat in comorbidity_categories if cat != base_cat]
+            base_inds = [
+                ind for ind in all_individuals
+                if base_cat in patient_info[str(ind[0])]["categories"]
+            ]
+            if not base_inds:
+                st.warning(f"No loaded patients have the index diagnosis category: {base_cat}.")
+                return
+
+            comorb_counts = {
+                cat: sum(
+                    1 for ind in base_inds
+                    if cat in patient_info[str(ind[0])]["categories"]
+                )
+                for cat in comorb_cats
+            }
+            active_comorb_cats = [
+                cat for cat in comorb_cats
+                if comorb_counts.get(cat, 0) >= int(comorbidity_min_disease_count)
+            ]
+            ignored_comorb_cats = [
+                cat for cat in comorb_cats
+                if comorb_counts.get(cat, 0) < int(comorbidity_min_disease_count)
+            ]
+            if ignored_comorb_cats:
+                st.caption(
+                    f"Ignoring {len(ignored_comorb_cats)} rare comorbidity categories with "
+                    f"< {int(comorbidity_min_disease_count)} patients. Patients are retained and "
+                    "assigned using the remaining larger comorbidity categories."
+                )
+                st.dataframe(
+                    pd.DataFrame([
+                        {"Ignored comorbidity": cat, "N patients within index diagnosis": comorb_counts.get(cat, 0)}
+                        for cat in sorted(ignored_comorb_cats, key=lambda c: (comorb_counts.get(c, 0), c))
+                    ]),
+                    use_container_width=True,
+                )
+            if not active_comorb_cats:
+                st.warning(
+                    f"No selected comorbidity categories have >= {int(comorbidity_min_disease_count)} "
+                    f"patients among {base_cat} patients. All patients will be grouped as {base_cat} only."
+                )
+
+            for ind in base_inds:
+                pid = str(ind[0])
+                patient_cats = set(patient_info[pid]["categories"])
+                combo = tuple(cat for cat in active_comorb_cats if cat in patient_cats)
+                if combo:
+                    label = f"{base_cat} + " + " + ".join(combo)
+                else:
+                    label = f"{base_cat} only"
+                group_to_inds.setdefault(label, []).append(ind)
+
+            subgroup_rows = []
+            for label, inds in sorted(group_to_inds.items(), key=lambda item: (-len(item[1]), item[0])):
+                subgroup_rows.append({
+                    "Subgroup": label,
+                    "N Patients": len(inds),
+                    "% of index diagnosis": f"{100*len(inds)/max(len(base_inds), 1):.1f}%",
+                    "Included": "Yes" if len(inds) >= int(min_group_size) else f"No (< {int(min_group_size)})",
+                })
+            st.caption(
+                f"Comorbidity subgroups are mutually exclusive exact combinations among "
+                f"{len(base_inds)} patients with {base_cat}. "
+                "Unselected and rare diagnosis categories are ignored when assigning subgroup labels, "
+                "but their patients remain in the broader subgroup."
+            )
+            st.dataframe(pd.DataFrame(subgroup_rows), use_container_width=True)
+
+        elif grouping_mode == "By Age Group":
+            for ind in all_individuals:
+                ag = patient_info[str(ind[0])]["age_group"]
+                group_to_inds.setdefault(ag, []).append(ind)
+
+        elif grouping_mode == "Exclusive Diagnosis Category":
+            all_cats_sorted = sorted(cat_counts.keys(), key=lambda c: -cat_counts[c])
+            if not all_cats_sorted:
+                st.warning("No diagnosis categories found for loaded patients.")
+                return
+            exclusive_strategy = st.radio(
+                "Exclusive grouping strategy",
+                ["Auto-find largest non-overlapping groups", "Only pure single-category overlap removal"],
+                horizontal=True,
+                key="dxgc_excl_strategy",
+            )
+
+            if exclusive_strategy == "Auto-find largest non-overlapping groups":
+                import itertools as _itertools
+                c1, c2 = st.columns(2)
+                with c1:
+                    max_auto_groups = st.number_input(
+                        "Max non-overlapping groups", 2, 20, 6, 1, key="dxgc_excl_auto_max_groups"
+                    )
+                with c2:
+                    max_candidate_cats = st.number_input(
+                        "Candidate categories to search", 2, 50, min(20, max(2, len(all_cats_sorted))), 1,
+                        key="dxgc_excl_auto_candidates",
+                    )
+                k = int(max_auto_groups)
+                # Cap search space to avoid combinatorial explosion (C(20,8)~125k is fine)
+                search_cats = all_cats_sorted[:min(int(max_candidate_cats), 20)]
+
+                # Pre-compute patient-id sets per category
+                cat_pid_sets = {
+                    cat: frozenset(str(ind[0]) for ind in all_individuals
+                                   if cat in patient_info[str(ind[0])]["categories"])
+                    for cat in search_cats
+                }
+
+                # Find combo of exactly k_try categories maximising min(exclusive_count).
+                # Exclusive count = patients in that category and NO other selected category.
+                best_combo = None
+                best_score = -1
+                best_excl_counts = None
+                found_k = None
+
+                for k_try in range(min(k, len(search_cats)), 1, -1):
+                    for combo in _itertools.combinations(search_cats, k_try):
+                        combo_sets = [cat_pid_sets[c] for c in combo]
+                        counts = []
+                        for i, c in enumerate(combo):
+                            others = frozenset().union(*(combo_sets[j] for j in range(k_try) if j != i))
+                            counts.append(len(combo_sets[i] - others))
+                        score = min(counts)
+                        if score >= int(min_group_size) and score > best_score:
+                            best_score = score
+                            best_combo = combo
+                            best_excl_counts = counts
+                    if best_combo is not None:
+                        found_k = k_try
+                        break
+
+                if best_combo is None:
+                    st.warning(
+                        "Could not find non-overlapping diagnosis groups that meet the minimum size. "
+                        "Lower Min patients per group or increase Candidate categories to search."
+                    )
+                    return
+
+                excl_info = []
+                combo_sets = [cat_pid_sets[c] for c in best_combo]
+                for i, cat in enumerate(best_combo):
+                    others = frozenset().union(*(combo_sets[j] for j in range(found_k) if j != i))
+                    excl_pids = combo_sets[i] - others
+                    excl_inds = [ind for ind in all_individuals if str(ind[0]) in excl_pids]
+                    group_to_inds[cat] = excl_inds
+                    excl_info.append({
+                        "Category": cat,
+                        "Total with diagnosis": len(combo_sets[i]),
+                        "Exclusive patients": len(excl_inds),
+                        "Excluded (overlap with others)": len(combo_sets[i]) - len(excl_inds),
+                    })
+
+                st.caption(
+                    f"**Auto exclusive mode:** searched top-{len(search_cats)} categories, "
+                    f"found best {found_k}-group combo maximising the smallest group. "
+                    "Patients belonging to multiple selected categories are excluded."
+                )
+                st.dataframe(pd.DataFrame(excl_info), use_container_width=True)
+            else:
+                top_n_excl = st.number_input(
+                    "Top N categories to consider", 2, 20, 5, 1, key="dxgc_excl_topn"
+                )
+                top_cats_excl = all_cats_sorted[:int(top_n_excl)]
+                selected_excl_cats = st.multiselect(
+                    "Select diagnosis categories — each group = patients with ONLY that category (no overlap with other selected categories)",
+                    options=all_cats_sorted,
+                    default=top_cats_excl,
+                    key="dxgc_excl_cats",
+                )
+                if not selected_excl_cats:
+                    st.warning("Select at least one category.")
+                    return
+                selected_excl_set = set(selected_excl_cats)
+                excl_info = []
+                for cat in selected_excl_cats:
+                    total_with_cat = sum(
+                        1 for ind in all_individuals
+                        if cat in patient_info[str(ind[0])]["categories"]
+                    )
+                    exclusive_inds = [
+                        ind for ind in all_individuals
+                        if cat in patient_info[str(ind[0])]["categories"]
+                        and not (set(patient_info[str(ind[0])]["categories"]) & (selected_excl_set - {cat}))
+                    ]
+                    group_to_inds[cat] = exclusive_inds
+                    excl_info.append({
+                        "Category": cat,
+                        "Total with diagnosis": total_with_cat,
+                        "Exclusive (no overlap)": len(exclusive_inds),
+                        "Excluded (overlap)": total_with_cat - len(exclusive_inds),
+                    })
+                st.caption(
+                    "**Pure exclusive mode:** each group contains only patients with that diagnosis "
+                    "and none of the other selected diagnoses."
+                )
+                st.dataframe(pd.DataFrame(excl_info), use_container_width=True)
+
+        else:  # By Sex
+            for ind in all_individuals:
+                sex = str(patient_info[str(ind[0])]["sex"] or "Unknown")
+                group_to_inds.setdefault(sex, []).append(ind)
+
+        # Filter by min size
+        all_sizes = sorted(group_to_inds.items(), key=lambda x: -len(x[1]))
+        valid_groups = {k: v for k, v in group_to_inds.items() if len(v) >= int(min_group_size)}
+        if grouping_mode == "Diagnosis Comorbidity Subgroups":
+            valid_groups = dict(
+                sorted(valid_groups.items(), key=lambda item: (-len(item[1]), item[0]))[
+                    :int(comorbidity_max_subgroups)
+                ]
+            )
+
+        st.subheader("\U0001f4ca Group Distribution")
+        def _included_label(group_name, inds):
+            if group_name in valid_groups:
+                return "Yes"
+            if len(inds) < int(min_group_size):
+                return f"No (< {int(min_group_size)})"
+            if grouping_mode == "Diagnosis Comorbidity Subgroups":
+                return f"No (outside top {int(comorbidity_max_subgroups)})"
+            return "No"
+
+        size_df = pd.DataFrame([
+            {"Group": k, "N Patients": len(v),
+             "Included": _included_label(k, v)}
+            for k, v in all_sizes
+        ])
+        st.dataframe(size_df, use_container_width=True)
+
+        if not valid_groups:
+            st.info(f"No groups meet minimum size {int(min_group_size)}. Reduce threshold or select more groups.")
+            return
+
+        palette = ['#1f77b4', '#d62728', '#2ca02c', '#9467bd', '#ff7f0e', '#17becf', '#8c564b', '#e377c2', '#bcbd22', '#7f7f7f']
+        group_color = {g: palette[i % len(palette)] for i, g in enumerate(sorted(valid_groups))}
+
+        def _extract_matrices(inds, clean_ecg=True):
+            eeg_by_ch = {}
+            ecg_traces = []
+            times_ref = None
+            ch_cnt = Counter()
+            for ind in inds:
+                try:
+                    unpacked = list(ind) + [None] * 7
+                    pid, hep_data, times, ch_names, _, ecg_hep = unpacked[:6]
+                except Exception:
+                    continue
+                if hep_data is None or times is None or ch_names is None:
+                    continue
+                if times_ref is None:
+                    times_ref = np.asarray(times, dtype=float)
+                eeg_arr = apply_ecg_regression(np.asarray(hep_data, dtype=float), ecg_hep) if (clean_ecg and ecg_hep is not None) else np.asarray(hep_data, dtype=float)
+                for ch in ch_names:
+                    if _is_eeg_channel(ch):
+                        idx = ch_names.index(ch)
+                        if idx < eeg_arr.shape[0]:
+                            eeg_by_ch.setdefault(ch, []).append(eeg_arr[idx])
+                            ch_cnt[ch] += 1
+                if ecg_hep is not None:
+                    ecg_t = np.asarray(ecg_hep, dtype=float).squeeze()
+                    if ecg_t.ndim == 1:
+                        ecg_traces.append(ecg_t * 1e6)
+            if times_ref is None:
+                return None, None, None, [], {}, None
+            n_p = len(inds)
+            common = [c for c, cnt in ch_cnt.items() if cnt >= max(2, n_p * 0.5)]
+            if not common:
+                return None, None, times_ref, [], {}, None
+            min_len = min(len(eeg_by_ch[c][0]) for c in common if eeg_by_ch.get(c))
+            pat_eeg = []
+            for i in range(n_p):
+                tr = [eeg_by_ch[c][i][:min_len] for c in common if i < len(eeg_by_ch.get(c, []))]
+                if tr:
+                    pat_eeg.append(np.mean(tr, axis=0))
+            if not pat_eeg:
+                return None, None, times_ref[:min_len], common, {}, None
+            eeg_mat = np.vstack(pat_eeg)
+            ecg_mat = None
+            if ecg_traces:
+                ve = [t[:min_len] for t in ecg_traces if len(t) >= min_len]
+                if ve:
+                    ecg_mat = np.vstack(ve)
+            # Per-channel matrices: {ch: (n_patients_with_ch, min_len)}
+            eeg_per_ch = {}
+            for c in common:
+                rows = [r[:min_len] for r in eeg_by_ch.get(c, [])]
+                if rows:
+                    eeg_per_ch[c] = np.vstack(rows)
+            # Multivariate matrix: each patient row = concatenation of all common channels
+            mv_rows = []
+            for i in range(len(pat_eeg)):
+                row_parts = [eeg_by_ch[c][i][:min_len] for c in common if i < len(eeg_by_ch.get(c, []))]
+                if len(row_parts) == len(common):
+                    mv_rows.append(np.concatenate(row_parts))
+            eeg_mv = np.vstack(mv_rows) if mv_rows else None
+            return eeg_mat, ecg_mat, times_ref[:min_len], common, eeg_per_ch, eeg_mv
+
+        group_data = {}
+        for cat, inds in valid_groups.items():
+            with st.spinner(f"Building matrices for {cat} (N={len(inds)})..."):
+                em, ecm, t, chs, per_ch, mv = _extract_matrices(inds, clean_ecg=apply_ecg_reg)
+                if em is not None:
+                    per_ch_raw = per_ch
+                    if apply_ecg_reg:
+                        _, _, _, _, per_ch_raw, _ = _extract_matrices(inds, clean_ecg=False)
+                    group_data[cat] = {
+                        "eeg": em, "ecg": ecm, "times": t, "channels": chs, "n": len(inds),
+                        "eeg_per_ch": per_ch,
+                        "eeg_per_ch_raw": per_ch_raw,
+                        "eeg_mv": mv,
+                    }
+
+        if not group_data:
+            st.error("No valid EEG data for any group.")
+            return
+
+        # Save to cache
+        try:
+            import pickle as _pkl_dxgc2
+            from datetime import datetime as _dt_dxgc2
+            patient_table_cache = []
+            for pid, info in list(patient_info.items())[:50]:
+                patient_table_cache.append({
+                    "PID": pid,
+                    "BDSPPatientID": str(info["bdsp_id"]) if info["bdsp_id"] else "—",
+                    "Age": info["age"] if info["age"] is not None else "—",
+                    "Sex": info["sex"] or "—",
+                    "Diagnosis Categories": ", ".join(sorted(info["categories"])) or "None matched",
+                    "N specific diagnoses": len(info["dx_names"]),
+                    "Sample diagnoses": "; ".join(info["dx_names"][:3]) + ("..." if len(info["dx_names"]) > 3 else ""),
+                })
+            group_sizes_cache = [
+                {"Group": k, "N Patients": len(v),
+                 "Included": _included_label(k, v)}
+                for k, v in sorted(group_to_inds.items(), key=lambda x: -len(x[1]))
+            ]
+            cache_payload = {
+                "group_data": group_data,
+                "patient_info": patient_info,
+                "cat_counts": cat_counts,
+                "n_individuals": len(all_individuals),
+                "n_individuals_on_disk": _dxgc_count_on_disk(base_path, selected_hep_groups, selected_stage),
+                "created_at": _dt_dxgc2.now().strftime("%Y-%m-%d %H:%M"),
+                "patient_table": patient_table_cache,
+                "group_sizes": group_sizes_cache,
+                "cache_key": cache_key,
+            }
+            with open(cache_path, "wb") as _cf2:
+                _pkl_dxgc2.dump(cache_payload, _cf2)
+            st.caption(f"✅ Results cached to `{os.path.basename(cache_path)}`.")
+        except Exception as _ce:
+            st.caption(f"Cache save failed: {_ce}")
+
+    group_data, _ = _filter_diagnosis_category_groups(group_data, cat_counts)
+    if not group_data:
+        return
+    palette = ['#1f77b4', '#d62728', '#2ca02c', '#9467bd', '#ff7f0e', '#17becf', '#8c564b', '#e377c2', '#bcbd22', '#7f7f7f']
+    group_color = {g: palette[i % len(palette)] for i, g in enumerate(group_data)}
+
+    # PLOT A: EEG HEP
+    st.markdown("---")
+    st.subheader("\U0001f4c8 A. EEG HEP by Diagnosis Group (Median +/- MAD)")
+    st.markdown(
+        "**Interpretation:** EEG response time-locked to each heartbeat R-peak (t=0). "
+        "Shaded = MAD (robust spread). Differences between diagnosis groups reflect "
+        "how cardiac diagnosis modulates brain-heart coupling."
+    )
+    eeg_sum = []
+    fig_eeg, ax_eeg = plt.subplots(figsize=(14, 5))
+    ax_eeg.axvline(0, color='red', ls='--', alpha=0.6, label='R-peak')
+    ax_eeg.axhline(0, color='black', lw=0.5, alpha=0.3)
+    for cat, gd in group_data.items():
+        mat = gd["eeg"]; t = gd["times"]
+        ml = min(mat.shape[1], len(t))
+        mat_uv = _eeg_display_matrix(mat[:, :ml])
+        med, mad_v = median_and_mad(mat_uv, axis=0)
+        ax_eeg.plot(t[:ml], med, color=group_color[cat], lw=2, label=f"{cat} (N={gd['n']})")
+        ax_eeg.fill_between(t[:ml], med - mad_v, med + mad_v, color=group_color[cat], alpha=0.18)
+        eeg_sum.append({"Group": cat, "N": mat.shape[0],
+            f"Peak |Amp| ({EEG_DISPLAY_UNIT})": f"{float(np.max(np.abs(med))):.4f}",
+            "Peak Time (s)": f"{float(t[np.argmax(np.abs(med))]):.3f}",
+            f"Mean MAD ({EEG_DISPLAY_UNIT})": f"{float(np.mean(mad_v)):.4f}",
+            "N EEG ch": len(gd["channels"])})
+    ax_eeg.set_xlabel("Time relative to R-peak (s)")
+    ax_eeg.set_ylabel(f"EEG amplitude ({EEG_DISPLAY_UNIT})")
+    ax_eeg.set_title(f"EEG HEP — {grouping_mode}", fontsize=13, fontweight='bold')
+    ax_eeg.legend(fontsize=9, loc='best')
+    ax_eeg.grid(True, alpha=0.25)
+    fig_eeg.tight_layout()
+    _show_non_ica_figure(fig_eeg, use_container_width=True)
+    plt.close(fig_eeg)
+    st.markdown("**EEG HEP summary table:**")
+    st.caption("Amplitude and MAD are computed from the raw EEG HEP after converting stored volts to µV; no z-score scaling is applied here.")
+    st.dataframe(pd.DataFrame(eeg_sum), use_container_width=True)
+
+    # PLOT A2: Per-Channel EEG HEP
+    st.markdown("---")
+    st.subheader("📊 A2. Per-Channel EEG HEP by Diagnosis Group")
+    st.markdown(
+        "**Interpretation:** Same data as plot A broken down per EEG channel. "
+        "Each subplot shows median ± MAD for each diagnosis group. Colors match plot A."
+    )
+    _per_ch_groups = {cat: gd["eeg_per_ch"] for cat, gd in group_data.items() if gd.get("eeg_per_ch")}
+    if _per_ch_groups:
+        _common_chs = sorted(set.intersection(*[set(d.keys()) for d in _per_ch_groups.values()])) if len(_per_ch_groups) > 1 else sorted(next(iter(_per_ch_groups.values())).keys())
+        _common_chs = [ch for ch in _common_chs if str(ch).strip().lower() != "sao2"]
+        if not _common_chs:
+            st.info("No channels common to all diagnosis groups.")
+        else:
+            _n_chs = len(_common_chs)
+            _ncols = min(4, _n_chs)
+            _nrows = math.ceil(_n_chs / _ncols)
+            _fig_pc, _axes_pc = plt.subplots(_nrows, _ncols, figsize=(5 * _ncols, 3.5 * _nrows), squeeze=False)
+            _axes_flat = _axes_pc.flatten()
+            for _i_ch, _ch in enumerate(_common_chs):
+                _ax = _axes_flat[_i_ch]
+                _ax.axvline(0, color='red', ls='--', alpha=0.5, lw=0.8)
+                _ax.axhline(0, color='black', lw=0.4, alpha=0.3)
+                for _cat, _per_ch in _per_ch_groups.items():
+                    if _ch not in _per_ch:
+                        continue
+                    _mat = _per_ch[_ch]
+                    _t = group_data[_cat]["times"]
+                    _ml = min(_mat.shape[1], len(_t))
+                    _mat_uv = _eeg_display_matrix(_mat[:, :_ml])
+                    _med, _mad_v = median_and_mad(_mat_uv, axis=0)
+                    _col = group_color.get(_cat, 'gray')
+                    _ax.plot(_t[:_ml], _med, color=_col, lw=1.5, label=f"{_cat} (N={_mat.shape[0]})")
+                    _ax.fill_between(_t[:_ml], _med - _mad_v, _med + _mad_v, color=_col, alpha=0.15)
+                _ax.set_title(_ch, fontsize=8.5, fontweight='bold', pad=4)
+                _ax.grid(True, alpha=0.2)
+                _ax.tick_params(labelsize=6)
+            for _j_ch in range(_n_chs, len(_axes_flat)):
+                _axes_flat[_j_ch].set_visible(False)
+            _handles, _labels_leg = _axes_flat[0].get_legend_handles_labels()
+            if _handles:
+                _fig_pc.legend(_handles, _labels_leg, loc='lower center',
+                               bbox_to_anchor=(0.5, -0.02), ncol=len(_per_ch_groups),
+                               fontsize=9, frameon=False)
+            _cleaned_label = " | ECG regression applied" if apply_ecg_reg else ""
+            _fig_pc.suptitle(
+                f"Per-Channel EEG HEP — {grouping_mode}  ({_n_chs} channels){_cleaned_label}",
+                fontsize=12, fontweight='bold',
+            )
+            _fig_pc.tight_layout()
+            _show_non_ica_figure(_fig_pc, use_container_width=True)
+            plt.close(_fig_pc)
+
+            # Raw per-channel (no ECG regression) — shown only when ECG regression is active
+            _raw_per_ch_groups = {
+                cat: gd["eeg_per_ch_raw"]
+                for cat, gd in group_data.items()
+                if gd.get("eeg_per_ch_raw")
+            }
+            if apply_ecg_reg and _raw_per_ch_groups:
+                _r_common = (
+                    sorted(set.intersection(*[set(d.keys()) for d in _raw_per_ch_groups.values()]))
+                    if len(_raw_per_ch_groups) > 1
+                    else sorted(next(iter(_raw_per_ch_groups.values())).keys())
+                )
+                _r_common = [ch for ch in _r_common if str(ch).strip().lower() != "sao2"]
+                if _r_common:
+                    _rn = len(_r_common)
+                    _rc = min(4, _rn)
+                    _rr = math.ceil(_rn / _rc)
+                    _fig_raw, _axes_raw = plt.subplots(_rr, _rc, figsize=(5 * _rc, 3.5 * _rr), squeeze=False)
+                    _axes_raw_flat = _axes_raw.flatten()
+                    for _ri, _rch in enumerate(_r_common):
+                        _ax_r = _axes_raw_flat[_ri]
+                        _ax_r.axvline(0, color='red', ls='--', alpha=0.5, lw=0.8)
+                        _ax_r.axhline(0, color='black', lw=0.4, alpha=0.3)
+                        for _rcat, _rpc in _raw_per_ch_groups.items():
+                            if _rch not in _rpc:
+                                continue
+                            _rm = _rpc[_rch]
+                            _rt = group_data[_rcat]["times"]
+                            _rml = min(_rm.shape[1], len(_rt))
+                            _rm_uv = _eeg_display_matrix(_rm[:, :_rml])
+                            _rmed, _rmad = median_and_mad(_rm_uv, axis=0)
+                            _rcol = group_color.get(_rcat, 'gray')
+                            _ax_r.plot(_rt[:_rml], _rmed, color=_rcol, lw=1.5, label=f"{_rcat} (N={_rm.shape[0]})")
+                            _ax_r.fill_between(_rt[:_rml], _rmed - _rmad, _rmed + _rmad, color=_rcol, alpha=0.15)
+                        _ax_r.set_title(_rch, fontsize=8.5, fontweight='bold', pad=4)
+                        _ax_r.grid(True, alpha=0.2)
+                        _ax_r.tick_params(labelsize=6)
+                    for _rj in range(_rn, len(_axes_raw_flat)):
+                        _axes_raw_flat[_rj].set_visible(False)
+                    _rh, _rl = _axes_raw_flat[0].get_legend_handles_labels()
+                    if _rh:
+                        _fig_raw.legend(_rh, _rl, loc='lower center',
+                                        bbox_to_anchor=(0.5, -0.02), ncol=len(_raw_per_ch_groups),
+                                        fontsize=9, frameon=False)
+                    _fig_raw.suptitle(
+                        f"Per-Channel EEG HEP — {grouping_mode}  ({_rn} channels) | Raw (no ECG regression)",
+                        fontsize=12, fontweight='bold',
+                    )
+                    _fig_raw.tight_layout()
+                    _show_non_ica_figure(_fig_raw, use_container_width=True)
+                    plt.close(_fig_raw)
+            elif apply_ecg_reg:
+                st.info("Raw per-channel data not in cache. Rebuild the cache to enable raw comparison.")
+    else:
+        st.info("Per-channel data not available. Please rebuild the cache.")
+
+    # PLOT B: ECG HEP
+    st.markdown("---")
+    st.subheader("\U0001fac0 B. ECG HEP by Diagnosis Group (Median +/- MAD)")
+    st.markdown("**Interpretation:** Average ECG around each R-peak. Cardiac morphology differences between diagnosis groups (e.g. broader QRS in heart failure, ST changes in CAD).")
+    ecg_groups = {c: gd for c, gd in group_data.items() if gd.get("ecg") is not None}
+    if ecg_groups:
+        ecg_sum = []
+        fig_ecg, ax_ecg = plt.subplots(figsize=(14, 5))
+        ax_ecg.axvline(0, color='red', ls='--', alpha=0.6, label='R-peak')
+        ax_ecg.axhline(0, color='black', lw=0.5, alpha=0.3)
+        for cat, gd in ecg_groups.items():
+            mat = gd["ecg"]; t = gd["times"]
+            ml = min(mat.shape[1], len(t))
+            med, mad_v = median_and_mad(mat[:, :ml], axis=0)
+            ax_ecg.plot(t[:ml], med, color=group_color[cat], lw=2, label=f"{cat} (N={mat.shape[0]})")
+            ax_ecg.fill_between(t[:ml], med - mad_v, med + mad_v, color=group_color[cat], alpha=0.18)
+            ecg_sum.append({"Group": cat, "N ECG": mat.shape[0],
+                "Peak ECG Amp (uV)": f"{float(np.max(np.abs(med))):.1f}",
+                "Peak Time (s)": f"{float(t[np.argmax(np.abs(med))]):.3f}"})
+        ax_ecg.set_xlabel("Time (s)"); ax_ecg.set_ylabel("ECG amplitude (uV)")
+        ax_ecg.set_title(f"ECG HEP — {grouping_mode}", fontsize=13, fontweight='bold')
+        ax_ecg.legend(fontsize=9); ax_ecg.grid(True, alpha=0.25)
+        fig_ecg.tight_layout()
+        _show_non_ica_figure(fig_ecg, use_container_width=True); plt.close(fig_ecg)
+        st.dataframe(pd.DataFrame(ecg_sum), use_container_width=True)
+    else:
+        st.info("No ECG data available for any group.")
+
+    # PLOT C: EEG vs 0
+    st.markdown("---")
+    st.subheader("\U0001f4ca C. EEG HEP vs Baseline (0) — Each Group")
+    st.markdown("**Interpretation:** Shaded time points = significantly non-zero EEG (p<0.05, one-sample t-test, uncorrected). Wider/stronger shading = stronger heartbeat-evoked potential.")
+    vs0_rows = []
+    n_grps = len(group_data)
+    fig_vs0, axes_vs0 = plt.subplots(1, n_grps, figsize=(max(14, 4*n_grps), 4), sharey=True)
+    if n_grps == 1:
+        axes_vs0 = [axes_vs0]
+    for ax_v, (cat, gd) in zip(axes_vs0, group_data.items()):
+        mat = gd["eeg"]; t = gd["times"]
+        ml = min(mat.shape[1], len(t))
+        t_st, p_v = stats.ttest_1samp(mat[:, :ml], 0, axis=0)
+        mat_uv = _eeg_display_matrix(mat[:, :ml])
+        med, _ = median_and_mad(mat_uv, axis=0)
+        sig = p_v < 0.05
+        ax_v.axhline(0, color='black', lw=0.5, alpha=0.3); ax_v.axvline(0, color='red', ls='--', alpha=0.5)
+        ax_v.plot(t[:ml], med, color=group_color[cat], lw=2)
+        ax_v.fill_between(t[:ml], med, 0, where=sig, color=group_color[cat], alpha=0.4, label='p<0.05')
+        ax_v.set_title(f"{cat}\nN={gd['n']}", fontsize=9, fontweight='bold')
+        ax_v.set_xlabel("Time (s)"); ax_v.grid(True, alpha=0.2); ax_v.legend(fontsize=7)
+        ns = int(np.sum(sig))
+        st_f = float(t[np.where(sig)[0][0]]) if ns > 0 else float('nan')
+        vs0_rows.append({"Group": cat, "N": mat.shape[0],
+            "N sig. tp (p<0.05)": ns,
+            "First sig. time (s)": f"{st_f:.3f}" if ns > 0 else "none",
+            "Max |t|": f"{float(np.max(np.abs(t_st))):.2f}",
+            "Min p": f"{float(np.min(p_v)):.4f}"})
+    axes_vs0[0].set_ylabel(f"EEG amplitude ({EEG_DISPLAY_UNIT})")
+    fig_vs0.suptitle("EEG HEP vs 0 (one-sample t-test, shaded = p<0.05 uncorrected)", fontsize=11, fontweight='bold')
+    fig_vs0.tight_layout()
+    _show_non_ica_figure(fig_vs0, use_container_width=True); plt.close(fig_vs0)
+    st.markdown("**vs-0 statistics table:**")
+    st.dataframe(pd.DataFrame(vs0_rows), use_container_width=True)
+
+    # PLOT D: EEG-ECG Correlation
+    st.markdown("---")
+    st.subheader("\U0001f517 D. EEG–ECG Cross-Correlation per Patient")
+    st.markdown(
+        "**Interpretation:** Pearson r between EEG and ECG HEP traces per patient. "
+        "High r = EEG mirrors ECG shape (cardiac artifact or tight cardiac-neural coupling). "
+        "After ECG regression (if enabled), residual r reflects true cardiac-neural coupling. "
+        "Kruskal-Wallis: overall difference; Mann-Whitney: pairwise."
+    )
+    corr_res = {}
+    for cat, gd in group_data.items():
+        em = gd["eeg"]; ecm = gd.get("ecg")
+        if ecm is None: continue
+        ml = min(em.shape[1], ecm.shape[1])
+        np_ = min(em.shape[0], ecm.shape[0])
+        corrs = []
+        for i in range(np_):
+            e, c = em[i, :ml], ecm[i, :ml]
+            if np.std(e) > 0 and np.std(c) > 0:
+                corrs.append(float(np.corrcoef(e, c)[0, 1]))
+        if corrs: corr_res[cat] = corrs
+    if corr_res:
+        fig_cor, ax_cor = plt.subplots(figsize=(max(6, len(corr_res)*2.5), 5))
+        cats_c = list(corr_res.keys())
+        bp = ax_cor.boxplot([corr_res[c] for c in cats_c], positions=list(range(len(cats_c))), patch_artist=True)
+        for patch, cat in zip(bp['boxes'], cats_c):
+            patch.set_facecolor(group_color.get(cat, '#aaa')); patch.set_alpha(0.7)
+        ax_cor.axhline(0, color='black', lw=0.5, ls='--', alpha=0.5)
+        ax_cor.set_xticks(list(range(len(cats_c))))
+        ax_cor.set_xticklabels([f"{c}\n(N={len(corr_res[c])})" for c in cats_c], fontsize=8)
+        ax_cor.set_ylabel("Pearson r"); ax_cor.grid(True, alpha=0.2)
+        if len(corr_res) >= 2:
+            kw_h, kw_p = stats.kruskal(*corr_res.values())
+            ax_cor.set_title(f"EEG–ECG Pearson r | KW H={kw_h:.2f}, p={kw_p:.4f}", fontsize=11, fontweight='bold')
+        fig_cor.tight_layout()
+        _show_non_ica_figure(fig_cor, use_container_width=True); plt.close(fig_cor)
+        c_sum = [{"Group": c, "N": len(corr_res[c]),
+            "Median r": f"{float(np.median(corr_res[c])):.3f}",
+            "Mean r": f"{float(np.mean(corr_res[c])):.3f}",
+            "Std r": f"{float(np.std(corr_res[c])):.3f}"} for c in cats_c]
+        st.markdown("**Correlation summary:**"); st.dataframe(pd.DataFrame(c_sum), use_container_width=True)
+        if len(cats_c) >= 2:
+            pw = []
+            for i2 in range(len(cats_c)):
+                for j2 in range(i2+1, len(cats_c)):
+                    ca, cb = cats_c[i2], cats_c[j2]
+                    u, p_mw = stats.mannwhitneyu(corr_res[ca], corr_res[cb], alternative='two-sided')
+                    pw.append({"Group A": ca, "Group B": cb, "Mann-Whitney U": f"{u:.1f}",
+                        "p-value": f"{p_mw:.4f}", "Sig (p<0.05)": "Yes" if p_mw < 0.05 else "No"})
+            st.markdown("**Pairwise correlation comparison:**"); st.dataframe(pd.DataFrame(pw), use_container_width=True)
+    else:
+        st.info("EEG–ECG correlation not available (no ECG data).")
+
+    # PLOT E: ECG Modulation
+    st.markdown("---")
+    st.subheader("\U0001f4e1 E. ECG->EEG Modulation (beta over Time)")
+    st.markdown("**Interpretation:** Regression beta predicting EEG from ECG amplitude at each time point across patients. Shaded = p<0.05. Larger |beta| = stronger ECG influence on EEG.")
+    mod_rows = []
+    fig_mod, ax_mod = plt.subplots(figsize=(14, 5))
+    ax_mod.axhline(0, color='black', lw=0.5, alpha=0.3); ax_mod.axvline(0, color='red', ls='--', alpha=0.5)
+    for cat, gd in group_data.items():
+        em = gd["eeg"]; ecm = gd.get("ecg")
+        if ecm is None: continue
+        ml = min(em.shape[1], ecm.shape[1]); np_ = min(em.shape[0], ecm.shape[0])
+        t = gd["times"][:ml]
+        betas = np.zeros(ml); pvals_m = np.ones(ml)
+        ec_c = ecm[:np_, :ml] - ecm[:np_, :ml].mean(axis=0, keepdims=True)
+        ee_c = em[:np_, :ml] - em[:np_, :ml].mean(axis=0, keepdims=True)
+        for ti in range(ml):
+            x_t = ec_c[:, ti]; y_t = ee_c[:, ti]; ss = np.sum(x_t**2)
+            if ss > 0:
+                b = np.dot(x_t, y_t) / ss; betas[ti] = b
+                res = y_t - b*x_t; se = np.sqrt(np.sum(res**2) / max(1, np_-2) / ss)
+                if se > 0: pvals_m[ti] = float(2*(1-stats.t.cdf(abs(b/se), df=np_-2)))
+        color = group_color[cat]
+        ax_mod.plot(t, betas, color=color, lw=2, label=f"{cat} (N={np_})")
+        ax_mod.fill_between(t, betas, 0, where=pvals_m < 0.05, color=color, alpha=0.25)
+        mod_rows.append({"Group": cat, "N": np_,
+            "Peak |beta|": f"{float(np.max(np.abs(betas))):.4f}",
+            "Peak beta Time (s)": f"{float(t[np.argmax(np.abs(betas))]):.3f}",
+            "N sig. tp (p<0.05)": int(np.sum(pvals_m < 0.05))})
+    ax_mod.set_xlabel("Time relative to R-peak (s)"); ax_mod.set_ylabel("ECG->EEG beta")
+    ax_mod.set_title(f"ECG->EEG Modulation — {grouping_mode}", fontsize=13, fontweight='bold')
+    ax_mod.legend(fontsize=9); ax_mod.grid(True, alpha=0.25)
+    fig_mod.tight_layout()
+    _show_non_ica_figure(fig_mod, use_container_width=True); plt.close(fig_mod)
+    if mod_rows:
+        st.markdown("**Modulation summary:**"); st.dataframe(pd.DataFrame(mod_rows), use_container_width=True)
+
+    # PLOT F: Pairwise EEG comparison
+    st.markdown("---")
+    st.subheader("F. Pairwise Between-Group EEG Comparison (Cluster Permutation)")
+    st.markdown(
+        "**Interpretation:** Cluster permutation test comparing EEG HEP waveforms between each pair of groups. "
+        "Top panel: group medians ± MAD and A−B difference (dashed black). "
+        "Bottom panel: T-statistic — dashed lines = ±clustering threshold (p=0.05). "
+        "Orange shading = significant cluster windows (cluster-mass permutation, p<0.05). Tables show windows."
+    )
+    grp_list = [c for c in group_data if group_data[c]["eeg"] is not None]
+    pw_summary = []
+    if len(grp_list) < 2:
+        st.info("Need >= 2 groups for pairwise comparison.")
+    else:
+        for i_p in range(len(grp_list)):
+            for j_p in range(i_p+1, len(grp_list)):
+                ca, cb = grp_list[i_p], grp_list[j_p]
+                ea = group_data[ca]["eeg"]; eb = group_data[cb]["eeg"]
+                ta = group_data[ca]["times"]; tb = group_data[cb]["times"]
+                ml = min(ea.shape[1], eb.shape[1], len(ta), len(tb))
+                ea = ea[:, :ml]; eb = eb[:, :ml]; t_c = ta[:ml]
+                st.markdown(f"#### {ca} vs {cb}")
+                with st.spinner(f"Cluster permutation: {ca} vs {cb}..."):
+                    try:
+                        sig_wins, t_st_p, cd_p = permutation_two_group_cluster_test(
+                            ea, eb, t_c, n_permutations=int(n_permutations),
+                            p_threshold=0.05, jitter_sec=0.1, label_a=ca, label_b=cb)
+                    except Exception as e:
+                        st.warning(f"Permutation test failed: {e}"); continue
+                ea_uv = _eeg_display_matrix(ea)
+                eb_uv = _eeg_display_matrix(eb)
+                ma, mda = median_and_mad(ea_uv, axis=0); mb, mdb = median_and_mad(eb_uv, axis=0)
+                fig_p, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 7), sharex=True,
+                                                   gridspec_kw={'height_ratios': [3, 1.5]})
+                ax1.axhline(0, color='black', lw=0.4, alpha=0.3); ax1.axvline(0, color='red', ls='--', alpha=0.5)
+                ax1.plot(t_c, ma, color=group_color.get(ca,'blue'), lw=2, label=f"{ca} (N={ea.shape[0]})")
+                ax1.fill_between(t_c, ma-mda, ma+mda, color=group_color.get(ca,'blue'), alpha=0.15)
+                ax1.plot(t_c, mb, color=group_color.get(cb,'red'), lw=2, label=f"{cb} (N={eb.shape[0]})")
+                ax1.fill_between(t_c, mb-mdb, mb+mdb, color=group_color.get(cb,'red'), alpha=0.15)
+                ax1.plot(t_c, ma-mb, color='black', lw=1.5, ls='--', label=f"{ca}-{cb}")
+                for win in sig_wins:
+                    ax1.axvspan(win['start'], win['end'], color='orange', alpha=0.25)
+                    ax2.axvspan(win['start'], win['end'], color='orange', alpha=0.25)
+                ax1.legend(fontsize=9); ax1.set_ylabel(f"EEG amplitude ({EEG_DISPLAY_UNIT})"); ax1.grid(True, alpha=0.2)
+                if t_st_p is not None:
+                    _df_p = ea.shape[0] + eb.shape[0] - 2
+                    _t_thresh_p = stats.t.ppf(1 - 0.05 / 2, df=_df_p)
+                    ax2.plot(t_c, t_st_p, color='#5c35cc', lw=2, label=f"T-statistic ({ca}−{cb})")
+                    ax2.axhline(0, color='black', lw=0.4)
+                    ax2.axhline(_t_thresh_p, color='gray', lw=0.8, ls='--', alpha=0.7,
+                                label=f'±t thresh={_t_thresh_p:.2f} (p=0.05)')
+                    ax2.axhline(-_t_thresh_p, color='gray', lw=0.8, ls='--', alpha=0.7)
+                    ax2.fill_between(t_c, 0, t_st_p, where=(t_st_p > 0),
+                                     color='#2196F3', alpha=0.2, interpolate=True)
+                    ax2.fill_between(t_c, 0, t_st_p, where=(t_st_p < 0),
+                                     color='#FF5722', alpha=0.2, interpolate=True)
+                    ax2.set_ylabel("T-statistic"); ax2.legend(fontsize=8, loc='upper right')
+                ax2.set_xlabel("Time relative to R-peak (s)"); ax2.grid(True, alpha=0.2)
+                ns = len(sig_wins)
+                mp = min((w['p_value'] for w in sig_wins), default=float('nan'))
+                ps = f"p={'<0.001' if mp<0.001 else f'{mp:.3f}'}" if sig_wins else "no sig. windows"
+                fig_p.suptitle(f"EEG HEP: {ca} vs {cb} | {ns} sig. window(s) | {ps}", fontsize=12, fontweight='bold')
+                fig_p.tight_layout()
+                _show_non_ica_figure(fig_p, use_container_width=True); plt.close(fig_p)
+                if sig_wins:
+                    st.markdown(f"**Significant windows:**")
+                    st.dataframe(pd.DataFrame([
+                        {"Start (s)": f"{w['start']:.3f}", "End (s)": f"{w['end']:.3f}",
+                         "Duration (ms)": f"{(w['end']-w['start'])*1000:.0f}", "p-value": f"{w['p_value']:.4f}"}
+                        for w in sig_wins]), use_container_width=True)
+                else:
+                    st.caption(f"No significant EEG differences between {ca} and {cb}.")
+
+                # Per-channel pairwise breakdown
+                ch_a = group_data[ca].get("eeg_per_ch", {})
+                ch_b = group_data[cb].get("eeg_per_ch", {})
+                shared_chs = [
+                    ch for ch in sorted(set(ch_a) & set(ch_b))
+                    if str(ch).strip().lower() != "sao2"
+                ]
+                if shared_chs:
+                    st.markdown(f"**Per-electrode significance: {ca} vs {cb}**")
+                    st.caption(
+                        "Each electrode is tested separately with the same two-group cluster-permutation approach. "
+                        "'Significant at any time' means at least one cluster-corrected window with p < 0.05."
+                    )
+                    show_only_sig_channels = st.toggle(
+                        "Show only channels with significant windows",
+                        value=False,
+                        key=f"dxgc_only_sig_channel_plots_{i_p}_{j_p}",
+                        help="Turn on to hide channel plots with no significant cluster-corrected window.",
+                    )
+                    with st.spinner(f"Testing each electrode: {ca} vs {cb}..."):
+                        ch_pw_rows = []
+                        ch_pw_plot_data = {}
+                        for ch_k in shared_chs:
+                            ea_k = ch_a[ch_k]; eb_k = ch_b[ch_k]
+                            t_k = group_data[ca]["times"]
+                            ml_k = min(ea_k.shape[1], eb_k.shape[1], len(t_k))
+                            ea_k = ea_k[:, :ml_k]; eb_k = eb_k[:, :ml_k]; tk = t_k[:ml_k]
+                            try:
+                                sw_k, _, cd_k = permutation_two_group_cluster_test(
+                                    ea_k, eb_k, tk, n_permutations=int(n_permutations),
+                                    p_threshold=0.05, jitter_sec=0.1,
+                                    label_a=ca, label_b=cb, channel_label=ch_k,
+                                    show_explanation=False)
+                            except Exception:
+                                sw_k, cd_k = [], None
+                            ch_pw_plot_data[ch_k] = (ea_k, eb_k, tk, sw_k)
+                            ns_k = len(sw_k)
+                            mp_k = min((w['p_value'] for w in sw_k), default=float('nan'))
+                            if sw_k:
+                                windows_k = "; ".join(
+                                    f"{w['start']:.3f}-{w['end']:.3f}s (p={w['p_value']:.4f}, {w.get('direction', '')})"
+                                    for w in sw_k
+                                )
+                            else:
+                                windows_k = "None"
+                            ch_pw_rows.append({
+                                "Electrode": ch_k,
+                                f"N({ca})": ea_k.shape[0],
+                                f"N({cb})": eb_k.shape[0],
+                                "Significant at any time": "Yes" if sw_k else "No",
+                                "Significant windows": ns_k,
+                                "Min cluster p-value": mp_k if sw_k else np.nan,
+                                "Window(s)": windows_k,
+                            })
+
+                    visible_ch_pw_plot_data = {
+                        ch: plot_values
+                        for ch, plot_values in ch_pw_plot_data.items()
+                        if not show_only_sig_channels or plot_values[3]
+                    }
+                    if not visible_ch_pw_plot_data:
+                        st.info(f"No channels have significant windows for {ca} vs {cb}.")
+                    else:
+                        n_ch_plot = len(visible_ch_pw_plot_data)
+                        ncols_ch = min(4, n_ch_plot)
+                        nrows_ch = math.ceil(n_ch_plot / ncols_ch)
+                        fig_ch_pw, axes_ch_pw = plt.subplots(
+                            nrows_ch, ncols_ch,
+                            figsize=(5 * ncols_ch, 3.6 * nrows_ch),
+                            sharex=True,
+                            squeeze=False,
+                        )
+                        axes_ch_pw_flat = axes_ch_pw.flatten()
+                        for ch_idx, (ch_k, (ea_k, eb_k, tk, sw_k)) in enumerate(visible_ch_pw_plot_data.items()):
+                            ax_ch = axes_ch_pw_flat[ch_idx]
+                            ea_k_uv = _eeg_display_matrix(ea_k)
+                            eb_k_uv = _eeg_display_matrix(eb_k)
+                            med_a, mad_a = median_and_mad(ea_k_uv, axis=0)
+                            med_b, mad_b = median_and_mad(eb_k_uv, axis=0)
+                            color_a = group_color.get(ca, "#1f77b4")
+                            color_b = group_color.get(cb, "#d62728")
+                            ax_ch.plot(tk, med_a, color=color_a, lw=1.6, label=f"{ca} (N={ea_k.shape[0]})")
+                            ax_ch.fill_between(tk, med_a - mad_a, med_a + mad_a, color=color_a, alpha=0.15)
+                            ax_ch.plot(tk, med_b, color=color_b, lw=1.6, label=f"{cb} (N={eb_k.shape[0]})")
+                            ax_ch.fill_between(tk, med_b - mad_b, med_b + mad_b, color=color_b, alpha=0.15)
+                            for win_k in sw_k:
+                                ax_ch.axvspan(win_k["start"], win_k["end"], color="orange", alpha=0.25)
+                            ax_ch.axhline(0, color="black", lw=0.4, alpha=0.35)
+                            ax_ch.axvline(0, color="red", lw=0.8, ls="--", alpha=0.5)
+                            min_p_k = min((win["p_value"] for win in sw_k), default=np.nan)
+                            sig_text = (
+                                f"{len(sw_k)} sig. window(s), p={'<0.001' if min_p_k < 0.001 else f'{min_p_k:.3f}'}"
+                                if sw_k else "no sig. windows"
+                            )
+                            ax_ch.set_title(f"{ch_k} | {sig_text}", fontsize=9, fontweight="bold")
+                            ax_ch.set_xlabel("Time from R-peak (s)")
+                            ax_ch.set_ylabel(f"Amplitude ({EEG_DISPLAY_UNIT})")
+                            ax_ch.grid(True, alpha=0.2)
+                            ax_ch.tick_params(labelsize=7)
+                        for unused_idx in range(n_ch_plot, len(axes_ch_pw_flat)):
+                            axes_ch_pw_flat[unused_idx].set_visible(False)
+                        handles_ch, labels_ch = axes_ch_pw_flat[0].get_legend_handles_labels()
+                        if handles_ch:
+                            fig_ch_pw.legend(
+                                handles_ch, labels_ch, loc="lower center",
+                                bbox_to_anchor=(0.5, -0.01), ncol=2, fontsize=8, frameon=False,
+                            )
+                        plot_scope = "Significant channels only" if show_only_sig_channels else "All channels"
+                        fig_ch_pw.suptitle(
+                            f"Per-Channel EEG HEP: {ca} vs {cb} | {plot_scope} | Orange = significant windows",
+                            fontsize=12, fontweight="bold",
+                        )
+                        fig_ch_pw.tight_layout(rect=[0, 0.04, 1, 0.96])
+                        _show_non_ica_figure(fig_ch_pw, use_container_width=True)
+                        plt.close(fig_ch_pw)
+
+                    ch_pw_df = pd.DataFrame(ch_pw_rows)
+                    if not ch_pw_df.empty:
+                        ch_pw_df = ch_pw_df.sort_values(
+                            ["Significant windows", "Min cluster p-value", "Electrode"],
+                            ascending=[False, True, True],
+                            na_position="last",
+                        )
+                        st.dataframe(
+                            ch_pw_df,
+                            use_container_width=True,
+                            column_config={
+                                "Min cluster p-value": st.column_config.NumberColumn(
+                                    "Min cluster p-value", format="%.4f"
+                                )
+                            },
+                        )
+                        st.download_button(
+                            label="Download per-electrode significance CSV",
+                            data=ch_pw_df.to_csv(index=False).encode("utf-8"),
+                            file_name=(
+                                f"per_electrode_pairwise_eeg_{ca}_vs_{cb}.csv"
+                                .replace(" ", "_")
+                                .replace("/", "-")
+                            ),
+                            mime="text/csv",
+                            key=f"download_pairwise_eeg_electrodes_{i_p}_{j_p}",
+                        )
+                    if not any(row["Significant at any time"] == "Yes" for row in ch_pw_rows):
+                        st.caption(f"No individual electrode had a significant cluster-corrected window for {ca} vs {cb}.")
+                else:
+                    st.info(f"No shared per-electrode EEG data available for {ca} vs {cb}.")
+
+                pw_summary.append({"Comparison": f"{ca} vs {cb}", "N sig. windows": ns,
+                    "Min p-value": f"{mp:.4f}" if sig_wins else "n/a"})
+        if pw_summary:
+            st.markdown("---")
+            st.subheader("\U0001f4cb G. Pairwise Comparison Summary")
+            st.dataframe(pd.DataFrame(pw_summary), use_container_width=True)
+
+    # ── PLOT H: Autoencoder latent space ──────────────────────────────────────
+    st.markdown("---")
+    st.subheader("\U0001f9e0 H. Autoencoder Latent Space — Group Separation")
+    st.markdown(
+        "**Interpretation:** Each dot = one patient. 2-D latent representation of the HEP waveform "
+        "computed by a neural (or linear fallback) autoencoder. Tighter within-group clusters and "
+        "wider between-group separation = stronger diagnosis-linked brain–heart coupling pattern. "
+        "H.1 = mean EEG (all channels averaged). H.2 = per EEG channel. H.3 = all channels stacked."
+    )
+
+    ae_groups = [g for g in group_data if group_data[g]["eeg"] is not None]
+    if len(ae_groups) < 2:
+        st.info("Need >= 2 groups with EEG data for autoencoder comparison.")
+    else:
+        # ── H.1 All-channels-mean ─────────────────────────────────────────────
+        X_all_list, lbl_all = [], []
+        for g in ae_groups:
+            m = group_data[g]["eeg"]
+            X_all_list.append(m)
+            lbl_all.extend([g] * m.shape[0])
+        try:
+            X_all = np.vstack(X_all_list)
+            lbl_all = np.array(lbl_all)
+            with st.spinner("Running autoencoder (mean EEG, all groups)..."):
+                z_all, err_all, ae_method_all = _run_waveform_autoencoder_embedding(X_all)
+            if z_all is not None:
+                fig_ae_all, ax_ae_all = plt.subplots(figsize=(8, 6))
+                for g in ae_groups:
+                    mask = lbl_all == g
+                    n_g = int(mask.sum())
+                    ax_ae_all.scatter(z_all[mask, 0], z_all[mask, 1],
+                                      color=group_color.get(g, 'gray'), label=f"{g} (N={n_g})",
+                                      alpha=0.7, s=60, edgecolors='k', linewidths=0.3)
+                ax_ae_all.set_xlabel("Latent dim 1"); ax_ae_all.set_ylabel("Latent dim 2")
+                ax_ae_all.set_title(f"H.1 Mean EEG HEP — {ae_method_all}", fontsize=11, fontweight='bold')
+                ax_ae_all.legend(fontsize=9, bbox_to_anchor=(1.01, 1), loc='upper left')
+                ax_ae_all.grid(True, alpha=0.25)
+                fig_ae_all.tight_layout()
+                _show_non_ica_figure(fig_ae_all, use_container_width=True)
+                plt.close(fig_ae_all)
+        except Exception as _ae_e:
+            st.warning(f"Mean-EEG autoencoder failed: {_ae_e}")
+
+        # ── H.2 Per-channel ───────────────────────────────────────────────────
+        all_chs_ae = sorted(set(ch for g in ae_groups for ch in group_data[g].get("eeg_per_ch", {})))
+        if all_chs_ae:
+            st.markdown("**H.2 Per-channel latent spaces:**")
+            max_ch_plots = st.slider("Max channels to plot", 1, min(len(all_chs_ae), 20),
+                                     min(len(all_chs_ae), 6), key="dxgc_ae_maxch")
+            chs_to_plot = all_chs_ae[:max_ch_plots]
+            n_cols_ae = min(3, len(chs_to_plot))
+            n_rows_ae = int(np.ceil(len(chs_to_plot) / n_cols_ae))
+            fig_ae_ch, axes_ae_ch = plt.subplots(n_rows_ae, n_cols_ae,
+                                                   figsize=(6 * n_cols_ae, 5 * n_rows_ae))
+            axes_flat = np.array(axes_ae_ch).ravel() if hasattr(np.array(axes_ae_ch), 'ravel') else [axes_ae_ch]
+            with st.spinner("Running per-channel autoencoders..."):
+                for ax_i, ch_k in enumerate(chs_to_plot):
+                    ax_k = axes_flat[ax_i]
+                    X_ch_list, lbl_ch = [], []
+                    for g in ae_groups:
+                        m_ch = group_data[g].get("eeg_per_ch", {}).get(ch_k)
+                        if m_ch is not None and m_ch.shape[0] >= 2:
+                            X_ch_list.append(m_ch)
+                            lbl_ch.extend([g] * m_ch.shape[0])
+                    if len(X_ch_list) < 2:
+                        ax_k.set_visible(False); continue
+                    try:
+                        X_ch = np.vstack(X_ch_list)
+                        lbl_ch_arr = np.array(lbl_ch)
+                        z_ch, _, ae_m_ch = _run_waveform_autoencoder_embedding(X_ch)
+                        if z_ch is None:
+                            ax_k.set_visible(False); continue
+                        for g in ae_groups:
+                            mask_k = lbl_ch_arr == g
+                            n_gk = int(mask_k.sum())
+                            if n_gk == 0:
+                                continue
+                            ax_k.scatter(z_ch[mask_k, 0], z_ch[mask_k, 1],
+                                         color=group_color.get(g, 'gray'),
+                                         label=f"{g} (N={n_gk})",
+                                         alpha=0.7, s=40, edgecolors='k', linewidths=0.2)
+                        ax_k.set_title(f"{ch_k} — {ae_m_ch}", fontsize=8, fontweight='bold')
+                        ax_k.set_xlabel("L1", fontsize=7); ax_k.set_ylabel("L2", fontsize=7)
+                        ax_k.legend(fontsize=6, loc='best')
+                        ax_k.grid(True, alpha=0.2)
+                        ax_k.tick_params(labelsize=7)
+                    except Exception:
+                        ax_k.set_visible(False)
+            for ax_rem in axes_flat[len(chs_to_plot):]:
+                ax_rem.set_visible(False)
+            fig_ae_ch.tight_layout()
+            _show_non_ica_figure(fig_ae_ch, use_container_width=True)
+            plt.close(fig_ae_ch)
+        else:
+            st.info("Per-channel data not available. Click '\U0001f504 Reload & Recompute' to rebuild cache with per-channel data.")
+
+        # ── H.3 All-channels multivariate ─────────────────────────────────────
+        mv_list, lbl_mv = [], []
+        for g in ae_groups:
+            mv_m = group_data[g].get("eeg_mv")
+            if mv_m is not None and mv_m.shape[0] >= 2:
+                mv_list.append(mv_m)
+                lbl_mv.extend([g] * mv_m.shape[0])
+        if len(mv_list) >= 2:
+            try:
+                # Trim columns to common width
+                min_mv_cols = min(m.shape[1] for m in mv_list)
+                X_mv = np.vstack([m[:, :min_mv_cols] for m in mv_list])
+                lbl_mv_arr = np.array(lbl_mv)
+                with st.spinner("Running autoencoder (all channels stacked)..."):
+                    z_mv, _, ae_m_mv = _run_waveform_autoencoder_embedding(X_mv)
+                if z_mv is not None:
+                    st.markdown("**H.3 All channels stacked (multivariate):**")
+                    fig_mv, ax_mv = plt.subplots(figsize=(8, 6))
+                    for g in ae_groups:
+                        mask_mv = lbl_mv_arr == g
+                        n_gm = int(mask_mv.sum())
+                        ax_mv.scatter(z_mv[mask_mv, 0], z_mv[mask_mv, 1],
+                                      color=group_color.get(g, 'gray'),
+                                      label=f"{g} (N={n_gm})", alpha=0.7, s=60,
+                                      edgecolors='k', linewidths=0.3)
+                    ax_mv.set_xlabel("Latent dim 1"); ax_mv.set_ylabel("Latent dim 2")
+                    ax_mv.set_title(f"H.3 All EEG Channels (stacked) — {ae_m_mv}", fontsize=11, fontweight='bold')
+                    ax_mv.legend(fontsize=9, bbox_to_anchor=(1.01, 1), loc='upper left')
+                    ax_mv.grid(True, alpha=0.25)
+                    fig_mv.tight_layout()
+                    _show_non_ica_figure(fig_mv, use_container_width=True)
+                    plt.close(fig_mv)
+            except Exception as _mv_e:
+                st.warning(f"Multivariate autoencoder failed: {_mv_e}")
+        else:
+            st.info("Multivariate (all channels stacked) data not available. Rebuild cache to enable.")
+
+    # ── PLOT I: Venn / Overlap diagram ────────────────────────────────────────
+    if grouping_mode in ("By Diagnosis Category", "By Specific Diagnosis") and len(group_data) >= 2:
+        st.markdown("---")
+        st.subheader("\U0001f9e9 I. Patient Overlap Between Groups")
+        st.markdown(
+            "**Interpretation:** Patients can have multiple diagnoses, so groups may overlap. "
+            "Each cell shows the number of patients in both groups simultaneously."
+        )
+        try:
+            pid_sets = {}
+            for g in group_data:
+                inds_for_g = valid_groups.get(g) if valid_groups else []
+                if inds_for_g:
+                    pid_sets[g] = set(str(ind[0]) for ind in inds_for_g)
+                else:
+                    pid_sets[g] = set()  # cache path: no patient-level data available
+            groups_ov = sorted(g for g in pid_sets if pid_sets[g])
+            n_ov = len(groups_ov)
+            if n_ov < 2:
+                st.info("Overlap data not available from cache. Rebuild cache to enable Venn diagram.")
+            else:
+                any_overlap = any(
+                    len(pid_sets[groups_ov[i]] & pid_sets[groups_ov[j]]) > 0
+                    for i in range(n_ov) for j in range(i+1, n_ov)
+                )
+                if not any_overlap:
+                    st.info("Groups are non-overlapping (mutually exclusive).")
+                else:
+                    ov_rows = []
+                    for i, ga in enumerate(groups_ov):
+                        for j, gb in enumerate(groups_ov):
+                            if i < j:
+                                ov = len(pid_sets[ga] & pid_sets[gb])
+                                ov_rows.append({
+                                    "Group A": ga, "N(A)": len(pid_sets[ga]),
+                                    "Group B": gb, "N(B)": len(pid_sets[gb]),
+                                    "Overlap N": ov,
+                                    "Overlap %A": f"{100*ov/max(len(pid_sets[ga]),1):.1f}%",
+                                    "Overlap %B": f"{100*ov/max(len(pid_sets[gb]),1):.1f}%",
+                                })
+                    st.dataframe(pd.DataFrame(ov_rows), use_container_width=True)
+
+                    ov_mat = np.zeros((n_ov, n_ov), dtype=int)
+                    for i in range(n_ov):
+                        for j in range(n_ov):
+                            ov_mat[i, j] = len(pid_sets[groups_ov[i]] & pid_sets[groups_ov[j]])
+                    fig_ov, ax_ov = plt.subplots(figsize=(max(6, n_ov*1.4), max(5, n_ov*1.2)))
+                    im = ax_ov.imshow(ov_mat, cmap='Blues', aspect='auto')
+                    ax_ov.set_xticks(range(n_ov)); ax_ov.set_yticks(range(n_ov))
+                    ax_ov.set_xticklabels(
+                        [f"{g}\n(N={len(pid_sets[g])})" for g in groups_ov],
+                        rotation=35, ha='right', fontsize=8)
+                    ax_ov.set_yticklabels([f"{g} (N={len(pid_sets[g])})" for g in groups_ov], fontsize=8)
+                    for i in range(n_ov):
+                        for j in range(n_ov):
+                            ax_ov.text(j, i, str(ov_mat[i, j]), ha='center', va='center',
+                                       fontsize=9,
+                                       color='white' if ov_mat[i, j] > ov_mat.max()*0.6 else 'black')
+                    plt.colorbar(im, ax=ax_ov, label='N patients in common')
+                    ax_ov.set_title(f"Patient Overlap Matrix — {grouping_mode}", fontsize=11, fontweight='bold')
+                    fig_ov.tight_layout()
+                    _show_non_ica_figure(fig_ov, use_container_width=True)
+                    plt.close(fig_ov)
+
+                    if n_ov in (2, 3):
+                        try:
+                            import matplotlib_venn as _mvenn
+                            fig_venn, ax_venn = plt.subplots(figsize=(7, 5))
+                            sets_v = [pid_sets[g] for g in groups_ov]
+                            labels_v = [f"{g}\nN={len(pid_sets[g])}" for g in groups_ov]
+                            if n_ov == 2:
+                                _mvenn.venn2(sets_v, set_labels=labels_v, ax=ax_venn)
+                            else:
+                                _mvenn.venn3(sets_v, set_labels=labels_v, ax=ax_venn)
+                            ax_venn.set_title(f"Venn Diagram — {grouping_mode}", fontsize=11, fontweight='bold')
+                            fig_venn.tight_layout()
+                            _show_non_ica_figure(fig_venn, use_container_width=True)
+                            plt.close(fig_venn)
+                        except ImportError:
+                            st.caption("Install `matplotlib-venn` for a Venn diagram. Overlap table shown above.")
+                        except Exception as _venn_e:
+                            st.caption(f"Venn diagram skipped: {_venn_e}")
+        except Exception as _ov_e:
+            st.warning(f"Overlap analysis failed: {_ov_e}")
+
 
 def main():
     st.title("HEP Group Comparison Dashboard")
@@ -10833,6 +14687,8 @@ def main():
         "Compare Sleep Stages",
         "Compare Groups All Sleep Stages",
         "Compare Groups Non-EEG Channels",
+        "Per Channel Group Comparison",
+        "Diagnosis Group Comparison",
     ]
     _cli_mode = _parse_mode_arg()
     _default_index = _all_modes.index(_cli_mode) if _cli_mode in _all_modes else 1
@@ -10846,6 +14702,10 @@ def main():
         run_compare_groups_all_stages_analysis(base_path)
     elif mode == "Compare Groups Non-EEG Channels":
         run_compare_groups_non_eeg_analysis(base_path, selected_stage)
+    elif mode == "Per Channel Group Comparison":
+        run_per_channel_group_comparison_analysis(base_path, selected_stage)
+    elif mode == "Diagnosis Group Comparison":
+        run_diagnosis_group_comparison_analysis(base_path, selected_stage)
     else: # Single Group Analysis
         run_single_group_analysis(base_path, selected_stage)
 

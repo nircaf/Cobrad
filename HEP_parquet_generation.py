@@ -3,6 +3,7 @@ import re
 import glob
 import pickle
 import csv
+import random
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -700,6 +701,38 @@ def group_edf_files_by_patient(edf_root="pickles/EDF"):
 
     return patient_to_files
 
+def _extract_patient_id_from_name(name):
+    """Return the stable patient/subject ID from an EDF or pickle stem."""
+    match = re.search(r'(SUB-I\d+)', name, flags=re.IGNORECASE)
+    if match:
+        return match.group(1).upper()
+
+    match = re.search(r'(\d{4}-\d{3})', name)
+    if match:
+        return match.group(1)
+
+    return os.path.basename(name).split('.')[0]
+
+
+def _parse_sleep_stage_pickle_path(path):
+    """Parse <patient>_<stage>_<duration>_<step>.pkl without guessing patient IDs."""
+    stem = os.path.basename(path)
+    if not stem.endswith('.pkl'):
+        return None
+
+    stem = stem[:-4]
+    for stage in sorted(VALID_SLEEP_STAGES, key=len, reverse=True):
+        match = re.match(rf'^(.+)_{re.escape(stage)}_(\d+)_([^_]+)$', stem)
+        if match:
+            return {
+                'patient_id': match.group(1),
+                'stage': stage,
+                'duration': int(match.group(2)),
+                'step': match.group(3),
+            }
+    return None
+
+
 def group_edf_files_by_patient_edf(edf_root="EDF_Format/EDF"):
     """
     Walk EDF directory and group .edf file paths by patient_id extracted via regex (\d{4}-\d{3}).
@@ -708,11 +741,7 @@ def group_edf_files_by_patient_edf(edf_root="EDF_Format/EDF"):
     
     if os.path.isfile(edf_root):
         if edf_root.lower().endswith(".edf"):
-            m = re.search(r'(\d{4}-\d{3})', edf_root)
-            if m:
-                pid = m.group(1)
-            else:
-                pid = os.path.basename(edf_root).split('.')[0]
+            pid = _extract_patient_id_from_name(edf_root)
             patient_to_files.setdefault(pid, []).append(edf_root)
         return patient_to_files
 
@@ -721,12 +750,7 @@ def group_edf_files_by_patient_edf(edf_root="EDF_Format/EDF"):
             if not file.lower().endswith(".edf"):
                 continue
             fpath = os.path.join(root, file)
-            m = re.search(r'(\d{4}-\d{3})', fpath)
-            if m:
-                pid = m.group(1)
-            else:
-                # try parent directory name as fallback
-                pid = file.split('.')[0]
+            pid = _extract_patient_id_from_name(file)
             patient_to_files.setdefault(pid, []).append(fpath)
 
     return patient_to_files
@@ -1074,6 +1098,8 @@ def process_patients_n1_stage_hep(edf_root="EDF_Format/EDF", step_sec=5, n1_dura
         if n_excluded > 0:
             log_stage(f"Excluded {n_excluded} patients from excluded_patients.csv (out of {before_excl} found).")
 
+    patient_to_files = dict(random.sample(list(patient_to_files.items()), len(patient_to_files)))
+
     if not patient_to_files:
         print(f"No EDF files found under {edf_root}.")
         return
@@ -1181,16 +1207,29 @@ def process_patients_n1_stage_hep(edf_root="EDF_Format/EDF", step_sec=5, n1_dura
             
             try:
                 # Load the EDF file using mne
-                raw = mne.io.read_raw_edf(file_path, preload=True, encoding='latin1')
-                # auto-detect power line frequency (50 or 60 Hz) from EDF header
-                line_freq = detect_line_frequency(raw)
-                raw.notch_filter(np.arange(line_freq, raw.info['sfreq']/2, line_freq))
-                raw.filter(l_freq=0.5, h_freq=raw.info['sfreq']/2 - 0.1)
-                # raw is in V. change to microV
-                # raw._data *= 1e6  # Convert from V to µV in-place at the numpy array level
-                # resample to 256 Hz
-                raw.resample(256)
-                raw = rename_channels(raw)
+                import signal as _signal
+                def _edf_timeout(signum, frame):
+                    raise TimeoutError("read_raw_edf timed out after 10 min")
+                _signal.signal(_signal.SIGALRM, _edf_timeout)
+                _signal.alarm(1200)
+                try:
+                    print(f"  Loading EDF: {file_path}")
+                    raw = mne.io.read_raw_edf(file_path, preload=True, encoding='latin1')
+                    print(f"  Detecting line frequency...")
+                    line_freq = detect_line_frequency(raw)
+                    print(f"  Notch filter at {line_freq} Hz")
+                    raw.notch_filter(np.arange(line_freq, raw.info['sfreq']/2, line_freq),verbose=False)
+                    print(f"  Bandpass filter 0.5–{raw.info['sfreq']/2 - 0.1:.1f} Hz")
+                    raw.filter(l_freq=0.5, h_freq=raw.info['sfreq']/2 - 0.1,verbose=False)
+                    # raw is in V. change to microV
+                    # raw._data *= 1e6  # Convert from V to µV in-place at the numpy array level
+                    print(f"  Resampling to 256 Hz")
+                    raw.resample(256)
+                    print(f"  Renaming channels")
+                    raw = rename_channels(raw)
+                finally:
+                    _signal.alarm(0)
+
                 ch_names = raw.ch_names
                 ch_lower = [ch.lower() for ch in raw.ch_names]                
                 ecg_indices = [i for i, ch in enumerate(ch_lower) if 'ecg' in ch or 'ekg' in ch]
@@ -1672,33 +1711,22 @@ def clean_duplicate_pickles(base_dir="pickles_sleep_stage"):
     """
     Remove duplicate patient pickles from the same sleep stage,
     keeping only the one with the longest duration.
-    A patient is considered the same if their ID after an optional hyphen matches.
+    Human Sleep Project files are grouped by the SUB-I... subject ID; other
+    datasets keep the exact patient ID prefix from the pickle filename.
     """
     files = glob.glob(os.path.join(base_dir, "**", "*.pkl"), recursive=True)
     groups = {}
     for f in files:
-        basename = os.path.basename(f)
-        parts = basename.replace('.pkl', '').split('_')
-        if len(parts) < 4:
+        parsed = _parse_sleep_stage_pickle_path(f)
+        if parsed is None:
             continue
-        
-        stage = parts[-3]
-        try:
-            duration = int(parts[-2])
-        except ValueError:
-            continue
-            
-        bare_patient_id = "_".join(parts[:-3])
-        
-        # Canonical patient ID: if there's a hyphen, take the part after it.
-        if '-' in bare_patient_id:
-            canon_id = bare_patient_id.split('-')[-1]
-        else:
-            canon_id = bare_patient_id
-            
+
+        bare_patient_id = parsed['patient_id']
+        patient_key = _extract_patient_id_from_name(bare_patient_id)
+
         # Group by canonical ID, stage, and the parent directory to avoid cross-project merging
-        key = (canon_id, stage, os.path.dirname(f))
-        groups.setdefault(key, []).append((duration, f, bare_patient_id))
+        key = (patient_key, parsed['stage'], os.path.dirname(f))
+        groups.setdefault(key, []).append((parsed['duration'], f, bare_patient_id))
         
     for key, items in groups.items():
         if len(items) > 1:
@@ -1722,8 +1750,8 @@ def clean_duplicate_pickles(base_dir="pickles_sleep_stage"):
 # ------------------------------------------------------------------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Process EDF files for brain-heart coupling analysis')
-    parser.add_argument('-c', '--edf_root', type=str, default="EDF_Format/EDF",
-                        help='Root directory containing EDF files (default: EDF_Format/EDF)')
+    parser.add_argument('-c', '--edf_root', type=str, default="EDF_Format/The_Human_Sleep_Project",
+                        help='Root directory containing EDF files')
     parser.add_argument('--mode', type=str, choices=['random', 'stage'], default='stage',
                         help='Processing mode: random (select k random files) or stage (extract selected sleep stages)')
     # Controls for random mode
