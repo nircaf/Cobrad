@@ -22,7 +22,7 @@ print("All imports successful!")
 
 # Configuration
 AWS_BIN="/storage/pblab_shared_data/Nir/bin/aws"
-DEST="/storage/pblab_shared_data/Nir/Cobrad/EDF_Format/Young_The_Human_Sleep_Project"
+DEST="/storage/pblab_shared_data2/Nir/Cobrad/EDF_Format/Young_The_Human_Sleep_Project"
 S3_BIDS="s3://arn:aws:s3:us-east-1:184438910517:accesspoint/bdsp-credentialed-access-point/PSG/bids"
 
 mkdir -p "$DEST"

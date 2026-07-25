@@ -7,7 +7,8 @@
 #   HEP_TOTAL_WORKERS=40 ./17_generate_hep_cache.sh   # environment override
 #
 # Two subprocesses run in separate tmux windows. Per-stage locks prevent them
-# from writing the same base cache concurrently.
+# from writing the same base cache concurrently. The tmux session closes after
+# both subprocesses finish, so a later invocation can start a new update.
 #
 # Attach to session:  tmux attach -t hep-cache
 # Switch windows:     Ctrl+B then N/P
@@ -75,8 +76,8 @@ if (( ${#COMMON_ARGS[@]} > 0 )); then
 fi
 COMMON_PREFIX="cd $(printf '%q' "$SCRIPT_DIR") && source venv/bin/activate &&"
 THREAD_LIMITS="OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1"
-NORMAL_CMD="$COMMON_PREFIX $THREAD_LIMITS python 17_generate_hep_cache.py$QUOTED_ARGS --workers $NORMAL_WORKERS; echo '--- NORMAL CACHE DONE ---'; read -p 'Press Enter to close...'"
-COHORT_CMD="$COMMON_PREFIX $THREAD_LIMITS python 17_generate_hep_cache.py$QUOTED_ARGS --min-eeg-channels 10 --workers $COHORT_WORKERS; echo '--- >=10 STANDARD 10-20 EEG CACHE DONE ---'; read -p 'Press Enter to close...'"
+NORMAL_CMD="$COMMON_PREFIX $THREAD_LIMITS python 17_generate_hep_cache.py$QUOTED_ARGS --workers $NORMAL_WORKERS; status=\$?; echo '--- NORMAL CACHE DONE ---'; exit \$status"
+COHORT_CMD="$COMMON_PREFIX $THREAD_LIMITS python 17_generate_hep_cache.py$QUOTED_ARGS --min-eeg-channels 10 --workers $COHORT_WORKERS; status=\$?; echo '--- >=10 STANDARD 10-20 EEG CACHE DONE ---'; exit \$status"
 
 tmux new-session -d -s "$SESSION" -n "all-patients" -x 220 -y 50
 tmux send-keys -t "$SESSION:all-patients" "$NORMAL_CMD" Enter

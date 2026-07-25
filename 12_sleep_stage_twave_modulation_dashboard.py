@@ -29,7 +29,7 @@ from sklearn.decomposition import FastICA
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-BASE_PATH = "/storage/pblab_shared_data/Nir/Cobrad/pickles_sleep_stage"
+BASE_PATH = "/storage/pblab_shared_data2/Nir/Cobrad/pickles_sleep_stage"
 DEFAULT_WINDOW = (-0.3, 0.5)
 DEFAULT_T_WINDOW = (0.15, 0.5)
 DEFAULT_EEG_T_RADIUS = 0.12

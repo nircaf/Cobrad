@@ -11,6 +11,7 @@ set -euo pipefail
 #   DRY_RUN=1 ./download_new_harvard_bids_patients_gt10_electrodes.sh start-tmux
 #   STUDIES="I0002 I0003" ./download_new_harvard_bids_patients_gt10_electrodes.sh start-tmux
 #   SHARDS_PER_STUDY=4 ./download_new_harvard_bids_patients_gt10_electrodes.sh start-tmux
+#   REFRESH_REGISTRY=1 ./download_new_harvard_bids_patients_gt10_electrodes.sh start-tmux
 #
 # Single-study worker/debug mode:
 #   RUN_WORKER=1 STUDY=I0002 ./download_new_harvard_bids_patients_gt10_electrodes.sh
@@ -20,7 +21,7 @@ AWS_BIN="${AWS_BIN:-/storage/pblab_shared_data/Nir/bin/aws}"
 S3_ROOT="${S3_ROOT:-s3://arn:aws:s3:us-east-1:184438910517:accesspoint/bdsp-credentialed-access-point}"
 S3_BIDS="${S3_BIDS:-${S3_ROOT}/PSG/bids}"
 STUDY="${STUDY:-I0002}"
-ROOT_DEST="${ROOT_DEST:-/storage/pblab_shared_data/Nir/Cobrad/EDF_Format/Harvard_Electroencephalography/bids}"
+ROOT_DEST="${ROOT_DEST:-/storage/pblab_shared_data2/Nir/Cobrad/EDF_Format/Harvard_Electroencephalography/bids}"
 DEST="${DEST:-${ROOT_DEST}/${STUDY}}"
 MIN_ELECTRODES="${MIN_ELECTRODES:-10}"
 DRY_RUN="${DRY_RUN:-0}"
@@ -28,13 +29,17 @@ MAX_DOWNLOADS="${MAX_DOWNLOADS:-0}"
 STUDIES="${STUDIES:-I0002 I0003 I0004 I0006}"
 TMUX_SESSION="${TMUX_SESSION:-harvard-bids-downloads}"
 RUN_WORKER="${RUN_WORKER:-0}"
-SHARDS_PER_STUDY="${SHARDS_PER_STUDY:-1}"
+SHARDS_PER_STUDY="${SHARDS_PER_STUDY:-4}"
 SHARD_INDEX="${SHARD_INDEX:-0}"
+USE_REGISTRY="${USE_REGISTRY:-1}"
+REFRESH_REGISTRY="${REFRESH_REGISTRY:-0}"
+REGISTRY_VERSION="${REGISTRY_VERSION:-1}"
 
 SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 LOG_DIR="${LOG_DIR:-${SCRIPT_DIR}/logs/harvard_bids_downloads}"
 LOCK_DIR="${LOCK_DIR:-${ROOT_DEST}/.download_locks}"
+REGISTRY_DIR="${REGISTRY_DIR:-${ROOT_DEST}/.checked_subjects/v${REGISTRY_VERSION}/min-${MIN_ELECTRODES}}"
 
 unique_studies() {
     awk '
@@ -82,10 +87,11 @@ start_tmux_downloads() {
 
             local worker_cmd
             worker_cmd=$(
-                printf 'cd %q && set -o pipefail && RUN_WORKER=1 STUDY=%q SHARDS_PER_STUDY=%q SHARD_INDEX=%q AWS_BIN=%q S3_ROOT=%q S3_BIDS=%q ROOT_DEST=%q MIN_ELECTRODES=%q DRY_RUN=%q MAX_DOWNLOADS=%q LOCK_DIR=%q bash %q 2>&1 | tee -a %q; echo; echo "--- %s shard %s worker done ---"; read -r -p "Press Enter to close..."' \
+                printf 'cd %q && set -o pipefail && RUN_WORKER=1 STUDY=%q SHARDS_PER_STUDY=%q SHARD_INDEX=%q AWS_BIN=%q S3_ROOT=%q S3_BIDS=%q ROOT_DEST=%q MIN_ELECTRODES=%q DRY_RUN=%q MAX_DOWNLOADS=%q LOCK_DIR=%q USE_REGISTRY=%q REFRESH_REGISTRY=%q REGISTRY_VERSION=%q REGISTRY_DIR=%q bash %q 2>&1 | tee -a %q; echo; echo "--- %s shard %s worker done ---"; read -r -p "Press Enter to close..."' \
                     "$SCRIPT_DIR" "$study" "$SHARDS_PER_STUDY" "$shard" \
                     "$AWS_BIN" "$S3_ROOT" "$S3_BIDS" "$ROOT_DEST" \
                     "$MIN_ELECTRODES" "$DRY_RUN" "$MAX_DOWNLOADS" "$LOCK_DIR" \
+                    "$USE_REGISTRY" "$REFRESH_REGISTRY" "$REGISTRY_VERSION" "$REGISTRY_DIR" \
                     "$SCRIPT_PATH" "${LOG_DIR}/${window_name}.log" "$study" "$shard"
             )
             tmux send-keys -t "${TMUX_SESSION}:${window_name}" "$worker_cmd" Enter
@@ -109,6 +115,7 @@ esac
 
 mkdir -p "$DEST"
 mkdir -p "$LOCK_DIR"
+mkdir -p "${REGISTRY_DIR}/${STUDY}"
 TMP_DIR="$(mktemp -d)"
 CURRENT_LOCK=""
 
@@ -126,6 +133,8 @@ skipped_existing=0
 skipped_no_matching_montage=0
 skipped_missing_channels=0
 skipped_locked=0
+registry_hits=0
+registry_writes=0
 
 if ! [[ "$SHARDS_PER_STUDY" =~ ^[0-9]+$ ]] || (( SHARDS_PER_STUDY < 1 )); then
     echo "SHARDS_PER_STUDY must be a positive integer." >&2
@@ -320,6 +329,29 @@ qualifying_sessions_for_subject() {
     fi
 }
 
+checked_result_for_subject() {
+    local subject="$1"
+    local output_file="$2"
+    local registry_file="${REGISTRY_DIR}/${STUDY}/${subject}.tsv"
+
+    if [[ "$USE_REGISTRY" == "1" && "$REFRESH_REGISTRY" != "1" && -s "$registry_file" ]]; then
+        ((registry_hits += 1))
+        echo "REGISTRY hit: ${subject}"
+        cp "$registry_file" "$output_file"
+        return 0
+    fi
+
+    qualifying_sessions_for_subject "$subject" > "$output_file"
+
+    if [[ "$USE_REGISTRY" == "1" ]]; then
+        # mv is atomic on this filesystem, so parallel shards never see a
+        # partially written registry entry.
+        cp "$output_file" "${registry_file}.tmp.$$"
+        mv "${registry_file}.tmp.$$" "$registry_file"
+        ((registry_writes += 1))
+    fi
+}
+
 download_subject_level_files() {
     local subject="$1"
     local final_dest="${DEST}/${subject}"
@@ -372,6 +404,8 @@ echo "Minimum 10-20 scalp EEG electrodes: >= ${MIN_ELECTRODES}"
 echo "Must contain one existing local montage template: yes"
 echo "Shard: ${SHARD_INDEX}/${SHARDS_PER_STUDY}"
 echo "Dry run: ${DRY_RUN}"
+echo "Persistent check registry: ${USE_REGISTRY} (${REGISTRY_DIR}/${STUDY})"
+echo "Refresh registry: ${REFRESH_REGISTRY}"
 echo
 
 subject_list="${TMP_DIR}/remote_subjects.txt"
@@ -390,11 +424,12 @@ while IFS= read -r subject; do
 
     qualifying_file="${TMP_DIR}/${subject}_qualifying_sessions.tsv"
     summary_file="${TMP_DIR}/${subject}_summary.tsv"
-    qualifying_sessions_for_subject "$subject" |
-        awk -F '\t' -v q="$qualifying_file" -v s="$summary_file" '
+    checked_file="${TMP_DIR}/${subject}_checked.tsv"
+    checked_result_for_subject "$subject" "$checked_file"
+    awk -F '\t' -v q="$qualifying_file" -v s="$summary_file" '
             $1 == "QUALIFIED" { print > q; next }
             $1 == "SUMMARY" { print > s; next }
-        '
+        ' "$checked_file"
 
     if [[ ! -s "$qualifying_file" ]]; then
         if [[ -s "$summary_file" ]]; then
@@ -478,3 +513,5 @@ echo "  Skipped existing qualifying sessions: ${skipped_existing}"
 echo "  Skipped locked by another worker: ${skipped_locked}"
 echo "  Skipped no matching local scalp montage: ${skipped_no_matching_montage}"
 echo "  Skipped missing channels.tsv: ${skipped_missing_channels}"
+echo "  Reused registry entries: ${registry_hits}"
+echo "  New/refreshed registry entries: ${registry_writes}"

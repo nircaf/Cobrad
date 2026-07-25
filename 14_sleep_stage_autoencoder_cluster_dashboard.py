@@ -70,9 +70,9 @@ except Exception:
     hdbscan = None
 
 
-BASE_PATH = Path("/storage/pblab_shared_data/Nir/Cobrad/pickles_sleep_stage")
-EDF_FORMAT_DIR = Path("/storage/pblab_shared_data/Nir/Cobrad/EDF_Format")
-CACHE_DIR = Path("/storage/pblab_shared_data/Nir/Cobrad/cache/14_autoencoder_clusters")
+BASE_PATH = Path("/storage/pblab_shared_data2/Nir/Cobrad/pickles_sleep_stage")
+EDF_FORMAT_DIR = Path("/storage/pblab_shared_data2/Nir/Cobrad/EDF_Format")
+CACHE_DIR = Path("/storage/pblab_shared_data2/Nir/Cobrad/cache/14_autoencoder_clusters")
 NON_PATIENT_PREFIXES = ("individuals_cache", "non_eeg_individuals_cache")
 STAGE_ORDER = ["W", "light_sleep", "N3", "R", "N1", "N2"]
 EEG_BANDS = {

@@ -42,7 +42,7 @@ def custom_st_pyplot(fig=None, clear_figure=None, **kwargs):
 st.pyplot = custom_st_pyplot
 
 # Paths
-BASE_PATH = "/storage/pblab_shared_data/Nir/Cobrad/pickles_sleep_stage"
+BASE_PATH = "/storage/pblab_shared_data2/Nir/Cobrad/pickles_sleep_stage"
 GROUPS = ["Berkeley_data", "EDF"]
 STAGES = ["N1", "N2", "N3", "W"]
 

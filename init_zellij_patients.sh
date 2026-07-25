@@ -35,22 +35,22 @@ QUEUE_FILE="$SCRIPT_DIR/logs/patients_queue.txt"
 LOCK_FILE="$SCRIPT_DIR/logs/patients_queue.lock"
 LAYOUT_FILE="$SCRIPT_DIR/logs/patients_session_layout.kdl"
 
-EDF_ROOT="/storage/pblab_shared_data/Nir/Cobrad/EDF_Format/EDF"
+EDF_ROOT="/storage/pblab_shared_data2/Nir/Cobrad/EDF_Format/EDF"
 
 # ─── Queue: one "edf_path|stage" entry per missing stage ─────────────────────
 populate_queue() {
     cat > "$QUEUE_FILE" <<'EOF'
-/storage/pblab_shared_data/Nir/Cobrad/EDF_Format/EDF/0345-016.EDF|N3
-/storage/pblab_shared_data/Nir/Cobrad/EDF_Format/EDF/0345-017  EDF/0345-017.EDF|N3
-/storage/pblab_shared_data/Nir/Cobrad/EDF_Format/EDF/0345-028  EDF/0345-028.EDF|R
-/storage/pblab_shared_data/Nir/Cobrad/EDF_Format/EDF/0345-071 EDF.EDF|N1
-/storage/pblab_shared_data/Nir/Cobrad/EDF_Format/EDF/0345-076 EDF.EDF|W
-/storage/pblab_shared_data/Nir/Cobrad/EDF_Format/EDF/0345-078.EDF|N1
-/storage/pblab_shared_data/Nir/Cobrad/EDF_Format/EDF/0345-081 EDF.EDF|W
-/storage/pblab_shared_data/Nir/Cobrad/EDF_Format/EDF/0345-083 EDF.EDF|N3
-/storage/pblab_shared_data/Nir/Cobrad/EDF_Format/EDF/0345-091 EDF.EDF|N3
-/storage/pblab_shared_data/Nir/Cobrad/EDF_Format/EDF/0345-098 EDF.EDF|N3
-/storage/pblab_shared_data/Nir/Cobrad/EDF_Format/EDF/0345-104.EDF|N1
+/storage/pblab_shared_data2/Nir/Cobrad/EDF_Format/EDF/0345-016.EDF|N3
+/storage/pblab_shared_data2/Nir/Cobrad/EDF_Format/EDF/0345-017  EDF/0345-017.EDF|N3
+/storage/pblab_shared_data2/Nir/Cobrad/EDF_Format/EDF/0345-028  EDF/0345-028.EDF|R
+/storage/pblab_shared_data2/Nir/Cobrad/EDF_Format/EDF/0345-071 EDF.EDF|N1
+/storage/pblab_shared_data2/Nir/Cobrad/EDF_Format/EDF/0345-076 EDF.EDF|W
+/storage/pblab_shared_data2/Nir/Cobrad/EDF_Format/EDF/0345-078.EDF|N1
+/storage/pblab_shared_data2/Nir/Cobrad/EDF_Format/EDF/0345-081 EDF.EDF|W
+/storage/pblab_shared_data2/Nir/Cobrad/EDF_Format/EDF/0345-083 EDF.EDF|N3
+/storage/pblab_shared_data2/Nir/Cobrad/EDF_Format/EDF/0345-091 EDF.EDF|N3
+/storage/pblab_shared_data2/Nir/Cobrad/EDF_Format/EDF/0345-098 EDF.EDF|N3
+/storage/pblab_shared_data2/Nir/Cobrad/EDF_Format/EDF/0345-104.EDF|N1
 EOF
     NUM=$(wc -l < "$QUEUE_FILE" | tr -d ' ')
     echo "Queue populated with $NUM patient/stage jobs."

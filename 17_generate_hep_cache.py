@@ -42,8 +42,15 @@ import importlib.util
 import traceback
 from typing import List, Optional
 
-BASE_PATH = "/storage/pblab_shared_data/Nir/Cobrad/pickles_sleep_stage"
-HEP_MODULE_PATH = "/storage/pblab_shared_data/Nir/Cobrad/6_hep_group_comparison.py"
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_PATH = os.environ.get(
+    "HEP_PICKLES_BASE_PATH",
+    os.path.join(SCRIPT_DIR, "pickles_sleep_stage"),
+)
+HEP_MODULE_PATH = os.environ.get(
+    "HEP_MODULE_PATH",
+    os.path.join(SCRIPT_DIR, "6_hep_group_comparison.py"),
+)
 
 STAGE_ORDER = ["W", "light_sleep", "N3", "R"]
 NON_PATIENT_CACHE_PREFIXES = ("individuals_cache", "non_eeg_individuals_cache")

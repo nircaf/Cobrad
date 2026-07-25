@@ -80,7 +80,7 @@ except Exception:
 # =============================================================================
 # Constants
 # =============================================================================
-BASE_PATH = Path("/storage/pblab_shared_data/Nir/Cobrad")
+BASE_PATH = Path("/storage/pblab_shared_data2/Nir/Cobrad")
 CLINICAL_FILE = BASE_PATH / "COBRAD_clinical_24022025.xlsx"
 PARQUET_CACHE = BASE_PATH / "cache" / "14_autoencoder_clusters"
 RANDOM_STATE = 42
@@ -96,7 +96,7 @@ CLINICAL_NUMERIC_COLS = [
 CLINICAL_CAT_COLS = ["sex"]
 
 # EHR data paths (Harvard Electroencephalography study)
-_EHR_BASE = "/storage/pblab_shared_data/Nir/Cobrad/EDF_Format/Harvard_Electroencephalography/EHR"
+_EHR_BASE = "/storage/pblab_shared_data2/Nir/Cobrad/EDF_Format/Harvard_Electroencephalography/EHR"
 _EHR_DIAG_BASE = os.path.join(
     _EHR_BASE, "data_Structured", "Parquet", "Parquet", "bdsp_i0006_diagnosis"
 )

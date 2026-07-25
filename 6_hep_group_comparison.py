@@ -2575,7 +2575,7 @@ def _nap_jitter(data_matrix, times, jitter_sec):
 
 def save_hep_to_downloads(hep_a: np.ndarray, hep_b: np.ndarray, times: np.ndarray,
                           label_a: str = "group_a", label_b: str = "group_b",
-                          downloads_dir: str = "/storage/pblab_shared_data/Nir/Cobrad/.downloads") -> str:
+                          downloads_dir: str = "/storage/pblab_shared_data2/Nir/Cobrad/.downloads") -> str:
     """Save hep_a and hep_b matrices (and times) as .npz to .downloads/.
 
     Returns the path of the saved file.
@@ -10735,7 +10735,39 @@ def run_compare_sleep_stages_analysis(base_path):
         'N3': 'blue',
         'R': 'red'
     }
-    
+
+    def _build_patient_ecg_stage_traces(pid):
+        """Per-stage (times, ecg_trace) for one patient, used for example plots."""
+        traces = {}
+        for stage in sleep_stages:
+            for ind in all_stage_individuals[stage]:
+                if ind[0].split('_')[0] == pid:
+                    ecg_hep, times_p = ind[5], ind[2]
+                    if ecg_hep is not None and times_p is not None:
+                        ecg_trace = np.asarray(ecg_hep, dtype=float).squeeze()
+                        min_len = min(len(times_p), len(ecg_trace))
+                        traces[stage] = (np.asarray(times_p)[:min_len], ecg_trace[:min_len])
+                    break
+        return traces
+
+    if analysis_mode == "Group Average":
+        st.markdown("#### Example Individual Patients (ECG HEP across Sleep Stages)")
+        example_pids = sorted(list(all_patients))[:3]
+        example_cols = st.columns(len(example_pids))
+        for col, pid in zip(example_cols, example_pids):
+            with col:
+                fig_ex, ax_ex = plt.subplots(figsize=(4, 3))
+                for stage, (t_p, trace_p) in _build_patient_ecg_stage_traces(pid).items():
+                    ax_ex.plot(t_p, trace_p * 1e6, label=stage, color=stage_colors.get(stage, 'gray'),
+                               linewidth=1.5, alpha=0.85)
+                ax_ex.axvline(0, color='black', linestyle='--', alpha=0.4)
+                ax_ex.set_title(f"Patient {pid}", fontsize=10)
+                ax_ex.set_xlabel("Time (s)", fontsize=8)
+                ax_ex.set_ylabel(u"μV", fontsize=8)
+                ax_ex.legend(fontsize=7)
+                st.pyplot(fig_ex, use_container_width=True)
+                plt.close(fig_ex)
+
     for stage in sleep_stages:
         stage_individuals = all_stage_individuals[stage]
         
@@ -10852,10 +10884,30 @@ def run_compare_sleep_stages_analysis(base_path):
         st.warning("No data found for any stage.")
         return
 
+    # --- Group-level cluster permutation test: is HEP significantly != 0 per stage? ---
+    stage_sig_windows = {}
+    stage_permtest_info = {}
+    if analysis_mode == "Group Average":
+        for stage, data in stage_data.items():
+            ecg_arr = data.get('ecg_heps_aligned')
+            times_stage = data.get('times')
+            if ecg_arr is None or times_stage is None:
+                continue
+            ecg_arr = np.asarray(ecg_arr, dtype=float)
+            if ecg_arr.ndim == 3:
+                ecg_arr = ecg_arr[:, 0, :]
+            if ecg_arr.shape[0] < 3:
+                continue
+            sig_windows, _, per_patient_info = permutation_cluster_jitter_test(
+                ecg_arr, np.asarray(times_stage)[:ecg_arr.shape[1]], n_permutations=100
+            )
+            stage_sig_windows[stage] = sig_windows
+            stage_permtest_info[stage] = per_patient_info
+
     # --- Plot ECG ---
     fig_ecg, ax_ecg = plt.subplots(figsize=(10, 6))
     has_ecg_data = False
-    
+
     for stage, data in stage_data.items():
         ecg_hep = data['ecg_hep']
         times = data['times']
@@ -10867,8 +10919,10 @@ def run_compare_sleep_stages_analysis(base_path):
              ecg_trace = np.asarray(ecg_hep, dtype=float).squeeze()
              min_len = min(len(times), len(ecg_trace))
              ax_ecg.plot(np.asarray(times)[:min_len], ecg_trace[:min_len] * 1e6, label=label_str, color=stage_colors.get(stage, 'gray'), linewidth=2, alpha=0.8)
+             for win in stage_sig_windows.get(stage, []):
+                 ax_ecg.axvspan(win['start'], win['end'], color=stage_colors.get(stage, 'gray'), alpha=0.15)
              has_ecg_data = True
-             
+
     if has_ecg_data:
         title_str = f"ECG HEP across Sleep Stages - {selected_pid}" if analysis_mode == "Single Patient" else f"ECG HEP across Sleep Stages - Group Average (N={len(all_patients)} patients)"
         ax_ecg.set_title(title_str)
@@ -10878,6 +10932,94 @@ def run_compare_sleep_stages_analysis(base_path):
         ax_ecg.legend()
         ax_ecg.axvline(0, color='black', linestyle='--', alpha=0.5)
         st.pyplot(fig_ecg, use_container_width=True)
+
+        # --- Significant HEP windows per stage (cluster permutation test vs 0) ---
+        if analysis_mode == "Group Average" and stage_sig_windows:
+            st.markdown("#### Significant HEP Windows per Sleep Stage (cluster permutation test, HEP != 0)")
+            rows = []
+            for stage in stage_data.keys():
+                info = stage_permtest_info.get(stage)
+                if info is None:
+                    continue
+                windows = stage_sig_windows.get(stage, [])
+                win_str = ", ".join(
+                    f"{w['start']*1000:.0f}-{w['end']*1000:.0f}ms (p={w['p_value']:.4f})" for w in windows
+                ) or "none"
+                rows.append({
+                    'Sleep Stage': stage,
+                    'N patients': len(info['p_values']),
+                    'N sig. patients': info['n_significant'],
+                    'Fisher p': f"{info['fisher_p']:.4f}",
+                    'Significant windows': win_str,
+                })
+            if rows:
+                st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
+            fig_sig, ax_sig = plt.subplots(figsize=(10, max(2, len(stage_sig_windows) * 0.6)))
+            y_ticks, y_labels = [], []
+            for y, (stage, windows) in enumerate(stage_sig_windows.items(), start=1):
+                y_ticks.append(y)
+                y_labels.append(stage)
+                for w in windows:
+                    ax_sig.plot([w['start'], w['end']], [y, y], color=stage_colors.get(stage, 'gray'),
+                                linewidth=6, solid_capstyle='butt')
+            ax_sig.set_yticks(y_ticks)
+            ax_sig.set_yticklabels(y_labels)
+            ax_sig.set_xlabel("Time (s)")
+            ax_sig.set_title("Cluster-Significant HEP Windows (Group Average, vs 0)")
+            ax_sig.axvline(0, color='black', linestyle='--', alpha=0.5)
+            ax_sig.grid(True, axis='x', alpha=0.3)
+            ax_sig.set_xlim(ax_ecg.get_xlim())
+            st.pyplot(fig_sig, use_container_width=True)
+            plt.close(fig_sig)
+
+        # --- Per-patient significance classification + significant-only group average ---
+        if analysis_mode == "Group Average" and stage_permtest_info:
+            st.markdown("#### Per-Patient Significance Classification per Sleep Stage")
+            sorted_patients = sorted(list(all_patients))
+            patient_rows = []
+            for stage, info in stage_permtest_info.items():
+                sig_flags = info.get('significant', [])
+                for pid, is_sig in zip(sorted_patients, sig_flags):
+                    patient_rows.append({
+                        'Patient ID': pid,
+                        'Sleep Stage': stage,
+                        'Significant': bool(is_sig),
+                    })
+            if patient_rows:
+                st.dataframe(pd.DataFrame(patient_rows), use_container_width=True)
+
+            fig_sigonly, ax_sigonly = plt.subplots(figsize=(10, 6))
+            has_sigonly_data = False
+            for stage, data in stage_data.items():
+                info = stage_permtest_info.get(stage)
+                if info is None:
+                    continue
+                sig_flags = np.asarray(info.get('significant', []), dtype=bool)
+                if sig_flags.sum() == 0:
+                    st.info(f"No significant patients for stage '{stage}' - skipping significant-only average.")
+                    continue
+                ecg_arr = np.asarray(data.get('ecg_heps_aligned'), dtype=float)
+                if ecg_arr.ndim == 3:
+                    ecg_arr = ecg_arr[:, 0, :]
+                sig_ecg = ecg_arr[sig_flags]
+                avg_sig_ecg = np.nanmedian(sig_ecg, axis=0)
+                times_stage = np.asarray(data.get('times'))
+                min_len = min(len(times_stage), len(avg_sig_ecg))
+                ax_sigonly.plot(times_stage[:min_len], avg_sig_ecg[:min_len] * 1e6,
+                                 label=f"{stage} (N={int(sig_flags.sum())} significant)",
+                                 color=stage_colors.get(stage, 'gray'), linewidth=2, alpha=0.8)
+                has_sigonly_data = True
+
+            if has_sigonly_data:
+                ax_sigonly.set_title("Group Average ECG HEP - Significant Patients Only")
+                ax_sigonly.set_xlabel("Time (s)")
+                ax_sigonly.set_ylabel("Amplitude (μV)")
+                ax_sigonly.grid(True)
+                ax_sigonly.legend()
+                ax_sigonly.axvline(0, color='black', linestyle='--', alpha=0.5)
+                st.pyplot(fig_sigonly, use_container_width=True)
+            plt.close(fig_sigonly)
 
         # Add Pairwise Comparison Matrix for Group Average
         if analysis_mode == "Group Average" and len(stage_data) > 1:
@@ -12811,7 +12953,7 @@ def run_per_channel_group_comparison_analysis(base_path, selected_stage):
 # DIAGNOSIS GROUP COMPARISON — helpers
 # ═══════════════════════════════════════════════════════════════════════════
 
-_DIAG_BASE = "/storage/pblab_shared_data/Nir/Cobrad/EDF_Format/Harvard_Electroencephalography/ECG/I0001"
+_DIAG_BASE = "/storage/pblab_shared_data2/Nir/Cobrad/EDF_Format/Harvard_Electroencephalography/ECG/I0001"
 
 def _load_12sl_diagnosis_map():
     """Load 12SL ECG diagnoses → {patient_id_str: category_name}."""
@@ -12888,7 +13030,7 @@ def _match_pid_to_bdsp(pid_str):
     return list(dict.fromkeys(candidates))
 
 
-_EHR_BASE = "/storage/pblab_shared_data/Nir/Cobrad/EDF_Format/Harvard_Electroencephalography/EHR"
+_EHR_BASE = "/storage/pblab_shared_data2/Nir/Cobrad/EDF_Format/Harvard_Electroencephalography/EHR"
 _EHR_DIAG_BASE = os.path.join(
     _EHR_BASE,
     "data_Structured",
@@ -13377,8 +13519,8 @@ def run_diagnosis_group_comparison_analysis(base_path, selected_stage):
     if not use_cache:
         # Load psg_metadata for age/sex
         meta_paths = [
-            "/storage/pblab_shared_data/Nir/Cobrad/EDF_Format/The_Human_Sleep_Project/psg_metadata.csv",
-            "/storage/pblab_shared_data/Nir/Cobrad/EDF_Format/Young_The_Human_Sleep_Project/psg_metadata.csv",
+            "/storage/pblab_shared_data2/Nir/Cobrad/EDF_Format/The_Human_Sleep_Project/psg_metadata.csv",
+            "/storage/pblab_shared_data2/Nir/Cobrad/EDF_Format/Young_The_Human_Sleep_Project/psg_metadata.csv",
         ]
         meta_frames = []
         for mp in meta_paths:
@@ -14674,7 +14816,7 @@ def main():
         st.sidebar.write("No figures saved yet.")
 
 
-    base_path = "/storage/pblab_shared_data/Nir/Cobrad/pickles_sleep_stage"
+    base_path = "/storage/pblab_shared_data2/Nir/Cobrad/pickles_sleep_stage"
 
     # Select Sleep Stage
     sleep_stages = ['light_sleep', 'N3', 'R', 'W']

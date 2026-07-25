@@ -18,8 +18,8 @@ import pickle
 import traceback
 from datetime import datetime
 
-BASE_PATH = "/storage/pblab_shared_data/Nir/Cobrad/pickles_sleep_stage"
-HEP_MODULE_PATH = "/storage/pblab_shared_data/Nir/Cobrad/6_hep_group_comparison.py"
+BASE_PATH = "/storage/pblab_shared_data2/Nir/Cobrad/pickles_sleep_stage"
+HEP_MODULE_PATH = "/storage/pblab_shared_data2/Nir/Cobrad/6_hep_group_comparison.py"
 
 VALID_STAGES = ['light_sleep', 'N3', 'R', 'W']
 
