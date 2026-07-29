@@ -1011,7 +1011,7 @@ def find_stage_epochs(preds, target_stages, bridge_gap=2):
 
 import yasa
 
-def process_patients_n1_stage_hep(edf_root="EDF_Format/EDF", step_sec=5, n1_duration_min=10, stage=DEFAULT_SLEEP_STAGE, rerun_failed=False, reverse=False):
+def process_patients_n1_stage_hep(edf_root="EDF_Format/EDF", step_sec=5, n1_duration_min=10, stage=DEFAULT_SLEEP_STAGE, rerun_failed=False, reverse=False, patient_ids_filter=None):
     """
     For each patient_id:
       - find all their EDF files from EDF_Format/EDF directory,
@@ -1097,6 +1097,14 @@ def process_patients_n1_stage_hep(edf_root="EDF_Format/EDF", step_sec=5, n1_dura
         n_excluded = before_excl - len(patient_to_files)
         if n_excluded > 0:
             log_stage(f"Excluded {n_excluded} patients from excluded_patients.csv (out of {before_excl} found).")
+
+    if patient_ids_filter is not None:
+        before_filter = len(patient_to_files)
+        patient_to_files = {pid: files for pid, files in patient_to_files.items() if pid in patient_ids_filter}
+        log_stage(
+            f"Restricted to --patient-ids-file list: {len(patient_to_files)} of {before_filter} "
+            f"found patients matched ({len(patient_ids_filter)} requested)."
+        )
 
     patient_to_files = dict(random.sample(list(patient_to_files.items()), len(patient_to_files)))
 
@@ -1771,8 +1779,16 @@ if __name__ == "__main__":
                         help='Re-process patients that previously failed (default: skip them)')
     parser.add_argument('--reverse', action='store_true', default=False,
                         help='Process patients in reverse order (Z→A), useful for parallel runs')
+    parser.add_argument('--patient-ids-file', type=str, default=None,
+                        help='Path to a text file of patient IDs (one per line, e.g. SUB-I0006179000097) '
+                             'to restrict processing to. Default: process all patients found under --edf_root')
 
     args = parser.parse_args()
+
+    patient_ids_filter = None
+    if args.patient_ids_file:
+        with open(args.patient_ids_file) as _f:
+            patient_ids_filter = {line.strip() for line in _f if line.strip()}
 
     # Setup run-specific logger
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1793,4 +1809,4 @@ if __name__ == "__main__":
     # Rename .edf files to uppercase
     args.edf_root = rename_edfs_to_upper(args.edf_root)
 
-    process_patients_n1_stage_hep(edf_root=args.edf_root, step_sec=args.step_sec, n1_duration_min=args.n1_duration_min, stage=args.stage, rerun_failed=args.rerun_failed, reverse=args.reverse)
+    process_patients_n1_stage_hep(edf_root=args.edf_root, step_sec=args.step_sec, n1_duration_min=args.n1_duration_min, stage=args.stage, rerun_failed=args.rerun_failed, reverse=args.reverse, patient_ids_filter=patient_ids_filter)

@@ -381,13 +381,6 @@ def process_single_patient(args_tuple):
                     logger.error(f"    Error processing {stage} segment: {e}")
                     patient_results[stage]['errors'] += 1
 
-            # Delete EDF after all stages processed
-            try:
-                os.remove(file_path)
-                logger.info(f"Deleted EDF after processing: {file_path}")
-            except OSError as del_e:
-                logger.warning(f"Could not delete EDF {file_path}: {del_e}")
-
         except Exception as e:
             logger.error(f"CRASHED file {file_path}: {e}")
 

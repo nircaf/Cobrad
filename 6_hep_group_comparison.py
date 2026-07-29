@@ -2235,7 +2235,8 @@ def _patient_cluster_p_value(patient_trace, null_traces, p_threshold, n_permutat
     )['p_value']
 
 
-def permutation_cluster_jitter_test(avg_hep, times, n_permutations=100, p_threshold=0.05, jitter_sec=None):
+def permutation_cluster_jitter_test(avg_hep, times, n_permutations=100, p_threshold=0.05, jitter_sec=None,
+                                     qrs_exclude_sec=0.05):
     """
     Cluster-based permutation test with pynapple jitter, per-patient significance,
     and Fisher-combined group p-value.
@@ -2333,7 +2334,11 @@ def permutation_cluster_jitter_test(avg_hep, times, n_permutations=100, p_thresh
     # Observed t-stats
     t_obs, _ = stats.ttest_1samp(avg_hep, 0)
 
-    obs_mask = np.abs(t_obs) > t_thresh
+    # QRS complex dominates ±qrs_exclude_sec around the R-peak (cardiac field
+    # artifact, not neural signal) — exclude it from cluster detection.
+    qrs_mask = np.abs(times) <= qrs_exclude_sec
+
+    obs_mask = (np.abs(t_obs) > t_thresh) & ~qrs_mask
     obs_labels, n_clusters = label(obs_mask)
 
     if n_clusters == 0:
@@ -2349,7 +2354,7 @@ def permutation_cluster_jitter_test(avg_hep, times, n_permutations=100, p_thresh
         # Stack jittered traces for all subjects at this permutation index
         hep_jittered = np.vstack([patient_null[s][perm] for s in range(n_subjects)])
         t_null, _    = stats.ttest_1samp(hep_jittered, 0)
-        null_mask    = np.abs(t_null) > t_thresh
+        null_mask    = (np.abs(t_null) > t_thresh) & ~qrs_mask
         null_labels, n_null_c = label(null_mask)
         if n_null_c > 0:
             null_dist[perm] = max(

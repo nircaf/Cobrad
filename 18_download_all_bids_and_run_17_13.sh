@@ -23,7 +23,9 @@ SCRIPT_13="${SCRIPT_DIR}/13_parallel_patient_processing_run.sh"
 
 SESSION="${SESSION:-harvard-bids-download-process}"
 STUDIES="${STUDIES:-I0002 I0003 I0004 I0006}"
-SHARDS_PER_STUDY="${SHARDS_PER_STUDY:-1}"
+AVAILABLE_CPUS="$(nproc)"
+SHARDS_PER_STUDY="${SHARDS_PER_STUDY:-4}"
+HEP_TOTAL_WORKERS="${HEP_TOTAL_WORKERS:-$(( AVAILABLE_CPUS / 2 ))}"
 LOG_DIR="${LOG_DIR:-${SCRIPT_DIR}/logs/18_download_all_bids}"
 
 require_file() {
@@ -87,11 +89,11 @@ run_pipeline() {
 
     echo
     echo "All BIDS downloads finished successfully."
-    echo "Launching script 17..."
+    echo "Launching script 17 (HEP_TOTAL_WORKERS=$HEP_TOTAL_WORKERS)..."
     # Both launchers try to attach after creating their own tmux session. Because
     # this pipeline already runs inside tmux, that attach is intentionally
     # rejected while the newly created sessions continue in the background.
-    bash "$SCRIPT_17" </dev/null || true
+    HEP_TOTAL_WORKERS="$HEP_TOTAL_WORKERS" bash "$SCRIPT_17" </dev/null || true
 
     echo
     echo "Launching script 13 for Harvard_Electroencephalography..."
@@ -121,8 +123,8 @@ fi
 
 mkdir -p "$LOG_DIR"
 printf -v worker_command \
-    'cd %q && STUDIES=%q SHARDS_PER_STUDY=%q LOG_DIR=%q bash %q --pipeline-worker 2>&1 | tee -a %q' \
-    "$SCRIPT_DIR" "$STUDIES" "$SHARDS_PER_STUDY" "$LOG_DIR" "$SCRIPT_PATH" \
+    'cd %q && STUDIES=%q SHARDS_PER_STUDY=%q HEP_TOTAL_WORKERS=%q LOG_DIR=%q bash %q --pipeline-worker 2>&1 | tee -a %q' \
+    "$SCRIPT_DIR" "$STUDIES" "$SHARDS_PER_STUDY" "$HEP_TOTAL_WORKERS" "$LOG_DIR" "$SCRIPT_PATH" \
     "${LOG_DIR}/pipeline.log"
 
 tmux new-session -d -s "$SESSION" -n pipeline "$worker_command"
@@ -130,6 +132,7 @@ tmux new-session -d -s "$SESSION" -n pipeline "$worker_command"
 echo "Download-and-process pipeline started."
 echo "  Studies : $STUDIES"
 echo "  Shards  : $SHARDS_PER_STUDY per study"
+echo "  HEP CPUs: $HEP_TOTAL_WORKERS (script 17)"
 echo "  Session : $SESSION"
 echo "  Attach  : tmux attach -t $SESSION"
 echo "  Log     : ${LOG_DIR}/pipeline.log"
