@@ -1,12 +1,17 @@
 # Ignore .edf and .EEG files
 *.edf
 *.EEG
-.vscode
+.vscode/
+.idea/
 __pycache__*/
 *.pkl
 .env
-*.DS_Store
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db
 venv/
+.venv/
 # xlsx that start with ~
 ~$*.xlsx
 .codex
@@ -27,6 +32,16 @@ __pycache__/
 
 # Other unnecessary folders
 cache/
+errors/
+*_cache/
+backup/
+backups/
+*_backup/
+*_backups/
+tmp/
+temp/
+*.tmp/
+*.temp/
 COBRAD_figures/
 figures/
 figures_HEP/
@@ -42,4 +57,16 @@ west_nile_virus/
 
 # Additional file types
 *.pyc
+*.pyo
+*.errors.parquet
+*.LOG
+*.tmp
+*.temp
+*.bak
+*.backup
+*.old
+*.orig
+*.swp
+*.swo
+*~
 .a5c/

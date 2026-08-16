@@ -35,11 +35,13 @@ import argparse
 import fcntl
 import multiprocessing
 import os
+import pickle
 import sys
 import time
 import types
 import importlib.util
 import traceback
+import re
 from typing import List, Optional
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -53,6 +55,7 @@ HEP_MODULE_PATH = os.environ.get(
 )
 
 STAGE_ORDER = ["W", "light_sleep", "N3", "R"]
+DEFAULT_COMPLETE_THREE_STAGES = ["W", "light_sleep", "N3"]
 NON_PATIENT_CACHE_PREFIXES = ("individuals_cache", "non_eeg_individuals_cache")
 DEFAULT_HEP_GROUPS = [
     "The_Human_Sleep_Project",
@@ -323,6 +326,75 @@ def generate_cache(
     return failed
 
 
+def _canonical_patient_id(value: str) -> str:
+    match = re.search(r"I\d{13}", str(value), flags=re.IGNORECASE)
+    return match.group(0).upper() if match else str(value)
+
+
+def retry_missing_third_stages_dynamically(
+    mod, groups, n_workers, complete_stages, candidate_patient_ids=None,
+    apply_ica=False,
+) -> int:
+    """Retry the missing stage with the minimum usable patient-specific cutoff."""
+    failed = 0
+    for group in groups:
+        successful_by_stage = {}
+        for stage in complete_stages:
+            cache_path = os.path.join(
+                BASE_PATH, group, stage,
+                mod._cache_filename_for_individuals(
+                    apply_ica=apply_ica, min_eeg_channels=None
+                ),
+            )
+            try:
+                with open(cache_path, "rb") as handle:
+                    successful_by_stage[stage] = {
+                        _canonical_patient_id(ind[0])
+                        for ind in pickle.load(handle)
+                        if ind is not None and len(ind) > 0
+                    }
+            except (FileNotFoundError, EOFError):
+                successful_by_stage[stage] = set()
+
+        all_patients = set().union(*successful_by_stage.values())
+        if candidate_patient_ids is not None:
+            all_patients &= set(candidate_patient_ids)
+        pass_counts = {
+            patient_id: sum(
+                patient_id in successful_by_stage[stage]
+                for stage in complete_stages
+            )
+            for patient_id in all_patients
+        }
+        for stage in complete_stages:
+            candidates = {
+                patient_id for patient_id, count in pass_counts.items()
+                if count == 2 and patient_id not in successful_by_stage[stage]
+            }
+            if not candidates:
+                continue
+            label = (
+                f"{group}/{stage}: dynamic third-stage retry "
+                f"({len(candidates)} patients)"
+            )
+            print(f"--- {label} ---", flush=True)
+            try:
+                with _StageGenerationLock(BASE_PATH, group, stage, label):
+                    mod.get_group_individuals(
+                        group, stage, BASE_PATH,
+                        recompute_cache=True,
+                        apply_ica=apply_ica,
+                        parallel_workers=n_workers,
+                        relaxed_patient_ids=candidates,
+                        recompute_patient_ids=candidates,
+                    )
+            except Exception as exc:
+                print(f"--- {label} FAILED: {exc} ---", file=sys.stderr, flush=True)
+                traceback.print_exc()
+                failed += 1
+    return failed
+
+
 # ── CLI ────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     # Required for ProcessPoolExecutor on some platforms
@@ -353,6 +425,15 @@ if __name__ == "__main__":
                         help="Process only the first ~10 files per group/stage (smoke test)")
     parser.add_argument("--min-eeg-channels", type=int, default=None,
                         help="Generate a separate cache requiring at least N channels from the canonical 10-20 list")
+    parser.add_argument(
+        "--complete-three-stages", nargs=3,
+        default=DEFAULT_COMPLETE_THREE_STAGES,
+        help="The three stages used by the conditional dynamic retry",
+    )
+    parser.add_argument(
+        "--third-stage-candidates-file",
+        help="Optional file restricting dynamic third-stage retries to these patient IDs",
+    )
     args = parser.parse_args()
 
     groups = [g for g in args.groups if os.path.isdir(os.path.join(BASE_PATH, g))]
@@ -372,5 +453,20 @@ if __name__ == "__main__":
         test_run=args.test_run,
         min_eeg_channels=args.min_eeg_channels,
     )
+    if not args.test_run and args.min_eeg_channels is None:
+        retry_candidates = None
+        if args.third_stage_candidates_file:
+            with open(args.third_stage_candidates_file, encoding="utf-8") as handle:
+                retry_candidates = {
+                    _canonical_patient_id(line.strip())
+                    for line in handle
+                    if line.strip() and not line.lstrip().startswith("#")
+                }
+        n_failed += retry_missing_third_stages_dynamically(
+            hep_mod, groups, args.workers,
+            complete_stages=args.complete_three_stages,
+            candidate_patient_ids=retry_candidates,
+            apply_ica=args.ica,
+        )
 
     sys.exit(1 if n_failed > 0 else 0)

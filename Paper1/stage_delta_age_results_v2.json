@@ -1,0 +1,165 @@
+{
+  "n_cohort": 2931,
+  "selected_channels": [
+    "Fp1",
+    "Fp2",
+    "F7",
+    "F3",
+    "Fz",
+    "F4",
+    "F8",
+    "T3",
+    "T7",
+    "C3",
+    "Cz",
+    "C4",
+    "T4",
+    "T8",
+    "T5",
+    "P7",
+    "P3",
+    "Pz",
+    "P4",
+    "T6",
+    "P8",
+    "O1",
+    "Oz",
+    "O2"
+  ],
+  "pairwise": [
+    {
+      "stage_a": "light_sleep",
+      "stage_b": "N3",
+      "n": 2075,
+      "p_formatted": "0.0050",
+      "n_electrodes_tested": 19,
+      "n_cluster_significant": 3,
+      "n_fdr_significant": 2,
+      "sig_channels": [
+        "C4",
+        "T4",
+        "T6"
+      ]
+    },
+    {
+      "stage_a": "N3",
+      "stage_b": "R",
+      "n": 2075,
+      "p_formatted": "0.0050",
+      "n_electrodes_tested": 19,
+      "n_cluster_significant": 15,
+      "n_fdr_significant": 15,
+      "sig_channels": [
+        "C4",
+        "Cz",
+        "F4",
+        "F8",
+        "Fp2",
+        "Fz",
+        "O1",
+        "O2",
+        "P3",
+        "P4",
+        "Pz",
+        "T3",
+        "T4",
+        "T5",
+        "T6"
+      ]
+    },
+    {
+      "stage_a": "light_sleep",
+      "stage_b": "R",
+      "n": 2075,
+      "p_formatted": "0.0249",
+      "n_electrodes_tested": 19,
+      "n_cluster_significant": 1,
+      "n_fdr_significant": 0,
+      "sig_channels": [
+        "F8"
+      ]
+    }
+  ],
+  "age_split": [
+    {
+      "stage": "light_sleep",
+      "n_younger": 1339,
+      "n_older": 1260,
+      "p_formatted": "0.0050",
+      "n_electrodes_tested": 19,
+      "n_cluster_significant": 5,
+      "n_fdr_significant": 5,
+      "sig_channels": [
+        "F4",
+        "F8",
+        "O1",
+        "T4",
+        "T5"
+      ]
+    },
+    {
+      "stage": "N3",
+      "n_younger": 1316,
+      "n_older": 1203,
+      "p_formatted": "0.0050",
+      "n_electrodes_tested": 19,
+      "n_cluster_significant": 4,
+      "n_fdr_significant": 4,
+      "sig_channels": [
+        "F8",
+        "O1",
+        "T4",
+        "T5"
+      ]
+    },
+    {
+      "stage": "R",
+      "n_younger": 1299,
+      "n_older": 1144,
+      "p_formatted": "0.0050",
+      "n_electrodes_tested": 19,
+      "n_cluster_significant": 9,
+      "n_fdr_significant": 9,
+      "sig_channels": [
+        "C4",
+        "F4",
+        "F8",
+        "Fp2",
+        "O1",
+        "O2",
+        "P4",
+        "T3",
+        "T5"
+      ]
+    }
+  ],
+  "age_median": 22.5,
+  "table1": [
+    {
+      "label": "Selected cohort (light/N3/REM, >=10 EEG ch)",
+      "n": 2931,
+      "n_with_age": 2913,
+      "age_mean": 26.834431857191902,
+      "age_median": 22.5,
+      "age_sd": 15.50926584624605,
+      "age_min": 1.0,
+      "age_max": 98.3,
+      "n_male": 1640,
+      "n_female": 1274,
+      "n_unknown": 17
+    },
+    {
+      "label": "Susp. Epilepsy matched 3-stage subset",
+      "n": 2075,
+      "n_with_age": 2061,
+      "age_mean": 21.89102377486657,
+      "age_median": 21.3,
+      "age_sd": 5.981420421777409,
+      "age_min": 3.6,
+      "age_max": 91.8,
+      "n_male": 1145,
+      "n_female": 917,
+      "n_unknown": 13
+    }
+  ]
+}

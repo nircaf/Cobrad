@@ -597,7 +597,7 @@ def fix_bad_eeg_channels(
     except ValueError as err:
         err_msg = str(err)
         print(f"[fix_bad_eeg_channels] PyPREP bad-channel detection error: {err_msg}. Continuing with amplitude checks only.")
-        raise
+        bad_pyprep = set()
 
     bad_channel_summary = " | ".join(
         line.strip() for line in bad_channel_log.getvalue().splitlines() if line.strip()

@@ -1,0 +1,168 @@
+{
+  "formula": "hep_amplitude_uv ~ C(neuro_group, Treatment('Unknown')) * C(stage, Treatment('light_sleep')) + C(region, Treatment('central')) + age_z + sex_bin + hr_z + cfa_z",
+  "n_obs": 143255,
+  "n_patients": 7651,
+  "log_likelihood": -148630.15483056556,
+  "aic": 297296.3096611311,
+  "group_var": 0.07018281352599894,
+  "resid_var": 0.43336192202338714,
+  "marginal_r2_approx": 0.11384703868029422,
+  "conditional_r2_approx": 0.23735683562407142,
+  "coefficients": [
+    {
+      "term": "age_z",
+      "estimate": 0.0021083512327646266,
+      "ci_lo": -0.0058769150798274085,
+      "ci_hi": 0.010093617545356662,
+      "p_value": 0.6048144083888243,
+      "abs_estimate": 0.0021083512327646266,
+      "label": "Age (z)"
+    },
+    {
+      "term": "C(neuro_group, Treatment('Unknown'))[T.Non-neurological]:C(stage, Treatment('light_sleep'))[T.R]",
+      "estimate": -0.004057702321266293,
+      "ci_lo": -0.025391229637186645,
+      "ci_hi": 0.017275824994654063,
+      "p_value": 0.7093038821567212,
+      "abs_estimate": 0.004057702321266293,
+      "label": "Diagnosis=Non-neurological x Stage=R"
+    },
+    {
+      "term": "C(neuro_group, Treatment('Unknown'))[T.Non-neurological]:C(stage, Treatment('light_sleep'))[T.N3]",
+      "estimate": 0.011413947076025102,
+      "ci_lo": -0.01001864529345091,
+      "ci_hi": 0.032846539445501116,
+      "p_value": 0.2965868861659856,
+      "abs_estimate": 0.011413947076025102,
+      "label": "Diagnosis=Non-neurological x Stage=N3"
+    },
+    {
+      "term": "C(neuro_group, Treatment('Unknown'))[T.Neurological]:C(stage, Treatment('light_sleep'))[T.N3]",
+      "estimate": 0.011473168073915347,
+      "ci_lo": -0.013933590682747821,
+      "ci_hi": 0.036879926830578516,
+      "p_value": 0.37611386387040335,
+      "abs_estimate": 0.011473168073915347,
+      "label": "Diagnosis=Neurological x Stage=N3"
+    },
+    {
+      "term": "C(neuro_group, Treatment('Unknown'))[T.Non-neurological]",
+      "estimate": -0.01920514229658761,
+      "ci_lo": -0.04295343234972879,
+      "ci_hi": 0.004543147756553567,
+      "p_value": 0.11296300984697594,
+      "abs_estimate": 0.01920514229658761,
+      "label": "Diagnosis=Non-neurological"
+    },
+    {
+      "term": "C(region, Treatment('central'))[T.temporal]",
+      "estimate": 0.02016810455714369,
+      "ci_lo": 0.001106552840809006,
+      "ci_hi": 0.03922965627347838,
+      "p_value": 0.038103189667829045,
+      "abs_estimate": 0.02016810455714369,
+      "label": "Region=temporal"
+    },
+    {
+      "term": "C(region, Treatment('central'))[T.frontal]",
+      "estimate": -0.020174377114436783,
+      "ci_lo": -0.028764078897784647,
+      "ci_hi": -0.01158467533108892,
+      "p_value": 4.158303164795037e-06,
+      "abs_estimate": 0.020174377114436783,
+      "label": "Region=frontal"
+    },
+    {
+      "term": "C(neuro_group, Treatment('Unknown'))[T.Neurological]:C(stage, Treatment('light_sleep'))[T.R]",
+      "estimate": -0.02215437312515643,
+      "ci_lo": -0.047300034923295944,
+      "ci_hi": 0.0029912886729830876,
+      "p_value": 0.08420184071728891,
+      "abs_estimate": 0.02215437312515643,
+      "label": "Diagnosis=Neurological x Stage=R"
+    },
+    {
+      "term": "C(stage, Treatment('light_sleep'))[T.R]",
+      "estimate": 0.03137194487598999,
+      "ci_lo": 0.013146613281797313,
+      "ci_hi": 0.049597276470182666,
+      "p_value": 0.0007414917194663568,
+      "abs_estimate": 0.03137194487598999,
+      "label": "Stage=R"
+    },
+    {
+      "term": "hr_z",
+      "estimate": 0.0377498295821826,
+      "ci_lo": 0.03073397492852531,
+      "ci_hi": 0.04476568423583989,
+      "p_value": 5.30780652433613e-26,
+      "abs_estimate": 0.0377498295821826,
+      "label": "Heart rate (z)"
+    },
+    {
+      "term": "sex_bin",
+      "estimate": 0.042576075346159564,
+      "ci_lo": 0.02855461383155631,
+      "ci_hi": 0.05659753686076282,
+      "p_value": 2.6582968077042105e-09,
+      "abs_estimate": 0.042576075346159564,
+      "label": "Sex (Male=1)"
+    },
+    {
+      "term": "C(stage, Treatment('light_sleep'))[T.N3]",
+      "estimate": -0.048894966257882665,
+      "ci_lo": -0.0671010447303979,
+      "ci_hi": -0.030688887785367432,
+      "p_value": 1.4114098001693247e-07,
+      "abs_estimate": 0.048894966257882665,
+      "label": "Stage=N3"
+    },
+    {
+      "term": "C(region, Treatment('central'))[T.occipital]",
+      "estimate": -0.056968827033415444,
+      "ci_lo": -0.065792417402043,
+      "ci_hi": -0.04814523666478789,
+      "p_value": 1.0584058802443222e-36,
+      "abs_estimate": 0.056968827033415444,
+      "label": "Region=occipital"
+    },
+    {
+      "term": "C(region, Treatment('central'))[T.parietal]",
+      "estimate": -0.06271480604056345,
+      "ci_lo": -0.091859359077655,
+      "ci_hi": -0.03357025300347191,
+      "p_value": 2.469653772881549e-05,
+      "abs_estimate": 0.06271480604056345,
+      "label": "Region=parietal"
+    },
+    {
+      "term": "C(neuro_group, Treatment('Unknown'))[T.Neurological]",
+      "estimate": -0.06343700968494453,
+      "ci_lo": -0.09129484335308762,
+      "ci_hi": -0.03557917601680145,
+      "p_value": 8.075583952062752e-06,
+      "abs_estimate": 0.06343700968494453,
+      "label": "Diagnosis=Neurological"
+    },
+    {
+      "term": "cfa_z",
+      "estimate": 0.1072577770357466,
+      "ci_lo": 0.10034450353393431,
+      "ci_hi": 0.11417105053755888,
+      "p_value": 4.257560923991693e-203,
+      "abs_estimate": 0.1072577770357466,
+      "label": "CFA contamination (z)"
+    }
+  ],
+  "n_by_group_stage": {
+    "Unknown|light_sleep": 1116,
+    "Unknown|N3": 1029,
+    "Unknown|R": 1059,
+    "Non-neurological|light_sleep": 4551,
+    "Non-neurological|N3": 4077,
+    "Non-neurological|R": 4323,
+    "Neurological|light_sleep": 1909,
+    "Neurological|N3": 1638,
+    "Neurological|R": 1763
+  }
+}

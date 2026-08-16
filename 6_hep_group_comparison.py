@@ -44,6 +44,10 @@ DEFAULT_HEP_GROUPS = [
     'Harvard_Electroencephalography',
 ]
 MAX_SPECTRAL_POWER_RATIO = 0.4
+MAX_DYNAMIC_THIRD_STAGE_SPECTRAL_POWER_RATIO = 0.8
+DYNAMIC_THIRD_STAGE_MIN_WINDOWS = 30
+_ACTIVE_SPECTRAL_POWER_RATIO = MAX_SPECTRAL_POWER_RATIO
+_DYNAMIC_THIRD_STAGE_SPECTRAL_FILTER = False
 HEP_WINDOW_MIN_PTP_UV = 0.05
 HEP_WINDOW_MIN_STD_UV = 0.01
 HEP_WINDOW_MAX_ABS_UV = 5000.0
@@ -719,7 +723,62 @@ def _valid_hep_window_mask(epochs, sfreq):
     )
 
     spectral_ratio = _epoch_spectral_power_ratio_hf_lf(epochs, sfreq)
-    bad_by_ch |= ~np.isfinite(spectral_ratio) | (spectral_ratio >= MAX_SPECTRAL_POWER_RATIO)
+    spectral_limit = MAX_SPECTRAL_POWER_RATIO
+    if _DYNAMIC_THIRD_STAGE_SPECTRAL_FILTER:
+        # Find the smallest patient-specific cutoff that retains a useful
+        # number of windows which already passed every non-spectral check.
+        # This avoids assigning every third stage the same relaxed threshold.
+        max_bad = int(np.floor(
+            HEP_WINDOW_MAX_BAD_CHANNEL_FRACTION * epochs.shape[1]
+        ))
+        required_limits = []
+        for base_bad, ratios in zip(bad_by_ch, spectral_ratio):
+            base_bad_count = int(np.sum(base_bad))
+            spectral_slots = max_bad - base_bad_count
+            otherwise_good = ~base_bad
+            finite_good_ratios = np.asarray(
+                ratios[otherwise_good & np.isfinite(ratios)], dtype=float
+            )
+            nonfinite_count = int(np.sum(
+                otherwise_good & ~np.isfinite(ratios)
+            ))
+            if spectral_slots < nonfinite_count:
+                continue
+            required_good = (
+                finite_good_ratios.size
+                - (spectral_slots - nonfinite_count)
+            )
+            if required_good <= 0:
+                required_limits.append(0.0)
+                continue
+            ordered = np.sort(finite_good_ratios)
+            required_limits.append(
+                float(np.nextafter(ordered[required_good - 1], np.inf))
+            )
+        if required_limits:
+            required_limits.sort()
+            target = min(DYNAMIC_THIRD_STAGE_MIN_WINDOWS, len(required_limits))
+            spectral_limit = max(
+                MAX_SPECTRAL_POWER_RATIO,
+                required_limits[target - 1],
+            )
+            spectral_limit = min(
+                spectral_limit,
+                MAX_DYNAMIC_THIRD_STAGE_SPECTRAL_POWER_RATIO,
+            )
+        print(
+            f"[HF/LF] Dynamic third-stage cutoff selected: "
+            f"{spectral_limit:.4f} "
+            f"(minimum {DYNAMIC_THIRD_STAGE_MIN_WINDOWS} usable windows, "
+            f"safety ceiling {MAX_DYNAMIC_THIRD_STAGE_SPECTRAL_POWER_RATIO:g})",
+            flush=True,
+        )
+
+    global _ACTIVE_SPECTRAL_POWER_RATIO
+    _ACTIVE_SPECTRAL_POWER_RATIO = spectral_limit
+    bad_by_ch |= ~np.isfinite(spectral_ratio) | (
+        spectral_ratio >= spectral_limit
+    )
 
     bad_fraction = np.mean(bad_by_ch, axis=1)
     return bad_fraction <= HEP_WINDOW_MAX_BAD_CHANNEL_FRACTION
@@ -760,7 +819,8 @@ def compute_hep_avg(raw, rpeaks, sfreq, minmax=(-0.5, 1.0), rpeak_ts=None):
         try:
             st.warning(
                 "No valid HEP windows remained after flat/noise and "
-                f"spectral_power_ratio_hf_lf < {MAX_SPECTRAL_POWER_RATIO} filtering."
+                f"spectral_power_ratio_hf_lf < "
+                f"{_ACTIVE_SPECTRAL_POWER_RATIO} filtering."
             )
         except Exception:
             pass
@@ -1533,15 +1593,23 @@ def _apply_ica_ecg_removal(raw, patient_id):
 
 def _process_patient_worker(args):
     """Module-level worker for ProcessPoolExecutor. Returns result tuple or None on failure."""
-    if len(args) == 4:
+    global _ACTIVE_SPECTRAL_POWER_RATIO, _DYNAMIC_THIRD_STAGE_SPECTRAL_FILTER
+    if len(args) == 5:
+        f_path, patient_id, apply_ica, group_name, dynamic_spectral_filter = args
+    elif len(args) == 4:
         f_path, patient_id, apply_ica, group_name = args
+        dynamic_spectral_filter = False
     elif len(args) == 3:
         f_path, patient_id, apply_ica = args
         group_name = ''
+        dynamic_spectral_filter = False
     else:
         f_path, patient_id = args
         apply_ica = False
         group_name = ''
+        dynamic_spectral_filter = False
+    _ACTIVE_SPECTRAL_POWER_RATIO = MAX_SPECTRAL_POWER_RATIO
+    _DYNAMIC_THIRD_STAGE_SPECTRAL_FILTER = bool(dynamic_spectral_filter)
     try:
         with open(f_path, 'rb') as f:
             raw = pickle.load(f)
@@ -1635,6 +1703,7 @@ def _standard_1020_channel_count(channel_names):
 def _dump_pickle_atomic_with_heartbeat(payload, destination):
     """Atomically write a cache while reporting disk-I/O progress every 10 seconds."""
     temp_path = f"{destination}.tmp.{os.getpid()}"
+    os.makedirs(os.path.dirname(destination), exist_ok=True)
     stop_event = threading.Event()
     started = time.monotonic()
 
@@ -1792,7 +1861,8 @@ def _load_incremental_individuals_cache(cache_path, args_list):
 def get_group_individuals(
     group_name, sleep_stage, base_path, test_run=False, recompute_cache=False,
     apply_ica=False, parallel_workers=DEFAULT_PATIENT_WORKERS,
-    min_eeg_channels=None,
+    min_eeg_channels=None, relaxed_patient_ids=None,
+    recompute_patient_ids=None,
 ):
     """
     Loads all files for a group/sleep_stage and returns individual HEPs.
@@ -1834,12 +1904,21 @@ def get_group_individuals(
         except Exception:
             pass
 
+    relaxed_patient_ids = set(relaxed_patient_ids or ())
     args_list = []
     for f in patient_files:
         pid = _patient_id_from_pickle_name(f)
         base_pid = pid.split('_')[0]
         if pid not in excluded_pids and base_pid not in excluded_pids:
-            args_list.append((os.path.join(group_dir, f), pid, apply_ica, group_name))
+            canonical_match = re.search(r"I\d{13}", pid, flags=re.IGNORECASE)
+            canonical_pid = canonical_match.group(0).upper() if canonical_match else pid
+            dynamic_spectral_filter = canonical_pid in relaxed_patient_ids
+            args_list.append(
+                (
+                    os.path.join(group_dir, f), pid, apply_ica, group_name,
+                    dynamic_spectral_filter,
+                )
+            )
 
     n_jobs = len(args_list)
     if n_jobs == 0:
@@ -1955,7 +2034,35 @@ def get_group_individuals(
     individuals = []
     jobs_to_run = args_list
     cache_data_changed = True
-    if not recompute_cache:
+    recompute_patient_ids = set(recompute_patient_ids or ())
+    if recompute_cache and recompute_patient_ids and os.path.exists(cache_path):
+        try:
+            with open(cache_path, 'rb') as f:
+                previous_individuals = pickle.load(f)
+
+            def canonical_for_retry(value):
+                match = re.search(r"I\d{13}", str(value), flags=re.IGNORECASE)
+                return match.group(0).upper() if match else str(value)
+
+            individuals = [
+                ind for ind in previous_individuals
+                if ind is not None
+                and canonical_for_retry(ind[0]) not in recompute_patient_ids
+            ]
+            jobs_to_run = [
+                args for args in args_list
+                if canonical_for_retry(args[1]) in recompute_patient_ids
+            ]
+            print(
+                f"Selective recompute for {group_name}/{sleep_stage}: "
+                f"{len(jobs_to_run)} target patient file(s), "
+                f"{len(individuals)} cached result(s) retained"
+            )
+        except Exception as exc:
+            print(f"Selective cache reuse failed; rebuilding full stage: {exc}")
+            individuals = []
+            jobs_to_run = args_list
+    elif not recompute_cache:
         individuals, jobs_to_run, changed_pids, cache_data_changed = _load_incremental_individuals_cache(
             cache_path, args_list
         )
@@ -2528,7 +2635,7 @@ def explain_permutation_test(
 
     # ── Figure 1: Group A median ± MAD ───────────────────────────────────────
     st.markdown(f"**{label_a}** — median ± MAD")
-    fig_a, ax_a = plt.subplots(figsize=(14, 5))
+    fig_a, ax_a = plt.subplots(figsize=(7, 7))
     _render_hep_spaghetti(ax_a, hep_a, times, label_a, "#1f77b4")
     _annotate_sig_windows(ax_a, sig_windows_a)
     ax_a.set_title(f"{label_a} - HEP Median +/- MAD (n={hep_a.shape[0]}){ch_suffix}")
@@ -2539,7 +2646,7 @@ def explain_permutation_test(
 
     # ── Figure 2: Group B median ± MAD ───────────────────────────────────────
     st.markdown(f"**{label_b}** — median ± MAD")
-    fig_b, ax_b = plt.subplots(figsize=(14, 5))
+    fig_b, ax_b = plt.subplots(figsize=(7, 7))
     _render_hep_spaghetti(ax_b, hep_b, times, label_b, "#d62728")
     _annotate_sig_windows(ax_b, sig_windows_b)
     ax_b.set_title(f"{label_b} - HEP Median +/- MAD (n={hep_b.shape[0]}){ch_suffix}")
@@ -2550,7 +2657,7 @@ def explain_permutation_test(
 
     # ── Figure 3: Combined — median ± MAD for both groups ────────────────────
     st.markdown("**Both groups combined** — median ± MAD")
-    fig_c, ax_c = plt.subplots(figsize=(14, 5))
+    fig_c, ax_c = plt.subplots(figsize=(7, 7))
     for _data, _lbl, _col in [(hep_a, label_a, "#1f77b4"), (hep_b, label_b, "#d62728")]:
         _med, _mad = median_and_mad(_data * 1e6, axis=0)
         ax_c.plot(times, _med, color=_col, linewidth=2.5, label=f"{_lbl} (n={_data.shape[0]})")
@@ -3672,7 +3779,7 @@ def run_compare_groups_analysis(base_path, selected_stage):
             group_ecg_matrix[group] = ecg_traces
 
     if group_ecg_matrix and ecg_times_ref is not None:
-        fig_ecg_cmp, ax_ecg_cmp = plt.subplots(figsize=(14, 5))
+        fig_ecg_cmp, ax_ecg_cmp = plt.subplots(figsize=(7, 7))
         ax_ecg_cmp.axvline(0, color='red', linestyle='--', alpha=0.6, label='R-peak (t=0)')
         ax_ecg_cmp.axhline(0, color='black', linewidth=0.5, alpha=0.3)
 
@@ -3959,7 +4066,7 @@ def run_compare_groups_analysis(base_path, selected_stage):
 
     # ── Render helper ────────────────────────────────────────────────────
     def _render_spaghetti(mat_dict, times_dict, title_suffix, mark_ica_cleaned=True):
-        fig, ax = plt.subplots(figsize=(14, 5))
+        fig, ax = plt.subplots(figsize=(7, 7))
         fig._skip_ica_cleaned_title = not mark_ica_cleaned
         ax.axvline(0, color='red', linestyle='--', alpha=0.6, label='R-peak (t=0)')
         ax.axhline(0, color='black', linewidth=0.5, alpha=0.3)
@@ -4006,7 +4113,7 @@ def run_compare_groups_analysis(base_path, selected_stage):
         left_chs, right_chs, _ = get_hemisphere_channels(common_channels)
 
         if left_chs and right_chs:
-            fig1c, (ax_L, ax_R) = plt.subplots(1, 2, figsize=(16, 5), sharey=True)
+            fig1c, (ax_L, ax_R) = plt.subplots(1, 2, figsize=(10, 5), sharey=True)
 
             for ax, side_chs, side_label in [
                 (ax_L, left_chs,  "Left hemisphere"),
@@ -4544,7 +4651,7 @@ def run_compare_groups_analysis(base_path, selected_stage):
             diff_arr = np.array(diff_matrix)   # (n_ch, n_times)
             t_hm = times[:diff_arr.shape[1]]
 
-            fig3, ax3 = plt.subplots(figsize=(14, max(4, len(valid_chs) * 0.35 + 2)))
+            fig3, ax3 = plt.subplots(figsize=(max(4, len(valid_chs) * 0.35 + 2), max(4, len(valid_chs) * 0.35 + 2)))
             vmax = np.nanpercentile(np.abs(diff_arr), 98)
 
             im = ax3.imshow(

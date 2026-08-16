@@ -1,0 +1,673 @@
+{
+  "top_diagnoses": [
+    [
+      "Obstructive Sleep Apnea",
+      7427
+    ],
+    [
+      "Hypertension",
+      5308
+    ],
+    [
+      "Obesity",
+      4093
+    ],
+    [
+      "Diabetes",
+      3283
+    ],
+    [
+      "Anxiety",
+      3203
+    ],
+    [
+      "Depression",
+      3104
+    ]
+  ],
+  "n_reference_patients_any_stage": 4324,
+  "waveform_results": {
+    "Obstructive Sleep Apnea": {
+      "light_sleep": {
+        "n": 6806,
+        "fisher_p": 1.0,
+        "n_significant_patients": 0,
+        "cluster_windows": [
+          {
+            "start": -0.30078125,
+            "end": -0.1953125,
+            "p_value": 0.009900990099009901,
+            "fisher_p": 1.0,
+            "n_sig_patients": 0,
+            "n_patients": 6806
+          },
+          {
+            "start": 0.05078125,
+            "end": 0.1875,
+            "p_value": 0.009900990099009901,
+            "fisher_p": 1.0,
+            "n_sig_patients": 0,
+            "n_patients": 6806
+          },
+          {
+            "start": 0.19921875,
+            "end": 0.3515625,
+            "p_value": 0.009900990099009901,
+            "fisher_p": 1.0,
+            "n_sig_patients": 0,
+            "n_patients": 6806
+          }
+        ]
+      },
+      "N3": {
+        "n": 6055,
+        "fisher_p": 1.0,
+        "n_significant_patients": 0,
+        "cluster_windows": [
+          {
+            "start": 0.05078125,
+            "end": 0.1875,
+            "p_value": 0.009900990099009901,
+            "fisher_p": 1.0,
+            "n_sig_patients": 0,
+            "n_patients": 6055
+          },
+          {
+            "start": 0.19921875,
+            "end": 0.3515625,
+            "p_value": 0.009900990099009901,
+            "fisher_p": 1.0,
+            "n_sig_patients": 0,
+            "n_patients": 6055
+          }
+        ]
+      },
+      "R": {
+        "n": 6453,
+        "fisher_p": 1.0,
+        "n_significant_patients": 0,
+        "cluster_windows": [
+          {
+            "start": -0.30078125,
+            "end": -0.1953125,
+            "p_value": 0.039603960396039604,
+            "fisher_p": 1.0,
+            "n_sig_patients": 0,
+            "n_patients": 6453
+          },
+          {
+            "start": -0.1875,
+            "end": -0.05078125,
+            "p_value": 0.009900990099009901,
+            "fisher_p": 1.0,
+            "n_sig_patients": 0,
+            "n_patients": 6453
+          },
+          {
+            "start": 0.05078125,
+            "end": 0.1875,
+            "p_value": 0.009900990099009901,
+            "fisher_p": 1.0,
+            "n_sig_patients": 0,
+            "n_patients": 6453
+          },
+          {
+            "start": 0.1953125,
+            "end": 0.34765625,
+            "p_value": 0.009900990099009901,
+            "fisher_p": 1.0,
+            "n_sig_patients": 0,
+            "n_patients": 6453
+          }
+        ]
+      }
+    },
+    "Hypertension": {
+      "light_sleep": {
+        "n": 4767,
+        "fisher_p": 1.0,
+        "n_significant_patients": 0,
+        "cluster_windows": [
+          {
+            "start": -0.30078125,
+            "end": -0.19921875,
+            "p_value": 0.009900990099009901,
+            "fisher_p": 1.0,
+            "n_sig_patients": 0,
+            "n_patients": 4767
+          },
+          {
+            "start": 0.05078125,
+            "end": 0.1953125,
+            "p_value": 0.009900990099009901,
+            "fisher_p": 1.0,
+            "n_sig_patients": 0,
+            "n_patients": 4767
+          },
+          {
+            "start": 0.203125,
+            "end": 0.3515625,
+            "p_value": 0.009900990099009901,
+            "fisher_p": 1.0,
+            "n_sig_patients": 0,
+            "n_patients": 4767
+          }
+        ]
+      },
+      "N3": {
+        "n": 4147,
+        "fisher_p": 1.0,
+        "n_significant_patients": 0,
+        "cluster_windows": [
+          {
+            "start": -0.30078125,
+            "end": -0.19921875,
+            "p_value": 0.009900990099009901,
+            "fisher_p": 1.0,
+            "n_sig_patients": 0,
+            "n_patients": 4147
+          },
+          {
+            "start": 0.05078125,
+            "end": 0.1953125,
+            "p_value": 0.009900990099009901,
+            "fisher_p": 1.0,
+            "n_sig_patients": 0,
+            "n_patients": 4147
+          },
+          {
+            "start": 0.20703125,
+            "end": 0.3515625,
+            "p_value": 0.009900990099009901,
+            "fisher_p": 1.0,
+            "n_sig_patients": 0,
+            "n_patients": 4147
+          }
+        ]
+      },
+      "R": {
+        "n": 4445,
+        "fisher_p": 1.0,
+        "n_significant_patients": 0,
+        "cluster_windows": [
+          {
+            "start": -0.30078125,
+            "end": -0.1953125,
+            "p_value": 0.009900990099009901,
+            "fisher_p": 1.0,
+            "n_sig_patients": 0,
+            "n_patients": 4445
+          },
+          {
+            "start": 0.05078125,
+            "end": 0.1953125,
+            "p_value": 0.009900990099009901,
+            "fisher_p": 1.0,
+            "n_sig_patients": 0,
+            "n_patients": 4445
+          },
+          {
+            "start": 0.20703125,
+            "end": 0.34765625,
+            "p_value": 0.009900990099009901,
+            "fisher_p": 1.0,
+            "n_sig_patients": 0,
+            "n_patients": 4445
+          }
+        ]
+      }
+    },
+    "Obesity": {
+      "light_sleep": {
+        "n": 3724,
+        "fisher_p": 1.0,
+        "n_significant_patients": 0,
+        "cluster_windows": [
+          {
+            "start": -0.30078125,
+            "end": -0.1953125,
+            "p_value": 0.009900990099009901,
+            "fisher_p": 1.0,
+            "n_sig_patients": 0,
+            "n_patients": 3724
+          },
+          {
+            "start": 0.05078125,
+            "end": 0.19140625,
+            "p_value": 0.009900990099009901,
+            "fisher_p": 1.0,
+            "n_sig_patients": 0,
+            "n_patients": 3724
+          },
+          {
+            "start": 0.203125,
+            "end": 0.34765625,
+            "p_value": 0.009900990099009901,
+            "fisher_p": 1.0,
+            "n_sig_patients": 0,
+            "n_patients": 3724
+          }
+        ]
+      },
+      "N3": {
+        "n": 3329,
+        "fisher_p": 1.0,
+        "n_significant_patients": 0,
+        "cluster_windows": [
+          {
+            "start": -0.30078125,
+            "end": -0.1953125,
+            "p_value": 0.009900990099009901,
+            "fisher_p": 1.0,
+            "n_sig_patients": 0,
+            "n_patients": 3329
+          },
+          {
+            "start": 0.05078125,
+            "end": 0.19140625,
+            "p_value": 0.009900990099009901,
+            "fisher_p": 1.0,
+            "n_sig_patients": 0,
+            "n_patients": 3329
+          },
+          {
+            "start": 0.203125,
+            "end": 0.34765625,
+            "p_value": 0.009900990099009901,
+            "fisher_p": 1.0,
+            "n_sig_patients": 0,
+            "n_patients": 3329
+          }
+        ]
+      },
+      "R": {
+        "n": 3523,
+        "fisher_p": 1.0,
+        "n_significant_patients": 0,
+        "cluster_windows": [
+          {
+            "start": -0.30078125,
+            "end": -0.1953125,
+            "p_value": 0.009900990099009901,
+            "fisher_p": 1.0,
+            "n_sig_patients": 0,
+            "n_patients": 3523
+          },
+          {
+            "start": 0.05078125,
+            "end": 0.19140625,
+            "p_value": 0.009900990099009901,
+            "fisher_p": 1.0,
+            "n_sig_patients": 0,
+            "n_patients": 3523
+          },
+          {
+            "start": 0.19921875,
+            "end": 0.34375,
+            "p_value": 0.009900990099009901,
+            "fisher_p": 1.0,
+            "n_sig_patients": 0,
+            "n_patients": 3523
+          }
+        ]
+      }
+    },
+    "Diabetes": {
+      "light_sleep": {
+        "n": 2906,
+        "fisher_p": 1.0,
+        "n_significant_patients": 0,
+        "cluster_windows": [
+          {
+            "start": -0.30078125,
+            "end": -0.19921875,
+            "p_value": 0.009900990099009901,
+            "fisher_p": 1.0,
+            "n_sig_patients": 0,
+            "n_patients": 2906
+          },
+          {
+            "start": -0.1171875,
+            "end": -0.05078125,
+            "p_value": 0.009900990099009901,
+            "fisher_p": 1.0,
+            "n_sig_patients": 0,
+            "n_patients": 2906
+          },
+          {
+            "start": 0.05078125,
+            "end": 0.1953125,
+            "p_value": 0.009900990099009901,
+            "fisher_p": 1.0,
+            "n_sig_patients": 0,
+            "n_patients": 2906
+          },
+          {
+            "start": 0.20703125,
+            "end": 0.34375,
+            "p_value": 0.009900990099009901,
+            "fisher_p": 1.0,
+            "n_sig_patients": 0,
+            "n_patients": 2906
+          }
+        ]
+      },
+      "N3": {
+        "n": 2539,
+        "fisher_p": 1.0,
+        "n_significant_patients": 0,
+        "cluster_windows": [
+          {
+            "start": -0.30078125,
+            "end": -0.19921875,
+            "p_value": 0.009900990099009901,
+            "fisher_p": 1.0,
+            "n_sig_patients": 0,
+            "n_patients": 2539
+          },
+          {
+            "start": -0.1171875,
+            "end": -0.05078125,
+            "p_value": 0.0297029702970297,
+            "fisher_p": 1.0,
+            "n_sig_patients": 0,
+            "n_patients": 2539
+          },
+          {
+            "start": 0.05078125,
+            "end": 0.1953125,
+            "p_value": 0.009900990099009901,
+            "fisher_p": 1.0,
+            "n_sig_patients": 0,
+            "n_patients": 2539
+          },
+          {
+            "start": 0.2109375,
+            "end": 0.34375,
+            "p_value": 0.009900990099009901,
+            "fisher_p": 1.0,
+            "n_sig_patients": 0,
+            "n_patients": 2539
+          }
+        ]
+      },
+      "R": {
+        "n": 2704,
+        "fisher_p": 1.0,
+        "n_significant_patients": 0,
+        "cluster_windows": [
+          {
+            "start": -0.30078125,
+            "end": -0.19921875,
+            "p_value": 0.009900990099009901,
+            "fisher_p": 1.0,
+            "n_sig_patients": 0,
+            "n_patients": 2704
+          },
+          {
+            "start": -0.1171875,
+            "end": -0.05078125,
+            "p_value": 0.009900990099009901,
+            "fisher_p": 1.0,
+            "n_sig_patients": 0,
+            "n_patients": 2704
+          },
+          {
+            "start": 0.05078125,
+            "end": 0.1953125,
+            "p_value": 0.009900990099009901,
+            "fisher_p": 1.0,
+            "n_sig_patients": 0,
+            "n_patients": 2704
+          },
+          {
+            "start": 0.20703125,
+            "end": 0.34375,
+            "p_value": 0.009900990099009901,
+            "fisher_p": 1.0,
+            "n_sig_patients": 0,
+            "n_patients": 2704
+          }
+        ]
+      }
+    },
+    "Anxiety": {
+      "light_sleep": {
+        "n": 2919,
+        "fisher_p": 1.0,
+        "n_significant_patients": 0,
+        "cluster_windows": [
+          {
+            "start": -0.30078125,
+            "end": -0.19140625,
+            "p_value": 0.009900990099009901,
+            "fisher_p": 1.0,
+            "n_sig_patients": 0,
+            "n_patients": 2919
+          },
+          {
+            "start": 0.05078125,
+            "end": 0.19140625,
+            "p_value": 0.009900990099009901,
+            "fisher_p": 1.0,
+            "n_sig_patients": 0,
+            "n_patients": 2919
+          },
+          {
+            "start": 0.19921875,
+            "end": 0.34765625,
+            "p_value": 0.009900990099009901,
+            "fisher_p": 1.0,
+            "n_sig_patients": 0,
+            "n_patients": 2919
+          }
+        ]
+      },
+      "N3": {
+        "n": 2592,
+        "fisher_p": 1.0,
+        "n_significant_patients": 0,
+        "cluster_windows": [
+          {
+            "start": -0.30078125,
+            "end": -0.19140625,
+            "p_value": 0.009900990099009901,
+            "fisher_p": 1.0,
+            "n_sig_patients": 0,
+            "n_patients": 2592
+          },
+          {
+            "start": 0.05078125,
+            "end": 0.18359375,
+            "p_value": 0.009900990099009901,
+            "fisher_p": 1.0,
+            "n_sig_patients": 0,
+            "n_patients": 2592
+          },
+          {
+            "start": 0.19921875,
+            "end": 0.34375,
+            "p_value": 0.009900990099009901,
+            "fisher_p": 1.0,
+            "n_sig_patients": 0,
+            "n_patients": 2592
+          }
+        ]
+      },
+      "R": {
+        "n": 2746,
+        "fisher_p": 1.0,
+        "n_significant_patients": 0,
+        "cluster_windows": [
+          {
+            "start": -0.30078125,
+            "end": -0.19140625,
+            "p_value": 0.009900990099009901,
+            "fisher_p": 1.0,
+            "n_sig_patients": 0,
+            "n_patients": 2746
+          },
+          {
+            "start": 0.05078125,
+            "end": 0.1875,
+            "p_value": 0.009900990099009901,
+            "fisher_p": 1.0,
+            "n_sig_patients": 0,
+            "n_patients": 2746
+          },
+          {
+            "start": 0.19921875,
+            "end": 0.34375,
+            "p_value": 0.009900990099009901,
+            "fisher_p": 1.0,
+            "n_sig_patients": 0,
+            "n_patients": 2746
+          }
+        ]
+      }
+    },
+    "Depression": {
+      "light_sleep": {
+        "n": 2811,
+        "fisher_p": 1.0,
+        "n_significant_patients": 0,
+        "cluster_windows": [
+          {
+            "start": -0.30078125,
+            "end": -0.1953125,
+            "p_value": 0.009900990099009901,
+            "fisher_p": 1.0,
+            "n_sig_patients": 0,
+            "n_patients": 2811
+          },
+          {
+            "start": 0.05078125,
+            "end": 0.19140625,
+            "p_value": 0.009900990099009901,
+            "fisher_p": 1.0,
+            "n_sig_patients": 0,
+            "n_patients": 2811
+          },
+          {
+            "start": 0.203125,
+            "end": 0.34375,
+            "p_value": 0.009900990099009901,
+            "fisher_p": 1.0,
+            "n_sig_patients": 0,
+            "n_patients": 2811
+          }
+        ]
+      },
+      "N3": {
+        "n": 2483,
+        "fisher_p": 1.0,
+        "n_significant_patients": 0,
+        "cluster_windows": [
+          {
+            "start": -0.30078125,
+            "end": -0.1953125,
+            "p_value": 0.019801980198019802,
+            "fisher_p": 1.0,
+            "n_sig_patients": 0,
+            "n_patients": 2483
+          },
+          {
+            "start": 0.05078125,
+            "end": 0.1875,
+            "p_value": 0.009900990099009901,
+            "fisher_p": 1.0,
+            "n_sig_patients": 0,
+            "n_patients": 2483
+          },
+          {
+            "start": 0.203125,
+            "end": 0.34375,
+            "p_value": 0.009900990099009901,
+            "fisher_p": 1.0,
+            "n_sig_patients": 0,
+            "n_patients": 2483
+          }
+        ]
+      },
+      "R": {
+        "n": 2648,
+        "fisher_p": 1.0,
+        "n_significant_patients": 0,
+        "cluster_windows": [
+          {
+            "start": -0.30078125,
+            "end": -0.1953125,
+            "p_value": 0.009900990099009901,
+            "fisher_p": 1.0,
+            "n_sig_patients": 0,
+            "n_patients": 2648
+          },
+          {
+            "start": 0.05078125,
+            "end": 0.1875,
+            "p_value": 0.009900990099009901,
+            "fisher_p": 1.0,
+            "n_sig_patients": 0,
+            "n_patients": 2648
+          },
+          {
+            "start": 0.19921875,
+            "end": 0.34375,
+            "p_value": 0.009900990099009901,
+            "fisher_p": 1.0,
+            "n_sig_patients": 0,
+            "n_patients": 2648
+          }
+        ]
+      }
+    },
+    "Unknown": {
+      "light_sleep": {
+        "n": 3598,
+        "fisher_p": 1.0,
+        "n_significant_patients": 0,
+        "cluster_windows": [
+          {
+            "start": 0.1796875,
+            "end": 0.34375,
+            "p_value": 0.009900990099009901,
+            "fisher_p": 1.0,
+            "n_sig_patients": 0,
+            "n_patients": 3598
+          }
+        ]
+      },
+      "N3": {
+        "n": 3407,
+        "fisher_p": 1.0,
+        "n_significant_patients": 0,
+        "cluster_windows": [
+          {
+            "start": 0.1796875,
+            "end": 0.33984375,
+            "p_value": 0.009900990099009901,
+            "fisher_p": 1.0,
+            "n_sig_patients": 0,
+            "n_patients": 3407
+          }
+        ]
+      },
+      "R": {
+        "n": 3429,
+        "fisher_p": 1.0,
+        "n_significant_patients": 0,
+        "cluster_windows": [
+          {
+            "start": 0.18359375,
+            "end": 0.33984375,
+            "p_value": 0.009900990099009901,
+            "fisher_p": 1.0,
+            "n_sig_patients": 0,
+            "n_patients": 3429
+          }
+        ]
+      }
+    }
+  },
+  "n_permutations": 100
+}

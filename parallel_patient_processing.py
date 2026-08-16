@@ -4,7 +4,10 @@ import glob
 import pickle
 import argparse
 import logging
+import re
+import sys
 import tempfile
+import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 import numpy as np
@@ -93,22 +96,38 @@ def save_patient_pickle_atomic(raw, pickle_path):
                 pass
 
 
-def patient_stage_pickle_exists(project_name, patient_id, stage):
-    """Return True when this patient already has one saved scan for this stage."""
+def patient_stage_pickle_exists(project_name, recording_id, stage):
+    """Return True when this exact PSG recording already has a stage pickle."""
     pickle_dir = os.path.join("pickles_sleep_stage", project_name, stage)
-    patient_key = _extract_patient_id_from_name(patient_id)
+    recording_key = str(recording_id).upper()
+    recording_pattern = os.path.join(
+        pickle_dir,
+        f"{glob.escape(str(recording_id))}_{glob.escape(stage)}_*.pkl",
+    )
 
-    for pickle_path in glob.glob(os.path.join(pickle_dir, "*.pkl")):
+    for pickle_path in glob.glob(recording_pattern):
         parsed = _parse_sleep_stage_pickle_path(pickle_path)
         if parsed is None or parsed['stage'] != stage:
             continue
         if not patient_pickle_is_complete(pickle_path):
             remove_incomplete_patient_pickle(pickle_path)
             continue
-        if _extract_patient_id_from_name(parsed['patient_id']) == patient_key:
+        if str(parsed['patient_id']).upper() == recording_key:
             return True
 
     return False
+
+
+def recording_id_from_edf(file_path, fallback_patient_id=None):
+    """Stable BIDS recording ID; preserve legacy IDs outside sessioned BIDS."""
+    stem = os.path.splitext(os.path.basename(file_path))[0]
+    if re.search(r'_ses-[^_]+', stem, flags=re.IGNORECASE):
+        return stem.upper()
+    return str(
+        fallback_patient_id
+        if fallback_patient_id is not None
+        else _extract_patient_id_from_name(file_path)
+    )
 
 
 def setup_logger(name, log_file, level=logging.INFO):
@@ -182,7 +201,21 @@ def process_single_patient(args_tuple):
     patient_results = {stage: {'successful': 0, 'errors': 0, 'skipped': 0} for stage in stages_to_extract}
     
     for file_path in files:
-        logger.info(f"Processing file: {file_path}")
+        recording_id = recording_id_from_edf(file_path, patient_id)
+        pending_stages = [
+            stage
+            for stage in stages_to_extract
+            if not patient_stage_pickle_exists(
+                project_name, recording_id, stage
+            )
+        ]
+        if not pending_stages:
+            logger.info(
+                f"Skipping completed recording {recording_id}: all target "
+                "sleep-stage pickles already exist."
+            )
+            continue
+        logger.info(f"Processing recording {recording_id}: {file_path}")
         try:
             # 1. Load EDF and preprocess
             import signal as _signal
@@ -287,15 +320,14 @@ def process_single_patient(args_tuple):
             logger.info(f"Selected best electrode '{eeg_name}' for file {file_path}. Proceeding to extract stages.")
             
             # Extract and process each target stage
-            for stage in stages_to_extract:
+            for stage in pending_stages:
                 logger.info(f"  Extracting stage: {stage}")
-                if (
-                    patient_results[stage]['successful'] > 0
-                    or patient_stage_pickle_exists(project_name, patient_id, stage)
+                if patient_stage_pickle_exists(
+                    project_name, recording_id, stage
                 ):
                     logger.info(
-                        f"    Existing {stage} pickle found for {patient_id}; "
-                        "leaving it untouched and skipping extra scans for this stage."
+                        f"    Existing {stage} pickle found for recording "
+                        f"{recording_id}; leaving it untouched."
                     )
                     continue
 
@@ -354,7 +386,9 @@ def process_single_patient(args_tuple):
                         duration = int(end_sec - start_sec_orig)
                         pickle_dir = os.path.join("pickles_sleep_stage", project_name, stage)
                         os.makedirs(pickle_dir, exist_ok=True)
-                        pickle_filename = f"{patient_id}_{stage}_{duration}_{step_sec}.pkl"
+                        pickle_filename = (
+                            f"{recording_id}_{stage}_{duration}_{step_sec}.pkl"
+                        )
                         pickle_path = os.path.join(pickle_dir, pickle_filename)
 
                         remove_incomplete_patient_pickle(pickle_path, logger)
@@ -396,27 +430,185 @@ def process_single_patient(args_tuple):
     logger.info(f"SUMMARY for {patient_id}: {patient_results}")
     return patient_id, patient_results
 
-def run_parallel_processing(edf_root="EDF_Format/EDF", step_sec=5, n1_duration_min=10, workers=4, reverse=False):
+def group_manifest_edfs_by_patient(edf_files_file):
+    """Group only the exact EDF paths listed in a recording-level manifest."""
+    patient_to_files = {}
+    with open(edf_files_file, encoding="utf-8") as manifest:
+        for line_number, raw_path in enumerate(manifest, 1):
+            value = raw_path.strip()
+            if not value or value.startswith("#"):
+                continue
+            file_path = os.path.abspath(value)
+            if not os.path.isfile(file_path):
+                raise FileNotFoundError(
+                    f"Manifest line {line_number} is not a file: {value}"
+                )
+            if not file_path.lower().endswith(".edf"):
+                raise ValueError(
+                    f"Manifest line {line_number} is not an EDF: {value}"
+                )
+            patient_id = _extract_patient_id_from_name(file_path)
+            patient_to_files.setdefault(patient_id, []).append(file_path)
+    return patient_to_files
+
+
+def excluded_patient_ids():
+    """Load the shared patient exclusion list."""
+    excluded_csv = os.path.join("pickles_sleep_stage", "excluded_patients.csv")
+    if not os.path.exists(excluded_csv):
+        return set()
+    with open(excluded_csv, newline="") as excluded_file:
+        reader = csv.DictReader(excluded_file)
+        return {
+            row["patient_id"].strip()
+            for row in reader
+            if row.get("patient_id", "").strip()
+        }
+
+
+def run_manifest_watch_processing(
+    edf_root,
+    edf_files_file,
+    done_file,
+    step_sec=5,
+    n1_duration_min=10,
+    workers=4,
+    poll_seconds=5.0,
+):
+    """Process EDF paths as they are appended until the producer marks done."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    project_name = get_project_name(edf_root)
+    log_file = f"logs/live_manifest_{project_name}_{timestamp}.log"
+    logger = setup_logger("live_manifest_processing", log_file)
+    excluded_ids = excluded_patient_ids()
+    seen_paths = set()
+    in_flight = {}
+    completed = 0
+    failures = 0
+    max_queued = max(workers * 2, 1)
+
+    logger.info(
+        f"Watching {edf_files_file}; downloads-done marker={done_file}; "
+        f"workers={workers}"
+    )
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        while True:
+            try:
+                with open(edf_files_file, encoding="utf-8") as manifest:
+                    manifest_values = manifest.read().splitlines()
+            except FileNotFoundError:
+                manifest_values = []
+
+            # Download workers append new recordings at the end. Read newest
+            # first so fresh downloads do not sit behind a large seed backlog.
+            for raw_path in reversed(manifest_values):
+                if len(in_flight) >= max_queued:
+                    break
+                value = raw_path.strip()
+                if not value or value.startswith("#"):
+                    continue
+                file_path = os.path.abspath(value)
+                if file_path in seen_paths:
+                    continue
+                # A writer may have appended the line just before publishing
+                # the completed session directory. Retry it on the next poll.
+                if not os.path.isfile(file_path):
+                    continue
+                if not file_path.lower().endswith(".edf"):
+                    logger.warning(f"Ignoring non-EDF manifest entry: {file_path}")
+                    seen_paths.add(file_path)
+                    continue
+
+                patient_id = _extract_patient_id_from_name(file_path)
+                if patient_id in excluded_ids:
+                    logger.info(f"Skipping excluded patient: {patient_id}")
+                    seen_paths.add(file_path)
+                    continue
+                recording_id = recording_id_from_edf(file_path, patient_id)
+                worker_args = (
+                    recording_id,
+                    [file_path],
+                    edf_root,
+                    step_sec,
+                    n1_duration_min,
+                    project_name,
+                )
+                future = executor.submit(process_single_patient, worker_args)
+                in_flight[future] = (recording_id, file_path)
+                seen_paths.add(file_path)
+                logger.info(
+                    f"Queued downloaded recording {recording_id}; "
+                    f"in-flight/queued={len(in_flight)}"
+                )
+
+            for future in [
+                candidate for candidate in in_flight if candidate.done()
+            ]:
+                recording_id, file_path = in_flight.pop(future)
+                try:
+                    _patient_id, results = future.result()
+                    completed += 1
+                    logger.info(
+                        f"Completed downloaded recording {recording_id} "
+                        f"({completed} total): {results}"
+                    )
+                except Exception as exc:
+                    failures += 1
+                    logger.error(
+                        f"Downloaded recording {recording_id} failed "
+                        f"({file_path}): {exc}"
+                    )
+
+            if os.path.exists(done_file) and not in_flight:
+                # Download workers have exited and the orchestrator has made
+                # its final atomic manifest refresh, so no more paths can arrive.
+                remaining = {
+                    os.path.abspath(value.strip())
+                    for value in manifest_values
+                    if value.strip()
+                    and not value.lstrip().startswith("#")
+                    and os.path.isfile(os.path.abspath(value.strip()))
+                } - seen_paths
+                if not remaining:
+                    break
+
+            time.sleep(max(float(poll_seconds), 0.2))
+
+    logger.info(
+        f"Live manifest drained: completed={completed}, failures={failures}, "
+        f"unique paths seen={len(seen_paths)}"
+    )
+    return failures
+
+
+def run_parallel_processing(
+    edf_root="EDF_Format/EDF",
+    step_sec=5,
+    n1_duration_min=10,
+    workers=4,
+    reverse=False,
+    edf_files_file=None,
+):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     project_name = get_project_name(edf_root)
     log_file = f"logs/parallel_run_{project_name}_{timestamp}.log"
     logger = setup_logger('parallel_processing', log_file)
     
-    logger.info(f"Starting parallel processing. edf_root={edf_root}, workers={workers}")
+    logger.info(
+        f"Starting parallel processing. edf_root={edf_root}, workers={workers}, "
+        f"edf_files_file={edf_files_file or 'all local EDFs'}"
+    )
     
-    # 1. Rename EDFs
-    edf_root = rename_edfs_to_upper(edf_root)
-    
-    # 2. Find EDF files and group by patient
-    patient_to_files = group_edf_files_by_patient_edf(edf_root=edf_root)
+    if edf_files_file:
+        # Preserve BIDS filenames so they continue matching channels/JSON
+        # sidecars, and avoid scanning any ineligible local recordings.
+        patient_to_files = group_manifest_edfs_by_patient(edf_files_file)
+    else:
+        edf_root = rename_edfs_to_upper(edf_root)
+        patient_to_files = group_edf_files_by_patient_edf(edf_root=edf_root)
     
     # Filter out excluded patients
-    excluded_csv = os.path.join("pickles_sleep_stage", "excluded_patients.csv")
-    excluded_ids = set()
-    if os.path.exists(excluded_csv):
-        with open(excluded_csv, newline='') as _f:
-            _reader = csv.DictReader(_f)
-            excluded_ids = {row['patient_id'].strip() for row in _reader if row.get('patient_id', '').strip()}
+    excluded_ids = excluded_patient_ids()
     if excluded_ids:
         patient_to_files = {pid: files for pid, files in patient_to_files.items() if pid not in excluded_ids}
         
@@ -463,17 +655,64 @@ if __name__ == "__main__":
                         help=f'Number of parallel workers (processes). Default: {default_workers} (1/3 of cores)')
     parser.add_argument('--reverse', action='store_true', default=False,
                         help='Process patients in reverse order (Z→A)')
+    parser.add_argument(
+        '--edf-files-file',
+        type=str,
+        default=None,
+        help=(
+            'Optional newline-delimited EDF manifest. When supplied, process '
+            'only those exact recordings and preserve their BIDS filenames.'
+        ),
+    )
+    parser.add_argument(
+        '--watch-manifest',
+        action='store_true',
+        help='Keep watching --edf-files-file for newly downloaded recordings.',
+    )
+    parser.add_argument(
+        '--watch-done-file',
+        type=str,
+        default=None,
+        help='Exit watch mode after this marker exists and the queue is drained.',
+    )
+    parser.add_argument(
+        '--watch-poll-seconds',
+        type=float,
+        default=5.0,
+        help='Manifest polling interval in watch mode (default: 5 seconds).',
+    )
 
     args = parser.parse_args()
 
     os.makedirs('logs', exist_ok=True)
     project_name = get_project_name(args.edf_root)
-    clean_duplicate_pickles(os.path.join("pickles_sleep_stage", project_name))
+    if not args.edf_files_file:
+        clean_duplicate_pickles(
+            os.path.join("pickles_sleep_stage", project_name)
+        )
 
-    run_parallel_processing(
-        edf_root=args.edf_root,
-        step_sec=args.step_sec,
-        n1_duration_min=args.n1_duration_min,
-        workers=args.workers,
-        reverse=args.reverse
-    )
+    if args.watch_manifest:
+        if not args.edf_files_file or not args.watch_done_file:
+            parser.error(
+                "--watch-manifest requires --edf-files-file and "
+                "--watch-done-file"
+            )
+        failure_count = run_manifest_watch_processing(
+            edf_root=args.edf_root,
+            edf_files_file=args.edf_files_file,
+            done_file=args.watch_done_file,
+            step_sec=args.step_sec,
+            n1_duration_min=args.n1_duration_min,
+            workers=args.workers,
+            poll_seconds=args.watch_poll_seconds,
+        )
+        raise SystemExit(1 if failure_count else 0)
+    else:
+        run_parallel_processing(
+            edf_root=args.edf_root,
+            step_sec=args.step_sec,
+            n1_duration_min=args.n1_duration_min,
+            workers=args.workers,
+            reverse=args.reverse,
+            edf_files_file=args.edf_files_file,
+        )

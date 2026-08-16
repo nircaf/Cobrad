@@ -14,13 +14,17 @@ from __future__ import annotations
 import argparse
 import glob as _glob
 import base64
+import hashlib
 import importlib.util
 import io
+import json
 import os
 import pickle
 import re
+import sqlite3
 import sys
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from itertools import combinations
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
@@ -34,8 +38,8 @@ import streamlit as st
 from plotly.subplots import make_subplots
 from scipy import stats
 from scipy.ndimage import label as connected_components
-from scipy.signal import savgol_filter
-from sklearn.cluster import KMeans
+from scipy.signal import savgol_filter, welch
+from sklearn.cluster import AgglomerativeClustering, MiniBatchKMeans
 from sklearn.decomposition import PCA
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.impute import SimpleImputer
@@ -44,6 +48,7 @@ from sklearn.metrics import (
     balanced_accuracy_score,
     confusion_matrix,
     f1_score,
+    silhouette_score,
 )
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder, StandardScaler
@@ -95,6 +100,9 @@ def _load_hep_module():
 BASE_PATH = "/storage/pblab_shared_data2/Nir/Cobrad/pickles_sleep_stage"
 CLINICAL_FILE = Path("/storage/pblab_shared_data2/Nir/Cobrad/COBRAD_clinical_24022025.xlsx")
 EHR_DEMOGRAPHICS_CACHE = Path("/storage/pblab_shared_data2/Nir/Cobrad/cache/ehr_demographics.parquet")
+EDF_RECORDING_METADATA_CACHE = Path(
+    "/storage/pblab_shared_data2/Nir/Cobrad/cache/16_edf_recording_metadata.sqlite3"
+)
 _EHR_BASE = "/storage/pblab_shared_data2/Nir/Cobrad/EDF_Format/Harvard_Electroencephalography/EHR"
 _EHR_DIAG_BASE = os.path.join(
     _EHR_BASE, "data_Structured", "Parquet", "Parquet", "bdsp_i0006_diagnosis"
@@ -105,12 +113,23 @@ _EHR_I0002_ICD10_BASE = os.path.join(
 
 STAGE_ORDER = ["light_sleep", "N3", "R"]
 STAGE_LABELS = {"W": "Wake", "light_sleep": "Light Sleep", "N3": "N3 (SWS)", "R": "REM"}
+# Both legacy temporal names (T3/T4/T5/T6) and their modern equivalents
+# (T7/T8/P7/P8) are accepted when present in the processed data.
+MONTAGE_1020_CHANNEL_ORDER = [
+    "Fp1", "Fp2", "F7", "F3", "Fz", "F4", "F8",
+    "T3", "T7", "C3", "Cz", "C4", "T4", "T8",
+    "T5", "P7", "P3", "Pz", "P4", "T6", "P8",
+    "O1", "Oz", "O2",
+]
 PALETTE = ["#0072B2", "#D55E00", "#009E73", "#CC79A7", "#F0E442", "#56B4E9", "#E69F00", "#000000"]
 PAIRWISE_CLUSTER_ALPHA = 0.01
 # Cardiac field artifact: heart's own electrical field volume-conducts into
 # EEG right around the R-peak, so exclude this window from cluster detection.
 HEP_ARTIFACT_EXCLUDE_S = (-0.05, 0.05)
 ELECTRODE_MIN_PATIENT_COVERAGE_FRACTION = 0.05
+# Significance-window shading across all HEP plots: neutral gray, not attention-grabbing yellow.
+HEP_SIG_COLOR = "#808080"
+HEP_SIG_OPACITY = 0.1
 ELECTRODE_MIN_MATCHED_PATIENTS = 2
 WAVEFORM_PLOT_SIZE = 900
 AI_FEATURE_CACHE = Path("/storage/pblab_shared_data2/Nir/Cobrad/cache/14_autoencoder_clusters")
@@ -159,6 +178,21 @@ _DIAG_CATEGORIES: Dict[str, Any] = {
     "Anemia": lambda n: "anemia" in n.lower(),
 }
 
+# Keyword-based Neurological / Non-neurological split, independent of the
+# exclusive categories above — a patient can be e.g. both "Obesity" and
+# "Neurological" at once (comorbidity handled the same way as any other pair).
+_NEUROLOGICAL_KEYWORDS = (
+    "epilepsy", "seizure", "stroke", "cerebrovascular", "cerebral",
+    "dementia", "alzheimer", "cognitive", "parkinson", "multiple sclerosis",
+    "neuropathy", "migraine", "encephalopathy", "brain injury",
+    "intracranial", "neurologic",
+)
+
+
+def _is_neurological_dx(dx_name: str) -> bool:
+    lowered = dx_name.lower()
+    return any(keyword in lowered for keyword in _NEUROLOGICAL_KEYWORDS)
+
 # =============================================================================
 # EHR helpers (copied verbatim from file 15)
 # =============================================================================
@@ -202,6 +236,27 @@ def _assign_categories(dx_names_list: List[str]) -> List[str]:
             if test_fn(dx):
                 cats.add(cat_name)
     return sorted(cats)
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def _diagnosis_category_rows(ehr_df: pd.DataFrame, patient_ids: tuple) -> pd.DataFrame:
+    """One (patient_id, diagnosis_group) row per matched category, or Unknown.
+
+    Cached per (ehr_df, patient_ids) so switching sidebar widgets doesn't
+    re-run the per-patient category matching on every Streamlit rerun.
+    """
+    dx_map = dict(zip(ehr_df["patient_id"], ehr_df["dx_names"]))
+    rows = []
+    for pid in patient_ids:
+        dx_names = dx_map.get(pid, [])
+        for category in (_assign_categories(dx_names) or ["Unknown"]):
+            rows.append({"patient_id": pid, "diagnosis_group": category})
+        neuro_label = (
+            "Neurological" if any(_is_neurological_dx(dx) for dx in dx_names)
+            else "Non-neurological"
+        )
+        rows.append({"patient_id": pid, "diagnosis_group": neuro_label})
+    return pd.DataFrame(rows)
 
 
 def _add_dx_rows_to_patient_map(
@@ -273,7 +328,8 @@ def load_cobrad_clinical() -> pd.DataFrame:
         return pd.DataFrame()
 
     keep = [
-        "record_id", "age", "sex", "mmse", "moca",
+        "record_id", "age", "sex", "handedness", "education_by_diploma",
+        "age at symptoms", "years_symptom_visit", "mmse", "moca",
         "cdr_sum_of_boxes", "ApoE4", "Class_bvftd", "Class_LBD",
     ]
     present = [c for c in keep if c in df.columns]
@@ -285,7 +341,11 @@ def load_cobrad_clinical() -> pd.DataFrame:
     df["record_id"] = df["record_id"].astype(str).str.strip()
     df = df.drop_duplicates(subset=["record_id"]).reset_index(drop=True)
 
-    for c in ["age", "mmse", "moca", "cdr_sum_of_boxes", "ApoE4", "Class_bvftd", "Class_LBD"]:
+    for c in [
+        "age", "education_by_diploma", "age at symptoms",
+        "years_symptom_visit", "mmse", "moca", "cdr_sum_of_boxes",
+        "ApoE4", "Class_bvftd", "Class_LBD",
+    ]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
@@ -447,7 +507,7 @@ def extract_metric(hep_mod, individual: tuple, metric: str, t_window: tuple, sel
 # No separate disk cache / checkpoint / session-state streaming is needed here.
 # =============================================================================
 
-def load_patient_data(
+def _load_patient_data_uncached(
     hep_mod,
     groups: Sequence[str],
     stages: Sequence[str],
@@ -477,11 +537,76 @@ def load_patient_data(
                 rows.append({
                     "group": g,
                     "stage": s,
-                    "patient_id": ind[0],
+                    # Cache tuple IDs include stage/duration suffixes. Collapse
+                    # them here so cohort metrics count real subjects rather
+                    # than one pseudo-patient per stage.
+                    "patient_id": _canonical_patient_id(ind[0]),
                     "individual": ind,
                 })
     return pd.DataFrame(rows) if rows else pd.DataFrame(
         columns=["group", "stage", "patient_id", "individual"])
+
+
+@st.cache_resource(
+    show_spinner=False,
+    max_entries=12,
+)
+def load_patient_data(
+    _hep_mod,
+    groups: tuple,
+    stages: tuple,
+    apply_ica: bool = False,
+    min_eeg_channels: Optional[int] = None,
+) -> pd.DataFrame:
+    """Keep loaded HEP arrays in memory across Streamlit reruns.
+
+    ``get_group_individuals`` already persists its results on disk, but reading
+    and reconstructing all of those large patient tuples on every widget change
+    is still expensive.  A resource cache is intentional here: unlike
+    ``cache_data``, it does not serialize and copy the large array-backed frame
+    for every rerun.  Callers treat the returned frame/tuples as read-only.
+
+    The leading underscore excludes the imported module from Streamlit's cache
+    key; the data-affecting settings remain explicit, hashable key arguments.
+    """
+    return _load_patient_data_uncached(
+        _hep_mod,
+        groups,
+        stages,
+        force_rebuild=False,
+        apply_ica=apply_ica,
+        min_eeg_channels=min_eeg_channels,
+    )
+
+
+@st.cache_resource(show_spinner=False, max_entries=48)
+def extract_metric_frame(
+    _hep_mod,
+    _raw_df: pd.DataFrame,
+    data_signature: tuple,
+    metric: str,
+    t_window: tuple,
+    selected_channels: tuple,
+) -> pd.DataFrame:
+    """Cache patient-level scalar metrics independently of display widgets."""
+    # data_signature participates in the cache key while the large raw frame
+    # and imported module are deliberately excluded from hashing.
+    del data_signature
+    rows = []
+    for row in _raw_df.itertuples(index=False):
+        if row.individual is None:
+            continue
+        rows.append({
+            "group": row.group,
+            "stage": row.stage,
+            "patient_id": row.patient_id,
+            "metric_value": extract_metric(
+                _hep_mod, row.individual, metric, t_window, list(selected_channels)
+            ),
+            "individual": row.individual,
+        })
+    result = pd.DataFrame(rows)
+    return result.dropna(subset=["metric_value"]) if not result.empty else result
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -508,7 +633,7 @@ def select_non_diagnosis_cohort(
     metric_df: pd.DataFrame,
     ehr_df: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Return rows whose patient has Susp. Epilepsy in the available EHR mapping."""
+    """Return rows whose patient has Unknown in the available EHR mapping."""
     diagnosis_names_by_patient = (
         dict(zip(ehr_df["patient_id"], ehr_df["dx_names"]))
         if not ehr_df.empty else {}
@@ -518,7 +643,7 @@ def select_non_diagnosis_cohort(
             lambda patient_id: not diagnosis_names_by_patient.get(patient_id, [])
         )
     ].copy()
-    selected["diagnosis_group"] = "Susp. Epilepsy"
+    selected["diagnosis_group"] = "Unknown"
     return selected
 
 
@@ -1606,6 +1731,82 @@ def _align_trace_maps(
     return stack(traces_a), stack(traces_b), common_times, list(traces_a), list(traces_b)
 
 
+def _align_trace_maps_multi(
+    trace_maps: Dict[str, Dict[str, tuple]],
+) -> Optional[tuple]:
+    """Interpolate any number of patient-trace collections onto a shared time grid."""
+    all_items = [item for traces in trace_maps.values() for item in traces.values()]
+    if not all_items:
+        return None
+    overlap_start = max(float(times[0]) for _, times in all_items)
+    overlap_end = min(float(times[-1]) for _, times in all_items)
+    if overlap_start >= overlap_end:
+        return None
+    ref_trace, ref_times = min(
+        all_items,
+        key=lambda item: np.sum((item[1] >= overlap_start) & (item[1] <= overlap_end)),
+    )
+    del ref_trace
+    common_times = ref_times[(ref_times >= overlap_start) & (ref_times <= overlap_end)]
+    if len(common_times) < 3:
+        return None
+    stacked = {
+        label: np.vstack([
+            np.interp(common_times, times, trace) for trace, times in traces.values()
+        ])
+        for label, traces in trace_maps.items()
+    }
+    return stacked, common_times
+
+
+def _plot_age_decade_hep(
+    trace_maps: Dict[str, Dict[str, tuple]], palette: Sequence[str], title: str,
+) -> go.Figure:
+    """Mean ± SEM HEP per age-decade group, all groups overlaid on one axis."""
+    fig = go.Figure()
+    aligned = _align_trace_maps_multi(trace_maps)
+    if aligned is None:
+        fig.update_layout(
+            title=f"{title} — no overlapping time window",
+            plot_bgcolor="white", paper_bgcolor="white", font_color="black",
+        )
+        return fig
+    stacked, times = aligned
+    for i, (label, matrix) in enumerate(stacked.items()):
+        mean_curve = np.nanmean(matrix, axis=0)
+        sem_curve = (
+            stats.sem(matrix, axis=0, nan_policy="omit")
+            if matrix.shape[0] > 1 else np.zeros_like(mean_curve)
+        )
+        color = palette[i % len(palette)]
+        fig.add_trace(go.Scatter(
+            x=np.r_[times, times[::-1]],
+            y=np.r_[mean_curve - sem_curve, (mean_curve + sem_curve)[::-1]],
+            fill="toself", fillcolor=color, opacity=0.15,
+            line=dict(width=0), showlegend=False, hoverinfo="skip",
+        ))
+        fig.add_trace(go.Scatter(
+            x=times, y=mean_curve, mode="lines",
+            name=f"{label} yr (N={matrix.shape[0]})",
+            line=dict(color=color, width=3.5),
+        ))
+    fig.add_vline(x=0, line_color="#C0392B", line_dash="dash", opacity=0.6)
+    fig.add_hline(y=0, line_color="#555555", opacity=0.35)
+    fig.add_annotation(
+        x=0, y=1.0, xref="x", yref="y domain",
+        text="R-peak", showarrow=False, yshift=14, font=dict(color="black"),
+    )
+    fig.update_layout(
+        title=title,
+        xaxis_title="Time from R-peak (s)", yaxis_title="Mean HEP ± SEM (µV)",
+        height=450,
+        plot_bgcolor="white", paper_bgcolor="white", font_color="black",
+        xaxis=dict(showgrid=False, showline=False, mirror=False),
+        yaxis=dict(showgrid=False, showline=False, mirror=False),
+    )
+    return fig
+
+
 def _electrode_patient_coverage_threshold(n_patients: int) -> int:
     """Minimum patient count required for a per-electrode contrast."""
     if n_patients <= 0:
@@ -1852,35 +2053,28 @@ def prepare_electrode_contrasts(
         paired,
     )
 
-    reference_traces_a = _collect_hep_traces(
-        grouped_df, group_a, stage_a, channels, zscore_subjects
-    )
-    reference_traces_b = _collect_hep_traces(
-        grouped_df, group_b, stage_b, channels, zscore_subjects
-    )
+    # Coverage denominator: everyone in this group/stage cell with *any*
+    # recording, not just those whose multi-channel-averaged trace happens to
+    # pass the flatline/roughness validity check. Using the validity-filtered
+    # set here undercounted the denominator relative to single-channel counts
+    # (averaging can fail validity where an individual channel wouldn't),
+    # which let a channel's coverage read as >100%. This matches the basis
+    # _channels_meeting_comparison_coverage already uses for its own gate.
+    patient_channels_a = _patient_channel_sets(grouped_df, group_a, stage_a)
+    patient_channels_b = _patient_channel_sets(grouped_df, group_b, stage_b)
     shared_reference_patients: set = set()
-    if not paired:
-        shared_reference_patients = set(reference_traces_a) & set(reference_traces_b)
-        reference_traces_a = {
-            pid: value for pid, value in reference_traces_a.items()
-            if pid not in shared_reference_patients
-        }
-        reference_traces_b = {
-            pid: value for pid, value in reference_traces_b.items()
-            if pid not in shared_reference_patients
-        }
-    reference_aligned = _align_trace_maps(
-        reference_traces_a, reference_traces_b, paired=paired
-    )
-    if reference_aligned is not None:
-        _, _, _, reference_patient_ids_a, reference_patient_ids_b = reference_aligned
-    elif paired:
-        matched = sorted(set(reference_traces_a) & set(reference_traces_b))
+    if paired:
+        matched = sorted(set(patient_channels_a) & set(patient_channels_b))
         reference_patient_ids_a = matched
         reference_patient_ids_b = matched
     else:
-        reference_patient_ids_a = list(reference_traces_a)
-        reference_patient_ids_b = list(reference_traces_b)
+        shared_reference_patients = set(patient_channels_a) & set(patient_channels_b)
+        reference_patient_ids_a = [
+            pid for pid in patient_channels_a if pid not in shared_reference_patients
+        ]
+        reference_patient_ids_b = [
+            pid for pid in patient_channels_b if pid not in shared_reference_patients
+        ]
     denominator_a = len(reference_patient_ids_a)
     denominator_b = len(reference_patient_ids_b)
     required_a = _electrode_patient_coverage_threshold(denominator_a)
@@ -2017,7 +2211,7 @@ def plot_waveform_contrast(
         ), row=1, col=1)
         fig.add_trace(go.Scatter(
             x=times, y=mean, mode="lines", name=f"{label_text} mean",
-            line=dict(color=color, width=2.5), legendgroup=label_text,
+            line=dict(color=color, width=3.5), legendgroup=label_text,
         ), row=1, col=1)
 
     for ecg_matrix, label_text, color in (
@@ -2030,7 +2224,7 @@ def plot_waveform_contrast(
         fig.add_trace(go.Scatter(
             x=times, y=mean_ecg, mode="lines",
             name=f"{label_text} average ECG",
-            line=dict(color=color, width=2.0, dash="dot"),
+            line=dict(color=color, width=3.0, dash="dot"),
             opacity=0.65, legendgroup=f"{label_text}-ecg",
             hovertemplate=(
                 "Time: %{x:.3f} s<br>Average ECG: %{y:.2f} µV<extra></extra>"
@@ -2039,7 +2233,7 @@ def plot_waveform_contrast(
 
     fig.add_trace(go.Scatter(
         x=times, y=difference, mode="lines", name="Mean difference (A − B)",
-        line=dict(color="#222222", width=2.2),
+        line=dict(color="#222222", width=3.2),
         fill="tozeroy", fillcolor="rgba(50,50,50,0.10)",
         customdata=np.column_stack([difference_se, t_stat]),
         hovertemplate=(
@@ -2050,13 +2244,13 @@ def plot_waveform_contrast(
     ), row=2, col=1)
     fig.add_trace(go.Scatter(
         x=times, y=t_stat, mode="lines", name="Observed T statistic",
-        line=dict(color="#6F42C1", width=2),
+        line=dict(color="#6F42C1", width=3),
     ), row=3, col=1)
     superthreshold_t = np.where(np.abs(t_stat) > t_threshold, t_stat, np.nan)
     fig.add_trace(go.Scatter(
         x=times, y=superthreshold_t, mode="lines",
         name="T exceeds cluster threshold",
-        line=dict(color="#C0392B", width=3.5),
+        line=dict(color="#C0392B", width=4.5),
     ), row=3, col=1)
     fig.add_hline(
         y=t_threshold, line_color="#C0392B", line_dash="dash", line_width=1.5,
@@ -2075,20 +2269,25 @@ def plot_waveform_contrast(
     for cluster_number, cluster in enumerate(significant_clusters, start=1):
         annotation = f"C{cluster_number}"
         fig.add_vrect(
-            x0=cluster["start"], x1=cluster["end"], fillcolor="#F0A202",
-            opacity=0.22, line_width=0, row=1, col=1,
+            x0=cluster["start"], x1=cluster["end"], fillcolor=HEP_SIG_COLOR,
+            opacity=HEP_SIG_OPACITY, line_width=0, row=1, col=1,
         )
         fig.add_vrect(
-            x0=cluster["start"], x1=cluster["end"], fillcolor="#F0A202",
-            opacity=0.18, line_width=0, row=2, col=1,
+            x0=cluster["start"], x1=cluster["end"], fillcolor=HEP_SIG_COLOR,
+            opacity=HEP_SIG_OPACITY, line_width=0, row=2, col=1,
         )
         fig.add_vrect(
-            x0=cluster["start"], x1=cluster["end"], fillcolor="#F0A202",
-            opacity=0.18, line_width=0, annotation_text=annotation,
+            x0=cluster["start"], x1=cluster["end"], fillcolor=HEP_SIG_COLOR,
+            opacity=HEP_SIG_OPACITY, line_width=0, annotation_text=annotation,
             annotation_position="top", row=3, col=1,
         )
     fig.add_vline(x=0, line_color="red", line_dash="dash", opacity=0.55, row="all", col=1)
     fig.add_hline(y=0, line_color="#555", opacity=0.4, row="all", col=1)
+    fig.add_annotation(
+        x=0, y=1.0, xref="x", yref="y domain", row=1, col=1,
+        text="R-peak", showarrow=False, yshift=14,
+        font=dict(color="black"),
+    )
     fig.update_yaxes(
         title_text="Amplitude (z-score)" if zscore_subjects else "Amplitude (µV)",
         row=1, col=1, secondary_y=False,
@@ -2114,9 +2313,21 @@ def plot_waveform_contrast(
         ),
         plot_bgcolor="white", paper_bgcolor="white", font_color="black",
         hovermode="x unified", legend_title="Waveform", showlegend=True,
+        title_font_color="black",
+        legend=dict(
+            font=dict(color="black"),
+            title=dict(font=dict(color="black")),
+        ),
     )
-    fig.update_xaxes(showgrid=True, gridcolor="#eee")
-    fig.update_yaxes(showgrid=True, gridcolor="#eee")
+    fig.update_annotations(font_color="black")
+    fig.update_xaxes(
+        showgrid=False, showline=False, mirror=False, color="black",
+        tickfont=dict(color="black"), title_font=dict(color="black"),
+    )
+    fig.update_yaxes(
+        showgrid=False, showline=False, mirror=False, color="black",
+        tickfont=dict(color="black"), title_font=dict(color="black"),
+    )
     return fig
 
 
@@ -2161,24 +2372,24 @@ def plot_electrode_overview(
         fig.add_trace(go.Scatter(
             x=times, y=components["mean_a"], mode="lines",
             name=f"{label_a} mean", legendgroup="electrode_a",
-            showlegend=show_legend, line=dict(color=PALETTE[0], width=1.5),
+            showlegend=show_legend, line=dict(color=PALETTE[0], width=2.5),
         ), row=row, col=col)
         fig.add_trace(go.Scatter(
             x=times, y=components["mean_b"], mode="lines",
             name=f"{label_b} mean", legendgroup="electrode_b",
-            showlegend=show_legend, line=dict(color=PALETTE[1], width=1.5),
+            showlegend=show_legend, line=dict(color=PALETTE[1], width=2.5),
         ), row=row, col=col)
         fig.add_trace(go.Scatter(
             x=times, y=components["mean_difference"], mode="lines",
             name="Mean A − B", legendgroup="electrode_difference",
             showlegend=show_legend,
-            line=dict(color="#222222", width=1.2, dash="dash"),
+            line=dict(color="#222222", width=2.2, dash="dash"),
         ), row=row, col=col)
         for cluster in result["clusters"]:
             if cluster["significant"]:
                 fig.add_vrect(
                     x0=cluster["start"], x1=cluster["end"],
-                    fillcolor="#F0A202", opacity=0.20, line_width=0,
+                    fillcolor=HEP_SIG_COLOR, opacity=HEP_SIG_OPACITY, line_width=0,
                     row=row, col=col,
                 )
         fig.add_vline(
@@ -2189,8 +2400,8 @@ def plot_electrode_overview(
             y=0, line_color="#777", opacity=0.3, row=row, col=col
         )
     y_title = "Amplitude (z-score)" if zscore_subjects else "Amplitude (µV)"
-    fig.update_yaxes(title_text=y_title, showgrid=True, gridcolor="#eee")
-    fig.update_xaxes(showgrid=True, gridcolor="#eee")
+    fig.update_yaxes(title_text=y_title, showgrid=False, showline=False, mirror=False)
+    fig.update_xaxes(showgrid=False, showline=False, mirror=False)
     fig.update_layout(
         height=max(420, 285 * n_rows),
         title=(
@@ -2285,12 +2496,11 @@ def make_significant_channel_topomaps(
     for axis, (data, title, colorbar_label) in zip(axes, map_specs):
         vmax = float(np.nanmax(np.abs(data))) if np.any(np.isfinite(data)) else 1.0
         vmax = max(vmax, 1e-6)
-        topomap = mne.viz.plot_topomap(
-            data, info, axes=axis, cmap="RdBu_r", vlim=(-vmax, vmax),
-            names=names, mask=mask, mask_params=mask_params,
-            extrapolate="head", contours=0, show=False,
+        image, _ = mne.viz.plot_topomap(
+            data, info, axes=axis, show=False, cmap="RdBu_r", vlim=(-vmax, vmax),
+            names=names, sensors=False, mask=mask, mask_params=mask_params,
+            extrapolate="head", contours=0,
         )
-        image = topomap[0] if isinstance(topomap, tuple) else topomap
         colorbar = fig.colorbar(image, ax=axis, shrink=0.8)
         colorbar.set_label(colorbar_label)
         axis.set_title(title)
@@ -2308,8 +2518,15 @@ def make_red_significance_topomap(
     label_a: str,
     label_b: str,
     stage_label: str = "",
+    use_fdr: bool = False,
+    show_colorbar: bool = True,
 ):
-    """Map raw cluster-permutation p-values: red at zero, white at/above p=0.05."""
+    """Map cluster-permutation p-values: red at zero, white at/above p=0.05.
+
+    use_fdr=True maps each channel's Benjamini-Hochberg q_value (see
+    prepare_electrode_contrasts) instead of the raw contrast_p, and flags
+    significance via the precomputed fdr_significant flag.
+    """
     import matplotlib.pyplot as plt
     import mne
 
@@ -2326,12 +2543,16 @@ def make_red_significance_topomap(
         montage_name = montage_lookup.get(lookup_name)
         if montage_name is None or montage_name in montage_names:
             continue
-        p_value = float(result.get("contrast_p", 1.0))
-        is_significant = bool(
-            result.get("cluster_significant", False)
-            and np.isfinite(p_value)
-            and p_value < display_p_threshold
-        )
+        if use_fdr:
+            p_value = float(result.get("q_value", 1.0))
+            is_significant = bool(result.get("fdr_significant", False) and np.isfinite(p_value))
+        else:
+            p_value = float(result.get("contrast_p", 1.0))
+            is_significant = bool(
+                result.get("cluster_significant", False)
+                and np.isfinite(p_value)
+                and p_value < display_p_threshold
+            )
         displayed_p = max(0.0, p_value) if is_significant else display_p_threshold
         montage_names.append(montage_name)
         display_names.append(channel)
@@ -2361,22 +2582,15 @@ def make_red_significance_topomap(
     info = mne.pick_info(info, np.flatnonzero(valid_positions))
     data = np.asarray(displayed_p_values, dtype=float)[valid_positions]
     names = np.asarray(display_names, dtype=object)[valid_positions].tolist()
-    topomap = mne.viz.plot_topomap(
-        data,
-        info,
-        axes=axis,
-        cmap="Reds_r",
-        vlim=(0.0, display_p_threshold),
-        names=names,
-        sensors=True,
-        extrapolate="head",
-        contours=0,
-        show=False,
+    image, _ = mne.viz.plot_topomap(
+        data, info, axes=axis, show=False, cmap="Reds_r",
+        vlim=(0.0, display_p_threshold), names=names, sensors=False,
+        extrapolate="head", contours=0,
     )
-    image = topomap[0] if isinstance(topomap, tuple) else topomap
-    colorbar = fig.colorbar(image, ax=axis, shrink=0.82)
-    colorbar.set_ticks(np.linspace(0.0, display_p_threshold, 6))
-    colorbar.set_label("p-value")
+    if show_colorbar:
+        colorbar = fig.colorbar(image, ax=axis, shrink=0.8)
+        colorbar.set_ticks(np.linspace(0.0, display_p_threshold, 6))
+        colorbar.set_label("FDR corr. p-value" if use_fdr else "p-value")
     title = f"{label_a} vs {label_b}"
     if stage_label:
         title += f" ({stage_label})"
@@ -2521,51 +2735,24 @@ def make_peak_significance_time_topomap(
 
     jet = mpl.colormaps["jet"]
     significant_mask = np.isfinite(peak_times)
-    # Keep missingness separate from the time values. Encoding "not significant"
-    # as a value beyond time_max creates a false red halo because interpolation
-    # traverses the red end of jet before reaching the sentinel's white color.
-    # The neutral fill below is hidden by the independent white mask.
+    # Non-significant electrodes have no peak time; fill with the median so
+    # the colormap has a value to interpolate, and circle only the
+    # significant ones via `mask` so the fill isn't mistaken for real data.
     if significant_mask.any():
         neutral_time = float(np.nanmedian(peak_times[significant_mask]))
     else:
         neutral_time = 0.5 * (time_min + time_max)
     map_data = np.where(significant_mask, peak_times, neutral_time)
-    mne.viz.plot_topomap(
-        map_data,
-        info,
-        axes=axis,
-        cmap=jet,
-        vlim=(time_min, time_max),
-        names=names,
-        sensors=False,
-        extrapolate="head",
-        contours=0,
-        show=False,
+    mask_params = dict(
+        marker="o", markerfacecolor="none", markeredgecolor="black",
+        linewidth=1.5, markersize=8,
     )
-
-    # A discrete overlay makes regions supported primarily by non-significant
-    # electrodes fully white, without routing them through any jet color.
-    white_or_clear = mpl.colors.ListedColormap(
-        [(1.0, 1.0, 1.0, 1.0), (1.0, 1.0, 1.0, 0.0)],
-        name="white_nonsignificant_mask",
+    image, _ = mne.viz.plot_topomap(
+        map_data, info, axes=axis, show=False, cmap=jet, vlim=(time_min, time_max),
+        names=names, sensors=False, mask=significant_mask, mask_params=mask_params,
+        extrapolate="head", contours=0,
     )
-    mne.viz.plot_topomap(
-        significant_mask.astype(float),
-        info,
-        axes=axis,
-        cmap=white_or_clear,
-        vlim=(0.0, 1.0),
-        sensors=False,
-        extrapolate="head",
-        contours=0,
-        outlines=None,
-        show=False,
-    )
-
-    norm = mpl.colors.Normalize(vmin=time_min, vmax=time_max)
-    scalar_map = mpl.cm.ScalarMappable(norm=norm, cmap=jet)
-    scalar_map.set_array([])
-    colorbar = fig.colorbar(scalar_map, ax=axis, shrink=0.82)
+    colorbar = fig.colorbar(image, ax=axis, shrink=0.82)
     colorbar.set_label("Time relative to R-peak (s)")
     axis.set_title(f"{label_a} vs {label_b}")
     fig.tight_layout()
@@ -2729,17 +2916,16 @@ def make_testing_window_topomaps(
     ):
         vmax = float(np.nanmax(np.abs(values))) if np.any(np.isfinite(values)) else 1.0
         vmax = max(vmax, 1e-6)
-        topomap = mne.viz.plot_topomap(
-            values, info, axes=axis, cmap="RdBu_r", vlim=(-vmax, vmax),
-            names=positioned["Electrode"].tolist(),
+        image, _ = mne.viz.plot_topomap(
+            values, info, axes=axis, show=False, cmap="RdBu_r", vlim=(-vmax, vmax),
+            names=positioned["Electrode"].tolist(), sensors=False,
             mask=mask,
             mask_params=dict(
                 marker="o", markerfacecolor="none", markeredgecolor="black",
                 linewidth=1.5, markersize=8,
             ),
-            extrapolate="head", contours=0, show=False,
+            extrapolate="head", contours=0,
         )
-        image = topomap[0] if isinstance(topomap, tuple) else topomap
         colorbar = fig.colorbar(image, ax=axis, shrink=0.8)
         colorbar.set_label(colorbar_label)
         axis.set_title(title)
@@ -2759,21 +2945,10 @@ def plot_3d_electrode_brain_map(
     time_window: tuple[float, float],
     color_metric: str,
 ) -> go.Figure:
-    """Interactive 3D scalp-style electrode map."""
+    """Scalp-style electrode map, PCA-projected to 2D (SVG, no WebGL)."""
     positioned = _with_positions(summary)
-    fig = go.Figure()
-    theta = np.linspace(0, 2 * np.pi, 48)
-    phi = np.linspace(0, np.pi, 24)
-    radius = 0.105
-    sphere_x = radius * np.outer(np.cos(theta), np.sin(phi))
-    sphere_y = radius * np.outer(np.sin(theta), np.sin(phi))
-    sphere_z = radius * np.outer(np.ones_like(theta), np.cos(phi))
-    fig.add_trace(go.Surface(
-        x=sphere_x, y=sphere_y, z=sphere_z,
-        colorscale=[[0, "#eeeeee"], [1, "#eeeeee"]],
-        showscale=False, opacity=0.20, hoverinfo="skip",
-    ))
     if positioned.empty:
+        fig = go.Figure()
         fig.update_layout(title="No montage-compatible electrodes")
         return fig
     values = positioned[color_metric].to_numpy(dtype=float)
@@ -2789,13 +2964,16 @@ def plot_3d_electrode_brain_map(
     )
     finite_signed_q = np.abs(signed_window_q[np.isfinite(signed_window_q)])
     signed_q_scale = max(float(finite_signed_q.max()) if finite_signed_q.size else 1.0, 1.0)
-    marker_sizes = 8 + 10 * np.clip(
+    marker_sizes = 16 + 20 * np.clip(
         np.nan_to_num(np.abs(signed_window_q), nan=0.0) / signed_q_scale,
         0,
         1,
     )
-    fig.add_trace(go.Scatter3d(
-        x=positioned["x"], y=positioned["y"], z=positioned["z"],
+    positions_3d = positioned[["x", "y", "z"]].to_numpy(dtype=float)
+    projected = PCA(n_components=2, random_state=42).fit_transform(positions_3d)
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=projected[:, 0], y=projected[:, 1],
         mode="markers+text",
         text=positioned["Electrode"],
         textposition="top center",
@@ -2812,7 +2990,7 @@ def plot_3d_electrode_brain_map(
             cmin=-cmax,
             cmax=cmax,
             colorbar=dict(title=color_metric),
-            line=dict(color="black", width=2),
+            line=dict(color="black", width=1.5),
         ),
         hovertemplate=(
             "%{text}<br>A-B: %{customdata[0]:.4f}<br>"
@@ -2823,18 +3001,14 @@ def plot_3d_electrode_brain_map(
     ))
     fig.update_layout(
         title=(
-            f"3D electrode map: {label_a} vs {label_b} | "
+            f"Electrode map (PCA-projected): {label_a} vs {label_b} | "
             f"{time_window[0]:.3f}-{time_window[1]:.3f}s"
         ),
-        height=720,
-        scene=dict(
-            aspectmode="cube",
-            xaxis=dict(visible=False),
-            yaxis=dict(visible=False),
-            zaxis=dict(visible=False),
-            camera=dict(eye=dict(x=0, y=-1.7, z=0.75)),
-        ),
+        height=600,
+        xaxis=dict(visible=False, scaleanchor="y", scaleratio=1),
+        yaxis=dict(visible=False),
         margin=dict(l=0, r=0, t=60, b=0),
+        plot_bgcolor="white", paper_bgcolor="white", font_color="black",
     )
     return fig
 
@@ -2915,6 +3089,7 @@ def plot_circular_electrode_statistics(
             angularaxis=dict(rotation=90, direction="clockwise", showticklabels=False),
         ),
         showlegend=False,
+        plot_bgcolor="white", paper_bgcolor="white", font_color="black",
     )
     return fig
 
@@ -3111,6 +3286,20 @@ def render_pairwise_waveform_mode(
             help="Useful for waveform shape; leave off to retain amplitude in µV.",
         )
 
+    all_groups = st.multiselect(
+        "Diagnosis groups to compare",
+        all_groups,
+        default=list(all_groups[:5]),
+        help=(
+            "Every extra group multiplies the number of pairwise contrasts "
+            "run below. Limited to the first 5 groups by default so this "
+            "page loads quickly; add more if you need them."
+        ),
+    )
+    if len(all_groups) < 2 and len(selected_stages) < 2:
+        st.warning("Select at least two diagnosis groups or at least two sleep stages.")
+        return
+
     comparison_definitions = []
     for stage in selected_stages:
         for group_a, group_b in combinations(all_groups, 2):
@@ -3159,24 +3348,38 @@ def render_pairwise_waveform_mode(
             f"Loaded {len(comparison_results)} automatic pairwise results from this session."
         )
     else:
-        comparison_results = []
+        results_by_index: list = [None] * len(comparison_definitions)
         progress = st.progress(0, text="Starting automatic pairwise comparisons…")
-        for index, definition in enumerate(comparison_definitions):
-            progress.progress(
-                (index + 1) / len(comparison_definitions),
-                text=(
-                    f"Comparison {index + 1}/{len(comparison_definitions)}: "
-                    f"{definition['label_a']} vs {definition['label_b']}"
-                ),
-            )
-            result = prepare_waveform_contrast(
-                grouped_df,
-                definition["group_a"], definition["stage_a"],
-                definition["group_b"], definition["stage_b"],
-                selected_channels, zscore_subjects, n_permutations,
-                definition["paired"],
-            )
-            comparison_results.append({**definition, "result": result})
+        completed = 0
+        max_workers = min(8, len(comparison_definitions))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_index = {
+                executor.submit(
+                    prepare_waveform_contrast,
+                    grouped_df,
+                    definition["group_a"], definition["stage_a"],
+                    definition["group_b"], definition["stage_b"],
+                    selected_channels, zscore_subjects, n_permutations,
+                    definition["paired"],
+                ): index
+                for index, definition in enumerate(comparison_definitions)
+            }
+            for future in as_completed(future_to_index):
+                index = future_to_index[future]
+                results_by_index[index] = future.result()
+                completed += 1
+                definition = comparison_definitions[index]
+                progress.progress(
+                    completed / len(comparison_definitions),
+                    text=(
+                        f"Comparison {completed}/{len(comparison_definitions)} done: "
+                        f"{definition['label_a']} vs {definition['label_b']}"
+                    ),
+                )
+        comparison_results = [
+            {**definition, "result": result}
+            for definition, result in zip(comparison_definitions, results_by_index)
+        ]
         progress.empty()
         st.session_state["_automatic_pairwise_hep_cache"] = {
             "key": cache_key,
@@ -3470,17 +3673,36 @@ def render_pairwise_waveform_mode(
                     "No comparison in this tab contained a cluster with permutation "
                     f"p < {PAIRWISE_CLUSTER_ALPHA:.2f}."
                 )
-            for item in tab_significant:
+            top_significant, rest_significant = tab_significant[:5], tab_significant[5:]
+            for item in top_significant:
                 render_result(item, expanded=True)
+            if rest_significant:
+                load_rest = st.checkbox(
+                    f"Load remaining {len(rest_significant)} significant comparison(s)",
+                    value=False,
+                    key=f"pairwise_load_rest_significant_{tab_label}",
+                    help="Only the top 5 (by cluster p-value) render by default so every tab loads fast.",
+                )
+                if load_rest:
+                    for item in rest_significant:
+                        render_result(item, expanded=True)
 
             st.subheader(
                 f"{tab_label}: non-significant comparisons ({len(tab_nonsignificant)})"
             )
             st.caption(
-                "Collapsed by default; open any comparison to see its complete plot."
+                "Listed only — no cluster survived the permutation test, so no plot is drawn."
             )
-            for item in tab_nonsignificant:
-                render_result(item, expanded=False)
+            if tab_nonsignificant:
+                st.dataframe(
+                    pd.DataFrame([{
+                        "Group A": item["label_a"],
+                        "Group B": item["label_b"],
+                        "cluster_p": item["result"]["contrast_p"],
+                        "q_value": item["q_value"],
+                    } for item in tab_nonsignificant]),
+                    use_container_width=True, hide_index=True,
+                )
 
             if tab_unavailable:
                 st.subheader(
@@ -3891,7 +4113,7 @@ def render_testing_figures_mode(
         channel_results = cache_entry["channel_results"]
         st.success("Loaded testing-figure electrode statistics from this session.")
     else:
-        # The complete Susp. Epilepsy mode renders the electrode/topomap section
+        # The complete Unknown mode renders the electrode/topomap section
         # immediately before this figure lab. Reuse its identical channel tests
         # instead of repeating every permutation for the same stage contrast.
         electrode_entry = st.session_state.get("_electrode_pairwise_hep_cache")
@@ -3968,7 +4190,7 @@ def render_testing_figures_mode(
     tabs = st.tabs([
         "Every Electrode",
         "Brain Maps",
-        "3D Brain Map",
+        "PCA Brain Map",
         "Circle",
         "Window Graph",
     ])
@@ -4012,7 +4234,7 @@ def render_testing_figures_mode(
         )
     with tabs[2]:
         color_metric = st.radio(
-            "3D color metric",
+            "Color metric",
             ["Window mean A-B", "Window t", "Peak |T| in window"],
             horizontal=True,
             key="testing_figures_3d_metric",
@@ -4077,11 +4299,11 @@ def render_per_patient_stage_significance_mode(
     apply_ica: bool = False,
 ) -> None:
     """Show per-patient and group-average HEP stability across sleep stages."""
-    st.header("Per-patient HEP stability across sleep stages (Susp. Epilepsy cohort)")
+    st.header("Per-patient HEP stability across sleep stages (Unknown cohort)")
     del apply_ica
 
     stage_traces = {
-        stage: _collect_hep_traces(grouped_df, "Susp. Epilepsy", stage, selected_channels, zscore_subjects=False)
+        stage: _collect_hep_traces(grouped_df, "Unknown", stage, selected_channels, zscore_subjects=False)
         for stage in selected_stages
     }
     common_patients = None
@@ -4268,6 +4490,36 @@ def _stage_delta_result(
     ecg_raw_b = _collect_ecg_traces(grouped_df, group, stage_b)
     ecg_a = {pid: ecg_raw_a[pid] for pid in matched if pid in ecg_raw_a}
     ecg_b = {pid: ecg_raw_b[pid] for pid in matched if pid in ecg_raw_b}
+
+    # Preserve electrode-level values for data exports.  Rows stay aligned to
+    # the channel-averaged paired cohort; an unavailable electrode is NaN
+    # instead of causing that patient (or the entire channel) to disappear.
+    channel_deltas: Dict[str, np.ndarray] = {}
+    for channel in selected_channels:
+        channel_a = _collect_channel_hep_traces(
+            grouped_df, group, stage_a, channel, zscore_subjects=False
+        )
+        channel_b = _collect_channel_hep_traces(
+            grouped_df, group, stage_b, channel, zscore_subjects=False
+        )
+        values = np.full((len(patient_ids_a), len(times)), np.nan, dtype=float)
+        for patient_index, patient_id in enumerate(patient_ids_a):
+            item_a = channel_a.get(patient_id)
+            item_b = channel_b.get(patient_id)
+            if item_a is None or item_b is None:
+                continue
+            trace_a, times_a = item_a
+            trace_b, times_b = item_b
+            if (
+                times_a[0] > times[0] or times_a[-1] < times[-1]
+                or times_b[0] > times[0] or times_b[-1] < times[-1]
+            ):
+                continue
+            values[patient_index] = (
+                np.interp(times, times_a, trace_a)
+                - np.interp(times, times_b, trace_b)
+            )
+        channel_deltas[str(channel)] = values
     return {
         "matrix_a": matrix_a,
         "matrix_b": matrix_b,
@@ -4276,6 +4528,7 @@ def _stage_delta_result(
         "patient_ids": patient_ids_a,
         "stage_a": stage_a,
         "stage_b": stage_b,
+        "channel_deltas": channel_deltas,
         "ecg_a": ecg_a,
         "ecg_b": ecg_b,
     }
@@ -4335,7 +4588,7 @@ def _plot_delta_summary(
         patient_x.append(None)
         patient_y.extend(patient_delta[::display_step].tolist())
         patient_y.append(None)
-    figure.add_trace(go.Scattergl(
+    figure.add_trace(go.Scatter(
         x=patient_x, y=patient_y, mode="lines",
         name=f"Individual delta (N={len(delta)})",
         line=dict(color="rgba(60,60,60,0.28)", width=1.0),
@@ -4357,13 +4610,16 @@ def _plot_delta_summary(
     figure.add_trace(go.Scatter(
         x=times, y=mean_delta, mode="lines",
         name=f"Mean Δ ± SEM (N={len(delta)})",
-        line=dict(color="#0072B2", width=3),
+        line=dict(color="#0072B2", width=4),
         hovertemplate="t=%{x:.3f}s  Δ=%{y:.4f}<extra></extra>",
     ))
 
     figure.add_hline(y=0, line_color="#333333", line_dash="dot", line_width=1.5)
-    figure.add_vline(x=0, line_color="#333333", line_dash="dash", line_width=1.5,
-                     annotation_text="R-peak", annotation_position="top right")
+    figure.add_vline(x=0, line_color="#333333", line_dash="dash", line_width=1.5)
+    figure.add_annotation(
+        x=0, y=1.0, xref="x", yref="y domain",
+        text="R-peak", showarrow=False, yshift=14, font=dict(color="#111111"),
+    )
 
     # Significant windows via permutation cluster jitter test on mean delta
     sig_windows: list = []
@@ -4377,7 +4633,7 @@ def _plot_delta_summary(
     for win in sig_windows:
         figure.add_vrect(
             x0=float(win["start"]), x1=float(win["end"]),
-            fillcolor="rgba(240,162,2,0.28)", line_width=0,
+            fillcolor=HEP_SIG_COLOR, opacity=HEP_SIG_OPACITY, line_width=0,
         )
 
     flipped_note = " (auto-flipped: R-peak positive)" if stage_a != delta_result["stage_a"] else ""
@@ -4426,19 +4682,19 @@ def _plot_delta_summary(
         )],
         xaxis=dict(
             title=dict(text="Time from R-peak (s)", font=dict(color="#111111")),
-            showgrid=True, gridcolor="#cccccc", gridwidth=1,
+            showgrid=False,
             zeroline=True, zerolinecolor="#888888", zerolinewidth=1,
-            linecolor="#333333", linewidth=1.5, mirror=True,
+            showline=False, mirror=False,
             tickfont=dict(color="#111111"),
         ),
         yaxis=dict(
             title=dict(text=y_label, font=dict(color="#111111")),
-            showgrid=True, gridcolor="#cccccc", gridwidth=1,
+            showgrid=False,
             zeroline=False,
-            linecolor="#333333", linewidth=1.5, mirror=True,
+            showline=False, mirror=False,
             tickfont=dict(color="#111111"),
         ),
-        plot_bgcolor="#f8f8f8",
+        plot_bgcolor="white",
         paper_bgcolor="white",
         font=dict(color="#111111"),
         margin=dict(l=70, r=30, t=90, b=60),
@@ -4488,16 +4744,13 @@ def _classify_hep_failure_reason(individual: tuple, selected_channels: Sequence[
 
 
 def _render_cohort_attrition_container(
-    healthy: pd.DataFrame,
+    cohort_df: pd.DataFrame,
     selected_stages: Sequence[str],
     selected_channels: Sequence[str],
+    cohort_label: str,
 ) -> None:
-    """Explain, stage by stage and reason by reason, why the raw Susp. Epilepsy
-    patient count shrinks once every selected stage requires a clean, valid
-    HEP trace for the same patient (the requirement _rank_stage_pairs applies
-    before any pairwise stage comparison).
-    """
-    all_patients = sorted(set(healthy["patient_id"].map(_canonical_patient_id)))
+    """Explain why a cohort shrinks when every stage needs a valid HEP trace."""
+    all_patients = sorted(set(cohort_df["patient_id"].map(_canonical_patient_id)))
     n_total = len(all_patients)
     if n_total == 0:
         return
@@ -4506,7 +4759,7 @@ def _render_cohort_attrition_container(
     per_stage_row: Dict[str, Dict[str, Any]] = {}
     for stage in selected_stages:
         stage_rows: Dict[str, Any] = {}
-        stage_df = healthy[healthy["stage"] == stage]
+        stage_df = cohort_df[cohort_df["stage"] == stage]
         for _, row in stage_df.iterrows():
             pid = _canonical_patient_id(row["patient_id"])
             if pid not in stage_rows:
@@ -4533,16 +4786,17 @@ def _render_cohort_attrition_container(
 
     n_common = n_total - len(excluded_any_stage)
     with st.expander(
-        f"Why the Susp. Epilepsy cohort shrinks from {n_total} to {n_common} "
+        f"Why the {cohort_label} cohort shrinks from {n_total} to {n_common} "
         f"patients once every selected stage is required",
         expanded=False,
     ):
         st.caption(
             "Pairwise stage-delta tests need one clean, R-locked HEP trace per "
             "patient in *every* selected stage — a patient counted in the raw "
-            "Susp. Epilepsy total is dropped from that intersection if it fails "
-            "in any single stage. Percentages are of the raw Susp. Epilepsy total."
+            f"{cohort_label} total is dropped from that intersection if it fails "
+            f"in any single stage. Percentages are of the raw {cohort_label} total."
         )
+        percent_column = f"% of {cohort_label} cohort"
         rows = []
         for stage in selected_stages:
             counts = reason_counts[stage]
@@ -4552,13 +4806,13 @@ def _render_cohort_attrition_container(
                     "Stage": STAGE_LABELS.get(stage, stage),
                     "Reason": reason,
                     "N patients": n,
-                    "% of Susp. Epilepsy cohort": round(100 * n / n_total, 1),
+                    percent_column: round(100 * n / n_total, 1),
                 })
             rows.append({
                 "Stage": STAGE_LABELS.get(stage, stage),
                 "Reason": "— stage subtotal —",
                 "N patients": n_stage_failed,
-                "% of Susp. Epilepsy cohort": round(100 * n_stage_failed / n_total, 1),
+                percent_column: round(100 * n_stage_failed / n_total, 1),
             })
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
@@ -4566,12 +4820,13 @@ def _render_cohort_attrition_container(
         n_single = len(excluded_any_stage) - n_multi
         st.markdown(
             f"**Overall:** {len(excluded_any_stage)} of {n_total} "
-            f"({100 * len(excluded_any_stage) / n_total:.1f}%) Susp. Epilepsy patients "
+            f"({100 * len(excluded_any_stage) / n_total:.1f}%) {cohort_label} patients "
             f"are excluded from the {len(selected_stages)}-stage intersection — "
             f"{n_single} failed in exactly one stage, {n_multi} failed in two or more."
         )
 
 
+@st.cache_data(show_spinner=False)
 def _rank_stage_pairs(
     grouped_df: pd.DataFrame,
     group: str,
@@ -4584,6 +4839,10 @@ def _rank_stage_pairs(
     Restricted to patients with a valid HEP trace in every selected stage, so
     every pairwise plot for this group uses the same fixed patient set.
     """
+    # Bump when the cached result payload changes. Version 2 includes the
+    # per-electrode delta matrices required by the Parquet download.
+    result_schema_version = 2
+    del result_schema_version
     common_patients = None
     for stage in selected_stages:
         ids = set(_collect_hep_traces(grouped_df, group, stage, selected_channels, False))
@@ -4616,16 +4875,30 @@ def _rank_stage_pairs(
     return sorted(ranked, key=lambda item: item["p_value"])
 
 
-def _pairwise_delta_workbook(
+def _pairwise_delta_frames(
     pair_results: Sequence[dict],
     zscore: bool,
-) -> bytes:
-    """Build one Excel sheet per plotted stage pair with all patient deltas."""
-    output = io.BytesIO()
-    used_sheet_names = set()
+    clinical_df: Optional[pd.DataFrame] = None,
+):
+    """Yield (sheet_name, title, meta_frame, times, delta) per plotted stage pair.
 
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        for result in pair_results:
+    meta_frame has one row per patient (no time columns) so callers can lay
+    the waveform out wide -- one column per time point -- for Excel, or melt
+    it to a tidy long table for Parquet, without repeating patient metadata
+    once per time point the way a single long Excel sheet used to.
+    """
+    all_patient_ids = list(dict.fromkeys(
+        str(patient_id)
+        for result in pair_results
+        for patient_id in result["patient_ids"]
+    ))
+    demographics = _patient_demographics(all_patient_ids, clinical_df)
+    age_map = dict(zip(demographics["patient_id"], demographics["age"]))
+    sex_map = dict(zip(demographics["patient_id"], demographics["sex"]))
+
+    used_sheet_names = set()
+    for result in pair_results:
+        try:
             times = np.asarray(result["times"], dtype=float)
             delta = np.asarray(result["delta"], dtype=float).copy()
             stage_a = result["stage_a"]
@@ -4645,18 +4918,20 @@ def _pairwise_delta_workbook(
 
             label_a = STAGE_LABELS.get(stage_a, stage_a)
             label_b = STAGE_LABELS.get(stage_b, stage_b)
+            category = result.get("category")
             patient_ids = np.asarray(result["patient_ids"], dtype=object)
-            n_patients, n_times = delta.shape
-            delta_column = "Patient delta (z-score)" if zscore else "Patient delta (µV)"
-            sheet_data = pd.DataFrame({
-                "Sleep stage 1": np.repeat(label_a, n_patients * n_times),
-                "Sleep stage 2": np.repeat(label_b, n_patients * n_times),
-                "Patient ID": np.repeat(patient_ids, n_times),
-                "Time (s)": np.tile(times, n_patients),
-                delta_column: delta.reshape(-1),
+
+            meta_frame = pd.DataFrame({
+                **({"Diagnosis": [category] * len(patient_ids)} if category else {}),
+                "Sleep stage 1": label_a,
+                "Sleep stage 2": label_b,
+                "Patient ID": patient_ids,
+                "Age": [age_map.get(str(pid), np.nan) for pid in patient_ids],
+                "Gender": [sex_map.get(str(pid), "Unknown") for pid in patient_ids],
             })
 
-            base_name = re.sub(r"[:\\/?*\[\]]", "_", f"{label_a} - {label_b}")[:31]
+            title = f"{category} - {label_a} vs {label_b}" if category else f"{label_a} - {label_b}"
+            base_name = re.sub(r"[:\\/?*\[\]]", "_", title)[:31]
             sheet_name = base_name
             suffix = 2
             while sheet_name in used_sheet_names:
@@ -4664,9 +4939,124 @@ def _pairwise_delta_workbook(
                 sheet_name = f"{base_name[:31 - len(suffix_text)]}{suffix_text}"
                 suffix += 1
             used_sheet_names.add(sheet_name)
+            yield sheet_name, title, meta_frame, times, delta
+        except Exception as exc:
+            # A malformed pair shouldn't sink the whole export; openpyxl also
+            # requires >=1 visible sheet, so skipping silently here would
+            # otherwise surface as a misleading "At least one sheet must be
+            # visible" error masking this real cause.
+            print(f"Skipping pairwise delta sheet for {result.get('stage_a')}/{result.get('stage_b')}: {exc}")
+            continue
+
+
+def _pairwise_delta_workbook(
+    pair_results: Sequence[dict],
+    zscore: bool,
+    clinical_df: Optional[pd.DataFrame] = None,
+) -> bytes:
+    """One Excel sheet per stage pair: one row per patient, one column per time point."""
+    output = io.BytesIO()
+    wrote_any = False
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        for sheet_name, _title, meta_frame, times, delta in _pairwise_delta_frames(
+            pair_results, zscore, clinical_df
+        ):
+            time_columns = pd.DataFrame(delta, columns=[f"{t:.3f}" for t in times])
+            sheet_data = pd.concat([meta_frame.reset_index(drop=True), time_columns], axis=1)
             sheet_data.to_excel(writer, sheet_name=sheet_name, index=False)
+            wrote_any = True
+
+        if not wrote_any:
+            pd.DataFrame({"Note": ["No matched patients for this export."]}).to_excel(
+                writer, sheet_name="No data", index=False
+            )
 
     return output.getvalue()
+
+
+def _pairwise_delta_parquet(
+    pair_results: Sequence[dict],
+    zscore: bool,
+    clinical_df: Optional[pd.DataFrame] = None,
+) -> bytes:
+    """Tidy per-electrode Parquet with every stage pair in one table.
+
+    Each row identifies a patient, channel, and time point. Repeated text is
+    dictionary-encoded through categorical columns to keep the file compact.
+    """
+    delta_column = "Patient delta (z-score)" if zscore else "Patient delta (uV)"
+    frames = []
+    frame_iterator = _pairwise_delta_frames(
+        pair_results, zscore, clinical_df
+    )
+    for result, (_sheet_name, title, meta_frame, times, averaged_delta) in zip(
+        pair_results, frame_iterator
+    ):
+        channel_deltas = result.get("channel_deltas", {})
+        # Backward-compatible fallback for an old cached result: make its
+        # channel-averaged nature explicit rather than emitting no data.
+        if not channel_deltas:
+            channel_deltas = {"Selected-channel average": averaged_delta}
+
+        # _pairwise_delta_frames may reverse A/B to keep the R-peak positive.
+        exported_stage_a = str(meta_frame["Sleep stage 1"].iloc[0])
+        original_stage_a = STAGE_LABELS.get(result["stage_a"], result["stage_a"])
+        orientation = 1.0 if exported_stage_a == original_stage_a else -1.0
+
+        for channel, raw_channel_delta in channel_deltas.items():
+            channel_delta = orientation * np.asarray(raw_channel_delta, dtype=float)
+            if zscore:
+                stds = np.nanstd(channel_delta, axis=1, ddof=1)
+                stds = np.where(stds > 0, stds, np.nan)
+                channel_delta = channel_delta / stds[:, np.newaxis]
+            n_patients, n_times = channel_delta.shape
+            long_frame = meta_frame.loc[
+                meta_frame.index.repeat(n_times)
+            ].reset_index(drop=True)
+            long_frame["Channel"] = str(channel)
+            long_frame["Time (s)"] = np.tile(times, n_patients)
+            long_frame[delta_column] = channel_delta.reshape(-1)
+            # Missing electrodes are represented internally as NaN to retain
+            # cohort alignment, but they should not become empty measurement
+            # rows in the downloadable dataset.
+            long_frame = long_frame[
+                np.isfinite(long_frame[delta_column].to_numpy(dtype=float))
+            ].reset_index(drop=True)
+            if long_frame.empty:
+                continue
+            long_frame.insert(0, "Stage pair", title)
+            frames.append(long_frame)
+
+    combined = (
+        pd.concat(frames, ignore_index=True) if frames
+        else pd.DataFrame({"Note": ["No matched patients for this export."]})
+    )
+    for column in (
+        "Stage pair", "Diagnosis", "Sleep stage 1", "Sleep stage 2",
+        "Patient ID", "Gender", "Channel",
+    ):
+        if column in combined.columns:
+            combined[column] = combined[column].astype("category")
+
+    output = io.BytesIO()
+    combined.to_parquet(output, index=False)
+    return output.getvalue()
+
+
+def _dilate_bool_mask(mask: np.ndarray, n: int = 1) -> np.ndarray:
+    """Grow a boolean mask by n samples on each side.
+
+    Used so adjacent color-coded segments of the same underlying curve share a
+    boundary sample instead of leaving a one-sample visual gap between them.
+    """
+    dilated = mask.copy()
+    for _ in range(n):
+        dilated = (
+            dilated
+            | np.r_[False, dilated[:-1]]
+            | np.r_[dilated[1:], False]
+        )
+    return dilated
 
 
 def _plot_delta_tstat(delta_result: dict, cohort_label: str) -> go.Figure:
@@ -4677,29 +5067,33 @@ def _plot_delta_tstat(delta_result: dict, cohort_label: str) -> go.Figure:
     clusters = delta_result["clusters"]
 
     artifact_mask = (times >= HEP_ARTIFACT_EXCLUDE_S[0]) & (times <= HEP_ARTIFACT_EXCLUDE_S[1])
+    artifact_mask_disp = _dilate_bool_mask(artifact_mask)
+    base_mask_disp = _dilate_bool_mask(~artifact_mask)
 
     figure = go.Figure()
     figure.add_trace(go.Scatter(
-        x=times, y=np.where(artifact_mask, np.nan, t_stat), mode="lines",
+        x=times, y=np.where(base_mask_disp, t_stat, np.nan), mode="lines",
         name="Observed T statistic",
-        line=dict(color="#6F42C1", width=2),
+        line=dict(color="#6F42C1", width=3),
         hovertemplate="t=%{x:.3f}s  T=%{y:.3f}<extra></extra>",
         connectgaps=False,
     ))
     figure.add_trace(go.Scatter(
-        x=times, y=np.where(artifact_mask, t_stat, np.nan), mode="lines",
+        x=times, y=np.where(artifact_mask_disp, t_stat, np.nan), mode="lines",
         name="QRS artifact window (excluded)",
-        line=dict(color="#999999", width=2),
+        line=dict(color="#999999", width=3),
         hovertemplate="t=%{x:.3f}s  T=%{y:.3f}<extra></extra>",
         connectgaps=False,
     ))
-    superthreshold_t = np.where(
-        (np.abs(t_stat) > t_threshold) & ~artifact_mask, t_stat, np.nan
+    superthreshold_mask_disp = _dilate_bool_mask(
+        (np.abs(t_stat) > t_threshold) & ~artifact_mask
     )
+    superthreshold_t = np.where(superthreshold_mask_disp, t_stat, np.nan)
     figure.add_trace(go.Scatter(
         x=times, y=superthreshold_t, mode="lines",
         name="T exceeds cluster threshold",
-        line=dict(color="#C0392B", width=3.5),
+        line=dict(color="#C0392B", width=4.5),
+        connectgaps=False,
     ))
     figure.add_hline(
         y=t_threshold, line_color="#C0392B", line_dash="dash", line_width=1.5,
@@ -4713,11 +5107,14 @@ def _plot_delta_tstat(delta_result: dict, cohort_label: str) -> go.Figure:
     )
     for cluster in (c for c in clusters if c["significant"]):
         figure.add_vrect(
-            x0=cluster["start"], x1=cluster["end"], fillcolor="#F0A202",
-            opacity=0.22, line_width=0,
+            x0=cluster["start"], x1=cluster["end"], fillcolor=HEP_SIG_COLOR,
+            opacity=HEP_SIG_OPACITY, line_width=0,
         )
-    figure.add_vline(x=0, line_color="#333333", line_dash="dash", line_width=1.5,
-                     annotation_text="R-peak", annotation_position="top right")
+    figure.add_vline(x=0, line_color="#333333", line_dash="dash", line_width=1.5)
+    figure.add_annotation(
+        x=0, y=1.0, xref="x", yref="y domain",
+        text="R-peak", showarrow=False, yshift=14, font=dict(color="#111111"),
+    )
     figure.add_hline(y=0, line_color="#555555", opacity=0.4)
     figure.update_layout(
         title=dict(
@@ -4735,17 +5132,15 @@ def _plot_delta_tstat(delta_result: dict, cohort_label: str) -> go.Figure:
         legend=dict(font=dict(color="#111111")),
         xaxis=dict(
             title=dict(text="Time from R-peak (s)", font=dict(color="#111111")),
-            showgrid=True, gridcolor="#cccccc", gridwidth=1,
-            linecolor="#333333", linewidth=1.5, mirror=True,
+            showgrid=False, showline=False, mirror=False,
             tickfont=dict(color="#111111"),
         ),
         yaxis=dict(
             title=dict(text="T statistic", font=dict(color="#111111")),
-            showgrid=True, gridcolor="#cccccc", gridwidth=1,
-            linecolor="#333333", linewidth=1.5, mirror=True,
+            showgrid=False, showline=False, mirror=False,
             tickfont=dict(color="#111111"),
         ),
-        plot_bgcolor="#f8f8f8",
+        plot_bgcolor="white",
         paper_bgcolor="white",
     )
     figure.update_annotations(font=dict(color="#111111"))
@@ -4797,7 +5192,7 @@ def _plot_delta_summary_and_tstat(
         patient_x.append(None)
         patient_y.extend(patient_delta[::display_step].tolist())
         patient_y.append(None)
-    figure.add_trace(go.Scattergl(
+    figure.add_trace(go.Scatter(
         x=patient_x, y=patient_y, mode="lines",
         name=f"Individual delta (N={len(delta)})",
         line=dict(color="rgba(60,60,60,0.28)", width=1.0),
@@ -4817,13 +5212,16 @@ def _plot_delta_summary_and_tstat(
     figure.add_trace(go.Scatter(
         x=times, y=mean_delta, mode="lines",
         name=f"Mean Δ ± SEM (N={len(delta)})",
-        line=dict(color="#0072B2", width=3),
+        line=dict(color="#0072B2", width=4),
         hovertemplate="t=%{x:.3f}s  Δ=%{y:.4f}<extra></extra>",
     ), row=1, col=1)
 
     figure.add_hline(y=0, line_color="#333333", line_dash="dot", line_width=1.5, row=1, col=1)
-    figure.add_vline(x=0, line_color="#333333", line_dash="dash", line_width=1.5,
-                     annotation_text="R-peak", annotation_position="top right", row=1, col=1)
+    figure.add_vline(x=0, line_color="#333333", line_dash="dash", line_width=1.5, row=1, col=1)
+    figure.add_annotation(
+        x=0, y=1.0, xref="x", yref="y domain", row=1, col=1,
+        text="R-peak", showarrow=False, yshift=14, font=dict(color="#111111"),
+    )
 
     sig_windows: list = []
     if hep_mod is not None:
@@ -4836,7 +5234,7 @@ def _plot_delta_summary_and_tstat(
     for win in sig_windows:
         figure.add_vrect(
             x0=float(win["start"]), x1=float(win["end"]),
-            fillcolor="rgba(240,162,2,0.28)", line_width=0, row=1, col=1,
+            fillcolor=HEP_SIG_COLOR, opacity=HEP_SIG_OPACITY, row=1, col=1, line_width=0,
         )
 
     flipped_note = " (auto-flipped: R-peak positive)" if stage_a != delta_result["stage_a"] else ""
@@ -4846,27 +5244,31 @@ def _plot_delta_summary_and_tstat(
     clusters = delta_result["clusters"]
     artifact_mask = (times >= HEP_ARTIFACT_EXCLUDE_S[0]) & (times <= HEP_ARTIFACT_EXCLUDE_S[1])
 
+    artifact_mask_disp = _dilate_bool_mask(artifact_mask)
+    base_mask_disp = _dilate_bool_mask(~artifact_mask)
     figure.add_trace(go.Scatter(
-        x=times, y=np.where(artifact_mask, np.nan, t_stat), mode="lines",
+        x=times, y=np.where(base_mask_disp, t_stat, np.nan), mode="lines",
         name="Observed T statistic",
-        line=dict(color="#6F42C1", width=2),
+        line=dict(color="#6F42C1", width=3),
         hovertemplate="t=%{x:.3f}s  T=%{y:.3f}<extra></extra>",
         connectgaps=False,
     ), row=2, col=1)
     figure.add_trace(go.Scatter(
-        x=times, y=np.where(artifact_mask, t_stat, np.nan), mode="lines",
+        x=times, y=np.where(artifact_mask_disp, t_stat, np.nan), mode="lines",
         name="QRS artifact window (excluded)",
-        line=dict(color="#999999", width=2),
+        line=dict(color="#999999", width=3),
         hovertemplate="t=%{x:.3f}s  T=%{y:.3f}<extra></extra>",
         connectgaps=False,
     ), row=2, col=1)
-    superthreshold_t = np.where(
-        (np.abs(t_stat) > t_threshold) & ~artifact_mask, t_stat, np.nan
+    superthreshold_mask_disp = _dilate_bool_mask(
+        (np.abs(t_stat) > t_threshold) & ~artifact_mask
     )
+    superthreshold_t = np.where(superthreshold_mask_disp, t_stat, np.nan)
     figure.add_trace(go.Scatter(
         x=times, y=superthreshold_t, mode="lines",
         name="T exceeds cluster threshold",
-        line=dict(color="#C0392B", width=3.5),
+        line=dict(color="#C0392B", width=4.5),
+        connectgaps=False,
     ), row=2, col=1)
     figure.add_hline(
         y=t_threshold, line_color="#C0392B", line_dash="dash", line_width=1.5,
@@ -4880,11 +5282,14 @@ def _plot_delta_summary_and_tstat(
     )
     for cluster in (c for c in clusters if c["significant"]):
         figure.add_vrect(
-            x0=cluster["start"], x1=cluster["end"], fillcolor="#F0A202",
-            opacity=0.22, line_width=0, row=2, col=1,
+            x0=cluster["start"], x1=cluster["end"], fillcolor=HEP_SIG_COLOR,
+            opacity=HEP_SIG_OPACITY, line_width=0, row=2, col=1,
         )
-    figure.add_vline(x=0, line_color="#333333", line_dash="dash", line_width=1.5,
-                     annotation_text="R-peak", annotation_position="top right", row=2, col=1)
+    figure.add_vline(x=0, line_color="#333333", line_dash="dash", line_width=1.5, row=2, col=1)
+    figure.add_annotation(
+        x=0, y=1.0, xref="x2", yref="y2 domain", row=2, col=1,
+        text="R-peak", showarrow=False, yshift=14, font=dict(color="#111111"),
+    )
     figure.add_hline(y=0, line_color="#555555", opacity=0.4, row=2, col=1)
 
     figure.update_layout(
@@ -4909,28 +5314,28 @@ def _plot_delta_summary_and_tstat(
             yanchor="top", y=1, xanchor="left", x=1.02,
         ),
         showlegend=True,
-        plot_bgcolor="#f8f8f8",
+        plot_bgcolor="white",
         paper_bgcolor="white",
         font=dict(color="#111111"),
         margin=dict(l=70, r=170, t=90, b=60),
     )
     figure.update_xaxes(
         title=dict(text="Time from R-peak (s)", font=dict(color="#111111")),
-        showgrid=True, gridcolor="#cccccc", gridwidth=1,
+        showgrid=False,
         zeroline=True, zerolinecolor="#888888", zerolinewidth=1,
-        linecolor="#333333", linewidth=1.5, mirror=True,
+        showline=False, mirror=False,
         tickfont=dict(color="#111111"), row=2, col=1,
     )
     figure.update_yaxes(
         title=dict(text=y_label, font=dict(color="#111111")),
-        showgrid=True, gridcolor="#cccccc", gridwidth=1,
-        linecolor="#333333", linewidth=1.5, mirror=True,
+        showgrid=False,
+        showline=False, mirror=False,
         tickfont=dict(color="#111111"), row=1, col=1,
     )
     figure.update_yaxes(
         title=dict(text="T statistic", font=dict(color="#111111")),
-        showgrid=True, gridcolor="#cccccc", gridwidth=1,
-        linecolor="#333333", linewidth=1.5, mirror=True,
+        showgrid=False,
+        showline=False, mirror=False,
         tickfont=dict(color="#111111"), row=2, col=1,
     )
     figure.update_annotations(font=dict(color="#111111"))
@@ -4988,14 +5393,14 @@ def _plot_patient_examples(delta_result: dict, title: str, max_patients: int) ->
                 x=times, y=values, mode="lines",
                 name=STAGE_LABELS.get(stage, stage),
                 legendgroup=stage, showlegend=row_number == 1,
-                line=dict(color=color, width=2, dash="dash"),
+                line=dict(color=color, width=3, dash="dash"),
             ), row=row_number, col=1, secondary_y=False)
         label_a = STAGE_LABELS.get(delta_result["stage_a"], delta_result["stage_a"])
         label_b = STAGE_LABELS.get(delta_result["stage_b"], delta_result["stage_b"])
         figure.add_trace(go.Scatter(
             x=times, y=smoothed_a - smoothed_b, mode="lines",
             name=f"Δ {label_a} − {label_b}", legendgroup="delta", showlegend=row_number == 1,
-            line=dict(color="blue"),
+            line=dict(color="blue", width=2),
         ), row=row_number, col=1, secondary_y=False)
         # ECG overlay on secondary y-axis (stage A preferred; fall back to B)
         ecg_item = ecg_a.get(pid) or ecg_b.get(pid)
@@ -5005,23 +5410,30 @@ def _plot_patient_examples(delta_result: dict, title: str, max_patients: int) ->
                 x=ecg_times, y=ecg_trace, mode="lines",
                 name="ECG (avg)", legendgroup="ecg",
                 showlegend=not ecg_legend_shown,
-                line=dict(color="green", width=1.2, dash="dash"),
+                line=dict(color="green", width=2, dash="dash"),
                 opacity=0.65,
             ), row=row_number, col=1, secondary_y=True)
             ecg_legend_shown = True
     figure.add_vline(x=0, line_dash="dash", line_color="#555555")
+    for row_number in range(1, len(order) + 1):
+        y_id = "y" if row_number == 1 else f"y{row_number}"
+        figure.add_annotation(
+            x=0, y=1.0, xref=f"x{row_number}" if row_number > 1 else "x",
+            yref=f"{y_id} domain", row=row_number, col=1,
+            text="R-peak", showarrow=False, yshift=10, font=dict(color="#111111"),
+        )
     figure.update_yaxes(
         title_text="HEP (µV)", secondary_y=False, color="#111111",
-        showgrid=True, gridcolor="#cccccc", zeroline=True, zerolinecolor="#888888",
-        linecolor="#333333", linewidth=1.5,
+        showgrid=False, zeroline=True, zerolinecolor="#888888",
+        showline=False,
     )
     figure.update_yaxes(
         title_text="ECG (µV)", secondary_y=True, showgrid=False, color="#111111",
-        linecolor="#333333", linewidth=1.5,
+        showline=False,
     )
     figure.update_xaxes(
-        color="#111111", showgrid=True, gridcolor="#cccccc",
-        linecolor="#333333", linewidth=1.5,
+        color="#111111", showgrid=False,
+        showline=False,
     )
     figure.update_layout(
         title=dict(text=title, font=dict(color="#111111")),
@@ -5052,7 +5464,7 @@ def _index_edf_files_by_patient() -> Dict[str, List[str]]:
     patient_to_files: Dict[str, List[str]] = {}
     for dirpath, _dirs, files in os.walk(root):
         for name in files:
-            if not name.lower().endswith(".edf"):
+            if not name.lower().endswith(".edf") or name.startswith("._"):
                 continue
             path = os.path.join(dirpath, name)
             stem = name.rsplit(".", 1)[0]
@@ -5068,18 +5480,278 @@ def _index_edf_files_by_patient() -> Dict[str, List[str]]:
     return patient_to_files
 
 
-@st.cache_data(show_spinner=False)
-def _edf_scan_seconds(paths: tuple) -> Optional[float]:
-    """Mean recording duration (s) across a patient's .edf file(s), header-only read."""
-    import mne
-    durations = []
-    for path in paths:
+def _edf_paths_signature(paths: Sequence[str]) -> tuple[str, tuple[str, ...]]:
+    """Return a stable cache key that changes when any source EDF changes."""
+    normalized_paths = tuple(sorted(set(map(str, paths))))
+    signature_rows = []
+    for path in normalized_paths:
+        source_paths = [Path(path)]
+        source_paths.extend(Path(path).parent.parent.glob("*_scans.tsv"))
+        for source_path in source_paths:
+            try:
+                stat_result = source_path.stat()
+                signature_rows.append(
+                    f"{source_path}\0{stat_result.st_size}\0"
+                    f"{stat_result.st_mtime_ns}"
+                )
+            except OSError:
+                signature_rows.append(f"{source_path}\0missing")
+    digest = hashlib.sha256("\n".join(signature_rows).encode("utf-8")).hexdigest()
+    return digest, normalized_paths
+
+
+def _read_edf_metadata_disk_cache(signature: str) -> Optional[dict]:
+    if not EDF_RECORDING_METADATA_CACHE.exists():
+        return None
+    try:
+        with sqlite3.connect(EDF_RECORDING_METADATA_CACHE, timeout=30) as connection:
+            row = connection.execute(
+                "SELECT metadata_json FROM recording_metadata WHERE signature = ?",
+                (signature,),
+            ).fetchone()
+        return json.loads(row[0]) if row else None
+    except (OSError, sqlite3.Error, json.JSONDecodeError):
+        return None
+
+
+def _write_edf_metadata_disk_cache(signature: str, metadata: dict) -> None:
+    try:
+        EDF_RECORDING_METADATA_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(EDF_RECORDING_METADATA_CACHE, timeout=30) as connection:
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS recording_metadata (
+                    signature TEXT PRIMARY KEY,
+                    metadata_json TEXT NOT NULL,
+                    cached_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO recording_metadata(signature, metadata_json)
+                VALUES (?, ?)
+                ON CONFLICT(signature) DO UPDATE SET
+                    metadata_json = excluded.metadata_json,
+                    cached_at = CURRENT_TIMESTAMP
+                """,
+                (signature, json.dumps(metadata)),
+            )
+    except (OSError, sqlite3.Error):
+        # A cache failure must never prevent the demographics panel rendering.
+        pass
+
+
+def _read_cohort_demographics_disk_cache(
+    signature: str,
+) -> Optional[pd.DataFrame]:
+    if not EDF_RECORDING_METADATA_CACHE.exists():
+        return None
+    try:
+        with sqlite3.connect(EDF_RECORDING_METADATA_CACHE, timeout=30) as connection:
+            row = connection.execute(
+                "SELECT dataframe_pickle FROM cohort_demographics "
+                "WHERE signature = ?",
+                (signature,),
+            ).fetchone()
+        cached = pickle.loads(row[0]) if row else None
+        return cached if isinstance(cached, pd.DataFrame) else None
+    except (OSError, sqlite3.Error, pickle.UnpicklingError, EOFError):
+        return None
+
+
+def _write_cohort_demographics_disk_cache(
+    signature: str,
+    dataframe: pd.DataFrame,
+) -> None:
+    try:
+        EDF_RECORDING_METADATA_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(EDF_RECORDING_METADATA_CACHE, timeout=30) as connection:
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS cohort_demographics (
+                    signature TEXT PRIMARY KEY,
+                    dataframe_pickle BLOB NOT NULL,
+                    cached_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO cohort_demographics(signature, dataframe_pickle)
+                VALUES (?, ?)
+                ON CONFLICT(signature) DO UPDATE SET
+                    dataframe_pickle = excluded.dataframe_pickle,
+                    cached_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    signature,
+                    sqlite3.Binary(
+                        pickle.dumps(dataframe, protocol=pickle.HIGHEST_PROTOCOL)
+                    ),
+                ),
+            )
+            # Keep a bounded history for different stage/group selections.
+            connection.execute(
+                """
+                DELETE FROM cohort_demographics
+                WHERE signature NOT IN (
+                    SELECT signature FROM cohort_demographics
+                    ORDER BY cached_at DESC LIMIT 16
+                )
+                """
+            )
+    except (OSError, sqlite3.Error, pickle.PickleError):
+        pass
+
+
+def _cohort_demographics_cache_signature(
+    combined: pd.DataFrame,
+    selected_stages: Sequence[str],
+    diagnosis_names: Dict[str, List[str]],
+    diagnosis_categories: Dict[str, List[str]],
+) -> str:
+    """Hash cohort/clinical inputs without scanning the large EDF directory."""
+    patient_records = []
+    for row in combined.itertuples(index=False):
+        individual = row.individual
+        n_rpeaks = (
+            len(individual[4])
+            if individual is not None
+            and len(individual) > 4
+            and individual[4] is not None
+            else 0
+        )
+        n_channels = (
+            len(set(map(str, individual[3])))
+            if individual is not None
+            and len(individual) > 3
+            and individual[3] is not None
+            else 0
+        )
+        patient_records.append((
+            str(row.patient_id),
+            str(row.diagnosis_group),
+            str(row.stage),
+            n_rpeaks,
+            n_channels,
+        ))
+
+    def file_version(path: Path) -> tuple:
         try:
-            raw = mne.io.read_raw_edf(path, preload=False, verbose=False)
+            stat_result = path.stat()
+            return str(path), stat_result.st_size, stat_result.st_mtime_ns
+        except OSError:
+            return str(path), None, None
+
+    payload = {
+        "version": 1,
+        "selected_stages": list(selected_stages),
+        "patient_records": sorted(patient_records),
+        "diagnoses": sorted(
+            (str(patient_id), list(values))
+            for patient_id, values in diagnosis_names.items()
+        ),
+        "categories": sorted(
+            (str(patient_id), list(values))
+            for patient_id, values in diagnosis_categories.items()
+        ),
+        "clinical_file": file_version(CLINICAL_FILE),
+        "ehr_demographics": file_version(EHR_DEMOGRAPHICS_CACHE),
+    }
+    signature = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+    return signature
+
+
+@st.cache_data(show_spinner=False)
+def _edf_recording_metadata(paths: tuple) -> dict:
+    """Return persistent-cached dates, durations, studies, and sessions."""
+    import mne
+    import warnings
+
+    signature, unique_paths = _edf_paths_signature(paths)
+    cached = _read_edf_metadata_disk_cache(signature)
+    if cached is not None:
+        return cached
+
+    durations = []
+    acquisition_dates = []
+    studies = set()
+    sessions = set()
+    scanned_tsvs = set()
+    for path in unique_paths:
+        path_obj = Path(path)
+        study_match = re.search(r"/bids/(I\d{4})/", str(path_obj))
+        if study_match:
+            studies.add(study_match.group(1))
+        session_match = re.search(r"/(ses-[^/]+)/", str(path_obj))
+        if session_match:
+            sessions.add(session_match.group(1))
+
+        # Prefer the BIDS acquisition timestamp; unlike filesystem mtime, it
+        # represents the recording rather than when the EDF was downloaded.
+        session_dir = path_obj.parent.parent
+        for scans_path in session_dir.glob("*_scans.tsv"):
+            if scans_path in scanned_tsvs:
+                continue
+            scanned_tsvs.add(scans_path)
+            try:
+                scans_df = pd.read_csv(scans_path, sep="\t")
+                if "acq_time" in scans_df.columns:
+                    parsed = pd.to_datetime(
+                        scans_df["acq_time"], errors="coerce", utc=True
+                    ).dropna()
+                    acquisition_dates.extend(parsed.tolist())
+            except Exception:
+                pass
+
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                raw = mne.io.read_raw_edf(path, preload=False, verbose=False)
             durations.append(raw.times[-1])
+            if not acquisition_dates and raw.info.get("meas_date") is not None:
+                parsed_date = pd.to_datetime(
+                    raw.info["meas_date"], errors="coerce", utc=True
+                )
+                if not pd.isna(parsed_date):
+                    acquisition_dates.append(parsed_date)
+            raw.close()
         except Exception:
             continue
-    return float(np.mean(durations)) if durations else None
+
+    first_date = min(acquisition_dates) if acquisition_dates else pd.NaT
+    last_date = max(acquisition_dates) if acquisition_dates else pd.NaT
+    metadata = {
+        "Study": ", ".join(sorted(studies)),
+        "EDF recordings": len(unique_paths),
+        "Recording sessions": len(sessions) if sessions else len(unique_paths),
+        "First recording date": (
+            first_date.date().isoformat() if not pd.isna(first_date) else ""
+        ),
+        "Last recording date": (
+            last_date.date().isoformat() if not pd.isna(last_date) else ""
+        ),
+        "Total recording (min)": (
+            round(float(np.sum(durations)) / 60.0, 1) if durations else np.nan
+        ),
+        "Mean recording (min)": (
+            round(float(np.mean(durations)) / 60.0, 1) if durations else np.nan
+        ),
+    }
+    _write_edf_metadata_disk_cache(signature, metadata)
+    return metadata
+
+
+@st.cache_data(show_spinner=False)
+def _edf_scan_seconds(paths: tuple) -> Optional[float]:
+    """Mean recording duration (s) across a patient's EDF files."""
+    minutes = _edf_recording_metadata(paths).get("Mean recording (min)")
+    return float(minutes) * 60.0 if pd.notna(minutes) else None
 
 
 def _patient_demographics(
@@ -5116,39 +5788,460 @@ def _patient_demographics(
     return pd.DataFrame(rows)
 
 
-def _train_delta_autoencoder(x: np.ndarray, latent_dim: int, epochs: int, seed: int = 0) -> np.ndarray:
-    """Encode each row (a patient's delta curve) into a low-dim latent vector via a small dense autoencoder."""
-    import torch
-    from torch import nn
+def scaled_curves(values: np.ndarray, normalize_each: bool) -> np.ndarray:
+    """Return direct time-sample features, optionally z-scored within patient."""
+    x = np.nan_to_num(np.asarray(values, dtype=np.float64), nan=0.0)
+    if not normalize_each:
+        return x
+    means = np.mean(x, axis=1, keepdims=True)
+    stds = np.std(x, axis=1, keepdims=True)
+    stds = np.where(np.isfinite(stds) & (stds > 0), stds, 1.0)
+    return (x - means) / stds
 
-    torch.manual_seed(seed)
-    x_t = torch.tensor(x, dtype=torch.float32)
-    n_features = x_t.shape[1]
-    hidden = max(latent_dim * 4, 16)
-    encoder = nn.Sequential(nn.Linear(n_features, hidden), nn.ReLU(), nn.Linear(hidden, latent_dim))
-    decoder = nn.Sequential(nn.Linear(latent_dim, hidden), nn.ReLU(), nn.Linear(hidden, n_features))
-    optimizer = torch.optim.Adam(
-        list(encoder.parameters()) + list(decoder.parameters()), lr=1e-3, weight_decay=1e-4,
+
+def _merge_small_clusters(x: np.ndarray, labels: np.ndarray, min_frac: float) -> np.ndarray:
+    """Grow any cluster under min_frac of the population by reassigning it the
+    nearest available points from other (still-large-enough) clusters, one at
+    a time. Unlike merging whole clusters together, this never reduces the
+    cluster count — it keeps exactly the k the caller asked for, which matters
+    when outliers form several under-quota clusters that would otherwise
+    collapse into each other before reaching the main mass."""
+    labels = labels.copy()
+    n = len(labels)
+    min_size = max(1, int(np.ceil(min_frac * n)))
+    unique = np.unique(labels)
+    if len(unique) < 2 or min_size * len(unique) > n:
+        return labels  # floor is unsatisfiable for this k; leave labels as-is
+    for _ in range(n):
+        counts = {c: int(np.sum(labels == c)) for c in unique}
+        deficient = [c for c in unique if counts[c] < min_size]
+        if not deficient:
+            break
+        target = min(deficient, key=counts.get)
+        target_centroid = x[labels == target].mean(axis=0)
+        donor_idx = np.array([
+            i for i in range(n)
+            if labels[i] != target and counts[labels[i]] > min_size
+        ])
+        if len(donor_idx) == 0:
+            break
+        dists = np.linalg.norm(x[donor_idx] - target_centroid, axis=1)
+        labels[donor_idx[np.argmin(dists)]] = target
+    return labels
+
+
+@st.cache_data(show_spinner=False)
+def direct_cluster(
+    values_bytes: bytes,
+    shape: tuple,
+    n_clusters: int,
+    normalize_each: bool,
+    algorithm: str,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    values = np.frombuffer(values_bytes, dtype=np.float64).reshape(shape)
+    x = scaled_curves(values, normalize_each)
+    model = (
+        MiniBatchKMeans(
+            n_clusters=n_clusters,
+            n_init=10,
+            batch_size=256,
+            random_state=42,
+        )
+        if algorithm == "K-means"
+        else AgglomerativeClustering(n_clusters=n_clusters, linkage="ward")
     )
-    criterion = nn.MSELoss()
-    for _ in range(epochs):
-        optimizer.zero_grad()
-        loss = criterion(decoder(encoder(x_t)), x_t)
-        loss.backward()
-        optimizer.step()
-    with torch.no_grad():
-        return encoder(x_t).numpy()
+    labels = model.fit_predict(x)
+    labels = _merge_small_clusters(x, labels, min_frac=0.05)
+    # Randomized PCA is used only to display the high-dimensional direct solution.
+    display = PCA(
+        n_components=2,
+        svd_solver="randomized",
+        random_state=42,
+    ).fit_transform(x)
+    n_unique = len(np.unique(labels))
+    if 2 <= n_unique <= len(x) - 1:
+        score = silhouette_score(
+            x,
+            labels,
+            sample_size=min(750, len(x)),
+            random_state=42,
+        )
+        score = float(score)
+    else:
+        score = float("nan")
+    return labels, display, score
 
 
-@st.cache_data(show_spinner="Training delta autoencoder...")
-def _cached_delta_autoencoder(
-    delta_bytes: bytes, shape: tuple, latent_dim: int, epochs: int,
-) -> Optional[np.ndarray]:
-    try:
-        x = np.frombuffer(delta_bytes, dtype=np.float64).reshape(shape).astype(np.float32)
-        return _train_delta_autoencoder(x, latent_dim, epochs)
-    except ImportError:
-        return None
+def _cluster_delta_significance_table(
+    delta: np.ndarray,
+    labels: np.ndarray,
+    times: np.ndarray,
+    n_permutations: int,
+) -> pd.DataFrame:
+    """Exploratory independent cluster-mass tests between direct clusters."""
+    rows = []
+    for cluster_a, cluster_b in combinations(sorted(np.unique(labels)), 2):
+        matrix_a = delta[labels == cluster_a]
+        matrix_b = delta[labels == cluster_b]
+        row = {
+            "Comparison": f"Cluster {cluster_a} vs Cluster {cluster_b}",
+            "N cluster A": len(matrix_a),
+            "N cluster B": len(matrix_b),
+            "cluster_p": np.nan,
+            "q_value": np.nan,
+            "Cluster significant (p < 0.01)": False,
+            "FDR significant": False,
+            "Direction": "",
+            "Significant windows (s)": "",
+            "Status": "Tested",
+        }
+        if len(matrix_a) < 2 or len(matrix_b) < 2:
+            row["Status"] = "Needs at least 2 patients in each cluster"
+            rows.append(row)
+            continue
+
+        clusters, _t_stat, _threshold, contrast_p = cluster_permutation_contrast(
+            matrix_a,
+            matrix_b,
+            times,
+            paired=False,
+            n_permutations=n_permutations,
+        )
+        significant_clusters = [
+            cluster for cluster in clusters if cluster["significant"]
+        ]
+        row["Cluster significant (p < 0.01)"] = bool(significant_clusters)
+        best_cluster = (
+            min(clusters, key=lambda cluster: cluster["p_value"])
+            if clusters else None
+        )
+        row["cluster_p"] = contrast_p
+        if best_cluster is not None:
+            row["Direction"] = (
+                f"Cluster {cluster_a} > Cluster {cluster_b}"
+                if best_cluster["direction"] == "A > B"
+                else f"Cluster {cluster_b} > Cluster {cluster_a}"
+            )
+        row["Significant windows (s)"] = "; ".join(
+            f"{cluster['start']:.3f} to {cluster['end']:.3f}"
+            for cluster in significant_clusters
+        )
+        rows.append(row)
+
+    summary = pd.DataFrame(rows)
+    if not summary.empty:
+        finite = summary["cluster_p"].notna()
+        if finite.any():
+            summary.loc[finite, "q_value"] = benjamini_hochberg(
+                summary.loc[finite, "cluster_p"].to_numpy(dtype=float)
+            )
+            summary.loc[finite, "FDR significant"] = (
+                (summary.loc[finite, "q_value"] < 0.05)
+                & summary.loc[finite, "Cluster significant (p < 0.01)"]
+            )
+    return summary
+
+
+def _cluster_diagnosis_similarity_results(
+    metric_df: pd.DataFrame,
+    patient_categories: Dict[str, List[str]],
+    diagnosis_groups: Sequence[str],
+    stage_a: str,
+    stage_b: str,
+    selected_channels: Sequence[str],
+    cluster_delta: np.ndarray,
+    cluster_labels: np.ndarray,
+    cluster_times: np.ndarray,
+    zscore: bool,
+    n_permutations: int,
+) -> tuple[pd.DataFrame, Dict[str, dict]]:
+    """Compare every Susp. cluster with each diagnosis group's same stage delta."""
+    rows = []
+    plot_data: Dict[str, dict] = {}
+    cluster_times = np.asarray(cluster_times, dtype=float)
+
+    for diagnosis in diagnosis_groups:
+        diagnosis_df = metric_df[
+            metric_df["patient_id"].map(
+                lambda patient_id, name=diagnosis:
+                name in patient_categories.get(str(patient_id), [])
+            )
+        ].copy()
+        if diagnosis_df.empty:
+            continue
+        diagnosis_df["diagnosis_group"] = diagnosis
+        diagnosis_result = _stage_delta_result(
+            diagnosis_df, diagnosis, stage_a, stage_b, selected_channels
+        )
+        if diagnosis_result is None:
+            continue
+
+        overlap = (
+            (cluster_times >= diagnosis_result["times"][0])
+            & (cluster_times <= diagnosis_result["times"][-1])
+        )
+        comparison_times = cluster_times[overlap]
+        if len(comparison_times) < 3:
+            continue
+        diagnosis_delta = np.vstack([
+            np.interp(comparison_times, diagnosis_result["times"], patient_delta)
+            for patient_delta in diagnosis_result["delta"]
+        ])
+        diagnosis_delta = scaled_curves(diagnosis_delta, zscore)
+
+        for cluster_id in sorted(np.unique(cluster_labels)):
+            cluster_matrix = np.asarray(
+                cluster_delta[cluster_labels == cluster_id][:, overlap],
+                dtype=float,
+            )
+            if len(cluster_matrix) == 0:
+                continue
+            cluster_mean = np.nanmean(cluster_matrix, axis=0)
+            diagnosis_mean = np.nanmean(diagnosis_delta, axis=0)
+            similarity_mask = (
+                np.isfinite(cluster_mean)
+                & np.isfinite(diagnosis_mean)
+                & ~(
+                    (comparison_times >= HEP_ARTIFACT_EXCLUDE_S[0])
+                    & (comparison_times <= HEP_ARTIFACT_EXCLUDE_S[1])
+                )
+            )
+            if similarity_mask.sum() >= 3:
+                cluster_values = cluster_mean[similarity_mask]
+                diagnosis_values = diagnosis_mean[similarity_mask]
+                if np.nanstd(cluster_values) > 0 and np.nanstd(diagnosis_values) > 0:
+                    waveform_r = float(
+                        stats.pearsonr(cluster_values, diagnosis_values).statistic
+                    )
+                else:
+                    waveform_r = np.nan
+                denominator = (
+                    np.linalg.norm(cluster_values)
+                    * np.linalg.norm(diagnosis_values)
+                )
+                cosine_similarity = (
+                    float(np.dot(cluster_values, diagnosis_values) / denominator)
+                    if denominator > 0 else np.nan
+                )
+                rmse = float(np.sqrt(np.nanmean(
+                    (cluster_values - diagnosis_values) ** 2
+                )))
+            else:
+                waveform_r = cosine_similarity = rmse = np.nan
+
+            clusters = []
+            difference_p = np.nan
+            status = "Tested"
+            if len(cluster_matrix) >= 2 and len(diagnosis_delta) >= 2:
+                clusters, _t_stat, _threshold, difference_p = (
+                    cluster_permutation_contrast(
+                        cluster_matrix,
+                        diagnosis_delta,
+                        comparison_times,
+                        paired=False,
+                        n_permutations=n_permutations,
+                    )
+                )
+            else:
+                status = "Needs at least 2 patients in each group"
+
+            comparison_id = f"Cluster {cluster_id} ↔ {diagnosis}"
+            significant_windows = [
+                cluster for cluster in clusters if cluster["significant"]
+            ]
+            rows.append({
+                "Comparison": comparison_id,
+                "Susp. cluster": int(cluster_id),
+                "Diagnosis group": diagnosis,
+                "N Susp. cluster": len(cluster_matrix),
+                "N diagnosis": len(diagnosis_delta),
+                "Waveform correlation r": waveform_r,
+                "Cosine similarity": cosine_similarity,
+                "RMSE": rmse,
+                "Difference cluster p": difference_p,
+                "FDR q": np.nan,
+                "Significantly different": False,
+                "Descriptive resemblance": False,
+                "Significant difference windows (s)": "; ".join(
+                    f"{cluster['start']:.3f} to {cluster['end']:.3f}"
+                    for cluster in significant_windows
+                ),
+                "Status": status,
+            })
+            plot_data[comparison_id] = {
+                "cluster_delta": cluster_matrix,
+                "diagnosis_delta": diagnosis_delta,
+                "times": comparison_times,
+                "clusters": clusters,
+                "cluster_id": int(cluster_id),
+                "diagnosis": diagnosis,
+            }
+
+    summary = pd.DataFrame(rows)
+    if summary.empty:
+        return summary, plot_data
+    finite = summary["Difference cluster p"].notna()
+    if finite.any():
+        summary.loc[finite, "FDR q"] = benjamini_hochberg(
+            summary.loc[finite, "Difference cluster p"].to_numpy(dtype=float)
+        )
+        has_significant_window = summary[
+            "Significant difference windows (s)"
+        ].astype(str).ne("")
+        summary.loc[finite, "Significantly different"] = (
+            (summary.loc[finite, "FDR q"] < 0.05)
+            & has_significant_window.loc[finite]
+        )
+    summary["Descriptive resemblance"] = (
+        summary["Difference cluster p"].notna()
+        & (summary["Waveform correlation r"] >= 0.70)
+        & ~summary["Significantly different"]
+    )
+    summary["Similarity rank within cluster"] = (
+        summary.groupby("Susp. cluster")["Waveform correlation r"]
+        .rank(method="min", ascending=False)
+        .astype("Int64")
+    )
+    return summary.sort_values(
+        ["Susp. cluster", "Similarity rank within cluster", "Diagnosis group"]
+    ), plot_data
+
+
+def _plot_cluster_diagnosis_similarity(
+    comparison: dict,
+    waveform_r: float,
+    cosine_similarity: float,
+    significantly_different: Optional[bool] = None,
+) -> go.Figure:
+    """Cluster-only, diagnosis-only, and direct overlay for one comparison."""
+    cluster_delta = comparison["cluster_delta"]
+    diagnosis_delta = comparison["diagnosis_delta"]
+    times = comparison["times"]
+    cluster_id = comparison["cluster_id"]
+    diagnosis = comparison["diagnosis"]
+    cluster_mean = np.nanmean(cluster_delta, axis=0)
+    diagnosis_mean = np.nanmean(diagnosis_delta, axis=0)
+    cluster_sem = (
+        stats.sem(cluster_delta, axis=0, nan_policy="omit")
+        if len(cluster_delta) > 1 else np.zeros_like(cluster_mean)
+    )
+    diagnosis_sem = (
+        stats.sem(diagnosis_delta, axis=0, nan_policy="omit")
+        if len(diagnosis_delta) > 1 else np.zeros_like(diagnosis_mean)
+    )
+    figure = make_subplots(
+        rows=3,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.09,
+        subplot_titles=(
+            f"Unknown cluster {cluster_id} mean ± SEM "
+            f"(N={len(cluster_delta)})",
+            f"{diagnosis} mean ± SEM (N={len(diagnosis_delta)})",
+            "Direct comparison: means and cluster − diagnosis difference",
+        ),
+    )
+
+    def add_mean_sem(
+        mean: np.ndarray,
+        sem: np.ndarray,
+        row: int,
+        label: str,
+        color: str,
+    ) -> None:
+        figure.add_trace(go.Scatter(
+            x=np.r_[times, times[::-1]],
+            y=np.r_[mean - sem, (mean + sem)[::-1]],
+            fill="toself",
+            fillcolor=_hex_to_rgba(color, 0.18),
+            line=dict(width=0),
+            hoverinfo="skip",
+            showlegend=False,
+        ), row=row, col=1)
+        figure.add_trace(go.Scatter(
+            x=times,
+            y=mean,
+            mode="lines",
+            name=label,
+            line=dict(color=color, width=3.5),
+        ), row=row, col=1)
+
+    add_mean_sem(
+        cluster_mean, cluster_sem, 1,
+        f"Susp. cluster {cluster_id}", PALETTE[0],
+    )
+    add_mean_sem(
+        diagnosis_mean, diagnosis_sem, 2, diagnosis, PALETTE[1],
+    )
+    figure.add_trace(go.Scatter(
+        x=times, y=cluster_mean, mode="lines",
+        name=f"Susp. cluster {cluster_id} mean",
+        line=dict(color=PALETTE[0], width=3.5),
+    ), row=3, col=1)
+    figure.add_trace(go.Scatter(
+        x=times, y=diagnosis_mean, mode="lines",
+        name=f"{diagnosis} mean",
+        line=dict(color=PALETTE[1], width=3.5),
+    ), row=3, col=1)
+    figure.add_trace(go.Scatter(
+        x=times,
+        y=cluster_mean - diagnosis_mean,
+        mode="lines",
+        name="Mean difference",
+        line=dict(color="#222222", width=3, dash="dash"),
+    ), row=3, col=1)
+    for cluster in (
+        item for item in comparison["clusters"] if item["significant"]
+    ):
+        for row in (1, 2, 3):
+            figure.add_vrect(
+                x0=cluster["start"],
+                x1=cluster["end"],
+                fillcolor=HEP_SIG_COLOR,
+                opacity=HEP_SIG_OPACITY,
+                line_width=0,
+                row=row,
+                col=1,
+            )
+    figure.add_vline(
+        x=0, line_color="#C0392B", line_dash="dash", opacity=0.6,
+        row="all", col=1,
+    )
+    figure.add_hline(
+        y=0, line_color="#555555", opacity=0.35, row="all", col=1,
+    )
+    for row, x_id, y_id in ((1, "x", "y"), (2, "x2", "y2"), (3, "x3", "y3")):
+        figure.add_annotation(
+            x=0, y=1.0, xref=x_id, yref=f"{y_id} domain", row=row, col=1,
+            text="R-peak", showarrow=False, yshift=10, font=dict(color="black"),
+        )
+    figure.update_xaxes(
+        title_text="Time relative to R-peak (s)", row=3, col=1,
+        color="black", showgrid=False, showline=False, mirror=False,
+    )
+    figure.update_yaxes(
+        title_text="Delta amplitude", color="black", showgrid=False, showline=False, mirror=False,
+    )
+    figure.update_annotations(font_color="black")
+    if significantly_different is None:
+        verdict = "not tested" if not np.isfinite(waveform_r) else "n/a"
+    elif significantly_different:
+        verdict = "different populations (reject H0 of same distribution)"
+    else:
+        verdict = "consistent with same population (fail to reject H0)"
+    figure.update_layout(
+        title=(
+            f"Susp. cluster {cluster_id} vs {diagnosis} | {verdict}<br>"
+            f"<sup>waveform r={waveform_r:.3f}, cosine sim={cosine_similarity:.3f}</sup>"
+        ),
+        height=950,
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        font_color="black",
+        legend=dict(font=dict(color="black")),
+        hovermode="x unified",
+    )
+    return figure
 
 
 def render_healthy_sick_delta_mode(
@@ -5161,9 +6254,9 @@ def render_healthy_sick_delta_mode(
     stage_presence_df: Optional[pd.DataFrame] = None,
 ) -> None:
     """Five requested patient-level views of healthy and diagnosed stage deltas."""
-    st.header("Susp. Epilepsy vs diagnosed patients: sleep-stage delta analysis")
+    st.header("Unknown vs diagnosed patients: sleep-stage delta analysis")
     st.caption(
-        "Susp. Epilepsy means Susp. Epilepsy name is present in the available EHR map. "
+        "Unknown means Unknown name is present in the available EHR map. "
         "Diagnosed patients have at least one recorded diagnosis. All stage deltas "
         "are paired within patient before cohorts are compared."
     )
@@ -5178,14 +6271,20 @@ def render_healthy_sick_delta_mode(
     sick = metric_df_base[
         metric_df_base["patient_id"].map(lambda pid: bool(dx_names.get(pid, [])))
     ].copy()
-    healthy["diagnosis_group"] = "Susp. Epilepsy"
+    healthy["diagnosis_group"] = "Unknown"
     sick["diagnosis_group"] = "Diagnosed (any)"
     combined = pd.concat([healthy, sick], ignore_index=True)
     counts = st.columns(2)
-    counts[0].metric("Susp. Epilepsy", healthy["patient_id"].nunique())
+    counts[0].metric("Unknown", healthy["patient_id"].nunique())
     counts[1].metric("Diagnosed", sick["patient_id"].nunique())
     if not healthy.empty and len(selected_stages) >= 2:
-        _render_cohort_attrition_container(healthy, selected_stages, selected_channels)
+        _render_cohort_attrition_container(
+            healthy, selected_stages, selected_channels, "Unknown"
+        )
+    if not sick.empty and len(selected_stages) >= 2:
+        _render_cohort_attrition_container(
+            sick, selected_stages, selected_channels, "Diagnosed"
+        )
     if healthy.empty or sick.empty or len(selected_stages) < 2:
         st.warning("This mode needs both cohorts and at least two sleep stages.")
         return
@@ -5201,13 +6300,13 @@ def render_healthy_sick_delta_mode(
     )
     with st.spinner("Calculating paired sleep-stage deltas…"):
         healthy_pairs = _rank_stage_pairs(
-            combined, "Susp. Epilepsy", selected_stages, selected_channels, n_permutations
+            combined, "Unknown", selected_stages, selected_channels, n_permutations
         )
         sick_pairs = _rank_stage_pairs(
             combined, "Diagnosed (any)", selected_stages, selected_channels, n_permutations
         )
     if not healthy_pairs:
-        st.warning("Not enough matched Susp. Epilepsy patients across the selected stages.")
+        st.warning("Not enough matched Unknown patients across the selected stages.")
         return
 
     category_counts = Counter(
@@ -5216,17 +6315,17 @@ def render_healthy_sick_delta_mode(
     common_categories = [name for name, _count in category_counts.most_common(5)]
 
     tabs = st.tabs([
-        "1. Best Susp. Epilepsy examples",
-        "2. Susp. Epilepsy pairwise deltas",
-        "3. Common-disease examples",
-        "4. Diagnosed pairwise deltas",
-        "5. Susp. Epilepsy vs diagnosed",
-        "6. Raw EEG / ECG / HEP — patient sample & group average",
+        "1. Unknown delta clustering",
+        "2. Best Unknown examples",
+        "3. Unknown pairwise deltas",
+        "4. Common-disease examples",
+        "5. Diagnosed pairwise deltas",
+        "6. Unknown vs diagnosed",
         "7. Cohort demographics (age & sex)",
         "8. Gender & age HEP diff",
-        "9. Susp. Epilepsy delta clustering",
+        "9. Age-decade HEP",
     ])
-    with tabs[0]:
+    def _render_best_examples_tab() -> None:
         best = healthy_pairs[0]
         st.markdown(
             f"**Most significant cohort stage pair:** "
@@ -5242,11 +6341,11 @@ def render_healthy_sick_delta_mode(
             "all statistical tests use the unsmoothed valid waveforms."
         )
         st.plotly_chart(_plot_patient_examples(
-            best, "Susp. Epilepsy patients contributing the largest observed deltas",
+            best, "Unknown patients contributing the largest observed deltas",
             max_examples,
         ), use_container_width=True, theme=None)
 
-    with tabs[1]:
+    def _render_susp_pairwise_tab() -> None:
         st.caption(
             "Each patient's within-patient paired delta (Stage A − Stage B). "
             "Mean line is the arithmetic mean of those individual deltas — "
@@ -5257,13 +6356,24 @@ def render_healthy_sick_delta_mode(
             key="delta_healthy_zscore",
             help="Divides each patient's delta by its own std before averaging.",
         )
-        st.download_button(
-            "⬇️ Export all Susp. Epilepsy pairwise deltas",
-            data=_pairwise_delta_workbook(healthy_pairs, _t1_zscore),
-            file_name="susp_epilepsy_pairwise_deltas.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key="download_susp_epilepsy_pairwise_deltas",
-        )
+        if healthy_pairs:
+            export_col1, export_col2 = st.columns(2)
+            with export_col1:
+                st.download_button(
+                    "⬇️ Export all Unknown pairwise deltas (Excel)",
+                    data=_pairwise_delta_workbook(healthy_pairs, _t1_zscore, clinical_df),
+                    file_name="susp_epilepsy_pairwise_deltas.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="download_susp_epilepsy_pairwise_deltas",
+                )
+            with export_col2:
+                st.download_button(
+                    "⬇️ Export all Unknown pairwise deltas (Parquet)",
+                    data=_pairwise_delta_parquet(healthy_pairs, _t1_zscore, clinical_df),
+                    file_name="susp_epilepsy_pairwise_deltas.parquet",
+                    mime="application/octet-stream",
+                    key="download_susp_epilepsy_pairwise_deltas_parquet",
+                )
         for result in healthy_pairs:
             label = (f"{STAGE_LABELS.get(result['stage_a'], result['stage_a'])} − "
                      f"{STAGE_LABELS.get(result['stage_b'], result['stage_b'])}: "
@@ -5273,18 +6383,6 @@ def render_healthy_sick_delta_mode(
                     "Show patient lines", value=False,
                     key=f"delta_healthy_show_patient_lines_{result['stage_a']}_{result['stage_b']}",
                 )
-                st.plotly_chart(
-                    _plot_delta_summary_and_tstat(
-                        result, "Susp. Epilepsy",
-                        zscore=_t1_zscore,
-                        hep_mod=hep_mod,
-                        n_permutations=n_permutations,
-                        show_patient_lines=_show_patient_lines,
-                    ),
-                    use_container_width=True,
-                    theme=None,
-                )
-
                 topomap_key = (
                     "no_diagnosis_pairwise_delta_topomap_v1",
                     result["stage_a"], result["stage_b"],
@@ -5299,6 +6397,7 @@ def render_healthy_sick_delta_mode(
                         "electrode and plots the resulting p-values on a scalp topomap."
                     ),
                 )
+                channel_results: Dict[str, dict] = {}
                 if show_topomap:
                     topomap_cache = st.session_state.setdefault(
                         "_healthy_delta_topomap_cache", {}
@@ -5317,17 +6416,40 @@ def render_healthy_sick_delta_mode(
                             )
 
                         channel_results = prepare_electrode_contrasts(
-                            combined, "Susp. Epilepsy", result["stage_a"],
-                            "Susp. Epilepsy", result["stage_b"],
+                            combined, "Unknown", result["stage_a"],
+                            "Unknown", result["stage_b"],
                             selected_channels, False, n_permutations,
                             paired=True,
                             progress_callback=_update_progress,
                         )
                         electrode_progress.empty()
                         topomap_cache[topomap_key] = channel_results
+
+                waveform_figure = _plot_delta_summary_and_tstat(
+                    result, "Unknown",
+                    zscore=_t1_zscore,
+                    hep_mod=hep_mod,
+                    n_permutations=n_permutations,
+                    show_patient_lines=_show_patient_lines,
+                )
+                if channel_results:
+                    stage_label = (
+                        f"{STAGE_LABELS.get(result['stage_a'], result['stage_a'])} vs "
+                        f"{STAGE_LABELS.get(result['stage_b'], result['stage_b'])}"
+                    )
+                    waveform_figure = add_topomap_inset_to_waveform(
+                        waveform_figure, channel_results,
+                        "Unknown", "Unknown", stage_label,
+                    )
+                st.plotly_chart(
+                    waveform_figure, use_container_width=False, theme=None,
+                    key=f"susp_epilepsy_waveform_{result['stage_a']}_{result['stage_b']}",
+                )
+
+                if show_topomap:
                     if channel_results:
                         red_topomap = make_red_significance_topomap(
-                            channel_results, "Susp. Epilepsy", "Susp. Epilepsy",
+                            channel_results, "Unknown", "Unknown",
                         )
                         st.pyplot(red_topomap, use_container_width=True)
                         plt.close(red_topomap)
@@ -5338,7 +6460,7 @@ def render_healthy_sick_delta_mode(
                     else:
                         st.info("Not enough matched patients per electrode for this stage pair.")
 
-    with tabs[2]:
+    def _render_common_disease_tab() -> None:
         if not common_categories:
             st.info("No mapped disease categories are available.")
         for category in common_categories:
@@ -5365,7 +6487,7 @@ def render_healthy_sick_delta_mode(
                     max_examples,
                 ), use_container_width=True, theme=None)
 
-    with tabs[3]:
+    def _render_diagnosed_pairwise_tab() -> None:
         st.caption(
             "Each diagnosed patient's within-patient paired delta (Stage A − Stage B), "
             "broken out per diagnosis category. Mean line is the arithmetic mean of "
@@ -5378,6 +6500,47 @@ def render_healthy_sick_delta_mode(
         )
         if not sick_pairs:
             st.info("Not enough diagnosed patients matched across sleep stages.")
+
+        category_pairs_by_name: Dict[str, list] = {}
+        for category in common_categories:
+            category_df = metric_df_base[
+                metric_df_base["patient_id"].map(
+                    lambda pid, name=category: name in categories.get(pid, [])
+                )
+            ].copy()
+            category_df["diagnosis_group"] = category
+            category_pairs_by_name[category] = _rank_stage_pairs(
+                category_df, category, selected_stages, selected_channels,
+                n_permutations,
+            )
+
+        export_results = (
+            [{**r, "category": "Diagnosed (any)"} for r in sick_pairs]
+            + [
+                {**r, "category": category}
+                for category, pairs in category_pairs_by_name.items()
+                for r in pairs
+            ]
+        )
+        if export_results:
+            export_col1, export_col2 = st.columns(2)
+            with export_col1:
+                st.download_button(
+                    "⬇️ Export all Diagnosed pairwise deltas (Excel, one sheet per stage pair × diagnosis)",
+                    data=_pairwise_delta_workbook(export_results, _t3_zscore, clinical_df),
+                    file_name="diagnosed_pairwise_deltas.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="download_diagnosed_pairwise_deltas",
+                )
+            with export_col2:
+                st.download_button(
+                    "⬇️ Export all Diagnosed pairwise deltas (Parquet)",
+                    data=_pairwise_delta_parquet(export_results, _t3_zscore, clinical_df),
+                    file_name="diagnosed_pairwise_deltas.parquet",
+                    mime="application/octet-stream",
+                    key="download_diagnosed_pairwise_deltas_parquet",
+                )
+
         with st.expander("All diagnosed patients (any diagnosis)", expanded=False):
             for result in sick_pairs:
                 label = (f"{STAGE_LABELS.get(result['stage_a'], result['stage_a'])} − "
@@ -5393,6 +6556,7 @@ def render_healthy_sick_delta_mode(
                     ),
                     use_container_width=True,
                     theme=None,
+                    key=f"diagnosed_any_delta_{result['stage_a']}_{result['stage_b']}",
                 )
 
         if not common_categories:
@@ -5404,10 +6568,7 @@ def render_healthy_sick_delta_mode(
                 )
             ].copy()
             category_df["diagnosis_group"] = category
-            category_pairs = _rank_stage_pairs(
-                category_df, category, selected_stages, selected_channels,
-                n_permutations,
-            )
+            category_pairs = category_pairs_by_name[category]
             with st.expander(
                 f"{category} (patients={category_df['patient_id'].nunique()})",
                 expanded=False,
@@ -5432,241 +6593,110 @@ def render_healthy_sick_delta_mode(
                         key=f"diagnosed_delta_{category}_{result['stage_a']}_{result['stage_b']}",
                     )
 
-    with tabs[4]:
-        sick_by_pair = {
-            (item["stage_a"], item["stage_b"]): item for item in sick_pairs
-        }
-        comparison_rows = []
-        for healthy_result in healthy_pairs:
-            key = (healthy_result["stage_a"], healthy_result["stage_b"])
-            sick_result = sick_by_pair.get(key)
-            if sick_result is None:
-                continue
-            # Interpolate diagnosed deltas onto the Susp. Epilepsy grid.
-            times = healthy_result["times"]
-            overlap = ((times >= sick_result["times"][0]) &
-                       (times <= sick_result["times"][-1]))
-            comparison_times = times[overlap]
-            if len(comparison_times) < 3:
-                continue
-            healthy_delta = healthy_result["delta"][:, overlap]
-            sick_delta = np.vstack([
-                np.interp(comparison_times, sick_result["times"], row)
-                for row in sick_result["delta"]
-            ])
-            clusters, t_stat, threshold, p_value = cluster_permutation_contrast(
-                healthy_delta, sick_delta, comparison_times, paired=False,
-                n_permutations=n_permutations,
-            )
-            comparison_rows.append({
-                "Sleep-stage delta": (
-                    f"{STAGE_LABELS.get(key[0], key[0])} − "
-                    f"{STAGE_LABELS.get(key[1], key[1])}"
-                ),
-                "N Susp. Epilepsy": len(healthy_delta),
-                "N diagnosed": len(sick_delta),
-                "cluster_p": p_value,
-                "Significant clusters": sum(c["significant"] for c in clusters),
-            })
-            result = {
-                "matrix_a": healthy_delta, "matrix_b": sick_delta,
-                "times": comparison_times, "patient_ids_a": healthy_result["patient_ids"],
-                "patient_ids_b": sick_result["patient_ids"], "clusters": clusters,
-                "t_stat": t_stat, "t_threshold": threshold,
-                "contrast_p": p_value, "overlap_removed": 0, "paired": False,
-            }
-            with st.expander(
-                f"{comparison_rows[-1]['Sleep-stage delta']}: "
-                f"p={format_p(p_value)}",
-                expanded=len(comparison_rows) == 1,
-            ):
-                st.plotly_chart(plot_waveform_contrast(
-                    result, "Susp. Epilepsy patient deltas", "Diagnosed patient deltas",
-                    zscore_subjects=False,
-                ), use_container_width=True)
-        if comparison_rows:
-            comparison_table = pd.DataFrame(comparison_rows)
-            comparison_table["q_value"] = benjamini_hochberg(
-                comparison_table["cluster_p"].to_numpy(dtype=float)
-            )
-            st.dataframe(comparison_table, use_container_width=True, hide_index=True)
-        else:
-            st.info("No sleep-stage pair had enough data in both cohorts.")
-
-    with tabs[5]:
-        st.subheader("Raw EEG HEP / ECG — patient sample and group average")
+    def _render_cohort_comparison_tab() -> None:
         st.caption(
-            "EEG and ECG traces are R-peak-aligned averages from the HEP pipeline "
-            "(same waveforms used throughout the analysis; raw continuous signals are "
-            "not loaded here). Group average is the mean ± SEM across all patients "
-            "in the selected cohort and stage with valid traces."
+            "Unknown compared against each individual diagnosis category "
+            "(not the pooled Diagnosed group), per sleep-stage pair. Cluster "
+            "permutation testing is expensive, so only the biggest diagnosis "
+            "groups load by default -- tick a box to load a smaller one."
         )
-        col_cohort, col_stage = st.columns(2)
-        with col_cohort:
-            raw_cohort = st.radio(
-                "Cohort",
-                ["Susp. Epilepsy", "Diagnosed (any)"],
-                key="raw_signals_cohort",
-            )
-        with col_stage:
-            raw_stage = st.selectbox(
-                "Sleep stage",
-                selected_stages,
-                format_func=lambda s: STAGE_LABELS.get(s, s),
-                key="raw_signals_stage",
-            )
+        DEFAULT_COMPARISON_CATEGORIES = 3
+        sorted_categories = [name for name, _count in category_counts.most_common()]
+        default_categories = sorted_categories[:DEFAULT_COMPARISON_CATEGORIES]
+        optional_categories = sorted_categories[DEFAULT_COMPARISON_CATEGORIES:]
 
-        cohort_subset = combined[
-            (combined["diagnosis_group"] == raw_cohort)
-            & (combined["stage"] == raw_stage)
-        ]
+        selected_categories = list(default_categories)
+        if optional_categories:
+            st.markdown("**Load additional (smaller) diagnosis categories:**")
+            checkbox_cols = st.columns(3)
+            for index, category in enumerate(optional_categories):
+                with checkbox_cols[index % 3]:
+                    if st.checkbox(
+                        f"{category} (n={category_counts[category]})",
+                        value=False,
+                        key=f"cohort_compare_load_{category}",
+                    ):
+                        selected_categories.append(category)
 
-        if cohort_subset.empty:
-            st.warning("No patients found for this cohort / stage combination.")
-        else:
-            hep_traces_raw: Dict[str, tuple] = {}
-            ecg_traces_raw: Dict[str, tuple] = {}
-            for _, _row in cohort_subset.iterrows():
-                _pid = _canonical_patient_id(_row["patient_id"])
-                if _pid in hep_traces_raw:
+        for category in selected_categories:
+            category_df = metric_df_base[
+                metric_df_base["patient_id"].map(
+                    lambda pid, name=category: name in categories.get(pid, [])
+                )
+            ].copy()
+            category_df["diagnosis_group"] = category
+            with st.spinner(f"Calculating Unknown vs {category}…"):
+                category_pairs = _rank_stage_pairs(
+                    category_df, category, selected_stages, selected_channels,
+                    n_permutations,
+                )
+            category_by_pair = {
+                (item["stage_a"], item["stage_b"]): item for item in category_pairs
+            }
+
+            st.subheader(f"Unknown vs {category} (n={category_df['patient_id'].nunique()})")
+            comparison_rows = []
+            for healthy_result in healthy_pairs:
+                key = (healthy_result["stage_a"], healthy_result["stage_b"])
+                sick_result = category_by_pair.get(key)
+                if sick_result is None:
                     continue
-                _hep = _patient_hep_trace(_row.get("individual"), selected_channels, False)
-                _ecg = _patient_ecg_trace(_row.get("individual"))
-                if _hep is not None and _ecg is not None:
-                    hep_traces_raw[_pid] = _hep
-                    ecg_traces_raw[_pid] = _ecg
-
-            if not hep_traces_raw:
-                st.warning("No valid HEP / ECG traces found for this cohort / stage.")
+                # Interpolate diagnosed deltas onto the Unknown grid.
+                times = healthy_result["times"]
+                overlap = ((times >= sick_result["times"][0]) &
+                           (times <= sick_result["times"][-1]))
+                comparison_times = times[overlap]
+                if len(comparison_times) < 3:
+                    continue
+                healthy_delta = healthy_result["delta"][:, overlap]
+                sick_delta = np.vstack([
+                    np.interp(comparison_times, sick_result["times"], row)
+                    for row in sick_result["delta"]
+                ])
+                clusters, t_stat, threshold, p_value = cluster_permutation_contrast(
+                    healthy_delta, sick_delta, comparison_times, paired=False,
+                    n_permutations=n_permutations,
+                )
+                comparison_rows.append({
+                    "Sleep-stage delta": (
+                        f"{STAGE_LABELS.get(key[0], key[0])} − "
+                        f"{STAGE_LABELS.get(key[1], key[1])}"
+                    ),
+                    "N Unknown": len(healthy_delta),
+                    "N diagnosed": len(sick_delta),
+                    "cluster_p": p_value,
+                    "Significant clusters": sum(c["significant"] for c in clusters),
+                })
+                result = {
+                    "matrix_a": healthy_delta, "matrix_b": sick_delta,
+                    "times": comparison_times, "patient_ids_a": healthy_result["patient_ids"],
+                    "patient_ids_b": sick_result["patient_ids"], "clusters": clusters,
+                    "t_stat": t_stat, "t_threshold": threshold,
+                    "contrast_p": p_value, "overlap_removed": 0, "paired": False,
+                }
+                with st.expander(
+                    f"{comparison_rows[-1]['Sleep-stage delta']}: "
+                    f"p={format_p(p_value)}",
+                    expanded=len(comparison_rows) == 1,
+                ):
+                    st.plotly_chart(
+                        plot_waveform_contrast(
+                            result, "Unknown patient deltas", f"{category} patient deltas",
+                            zscore_subjects=False,
+                        ),
+                        use_container_width=True, theme=None,
+                        key=f"cohort_compare_{category}_{key[0]}_{key[1]}",
+                    )
+            if comparison_rows:
+                comparison_table = pd.DataFrame(comparison_rows)
+                comparison_table["q_value"] = benjamini_hochberg(
+                    comparison_table["cluster_p"].to_numpy(dtype=float)
+                )
+                st.dataframe(comparison_table, use_container_width=True, hide_index=True)
             else:
-                selected_raw_pid = st.selectbox(
-                    "Patient sample",
-                    sorted(hep_traces_raw.keys()),
-                    key="raw_signals_patient",
-                )
-                pat_hep, pat_hep_t = hep_traces_raw[selected_raw_pid]
-                pat_ecg, pat_ecg_t = ecg_traces_raw[selected_raw_pid]
+                st.info(f"No sleep-stage pair had enough data in both cohorts for {category}.")
 
-                # Group-average HEP on shared time grid
-                all_hep_times = [t for _, t in hep_traces_raw.values()]
-                hep_ovlp_start = max(float(t[0]) for t in all_hep_times)
-                hep_ovlp_end = min(float(t[-1]) for t in all_hep_times)
-                common_hep_t: Optional[np.ndarray] = None
-                group_avg_hep: Optional[np.ndarray] = None
-                group_sem_hep: Optional[np.ndarray] = None
-                if hep_ovlp_start < hep_ovlp_end:
-                    _ref_t = min(
-                        all_hep_times,
-                        key=lambda t: int(np.sum((t >= hep_ovlp_start) & (t <= hep_ovlp_end))),
-                    )
-                    common_hep_t = _ref_t[(_ref_t >= hep_ovlp_start) & (_ref_t <= hep_ovlp_end)]
-                    if len(common_hep_t) >= 3:
-                        hep_matrix_raw = np.vstack([
-                            np.interp(common_hep_t, _t, _tr)
-                            for _tr, _t in hep_traces_raw.values()
-                        ])
-                        group_avg_hep = np.nanmean(hep_matrix_raw, axis=0)
-                        group_sem_hep = stats.sem(hep_matrix_raw, axis=0, nan_policy="omit")
-
-                # Group-average ECG on shared time grid
-                all_ecg_times = [t for _, t in ecg_traces_raw.values()]
-                ecg_ovlp_start = max(float(t[0]) for t in all_ecg_times)
-                ecg_ovlp_end = min(float(t[-1]) for t in all_ecg_times)
-                common_ecg_t: Optional[np.ndarray] = None
-                group_avg_ecg: Optional[np.ndarray] = None
-                if ecg_ovlp_start < ecg_ovlp_end:
-                    _ecg_ref_t = min(
-                        all_ecg_times,
-                        key=lambda t: int(np.sum((t >= ecg_ovlp_start) & (t <= ecg_ovlp_end))),
-                    )
-                    common_ecg_t = _ecg_ref_t[
-                        (_ecg_ref_t >= ecg_ovlp_start) & (_ecg_ref_t <= ecg_ovlp_end)
-                    ]
-                    if len(common_ecg_t) >= 3:
-                        ecg_matrix_raw = np.vstack([
-                            np.interp(common_ecg_t, _t, _tr)
-                            for _tr, _t in ecg_traces_raw.values()
-                        ])
-                        group_avg_ecg = np.nanmean(ecg_matrix_raw, axis=0)
-
-                fig_raw = make_subplots(
-                    rows=2, cols=1, shared_xaxes=True,
-                    subplot_titles=(
-                        f"EEG HEP — patient sample vs group average "
-                        f"(N={len(hep_traces_raw)})",
-                        f"R-peak-aligned ECG — patient sample vs group average "
-                        f"(N={len(ecg_traces_raw)})",
-                    ),
-                    vertical_spacing=0.14,
-                )
-                # ── HEP row ──────────────────────────────────────────────────
-                fig_raw.add_trace(go.Scatter(
-                    x=pat_hep_t, y=pat_hep, mode="lines",
-                    name=f"Patient HEP ({selected_raw_pid})",
-                    line=dict(color=PALETTE[0], width=1.6, dash="dash"),
-                ), row=1, col=1)
-                if group_avg_hep is not None and common_hep_t is not None and group_sem_hep is not None:
-                    fig_raw.add_trace(go.Scatter(
-                        x=np.r_[common_hep_t, common_hep_t[::-1]],
-                        y=np.r_[
-                            group_avg_hep - group_sem_hep,
-                            (group_avg_hep + group_sem_hep)[::-1],
-                        ],
-                        fill="toself",
-                        fillcolor=_hex_to_rgba(PALETTE[1], 0.18),
-                        line=dict(width=0),
-                        hoverinfo="skip",
-                        showlegend=False,
-                    ), row=1, col=1)
-                    fig_raw.add_trace(go.Scatter(
-                        x=common_hep_t, y=group_avg_hep, mode="lines",
-                        name=f"Group mean HEP ± SEM (N={len(hep_traces_raw)})",
-                        line=dict(color=PALETTE[1], width=2.5),
-                    ), row=1, col=1)
-                # ── ECG row ──────────────────────────────────────────────────
-                fig_raw.add_trace(go.Scatter(
-                    x=pat_ecg_t, y=pat_ecg, mode="lines",
-                    name=f"Patient ECG ({selected_raw_pid})",
-                    line=dict(color="#C0392B", width=1.6, dash="dash"),
-                ), row=2, col=1)
-                if group_avg_ecg is not None and common_ecg_t is not None:
-                    fig_raw.add_trace(go.Scatter(
-                        x=common_ecg_t, y=group_avg_ecg, mode="lines",
-                        name=f"Group mean ECG (N={len(ecg_traces_raw)})",
-                        line=dict(color="#E74C3C", width=2.5),
-                    ), row=2, col=1)
-
-                fig_raw.add_vline(
-                    x=0, line_color="black", line_dash="dash", opacity=0.5,
-                    row="all", col=1,
-                )
-                fig_raw.update_yaxes(title_text="HEP (µV)", row=1, col=1)
-                fig_raw.update_yaxes(title_text="ECG (µV)", row=2, col=1)
-                fig_raw.update_xaxes(title_text="Time from R-peak (s)", row=2, col=1)
-                fig_raw.update_xaxes(showgrid=True, gridcolor="#eee")
-                fig_raw.update_yaxes(showgrid=True, gridcolor="#eee", zeroline=True)
-                fig_raw.update_layout(
-                    height=680,
-                    title=(
-                        f"{raw_cohort} — "
-                        f"{STAGE_LABELS.get(raw_stage, raw_stage)}"
-                    ),
-                    hovermode="x unified",
-                    legend_title="Waveform",
-                    showlegend=True,
-                    plot_bgcolor="white",
-                    paper_bgcolor="white",
-                    font_color="black",
-                )
-                st.plotly_chart(fig_raw, use_container_width=True, theme=None,
-                                key="raw_signals_fig")
-                st.caption(
-                    f"Dashed lines: selected patient ({selected_raw_pid}). "
-                    "Solid lines: group mean. Shaded band around HEP mean: ±1 SEM. "
-                    "Vertical dashed line at t=0 is the R-peak."
-                )
-
-    with tabs[6]:
+    def _render_demographics_tab() -> None:
         st.subheader("Age and sex by diagnosis group")
         has_clinical = clinical_df is not None and not clinical_df.empty and "record_id" in clinical_df.columns
         ehr_demo_df = load_ehr_demographics()
@@ -5684,8 +6714,120 @@ def render_healthy_sick_delta_mode(
             )) if has_clinical else {}
             ehr_age_map = dict(zip(ehr_demo_df["patient_id"], ehr_demo_df["age"])) if has_ehr else {}
             ehr_sex_map = dict(zip(ehr_demo_df["patient_id"], ehr_demo_df["sex"])) if has_ehr else {}
+            clinical_lookup = (
+                clinical_df.set_index(
+                    clinical_df["record_id"].astype(str)
+                ).to_dict(orient="index")
+                if has_clinical else {}
+            )
+            presence_df = stage_presence_df if stage_presence_df is not None else combined
+            stages_by_patient = (
+                presence_df.assign(
+                    patient_id=presence_df["patient_id"].map(_canonical_patient_id)
+                )
+                .groupby("patient_id")["stage"]
+                .agg(set)
+                .to_dict()
+            )
+            records_by_patient = {
+                str(patient_id): patient_rows
+                for patient_id, patient_rows in combined.groupby("patient_id")
+            }
+            selected_stage_set = set(selected_stages)
+            demographics_signature = _cohort_demographics_cache_signature(
+                combined,
+                selected_stages,
+                dx_names,
+                categories,
+            )
+            refresh_demographics = st.button(
+                "🔄 Refresh demographics and EDF metadata cache",
+                key="refresh_cohort_demographics_cache",
+                help=(
+                    "Re-scan the EDF directory and rebuild this cohort table. "
+                    "Use after adding or replacing EDF/BIDS files."
+                ),
+            )
+            cached_demo_df = (
+                None
+                if refresh_demographics
+                else _read_cohort_demographics_disk_cache(
+                    demographics_signature
+                )
+            )
+            demographics_lock_file = None
+            if cached_demo_df is None:
+                # Only one of the three dashboard servers performs a cold
+                # build; the others wait, then consume its completed table.
+                import fcntl
+
+                lock_path = EDF_RECORDING_METADATA_CACHE.with_suffix(
+                    ".cohort_demographics.lock"
+                )
+                lock_path.parent.mkdir(parents=True, exist_ok=True)
+                demographics_lock_file = lock_path.open("a+")
+                with st.spinner(
+                    "Waiting for or building the shared demographics cache…"
+                ):
+                    fcntl.flock(
+                        demographics_lock_file.fileno(), fcntl.LOCK_EX
+                    )
+                if not refresh_demographics:
+                    cached_demo_df = _read_cohort_demographics_disk_cache(
+                        demographics_signature
+                    )
+            patient_edf_paths: Dict[str, tuple] = {}
+            recording_metadata_by_patient: Dict[str, dict] = {}
+            if cached_demo_df is None:
+                if refresh_demographics:
+                    _index_edf_files_by_patient.clear()
+                edf_index = _index_edf_files_by_patient()
+                patient_edf_paths = {
+                    patient_id: tuple(
+                        edf_index.get(patient_id)
+                        or edf_index.get(patient_id.upper())
+                        or ()
+                    )
+                    for patient_id in sorted(
+                        set(combined["patient_id"].astype(str))
+                    )
+                }
+                metadata_jobs = {
+                    patient_id: paths
+                    for patient_id, paths in patient_edf_paths.items()
+                    if paths
+                }
+                if metadata_jobs:
+                    with st.spinner(
+                        "Building the persistent demographics cache from EDF "
+                        "headers and BIDS dates…"
+                    ):
+                        max_metadata_workers = min(12, len(metadata_jobs))
+                        with ThreadPoolExecutor(
+                            max_workers=max_metadata_workers
+                        ) as executor:
+                            future_to_patient = {
+                                executor.submit(
+                                    _edf_recording_metadata, paths
+                                ): patient_id
+                                for patient_id, paths in metadata_jobs.items()
+                            }
+                            for future in as_completed(future_to_patient):
+                                patient_id = future_to_patient[future]
+                                try:
+                                    recording_metadata_by_patient[patient_id] = (
+                                        future.result()
+                                    )
+                                except Exception:
+                                    continue
+
             demo_rows = []
-            for _, row in combined.drop_duplicates("patient_id").iterrows():
+            patients_to_build = (
+                combined.drop_duplicates("patient_id")
+                if cached_demo_df is None
+                else combined.iloc[0:0]
+            )
+            for _, row in patients_to_build.iterrows():
                 pid = str(row["patient_id"])
                 age = age_map.get(pid, np.nan)
                 sex_code = sex_map.get(pid, np.nan)
@@ -5698,14 +6840,120 @@ def render_healthy_sick_delta_mode(
                         if sex_label == "Unknown":
                             sex_label = ehr_sex_map.get(bdsp_pid) or "Unknown"
                 dx_list = dx_names.get(pid, [])
-                demo_rows.append({
+                category_list = categories.get(pid, [])
+                patient_stages = stages_by_patient.get(
+                    _canonical_patient_id(pid), set()
+                )
+                available_selected = [
+                    stage for stage in selected_stages if stage in patient_stages
+                ]
+                missing_selected = [
+                    stage for stage in selected_stages if stage not in patient_stages
+                ]
+                patient_rows = records_by_patient.get(pid, pd.DataFrame())
+                rpeak_counts = []
+                eeg_channel_counts = []
+                if not patient_rows.empty:
+                    for individual in patient_rows["individual"]:
+                        if individual is None:
+                            continue
+                        if len(individual) > 4 and individual[4] is not None:
+                            rpeak_counts.append(len(individual[4]))
+                        if len(individual) > 3 and individual[3] is not None:
+                            eeg_channel_counts.append(
+                                len(set(map(str, individual[3])))
+                            )
+
+                clinical_row = clinical_lookup.get(pid, {})
+                paths = patient_edf_paths.get(pid, ())
+                recording_metadata = (
+                    recording_metadata_by_patient.get(pid)
+                    or _edf_recording_metadata(tuple(paths))
+                    if paths else {
+                        "Study": "",
+                        "EDF recordings": 0,
+                        "Recording sessions": 0,
+                        "First recording date": "",
+                        "Last recording date": "",
+                        "Total recording (min)": np.nan,
+                        "Mean recording (min)": np.nan,
+                    }
+                )
+                demo_row = {
                     "Group": row["diagnosis_group"],
                     "Patient ID": pid,
+                    "BDSP patient ID": _pid_to_bdsp_ehr(pid),
                     "Age": age,
                     "Sex": sex_label,
+                    "Handedness": clinical_row.get("handedness", ""),
+                    "Education": clinical_row.get(
+                        "education_by_diploma", np.nan
+                    ),
+                    "Age at symptoms": clinical_row.get(
+                        "age at symptoms", np.nan
+                    ),
+                    "Years symptoms→visit": clinical_row.get(
+                        "years_symptom_visit", np.nan
+                    ),
+                    "MMSE": clinical_row.get("mmse", np.nan),
+                    "MoCA": clinical_row.get("moca", np.nan),
+                    "CDR sum of boxes": clinical_row.get(
+                        "cdr_sum_of_boxes", np.nan
+                    ),
+                    "ApoE4": clinical_row.get("ApoE4", np.nan),
+                    "bvFTD class": clinical_row.get("Class_bvftd", np.nan),
+                    "LBD class": clinical_row.get("Class_LBD", np.nan),
+                    "Diagnosis count": len(dx_list),
                     "Diagnosis": "; ".join(dx_list) if dx_list else "None",
-                })
-            demo_df = pd.DataFrame(demo_rows)
+                    "Diagnosis categories": (
+                        "; ".join(category_list) if category_list else "None"
+                    ),
+                    "Available selected stages": ", ".join(
+                        STAGE_LABELS.get(stage, stage)
+                        for stage in available_selected
+                    ),
+                    "Missing selected stages": ", ".join(
+                        STAGE_LABELS.get(stage, stage)
+                        for stage in missing_selected
+                    ),
+                    "Selected stages present": len(available_selected),
+                    "All selected stages": selected_stage_set.issubset(
+                        patient_stages
+                    ),
+                    "HEP patient-stage records": len(patient_rows),
+                    "Median R-peaks/stage": (
+                        round(float(np.median(rpeak_counts)), 1)
+                        if rpeak_counts else np.nan
+                    ),
+                    "Minimum EEG channels/stage": (
+                        min(eeg_channel_counts)
+                        if eeg_channel_counts else np.nan
+                    ),
+                }
+                for stage in selected_stages:
+                    demo_row[f"Has {STAGE_LABELS.get(stage, stage)}"] = (
+                        stage in patient_stages
+                    )
+                demo_row.update(recording_metadata)
+                demo_rows.append(demo_row)
+            if cached_demo_df is not None:
+                demo_df = cached_demo_df
+                st.caption("Loaded cohort demographics from the persistent cache.")
+            else:
+                demo_df = pd.DataFrame(demo_rows)
+                _write_cohort_demographics_disk_cache(
+                    demographics_signature, demo_df
+                )
+                st.caption(
+                    "Built and saved the persistent cohort-demographics cache."
+                )
+            if demographics_lock_file is not None:
+                import fcntl
+
+                fcntl.flock(
+                    demographics_lock_file.fileno(), fcntl.LOCK_UN
+                )
+                demographics_lock_file.close()
 
             def _summary_row(label, group_df):
                 ages = group_df["Age"].dropna()
@@ -5726,56 +6974,102 @@ def render_healthy_sick_delta_mode(
                 _summary_row(group, group_df)
                 for group, group_df in demo_df.groupby("Group")
             ]
-            all_stages = set(STAGE_LABELS.keys())
-            presence_df = stage_presence_df if stage_presence_df is not None else combined
-            stages_by_patient = presence_df.groupby("patient_id")["stage"].agg(set)
-            complete_pids = set(stages_by_patient[stages_by_patient.map(all_stages.issubset)].index.astype(str))
+            complete_pids = set(
+                patient_id
+                for patient_id, patient_stages in stages_by_patient.items()
+                if selected_stage_set.issubset(patient_stages)
+            )
             complete_df = demo_df[demo_df["Patient ID"].isin(complete_pids)]
-            summary_rows.append(_summary_row("All sleep cycles present (all 4 stages)", complete_df))
+            summary_rows.append(_summary_row(
+                f"All selected stages present ({len(selected_stage_set)} stages)",
+                complete_df,
+            ))
             st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
             st.markdown("**Per-patient table**")
+            enriched_demo_df = demo_df.sort_values(["Group", "Patient ID"])
             st.dataframe(
-                demo_df.sort_values(["Group", "Patient ID"]),
+                enriched_demo_df,
                 use_container_width=True, hide_index=True,
+            )
+            st.download_button(
+                "⬇️ Download enriched per-patient table",
+                enriched_demo_df.to_csv(index=False),
+                "susp_epilepsy_diagnosed_per_patient_details.csv",
+                "text/csv",
+                key="download_enriched_per_patient_table",
             )
 
             st.markdown("**Scan-time distribution (patients with locatable .edf files)**")
-            edf_index = _index_edf_files_by_patient()
-            scan_minutes = []
-            for pid in demo_df["Patient ID"].unique():
-                paths = edf_index.get(pid) or edf_index.get(pid.upper())
-                if not paths:
-                    continue
-                seconds = _edf_scan_seconds(tuple(paths))
-                if seconds is not None:
-                    scan_minutes.append(seconds / 60.0)
+            scan_minutes = (
+                demo_df["Mean recording (min)"].dropna().astype(float).tolist()
+            )
             if not scan_minutes:
                 st.info("No on-disk .edf files matched these patient IDs.")
             else:
-                st.caption(f"N={len(scan_minutes)} of {len(demo_df)} patients have a locatable .edf recording.")
+                median_scan_minutes = float(np.median(scan_minutes))
+                mad_scan_minutes = float(
+                    stats.median_abs_deviation(
+                        scan_minutes, nan_policy="omit", scale=1.0
+                    )
+                )
+                st.markdown(
+                    f"**Median scan time: {median_scan_minutes:.1f} ± "
+                    f"{mad_scan_minutes:.1f} min (median ± MAD)**"
+                )
+                st.caption(
+                    f"N={len(scan_minutes)} of {len(demo_df)} patients have a "
+                    "locatable .edf recording. MAD is the unscaled median "
+                    "absolute deviation."
+                )
                 fig_scan = px.histogram(
                     scan_minutes, nbins=30, labels={"value": "Scan time (min)"},
                 )
-                fig_scan.update_layout(showlegend=False, yaxis_title="Count")
+                fig_scan.update_layout(
+                    showlegend=False, yaxis_title="Count",
+                    plot_bgcolor="white", paper_bgcolor="white", font_color="black",
+                )
                 st.plotly_chart(fig_scan, use_container_width=True, theme=None)
 
-            no_dx_ages = demo_df.loc[demo_df["Group"] == "Susp. Epilepsy", "Age"].dropna()
-            if no_dx_ages.empty:
-                st.info("No age data available for the Susp. Epilepsy cohort.")
+            st.markdown("**Scan-date distribution (patients with locatable .edf files)**")
+            scan_dates = pd.to_datetime(
+                demo_df["First recording date"], errors="coerce"
+            ).dropna()
+            if scan_dates.empty:
+                st.info("No recording dates could be parsed from the EDF/BIDS metadata.")
             else:
-                st.markdown("**Susp. Epilepsy cohort: age distribution**")
+                st.caption(
+                    f"N={len(scan_dates)} of {len(demo_df)} patients have a "
+                    "locatable first recording date."
+                )
+                fig_scan_date = px.histogram(
+                    scan_dates, nbins=30, labels={"value": "First recording date"},
+                )
+                fig_scan_date.update_layout(
+                    showlegend=False, yaxis_title="Count",
+                    plot_bgcolor="white", paper_bgcolor="white", font_color="black",
+                )
+                st.plotly_chart(fig_scan_date, use_container_width=True, theme=None)
+
+            no_dx_ages = demo_df.loc[demo_df["Group"] == "Unknown", "Age"].dropna()
+            if no_dx_ages.empty:
+                st.info("No age data available for the Unknown cohort.")
+            else:
+                st.markdown("**Unknown cohort: age distribution**")
                 fig_no_dx_age = px.histogram(
                     no_dx_ages, nbins=20, labels={"value": "Age"},
                 )
-                fig_no_dx_age.update_layout(showlegend=False, yaxis_title="Count")
+                fig_no_dx_age.update_layout(
+                    showlegend=False, yaxis_title="Count",
+                    plot_bgcolor="white", paper_bgcolor="white", font_color="black",
+                )
                 st.plotly_chart(fig_no_dx_age, use_container_width=True, theme=None)
 
-    with tabs[7]:
+    def _render_gender_age_tab() -> None:
         st.subheader("HEP pairwise diff: gender and age (by sleep stage)")
         st.caption(
             "Independent-samples cluster-permutation contrast, run separately per "
             "selected sleep stage: Male vs Female, and an age median-split "
-            "(younger vs older). Same test used for the Susp. Epilepsy vs diagnosed "
+            "(younger vs older). Same test used for the Unknown vs diagnosed "
             "waveform contrasts above."
         )
         demo = _patient_demographics(combined["patient_id"].unique(), clinical_df)
@@ -5829,33 +7123,201 @@ def render_healthy_sick_delta_mode(
                     f"{STAGE_LABELS.get(stage, stage)}: p={format_p(result['contrast_p'])}",
                     expanded=idx == 0,
                 ):
-                    st.plotly_chart(
-                        plot_waveform_contrast(
-                            result, label_a, label_b, zscore_subjects=ga_zscore,
-                            stage_label=STAGE_LABELS.get(stage, stage),
+                    show_topomap = st.checkbox(
+                        "Show per-electrode brain map (p-values)",
+                        value=True,
+                        key=f"gender_age_topomap_{label_a}_{label_b}_{stage}",
+                        help=(
+                            "Runs the same independent-samples cluster test separately "
+                            "for each selected electrode and embeds the resulting p-values "
+                            "as a scalp topomap on the right side of the waveform plot."
                         ),
-                        use_container_width=True, theme=None,
                     )
+                    channel_results: Dict[str, dict] = {}
+                    if show_topomap:
+                        topomap_key = (
+                            "gender_age_electrode_topomap_v1", label_a, label_b, stage,
+                            tuple(selected_channels), bool(ga_zscore), int(n_permutations),
+                        )
+                        topomap_cache = st.session_state.setdefault(
+                            "_gender_age_topomap_cache", {}
+                        )
+                        if topomap_key in topomap_cache:
+                            channel_results = topomap_cache[topomap_key]
+                        else:
+                            electrode_progress = st.progress(
+                                0.0, text=f"Testing electrodes for {title} / {STAGE_LABELS.get(stage, stage)}..."
+                            )
+
+                            def _update_progress(index: int, total: int, channel: str) -> None:
+                                electrode_progress.progress(
+                                    (index + 1) / max(total, 1),
+                                    text=f"Testing electrode {index + 1}/{total}: {channel}",
+                                )
+
+                            channel_results = prepare_electrode_contrasts(
+                                grouped, label_a, stage, label_b, stage,
+                                selected_channels, ga_zscore, n_permutations,
+                                paired=False, progress_callback=_update_progress,
+                            )
+                            electrode_progress.empty()
+                            topomap_cache[topomap_key] = channel_results
+
+                    waveform_figure = plot_waveform_contrast(
+                        result, label_a, label_b, zscore_subjects=ga_zscore,
+                        stage_label=STAGE_LABELS.get(stage, stage),
+                    )
+                    if channel_results:
+                        waveform_figure = add_topomap_inset_to_waveform(
+                            waveform_figure, channel_results, label_a, label_b,
+                            STAGE_LABELS.get(stage, stage),
+                        )
+                    st.plotly_chart(
+                        waveform_figure,
+                        use_container_width=not bool(channel_results), theme=None,
+                    )
+                    if show_topomap and not channel_results:
+                        st.info(
+                            "Not enough patients with electrode-level data to build "
+                            "a brain map for this sleep stage."
+                        )
 
         _run_grouped_contrast(sex_map2, "Male", "Female", "Male vs Female")
         if age_group_map:
             _run_grouped_contrast(age_group_map, "Younger", "Older", "Younger vs Older (median split)")
 
-    with tabs[8]:
-        st.subheader("Susp. Epilepsy pairwise delta clustering (per patient)")
+    def _render_age_decade_hep_tab() -> None:
+        st.subheader("Raw HEP by 10-year age group, per sleep stage")
         st.caption(
-            "K-means clustering of each Susp. Epilepsy patient's paired stage delta "
-            "curve (Stage A − Stage B), run separately per stage pair. The elbow "
-            "curve (inertia vs. k) helps judge how many clusters the data support — "
-            "a small, distinct cluster can point to a subgroup that diverges from "
-            "the rest in a specific time window."
+            "Patients (Unknown + diagnosed, combined) are binned into "
+            "10-year age groups. For each selected sleep stage: every age group's "
+            "mean HEP is shown together, then repeated restricted to age groups "
+            "with more than 100 patients, with an independent-samples "
+            "cluster-permutation contrast between the two largest such groups."
+        )
+        demo = _patient_demographics(combined["patient_id"].unique(), clinical_df)
+        valid_ages = demo.set_index("patient_id")["age"].dropna()
+        if valid_ages.empty:
+            st.info("No age data available to build age-decade groups.")
+            return
+        decade_map = {
+            pid: f"{int(age // 10) * 10}-{int(age // 10) * 10 + 9}"
+            for pid, age in valid_ages.items()
+        }
+        age_binned = combined.copy()
+        age_binned["diagnosis_group"] = age_binned["patient_id"].astype(str).map(decade_map)
+        age_binned = age_binned.dropna(subset=["diagnosis_group"])
+
+        ad_zscore = st.checkbox(
+            "Z-score each patient's HEP before averaging", value=False,
+            key="age_decade_zscore",
+        )
+        palette = px.colors.qualitative.Set2
+
+        for stage in selected_stages:
+            stage_label = STAGE_LABELS.get(stage, stage)
+            decade_labels = sorted(
+                age_binned.loc[age_binned["stage"] == stage, "diagnosis_group"].dropna().unique(),
+                key=lambda label: int(label.split("-")[0]),
+            )
+            trace_maps = {
+                label: _collect_hep_traces(
+                    age_binned, label, stage, selected_channels, ad_zscore
+                )
+                for label in decade_labels
+            }
+            trace_maps = {
+                label: traces for label, traces in trace_maps.items() if len(traces) >= 2
+            }
+            if not trace_maps:
+                st.info(f"{stage_label}: not enough age-decade groups with data.")
+                continue
+
+            st.markdown(f"**{stage_label}**")
+            st.plotly_chart(
+                _plot_age_decade_hep(
+                    trace_maps, palette, f"{stage_label}: HEP by age decade (all groups)"
+                ),
+                use_container_width=True, theme=None,
+                key=f"age_decade_all_{stage}",
+            )
+
+            big_maps = {
+                label: traces for label, traces in trace_maps.items() if len(traces) > 100
+            }
+            if big_maps:
+                st.plotly_chart(
+                    _plot_age_decade_hep(
+                        big_maps, palette,
+                        f"{stage_label}: HEP by age decade (N>100 groups only)",
+                    ),
+                    use_container_width=True, theme=None,
+                    key=f"age_decade_big_{stage}",
+                )
+            else:
+                st.caption(f"{stage_label}: no age-decade group has more than 100 patients.")
+
+            big_sorted = sorted(big_maps.items(), key=lambda kv: -len(kv[1]))
+            if len(big_sorted) >= 2:
+                (label_a, traces_a), (label_b, traces_b) = big_sorted[0], big_sorted[1]
+                aligned = _align_trace_maps(traces_a, traces_b, paired=False)
+                if aligned is not None:
+                    matrix_a, matrix_b, times, ids_a, ids_b = aligned
+                    clusters, _t_stat, _t_threshold, contrast_p = cluster_permutation_contrast(
+                        matrix_a, matrix_b, times, paired=False,
+                        n_permutations=n_permutations,
+                    )
+                    sig_windows = "; ".join(
+                        f"{c['start']:.3f}-{c['end']:.3f}s ({c['direction']})"
+                        for c in clusters if c["significant"]
+                    ) or "none"
+                    st.caption(
+                        f"{label_a} yr (N={len(ids_a)}) vs {label_b} yr (N={len(ids_b)}): "
+                        f"cluster p={format_p(contrast_p)}; significant windows: {sig_windows}."
+                    )
+            elif len(big_sorted) == 1:
+                st.caption(
+                    "Only one age-decade group exceeds N=100; no between-group "
+                    "significance to report."
+                )
+
+    def _render_clustering_tab() -> None:
+        st.subheader("Unknown pairwise delta clustering (per patient)")
+        st.caption(
+            "Direct clustering of each Unknown patient's complete paired "
+            "stage delta curve (Stage A − Stage B), run separately per stage pair. "
+            "Randomized PCA is used only to display the high-dimensional direct "
+            "solution; it is not used to create the clusters."
         )
         if not healthy_pairs:
-            st.info("Not enough matched Susp. Epilepsy patients across the selected stages.")
+            st.info("Not enough matched Unknown patients across the selected stages.")
         _cluster_zscore = st.checkbox(
             "Z-score each patient's delta before clustering", value=False,
             key="delta_cluster_zscore",
-            help="Divides each patient's delta by its own std so shape, not amplitude, drives clustering.",
+            help=(
+                "Subtracts each patient's mean and divides by that patient's "
+                "standard deviation so shape, not offset or amplitude, drives clustering."
+            ),
+        )
+        _cluster_algorithm = st.selectbox(
+            "Direct clustering algorithm",
+            ("Ward hierarchical", "K-means"),
+            key="delta_cluster_algorithm",
+            help=(
+                "K-means uses MiniBatchKMeans. Ward hierarchical uses "
+                "agglomerative clustering with Ward linkage."
+            ),
+        )
+        available_diagnosis_groups = sorted(category_counts)
+        selected_cluster_diagnoses = st.multiselect(
+            "Diagnosed groups to compare with every Unknown cluster",
+            available_diagnosis_groups,
+            default=available_diagnosis_groups,
+            key="delta_cluster_diagnosis_groups",
+            help=(
+                "Each selected diagnosis is compared using the identical Stage A − "
+                "Stage B delta and the same selected EEG channels."
+            ),
         )
         palette = px.colors.qualitative.Set2
         for result in healthy_pairs:
@@ -5866,54 +7328,68 @@ def render_healthy_sick_delta_mode(
             with st.expander(label, expanded=result is healthy_pairs[0]):
                 times = result["times"]
                 patient_ids = result["patient_ids"]
-                delta = np.nan_to_num(result["delta"], nan=0.0)
-                if _cluster_zscore:
-                    stds = np.nanstd(delta, axis=1, ddof=1)
-                    stds[stds == 0] = 1.0
-                    delta = delta / stds[:, np.newaxis]
-                n_patients = delta.shape[0]
+                raw_delta = np.nan_to_num(result["delta"], nan=0.0)
+                n_patients = raw_delta.shape[0]
                 k_max = min(8, n_patients - 1)
                 if k_max < 2:
                     st.info("Not enough patients to cluster for this stage pair.")
                     continue
 
-                latent_dim = min(4, max(2, n_patients // 3))
-                latent = _cached_delta_autoencoder(
-                    np.ascontiguousarray(delta, dtype=np.float64).tobytes(),
-                    delta.shape, latent_dim, 300,
-                )
-                if latent is None:
-                    st.error("PyTorch is required to encode delta curves for clustering.")
-                    continue
                 st.caption(
-                    f"Clustering runs on a {latent_dim}-D autoencoder latent embedding of each "
-                    "patient's delta curve, not the raw waveform."
-                )
-
-                ks = list(range(1, k_max + 1))
-                inertias = [
-                    KMeans(n_clusters=k, n_init=10, random_state=0).fit(latent).inertia_
-                    for k in ks
-                ]
-                elbow_fig = go.Figure()
-                elbow_fig.add_trace(go.Scatter(x=ks, y=inertias, mode="lines+markers"))
-                elbow_fig.update_layout(
-                    title="Elbow curve (inertia vs. k, on latent features)",
-                    xaxis_title="k (number of clusters)", yaxis_title="Inertia",
-                    height=280, margin=dict(t=40, b=20),
-                )
-                st.plotly_chart(
-                    elbow_fig, use_container_width=True, theme=None,
-                    key=f"delta_cluster_elbow_{pair_key}",
+                    f"{_cluster_algorithm} uses every aligned time sample in each "
+                    "patient's Stage A − Stage B delta curve. No autoencoder or "
+                    "latent embedding is used."
                 )
 
                 k_select = st.slider(
                     "Number of clusters (k)", 2, k_max, min(3, k_max), 1,
                     key=f"delta_cluster_k_{pair_key}",
                 )
-                labels = KMeans(
-                    n_clusters=k_select, n_init=10, random_state=0
-                ).fit_predict(latent)
+                clustering_values = np.ascontiguousarray(
+                    raw_delta, dtype=np.float64
+                )
+                with st.spinner(
+                    f"Running direct {_cluster_algorithm} clustering…"
+                ):
+                    labels, display, silhouette = direct_cluster(
+                        clustering_values.tobytes(),
+                        clustering_values.shape,
+                        k_select,
+                        _cluster_zscore,
+                        _cluster_algorithm,
+                    )
+                delta = scaled_curves(raw_delta, _cluster_zscore)
+
+                st.metric("Silhouette score", f"{silhouette:.3f}")
+                display_df = pd.DataFrame({
+                    "PCA 1": display[:, 0],
+                    "PCA 2": display[:, 1],
+                    "Cluster": [f"Cluster {label}" for label in labels],
+                    "Patient ID": list(map(str, patient_ids)),
+                })
+                display_fig = px.scatter(
+                    display_df,
+                    x="PCA 1",
+                    y="PCA 2",
+                    color="Cluster",
+                    hover_data=["Patient ID"],
+                    color_discrete_sequence=palette,
+                    render_mode="svg",
+                    title=(
+                        "PCA display of the direct clustering solution "
+                        "(visualization only)"
+                    ),
+                )
+                display_fig.update_layout(
+                    height=420,
+                    plot_bgcolor="white", paper_bgcolor="white", font_color="black",
+                )
+                st.plotly_chart(
+                    display_fig,
+                    use_container_width=True,
+                    theme=None,
+                    key=f"delta_cluster_pca_{pair_key}_{_cluster_algorithm}",
+                )
 
                 cluster_fig = go.Figure()
                 for cluster_id in range(k_select):
@@ -5942,6 +7418,7 @@ def render_healthy_sick_delta_mode(
                     title="Cluster mean delta ± SEM",
                     xaxis_title="Time (s)", yaxis_title="Delta amplitude",
                     height=420,
+                    plot_bgcolor="white", paper_bgcolor="white", font_color="black",
                 )
                 st.plotly_chart(
                     cluster_fig, use_container_width=True, theme=None,
@@ -5958,6 +7435,214 @@ def render_healthy_sick_delta_mode(
                     use_container_width=True, hide_index=True,
                 )
 
+                st.markdown("**Exploratory statistical differences between clusters**")
+                st.caption(
+                    "Independent cluster-mass permutation tests compare every cluster "
+                    "pair across time, excluding −50 to +50 ms around the R peak. "
+                    "The cluster p-value is corrected across time; q applies "
+                    "Benjamini–Hochberg FDR across the cluster pairs in this table. "
+                    "A pair is marked significant only when it has a cluster with "
+                    "p < 0.01 and its between-pair FDR q is < 0.05. "
+                    "Because these clusters were discovered from the same delta curves "
+                    "being tested, the results are descriptive and require validation "
+                    "in held-out patients."
+                )
+                cluster_significance = _cluster_delta_significance_table(
+                    delta, labels, times, n_permutations
+                )
+                if cluster_significance.empty:
+                    st.info("At least two clusters are required for comparison.")
+                else:
+                    n_significant = int(
+                        cluster_significance["FDR significant"].fillna(False).sum()
+                    )
+                    tested = int(cluster_significance["cluster_p"].notna().sum())
+                    metric_columns = st.columns(2)
+                    metric_columns[0].metric("Cluster pairs tested", tested)
+                    metric_columns[1].metric(
+                        "Significantly different (FDR q < 0.05)", n_significant
+                    )
+                    st.dataframe(
+                        cluster_significance,
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "cluster_p": st.column_config.NumberColumn(
+                                "Cluster p", format="%.4f"
+                            ),
+                            "q_value": st.column_config.NumberColumn(
+                                "FDR q", format="%.4f"
+                            ),
+                        },
+                    )
+
+                st.markdown(
+                    "**Similarity of each Unknown cluster to diagnosed groups**"
+                )
+                st.caption(
+                    "For every cluster × diagnosis pair, the diagnosed patients' "
+                    "delta uses this exact sleep-stage contrast. Correlation and "
+                    "cosine similarity describe mean-waveform resemblance outside "
+                    "the −50 to +50 ms R-peak artifact window. The p-value comes "
+                    "from an independent patient-level cluster-mass permutation "
+                    "test of the full time series; FDR q is corrected across all "
+                    "cluster × diagnosis comparisons for this stage pair. A large "
+                    "p-value does not prove equivalence, so “descriptive resemblance” "
+                    "is only a heuristic (r ≥ 0.70 with no FDR-significant difference)."
+                )
+                if not selected_cluster_diagnoses:
+                    st.info("Select at least one diagnosed group for comparison.")
+                else:
+                    similarity_cache = st.session_state.setdefault(
+                        "_cluster_diagnosis_similarity_cache", {}
+                    )
+                    similarity_key = (
+                        "direct_cluster_v2",
+                        pair_key,
+                        int(k_select),
+                        bool(_cluster_zscore),
+                        _cluster_algorithm,
+                        int(n_permutations),
+                        tuple(selected_cluster_diagnoses),
+                        tuple(selected_channels),
+                        tuple(map(str, patient_ids)),
+                        len(metric_df_base),
+                    )
+                    if similarity_key not in similarity_cache:
+                        with st.spinner(
+                            "Comparing every cluster with diagnosed stage deltas…"
+                        ):
+                            similarity_cache[similarity_key] = (
+                                _cluster_diagnosis_similarity_results(
+                                    metric_df_base,
+                                    categories,
+                                    selected_cluster_diagnoses,
+                                    result["stage_a"],
+                                    result["stage_b"],
+                                    selected_channels,
+                                    delta,
+                                    labels,
+                                    times,
+                                    _cluster_zscore,
+                                    n_permutations,
+                                )
+                            )
+                    similarity_table, similarity_plot_data = similarity_cache[
+                        similarity_key
+                    ]
+                    if similarity_table.empty:
+                        st.info(
+                            "No selected diagnosis had at least two patients with "
+                            "this same stage-pair delta."
+                        )
+                    else:
+                        similarity_metrics = st.columns(3)
+                        similarity_metrics[0].metric(
+                            "Cluster × diagnosis comparisons",
+                            len(similarity_table),
+                        )
+                        similarity_metrics[1].metric(
+                            "Descriptive resemblances",
+                            int(similarity_table[
+                                "Descriptive resemblance"
+                            ].fillna(False).sum()),
+                        )
+                        similarity_metrics[2].metric(
+                            "FDR-significant differences",
+                            int(similarity_table[
+                                "Significantly different"
+                            ].fillna(False).sum()),
+                        )
+                        st.dataframe(
+                            similarity_table,
+                            use_container_width=True,
+                            hide_index=True,
+                            column_config={
+                                "Waveform correlation r":
+                                    st.column_config.NumberColumn(format="%.3f"),
+                                "Cosine similarity":
+                                    st.column_config.NumberColumn(format="%.3f"),
+                                "RMSE":
+                                    st.column_config.NumberColumn(format="%.4f"),
+                                "Difference cluster p":
+                                    st.column_config.NumberColumn(format="%.4f"),
+                                "FDR q":
+                                    st.column_config.NumberColumn(format="%.4f"),
+                            },
+                        )
+                        st.download_button(
+                            "⬇️ Download cluster-to-diagnosis comparisons",
+                            similarity_table.to_csv(index=False),
+                            (
+                                f"susp_cluster_diagnosis_similarity_"
+                                f"{result['stage_a']}_{result['stage_b']}.csv"
+                            ),
+                            "text/csv",
+                            key=f"download_cluster_diagnosis_{pair_key}",
+                        )
+                        st.markdown(
+                            "**Top 5 minority-cluster matches** (descriptive "
+                            "resemblance: r ≥ 0.70 and no FDR-significant "
+                            "difference), ranked by waveform correlation"
+                        )
+                        st.caption(
+                            "Excludes the dominant cluster (≥80% of this stage "
+                            "pair's Unknown patients) — the point is to "
+                            "find which smaller, more distinctive subgroup "
+                            "resembles a known diagnosis, not the bulk cohort."
+                        )
+                        dominant_clusters = {
+                            cid for cid in sizes.index
+                            if sizes[cid] / n_patients >= 0.80
+                        }
+                        similar_table = similarity_table[
+                            similarity_table["Descriptive resemblance"].fillna(False)
+                            & ~similarity_table["Susp. cluster"].isin(dominant_clusters)
+                        ].sort_values("Waveform correlation r", ascending=False)
+                        if similar_table.empty:
+                            st.info(
+                                "No minority cluster showed a descriptive "
+                                "resemblance (r ≥ 0.70, no FDR-significant "
+                                "difference) to any selected diagnosis."
+                            )
+                        else:
+                            for _, top_row in similar_table.head(5).iterrows():
+                                st.plotly_chart(
+                                    _plot_cluster_diagnosis_similarity(
+                                        similarity_plot_data[top_row["Comparison"]],
+                                        float(top_row["Waveform correlation r"]),
+                                        float(top_row["Cosine similarity"]),
+                                        bool(top_row["Significantly different"]),
+                                    ),
+                                    use_container_width=True,
+                                    theme=None,
+                                    key=(
+                                        f"cluster_diagnosis_top5_{pair_key}_"
+                                        f"{top_row['Comparison']}"
+                                    ),
+                                )
+
+                        selected_similarity = st.selectbox(
+                            "Comparison to plot",
+                            similarity_table["Comparison"].tolist(),
+                            key=f"cluster_diagnosis_plot_choice_{pair_key}",
+                        )
+                        selected_row = similarity_table[
+                            similarity_table["Comparison"]
+                            == selected_similarity
+                        ].iloc[0]
+                        st.plotly_chart(
+                            _plot_cluster_diagnosis_similarity(
+                                similarity_plot_data[selected_similarity],
+                                float(selected_row["Waveform correlation r"]),
+                                float(selected_row["Cosine similarity"]),
+                                bool(selected_row["Significantly different"]),
+                            ),
+                            use_container_width=True,
+                            theme=None,
+                            key=f"cluster_diagnosis_plot_{pair_key}",
+                        )
+
                 if st.checkbox(
                     "Show individual patient delta lines colored by cluster",
                     value=False, key=f"delta_cluster_show_lines_{pair_key}",
@@ -5972,11 +7657,34 @@ def render_healthy_sick_delta_mode(
                         ))
                     lines_fig.update_layout(
                         height=350, xaxis_title="Time (s)", yaxis_title="Delta amplitude",
+                        plot_bgcolor="white", paper_bgcolor="white", font_color="black",
                     )
                     st.plotly_chart(
                         lines_fig, use_container_width=True, theme=None,
                         key=f"delta_cluster_lines_{pair_key}",
                     )
+
+    # Streamlit executes tab bodies in source-call order, independent of the
+    # selected tab. Render clustering first so the first visible tab is also
+    # the first analysis calculated.
+    with tabs[0]:
+        _render_clustering_tab()
+    with tabs[1]:
+        _render_best_examples_tab()
+    with tabs[2]:
+        _render_susp_pairwise_tab()
+    with tabs[3]:
+        _render_common_disease_tab()
+    with tabs[4]:
+        _render_diagnosed_pairwise_tab()
+    with tabs[5]:
+        _render_cohort_comparison_tab()
+    with tabs[6]:
+        _render_demographics_tab()
+    with tabs[7]:
+        _render_gender_age_tab()
+    with tabs[8]:
+        _render_age_decade_hep_tab()
 
 
 def _clean_patient_candidates(
@@ -5998,7 +7706,11 @@ def _clean_patient_candidates(
         n_rpeaks = len(np.asarray(individual[4]).ravel()) if individual[4] is not None else 0
         if hep_roughness > 0.45 or ecg_roughness > 0.45 or n_rpeaks < 30:
             continue
-        source_path = os.path.join(BASE_PATH, str(row.group), str(row.stage), f"{row.patient_id}.pkl")
+        # individual[0] is the raw cache-tuple ID (matches the on-disk filename
+        # stem, e.g. "SUB-I0002..._N3_1200_5"); row.patient_id is canonicalized
+        # (stage/segment suffix stripped) for cross-stage grouping and does not
+        # exist as a file.
+        source_path = os.path.join(BASE_PATH, str(row.group), str(row.stage), f"{individual[0]}.pkl")
         if not os.path.exists(source_path):
             continue
         score = np.log1p(n_rpeaks) - 2.0 * hep_roughness - ecg_roughness
@@ -6023,6 +7735,17 @@ def _build_patient_hep_pipeline(
     with open(source_path, "rb") as source_file:
         source_raw = pickle.load(source_file)
     raw = hep_mod.drop_non_eeg_channels(source_raw.copy())
+    # process_file_data overwrites the ECG channel in-place with its cleaned
+    # version, so the true raw ECG must be captured before calling it.
+    pre_clean_ecg_idx = next(
+        (i for i, name in enumerate(raw.ch_names)
+         if "ecg" in name.lower() or "ekg" in name.lower()),
+        None,
+    )
+    raw_ecg_full = (
+        raw.get_data(picks=[pre_clean_ecg_idx])[0] * 1e6
+        if pre_clean_ecg_idx is not None else None
+    )
     processed = hep_mod.process_file_data(raw, patient_id)
     if processed is None:
         return None
@@ -6045,9 +7768,14 @@ def _build_patient_hep_pipeline(
     segment_end = min(clean_raw.n_times, center_peak + half_window)
     segment_times = np.arange(segment_start, segment_end) / sfreq
     segment_times -= segment_times[0]
-    ecg_segment = clean_raw.get_data(picks=[ecg_indices[0]])[0, segment_start:segment_end] * 1e6
+    cleaned_ecg_segment = clean_raw.get_data(picks=[ecg_indices[0]])[0, segment_start:segment_end] * 1e6
+    raw_ecg_segment = (
+        raw_ecg_full[segment_start:segment_end] if raw_ecg_full is not None else cleaned_ecg_segment
+    )
     example_eeg_index = eeg_indices[0]
-    eeg_segment = clean_raw.get_data(picks=[example_eeg_index])[0, segment_start:segment_end] * 1e6
+    # process_file_data does not touch EEG channels, so clean_raw's EEG here
+    # is still pre-ICA (raw) EEG; the ICA-cleaned version is sampled below.
+    raw_eeg_segment = clean_raw.get_data(picks=[example_eeg_index])[0, segment_start:segment_end] * 1e6
     segment_rpeaks = np.asarray(rpeaks, dtype=int)
     segment_rpeaks = segment_rpeaks[
         (segment_rpeaks >= segment_start) & (segment_rpeaks < segment_end)
@@ -6077,6 +7805,9 @@ def _build_patient_hep_pipeline(
     )
     ica_raw = clean_raw.copy()
     ica_raw = hep_mod._apply_ica_ecg_removal(ica_raw, patient_id)
+    cleaned_eeg_segment = (
+        ica_raw.get_data(picks=[example_eeg_index])[0, segment_start:segment_end] * 1e6
+    )
     after = hep_mod.process_and_invert_hep(
         ica_raw, rpeaks, sfreq, minmax, rpeak_ts,
         patient_id, group_name="pipeline_after_ica",
@@ -6088,8 +7819,10 @@ def _build_patient_hep_pipeline(
 
     return {
         "sfreq": float(sfreq), "detection_log": detection_log,
-        "segment_times": segment_times, "ecg_segment": ecg_segment,
-        "eeg_segment": eeg_segment, "eeg_name": clean_raw.ch_names[example_eeg_index],
+        "segment_times": segment_times,
+        "raw_ecg_segment": raw_ecg_segment, "cleaned_ecg_segment": cleaned_ecg_segment,
+        "raw_eeg_segment": raw_eeg_segment, "cleaned_eeg_segment": cleaned_eeg_segment,
+        "eeg_name": clean_raw.ch_names[example_eeg_index],
         "segment_rpeak_times": segment_rpeak_times,
         "epoch_times": epoch_times, "kept_epochs": kept_epochs * 1e6,
         "epoch_channel_names": [clean_raw.ch_names[index] for index in eeg_indices],
@@ -6155,26 +7888,40 @@ def render_patient_hep_pipeline_mode(
     metrics[2].metric("Complete epochs", pipeline["n_valid"])
     metrics[3].metric("QC-retained epochs", pipeline["n_kept"])
 
-    st.subheader("1. Sampled ECG and EEG with detected R-peaks")
-    sampled = make_subplots(rows=2, cols=1, shared_xaxes=True,
-                            subplot_titles=("Cleaned ECG", f"EEG — {pipeline['eeg_name']}"))
-    sampled.add_trace(go.Scattergl(
-        x=pipeline["segment_times"], y=pipeline["ecg_segment"], mode="lines",
-        name="ECG", line=dict(color="#C0392B", width=1.2),
-    ), row=1, col=1)
-    sampled.add_trace(go.Scattergl(
-        x=pipeline["segment_times"], y=pipeline["eeg_segment"], mode="lines",
-        name=pipeline["eeg_name"], line=dict(color="#0072B2", width=1.0),
-    ), row=2, col=1)
+    st.subheader("1. Raw vs. cleaned ECG and EEG, with detected R-peaks")
+    sampled = make_subplots(
+        rows=2, cols=2, shared_xaxes=True,
+        subplot_titles=(
+            "Raw ECG", f"Raw EEG — {pipeline['eeg_name']}",
+            "Cleaned ECG (fixed polarity + filtered)", "Cleaned EEG — after ICA",
+        ),
+    )
+    panels = [
+        ("raw_ecg_segment", "#C0392B", 1, 1), ("raw_eeg_segment", "#0072B2", 1, 2),
+        ("cleaned_ecg_segment", "#C0392B", 2, 1), ("cleaned_eeg_segment", "#0072B2", 2, 2),
+    ]
+    for key, color, row, col in panels:
+        sampled.add_trace(go.Scatter(
+            x=pipeline["segment_times"], y=pipeline[key], mode="lines",
+            showlegend=False, line=dict(color=color, width=1.0),
+        ), row=row, col=col)
     for peak_time in pipeline["segment_rpeak_times"]:
-        sampled.add_vline(x=float(peak_time), line_color="#E69F00", line_width=1,
-                          opacity=0.7, row="all", col=1)
-    sampled.update_yaxes(title_text="ECG (µV)", row=1, col=1)
-    sampled.update_yaxes(title_text="EEG (µV)", row=2, col=1)
-    sampled.update_xaxes(title_text="Time in sample (s)", row=2, col=1)
-    sampled.update_layout(height=650, hovermode="x unified")
-    st.plotly_chart(sampled, use_container_width=True)
-    st.caption("Orange vertical lines are detected ECG R-peaks used as alignment events.")
+        for row, col in ((1, 1), (1, 2), (2, 1), (2, 2)):
+            sampled.add_vline(x=float(peak_time), line_color="#E69F00", line_width=1,
+                              opacity=0.7, row=row, col=col)
+    sampled.update_yaxes(title_text="ECG (µV)", col=1)
+    sampled.update_yaxes(title_text="EEG (µV)", col=2)
+    sampled.update_xaxes(title_text="Time in sample (s)", row=2)
+    sampled.update_layout(
+        height=650, hovermode="x unified",
+        plot_bgcolor="white", paper_bgcolor="white", font_color="black",
+    )
+    st.plotly_chart(sampled, use_container_width=True, key="hep_pipeline_raw_vs_cleaned")
+    st.caption(
+        "Orange vertical lines are detected ECG R-peaks, the alignment events used "
+        "to lock EEG windows below. Cleaned EEG is the raw EEG after ICA-based "
+        "ECG-artifact removal; cleaned ECG has inverted polarity fixed and is filtered."
+    )
 
     st.subheader("2. Cut an EEG window around every R-peak, reject bad windows, then average")
     channel_epochs = pipeline["kept_epochs"][:, 0, :]
@@ -6188,12 +7935,19 @@ def render_patient_hep_pipeline_mode(
     epochs_figure.add_trace(go.Scatter(
         x=pipeline["epoch_times"], y=np.nanmean(channel_epochs, axis=0),
         mode="lines", name="Average retained EEG epoch",
-        line=dict(color="#009E73", width=3),
+        line=dict(color="#009E73", width=4),
     ))
     epochs_figure.add_vline(x=0, line_color="#E69F00", line_dash="dash")
+    epochs_figure.add_annotation(
+        x=0, y=1.0, xref="x", yref="y domain",
+        text="R-peak", showarrow=False, yshift=14, font=dict(color="black"),
+    )
     epochs_figure.update_layout(
         title=f"R-locked epochs for {pipeline['epoch_channel_names'][0]}",
         xaxis_title="Time from R-peak (s)", yaxis_title="EEG (µV)", height=480,
+        plot_bgcolor="white", paper_bgcolor="white", font_color="black",
+        xaxis=dict(showgrid=False, showline=False, mirror=False),
+        yaxis=dict(showgrid=False, showline=False, mirror=False),
     )
     st.plotly_chart(epochs_figure, use_container_width=True)
 
@@ -6207,6 +7961,7 @@ def render_patient_hep_pipeline_mode(
     heatmap.update_layout(
         xaxis_title="Time from R-peak (s)", yaxis_title="EEG electrode",
         height=max(520, 24 * len(pipeline["after_names"])),
+        plot_bgcolor="white", paper_bgcolor="white", font_color="black",
     )
     st.plotly_chart(heatmap, use_container_width=True)
 
@@ -6216,17 +7971,24 @@ def render_patient_hep_pipeline_mode(
     compiled = go.Figure()
     compiled.add_trace(go.Scatter(
         x=pipeline["before_times"], y=before_average, mode="lines",
-        name="Before ICA", line=dict(color="#888888", width=2), opacity=0.75,
+        name="Before ICA", line=dict(color="#888888", width=3), opacity=0.75,
     ))
     compiled.add_trace(go.Scatter(
         x=pipeline["after_times"], y=after_average, mode="lines",
-        name="After ICA (final HEP)", line=dict(color="#0072B2", width=3),
+        name="After ICA (final HEP)", line=dict(color="#0072B2", width=4),
     ))
     compiled.add_vline(x=0, line_color="#E69F00", line_dash="dash")
+    compiled.add_annotation(
+        x=0, y=1.0, xref="x", yref="y domain",
+        text="R-peak", showarrow=False, yshift=14, font=dict(color="black"),
+    )
     compiled.update_layout(
         title="Average across all retained EEG electrodes",
         xaxis_title="Time from R-peak (s)", yaxis_title="Mean HEP (µV)",
         height=500, hovermode="x unified",
+        plot_bgcolor="white", paper_bgcolor="white", font_color="black",
+        xaxis=dict(showgrid=False, showline=False, mirror=False),
+        yaxis=dict(showgrid=False, showline=False, mirror=False),
     )
     st.plotly_chart(compiled, use_container_width=True)
     st.info(
@@ -6237,16 +7999,465 @@ def render_patient_hep_pipeline_mode(
     )
 
 
+# =============================================================================
+# HR x EEG-power modulation across sleep stages
+# =============================================================================
+_HR_PSD_BANDS = {
+    "Broadband (0.5-45 Hz)": (0.5, 45.0),
+    "Delta (0.5-4 Hz)": (0.5, 4.0),
+    "Theta (4-8 Hz)": (4.0, 8.0),
+    "Alpha (8-12 Hz)": (8.0, 12.0),
+    "Beta (12-30 Hz)": (12.0, 30.0),
+    "Gamma (30-45 Hz)": (30.0, 45.0),
+}
+
+
+def _hr_psd_candidate_rows(raw_df: pd.DataFrame) -> pd.DataFrame:
+    """One source recording per (patient_id, group, stage) with enough R-peaks."""
+    rows = []
+    seen = set()
+    for row in raw_df.itertuples(index=False):
+        key = (row.patient_id, row.group, row.stage)
+        if key in seen:
+            continue
+        individual = row.individual
+        if individual is None or len(individual) <= 4 or individual[4] is None:
+            continue
+        n_rpeaks = len(np.asarray(individual[4]).ravel())
+        if n_rpeaks < 20:
+            continue
+        source_path = os.path.join(BASE_PATH, str(row.group), str(row.stage), f"{individual[0]}.pkl")
+        if not os.path.exists(source_path):
+            continue
+        seen.add(key)
+        rows.append({
+            "patient_id": str(row.patient_id), "group": str(row.group),
+            "stage": str(row.stage), "source_path": source_path,
+            "n_rpeaks": n_rpeaks,
+        })
+    return pd.DataFrame(rows)
+
+
+def _compute_hr_psd_patient_correlation(
+    hep_mod, source_path: str, patient_id: str,
+    selected_channels: Sequence[str], band_range: tuple,
+) -> Optional[dict]:
+    """Correlate instantaneous HR (bpm) against instantaneous EEG band power, per channel."""
+    try:
+        with open(source_path, "rb") as source_file:
+            source_raw = pickle.load(source_file)
+        raw = hep_mod.drop_non_eeg_channels(source_raw.copy())
+        processed = hep_mod.process_file_data(raw, patient_id)
+        if processed is None:
+            return None
+        clean_raw, sfreq, _rpeak_ts, rpeaks, _minmax, _log = processed
+        rpeaks = np.asarray(rpeaks, dtype=float)
+        if len(rpeaks) < 20:
+            return None
+        channel_lookup = {str(name).lower(): index for index, name in enumerate(clean_raw.ch_names)}
+        eeg_indices = [
+            channel_lookup[str(channel).lower()] for channel in selected_channels
+            if str(channel).lower() in channel_lookup
+        ]
+        if not eeg_indices:
+            return None
+        eeg_data = clean_raw.get_data(picks=eeg_indices)
+
+        band_powers, t_power = hep_mod._compute_eeg_band_power_series(
+            eeg_data, sfreq, fs_out=4.0, bands={"band": band_range}, window_sec=8.0,
+        )
+        if band_powers is None:
+            return None
+
+        rr_intervals = np.diff(rpeaks) / sfreq
+        valid_mask = (rr_intervals > 0.3) & (rr_intervals < 2.0)
+        rpeaks_trimmed = rpeaks[:-1][valid_mask]
+        rr_valid = rr_intervals[valid_mask]
+        if len(rr_valid) < 20:
+            return None
+        hr_bpm = 60.0 / rr_valid
+        t_hr = rpeaks_trimmed / sfreq
+
+        t_eeg_abs = rpeaks[0] / sfreq + t_power
+        t_start = max(t_hr[0], t_eeg_abs[0])
+        t_end = min(t_hr[-1], t_eeg_abs[-1])
+        if t_end <= t_start:
+            return None
+        t_common = np.arange(t_start, t_end, 0.25)
+        if len(t_common) < 20:
+            return None
+        hr_common = np.interp(t_common, t_hr, hr_bpm)
+
+        channel_names = [clean_raw.ch_names[index] for index in eeg_indices]
+        rows = []
+        for ch_i, ch_name in enumerate(channel_names):
+            power_common = np.interp(t_common, t_eeg_abs, band_powers["band"][ch_i])
+            log_power = np.log1p(power_common)
+            if np.std(log_power) < 1e-12 or np.std(hr_common) < 1e-12:
+                continue
+            r, p = stats.spearmanr(hr_common, log_power)
+            if not np.isfinite(r):
+                continue
+            rows.append({"channel": ch_name, "r": float(r), "p": float(p)})
+        if not rows:
+            return None
+        return {"n_samples": len(t_common), "mean_hr": float(np.mean(hr_common)), "rows": rows}
+    except Exception:
+        return None
+
+
+def _load_hr_psd_correlations(
+    hep_mod,
+    candidates_df: pd.DataFrame,
+    selected_channels: Sequence[str],
+    band_range: tuple,
+    band_key: str,
+    max_per_stage: int,
+) -> pd.DataFrame:
+    sampled = (
+        candidates_df.sort_values("n_rpeaks", ascending=False)
+        .groupby(["group", "stage"], group_keys=False)
+        .head(max_per_stage)
+    )
+    cache_key = (
+        tuple(sorted(sampled["source_path"])),
+        tuple(selected_channels), band_key,
+    )
+    cache = st.session_state.get("_hr_psd_correlation_cache")
+    if cache and cache.get("key") == cache_key:
+        return cache["result"]
+
+    n = len(sampled)
+    progress = st.progress(0.0, text="Computing HR-PSD correlations...")
+    records = []
+    for i, row in enumerate(sampled.itertuples(index=False)):
+        progress.progress((i + 1) / max(n, 1), text=f"{row.patient_id} ({i + 1}/{n})")
+        result = _compute_hr_psd_patient_correlation(
+            hep_mod, row.source_path, row.patient_id, selected_channels, band_range,
+        )
+        if result is None:
+            continue
+        for ch_row in result["rows"]:
+            records.append({
+                "patient_id": row.patient_id, "group": row.group, "stage": row.stage,
+                "channel": ch_row["channel"], "r": ch_row["r"], "p": ch_row["p"],
+            })
+    progress.empty()
+    out = pd.DataFrame(records)
+    st.session_state["_hr_psd_correlation_cache"] = {"key": cache_key, "result": out}
+    return out
+
+
+def _render_hr_psd_cohort_views(
+    df: pd.DataFrame, title: str, selected_stages: Sequence[str], band_label: str,
+) -> None:
+    if df.empty:
+        st.info("No data for this cohort.")
+        return
+    per_patient = df.groupby(["patient_id", "stage"], as_index=False)["r"].median()
+    st.markdown(f"**{title}** — n={per_patient['patient_id'].nunique()} patients")
+
+    fig_box = go.Figure()
+    for stage in selected_stages:
+        sdf = per_patient[per_patient["stage"] == stage]
+        if sdf.empty:
+            continue
+        fig_box.add_trace(go.Box(
+            y=sdf["r"].values, name=STAGE_LABELS.get(stage, stage),
+            boxpoints="all", jitter=0.3, pointpos=0,
+            text=sdf["patient_id"].astype(str),
+            hovertemplate="Patient: %{text}<br>median r: %{y:.3f}<extra></extra>",
+        ))
+    fig_box.update_layout(
+        title=f"Per-patient median-channel HR ↔ {band_label} correlation, by stage",
+        yaxis_title="Spearman r (HR vs log power)", height=450,
+        plot_bgcolor="white", paper_bgcolor="white", font_color="black",
+    )
+    st.plotly_chart(fig_box, use_container_width=True, theme=None)
+
+    if len(selected_stages) >= 2:
+        stage_groups = [
+            per_patient.loc[per_patient["stage"] == stage, "r"].values
+            for stage in selected_stages
+        ]
+        stage_groups = [group for group in stage_groups if len(group) >= 3]
+        if len(stage_groups) >= 2:
+            stat, p_value = stats.kruskal(*stage_groups)
+            st.caption(
+                f"Kruskal–Wallis across stages (median-channel r, one point per patient): "
+                f"H={stat:.2f}, p={format_p(p_value)}"
+            )
+
+    per_channel = df.groupby(["channel", "stage"], as_index=False)["r"].mean()
+    channel_order = [
+        channel for channel in MONTAGE_1020_CHANNEL_ORDER
+        if channel in per_channel["channel"].unique()
+    ] or sorted(per_channel["channel"].unique())
+    heat = per_channel.pivot(index="channel", columns="stage", values="r").reindex(channel_order)
+    heat = heat[[stage for stage in selected_stages if stage in heat.columns]]
+    fig_heat = go.Figure(go.Heatmap(
+        z=heat.values, x=[STAGE_LABELS.get(stage, stage) for stage in heat.columns],
+        y=heat.index, colorscale="RdBu_r", zmid=0, colorbar_title="mean r",
+    ))
+    fig_heat.update_layout(
+        title=f"Mean HR ↔ {band_label} correlation per channel × stage",
+        height=max(400, 22 * len(heat.index)),
+        plot_bgcolor="white", paper_bgcolor="white", font_color="black",
+    )
+    st.plotly_chart(fig_heat, use_container_width=True, theme=None)
+
+    with st.expander("Per-channel detail (every selected channel)", expanded=False):
+        for stage in selected_stages:
+            sdf = df[df["stage"] == stage]
+            if sdf.empty:
+                continue
+            fig_ch = go.Figure()
+            for channel in channel_order:
+                cdf = sdf[sdf["channel"] == channel]
+                if cdf.empty:
+                    continue
+                fig_ch.add_trace(go.Box(y=cdf["r"].values, name=channel, boxpoints=False))
+            fig_ch.update_layout(
+                title=f"{STAGE_LABELS.get(stage, stage)}: HR ↔ {band_label} r per channel",
+                yaxis_title="Spearman r", height=420,
+                plot_bgcolor="white", paper_bgcolor="white", font_color="black",
+            )
+            st.plotly_chart(fig_ch, use_container_width=True, theme=None)
+
+
+# Stage-appropriate band for the Oz spectral-peak search: alpha while awake,
+# sigma/spindle band once asleep (mirrors the classic HR-vs-peak-freq figure).
+_OZ_PEAK_BANDS = {
+    "W": (7.0, 13.0),
+    "light_sleep": (9.0, 16.0),
+    "N3": (9.0, 16.0),
+    "R": (7.0, 13.0),
+}
+
+
+def _compute_hr_oz_peak_point(
+    hep_mod, source_path: str, patient_id: str, stage: str,
+) -> Optional[dict]:
+    """Per-recording mean HR (Hz) and Oz PSD peak frequency in the stage's band."""
+    try:
+        with open(source_path, "rb") as source_file:
+            source_raw = pickle.load(source_file)
+        raw = hep_mod.drop_non_eeg_channels(source_raw.copy())
+        processed = hep_mod.process_file_data(raw, patient_id)
+        if processed is None:
+            return None
+        clean_raw, sfreq, _rpeak_ts, rpeaks, _minmax, _log = processed
+        rpeaks = np.asarray(rpeaks, dtype=float)
+        if len(rpeaks) < 20:
+            return None
+        rr_intervals = np.diff(rpeaks) / sfreq
+        rr_valid = rr_intervals[(rr_intervals > 0.3) & (rr_intervals < 2.0)]
+        if len(rr_valid) < 20:
+            return None
+        mean_hr_hz = float(np.mean(1.0 / rr_valid))
+
+        channel_lookup = {str(name).lower(): index for index, name in enumerate(clean_raw.ch_names)}
+        oz_index = channel_lookup.get("oz")
+        if oz_index is None:
+            return None
+        oz_data = clean_raw.get_data(picks=[oz_index])[0]
+        nperseg = min(len(oz_data), int(sfreq * 8))
+        if nperseg < int(sfreq * 2):
+            return None
+        freqs, psd = welch(oz_data, fs=float(sfreq), nperseg=nperseg)
+        fmin, fmax = _OZ_PEAK_BANDS.get(stage, (7.0, 16.0))
+        band_mask = (freqs >= fmin) & (freqs <= fmax)
+        if not np.any(band_mask):
+            return None
+        band_freqs, band_psd = freqs[band_mask], psd[band_mask]
+        peak_freq = float(band_freqs[np.argmax(band_psd)])
+        return {"mean_hr_hz": mean_hr_hz, "oz_peak_hz": peak_freq}
+    except Exception:
+        return None
+
+
+def _load_hr_oz_peak_scatter(
+    hep_mod, candidates_df: pd.DataFrame, max_per_stage: int,
+) -> pd.DataFrame:
+    sampled = (
+        candidates_df.sort_values("n_rpeaks", ascending=False)
+        .groupby(["group", "stage"], group_keys=False)
+        .head(max_per_stage)
+    )
+    cache_key = tuple(sorted(sampled["source_path"]))
+    cache = st.session_state.get("_hr_oz_peak_cache")
+    if cache and cache.get("key") == cache_key:
+        return cache["result"]
+
+    n = len(sampled)
+    progress = st.progress(0.0, text="Computing HR / Oz spectral-peak points...")
+    records = []
+    for i, row in enumerate(sampled.itertuples(index=False)):
+        progress.progress((i + 1) / max(n, 1), text=f"{row.patient_id} ({i + 1}/{n})")
+        point = _compute_hr_oz_peak_point(hep_mod, row.source_path, row.patient_id, row.stage)
+        if point is None:
+            continue
+        records.append({
+            "patient_id": row.patient_id, "group": row.group, "stage": row.stage,
+            "mean_hr_hz": point["mean_hr_hz"], "oz_peak_hz": point["oz_peak_hz"],
+        })
+    progress.empty()
+    out = pd.DataFrame(records)
+    st.session_state["_hr_oz_peak_cache"] = {"key": cache_key, "result": out}
+    return out
+
+
+def _render_hr_oz_peak_scatter(df: pd.DataFrame, selected_stages: Sequence[str]) -> None:
+    """One HR-vs-Oz-peak-frequency scatter panel per stage, with fit line and r/p."""
+    stages_present = [stage for stage in selected_stages if stage in df["stage"].unique()]
+    if df.empty or not stages_present:
+        st.info("No data available for the HR vs Oz spectral-peak scatter.")
+        return
+
+    fig = make_subplots(
+        rows=len(stages_present), cols=1,
+        subplot_titles=[STAGE_LABELS.get(stage, stage) for stage in stages_present],
+        vertical_spacing=0.35 / len(stages_present),
+    )
+    for i, stage in enumerate(stages_present, start=1):
+        sdf = df[df["stage"] == stage]
+        x, y = sdf["oz_peak_hz"].values, sdf["mean_hr_hz"].values
+        fig.add_trace(go.Scatter(
+            x=x, y=y, mode="markers", marker=dict(size=8, color="black"), showlegend=False,
+            text=sdf["patient_id"].astype(str),
+            hovertemplate="Patient: %{text}<br>Oz peak: %{x:.2f} Hz<br>HR: %{y:.3f} Hz<extra></extra>",
+        ), row=i, col=1)
+
+        annotation_lines = [f"mean HR = {np.mean(y):.2f} Hz", f"mean PF = {np.mean(x):.2f} Hz"]
+        if len(x) >= 3 and np.std(x) > 1e-12:
+            slope, intercept = np.polyfit(x, y, 1)
+            x_line = np.array([x.min(), x.max()])
+            fig.add_trace(go.Scatter(
+                x=x_line, y=slope * x_line + intercept, mode="lines",
+                line=dict(color="black", width=1), showlegend=False,
+            ), row=i, col=1)
+            r, p = stats.pearsonr(x, y)
+            annotation_lines.append(f"r = {r:.2f}, {format_p(p)}")
+        axis_suffix = "" if i == 1 else str(i)
+        fig.add_annotation(
+            xref=f"x{axis_suffix} domain", yref=f"y{axis_suffix} domain", x=1.0, y=1.0,
+            xanchor="left", yanchor="top", text="<br>".join(annotation_lines),
+            showarrow=False, align="left", font=dict(size=11),
+        )
+        fig.update_xaxes(title_text="Oz spectral peak [Hz]", row=i, col=1)
+        fig.update_yaxes(title_text="heart rate [Hz]", row=i, col=1)
+
+    fig.update_layout(
+        height=320 * len(stages_present), margin=dict(r=140),
+        plot_bgcolor="white", paper_bgcolor="white", font_color="black",
+    )
+    st.plotly_chart(fig, use_container_width=True, theme=None)
+
+
+def render_hr_psd_modulation_mode(
+    raw_df: pd.DataFrame,
+    ehr_df: pd.DataFrame,
+    selected_stages: Sequence[str],
+    selected_channels: Sequence[str],
+    hep_mod,
+) -> None:
+    """Correlate instantaneous heart rate with instantaneous EEG band power per stage/cohort."""
+    st.header("Heart rate × EEG power modulation across sleep stages")
+    st.caption(
+        "Per patient-stage recording: instantaneous heart rate (from R-R intervals) and "
+        "instantaneous EEG band power are interpolated onto a shared 4 Hz time grid, then "
+        "correlated (Spearman) per electrode. A sleep stage where this coupling is "
+        "consistently stronger (|r| further from 0) shows more HR-linked EEG power "
+        "modulation than a stage where it is closer to 0."
+    )
+
+    band_label = st.selectbox("Frequency band", list(_HR_PSD_BANDS), key="hr_psd_band")
+    band_range = _HR_PSD_BANDS[band_label]
+    max_per_stage = int(st.slider(
+        "Max patients per group/stage to process", 10, 150, 40, 5,
+        key="hr_psd_max_patients",
+        help="Raw recordings are re-loaded from disk for this analysis, so this caps runtime.",
+    ))
+
+    candidates = _hr_psd_candidate_rows(raw_df)
+    if candidates.empty:
+        st.warning("No source recordings with detectable R-peaks were found.")
+        return
+
+    with st.spinner("Loading raw recordings and computing HR/PSD correlations…"):
+        corr_df = _load_hr_psd_correlations(
+            hep_mod, candidates, selected_channels, band_range, band_label, max_per_stage,
+        )
+    if corr_df.empty:
+        st.error("Could not compute HR-PSD correlations for any sampled patient.")
+        return
+    corr_df = corr_df[corr_df["stage"].isin(selected_stages)]
+    st.success(
+        f"Computed correlations for {corr_df['patient_id'].nunique()} patients "
+        f"across {corr_df['stage'].nunique()} sleep stages."
+    )
+
+    dx_names = dict(zip(ehr_df["patient_id"], ehr_df["dx_names"])) if not ehr_df.empty else {}
+    categories = dict(zip(ehr_df["patient_id"], ehr_df["categories"])) if not ehr_df.empty else {}
+
+    tab_overview, tab_susp, tab_diagnosed, tab_oz_scatter = st.tabs([
+        "1. Whole population", "2. Unknown", "3. Diagnosed (by diagnosis)",
+        "4. HR vs Oz peak frequency",
+    ])
+
+    with tab_overview:
+        _render_hr_psd_cohort_views(corr_df, "All patients", selected_stages, band_label)
+
+    with tab_susp:
+        susp_df = corr_df[corr_df["patient_id"].map(lambda pid: not dx_names.get(pid, []))]
+        _render_hr_psd_cohort_views(
+            susp_df, "Unknown (no recorded diagnosis)", selected_stages, band_label,
+        )
+
+    with tab_diagnosed:
+        diagnosed_df = corr_df[corr_df["patient_id"].map(lambda pid: bool(dx_names.get(pid, [])))]
+        if diagnosed_df.empty:
+            st.info("No diagnosed patients in the current selection.")
+        else:
+            category_counts: Counter = Counter()
+            for pid in diagnosed_df["patient_id"].unique():
+                category_counts.update(categories.get(pid, []))
+            available_categories = [name for name, _count in category_counts.most_common()]
+            if not available_categories:
+                st.info("No mapped diagnosis categories are available.")
+            else:
+                selected_category = st.selectbox(
+                    "Diagnosis", available_categories, key="hr_psd_diagnosis_category",
+                )
+                category_df = diagnosed_df[diagnosed_df["patient_id"].map(
+                    lambda pid: selected_category in categories.get(pid, [])
+                )]
+                _render_hr_psd_cohort_views(
+                    category_df, selected_category, selected_stages, band_label,
+                )
+
+    with tab_oz_scatter:
+        st.caption(
+            "Per patient, one point per sleep stage: mean heart rate (from R-R intervals, "
+            "in Hz) against the Oz-channel spectral peak frequency (alpha band while awake, "
+            "sigma/spindle band during sleep). Fit line and Pearson r/p per stage."
+        )
+        with st.spinner("Loading raw recordings and computing HR / Oz-peak points…"):
+            oz_scatter_df = _load_hr_oz_peak_scatter(hep_mod, candidates, max_per_stage)
+        oz_scatter_df = oz_scatter_df[oz_scatter_df["stage"].isin(selected_stages)]
+        _render_hr_oz_peak_scatter(oz_scatter_df, selected_stages)
+
+
 def render_non_diagnosis_complete_mode(
     grouped_df: pd.DataFrame,
     selected_stages: Sequence[str],
     selected_channels: Sequence[str],
     apply_ica: bool = False,
 ) -> None:
-    """Expose every waveform/electrode/statistical view for the Susp. Epilepsy cohort."""
-    st.header("Susp. Epilepsy cohort: complete sleep-stage HEP analysis")
+    """Expose every waveform/electrode/statistical view for the Unknown cohort."""
+    st.header("Unknown cohort: complete sleep-stage HEP analysis")
     st.caption(
-        "All analyses below use only patients with Susp. Epilepsy recorded in the "
+        "All analyses below use only patients with Unknown recorded in the "
         "available diagnosis data. Sleep-stage waveform comparisons are paired by "
         "patient and tested with cluster-mass permutations; electrode tests include "
         "electrode-level FDR correction. Electrodes represented in less than 5% of "
@@ -6275,7 +8486,7 @@ def render_non_diagnosis_complete_mode(
     with waveform_tab:
         render_pairwise_waveform_mode(
             grouped_df,
-            ["Susp. Epilepsy"],
+            ["Unknown"],
             selected_stages,
             selected_channels,
             apply_ica=apply_ica,
@@ -6283,7 +8494,7 @@ def render_non_diagnosis_complete_mode(
     with electrode_tab:
         render_electrode_topomap_mode(
             grouped_df,
-            ["Susp. Epilepsy"],
+            ["Unknown"],
             selected_stages,
             selected_channels,
             apply_ica=apply_ica,
@@ -6291,7 +8502,7 @@ def render_non_diagnosis_complete_mode(
     with brain_map_tab:
         render_testing_figures_mode(
             grouped_df,
-            ["Susp. Epilepsy"],
+            ["Unknown"],
             selected_stages,
             selected_channels,
             apply_ica=apply_ica,
@@ -6302,6 +8513,105 @@ def render_non_diagnosis_complete_mode(
             selected_stages,
             selected_channels,
             apply_ica=apply_ica,
+        )
+
+
+_DIAGNOSIS_FEATURE_METRICS = [
+    "ECG T-peak time",
+    "EEG T-wave amplitude (mean)",
+    "EEG T-wave amplitude (peak)",
+]
+
+
+def _render_diagnosis_feature_tab(
+    grouped_df: pd.DataFrame,
+    selected_stages: Sequence[str],
+    selected_channels: Sequence[str],
+    hep_mod,
+) -> None:
+    """Per-patient HR-peak-time and T-wave amplitude, compared across diagnosis groups."""
+    st.caption(
+        "ECG T-peak time (heart-rate response timing) and EEG T-wave amplitude "
+        "(mean and peak), compared across diagnosis groups within each sleep stage."
+    )
+    t_window = (0.15, 0.5)
+    metric_tabs = st.tabs(_DIAGNOSIS_FEATURE_METRICS)
+    for tab, metric in zip(metric_tabs, _DIAGNOSIS_FEATURE_METRICS):
+        with tab:
+            rows = []
+            for row in grouped_df.itertuples(index=False):
+                if row.individual is None:
+                    continue
+                value = extract_metric(
+                    hep_mod, row.individual, metric, t_window, list(selected_channels)
+                )
+                if value is None or not np.isfinite(value):
+                    continue
+                rows.append({
+                    "stage": row.stage,
+                    "patient_id": row.patient_id,
+                    "diagnosis_group": row.diagnosis_group,
+                    "metric_value": value,
+                })
+            metric_df = pd.DataFrame(rows)
+            if metric_df.empty:
+                st.info("No values available for this metric.")
+                continue
+            fig = plot_stage_comparison(
+                metric_df, list(selected_stages), metric, "Exclusive Diagnosis Category",
+            )
+            st.plotly_chart(fig, use_container_width=True, theme=None)
+
+
+def render_diagnosis_category_hep_mode(
+    grouped_df: pd.DataFrame,
+    all_groups: Sequence[str],
+    selected_stages: Sequence[str],
+    selected_channels: Sequence[str],
+    hep_mod,
+    apply_ica: bool = False,
+) -> None:
+    """Compare HEP and HR/T-wave features across exclusive diagnosis categories."""
+    st.header("Diagnosis comparison: HEP + HR/T-wave features")
+    st.caption(
+        "Patients are grouped by one exclusive diagnosis category each (or Unknown). "
+        "The average-electrode tab tests every diagnosis pair; the per-electrode tab "
+        "shows the same contrasts as a small-multiple grid with a 1:1 amplitude/time "
+        "axis ratio per electrode."
+    )
+
+    include_unknown = st.checkbox(
+        "Include Unknown diagnosis group",
+        value=False,
+        help="Off by default: patients with no mapped diagnosis are excluded from these comparisons.",
+        key="diagnosis_hep_include_unknown",
+    )
+    if not include_unknown:
+        grouped_df = grouped_df[grouped_df["diagnosis_group"] != "Unknown"]
+        all_groups = [group for group in all_groups if group != "Unknown"]
+
+    if len(all_groups) < 1:
+        st.warning("No diagnosis groups available. Try including Unknown or lowering the minimum patient count.")
+        return
+
+    avg_tab, electrode_tab, feature_tab = st.tabs([
+        "🫀 Average-electrode HEP",
+        "🔲 Per-electrode HEP grid",
+        "📈 HR peak & T-wave features",
+    ])
+    with avg_tab:
+        render_pairwise_waveform_mode(
+            grouped_df, all_groups, selected_stages, selected_channels,
+            apply_ica=apply_ica,
+        )
+    with electrode_tab:
+        render_electrode_topomap_mode(
+            grouped_df, all_groups, selected_stages, selected_channels,
+            apply_ica=apply_ica,
+        )
+    with feature_tab:
+        _render_diagnosis_feature_tab(
+            grouped_df, selected_stages, selected_channels, hep_mod,
         )
 
 
@@ -6328,6 +8638,7 @@ def plot_ai_confusion_matrix(
         xaxis_title="Predicted diagnosis", yaxis_title="True diagnosis",
         height=max(480, 65 * len(class_names) + 180),
         margin=dict(l=180, b=150, t=50, r=30),
+        plot_bgcolor="white", paper_bgcolor="white", font_color="black",
     )
     fig.update_xaxes(tickangle=-35)
     return fig
@@ -6346,6 +8657,7 @@ def plot_ai_feature_importance(model_result: dict, title: str, top_n: int = 20) 
         title=title, xaxis_title="Random Forest importance",
         yaxis_title="Feature", height=max(430, 25 * len(order) + 120),
         margin=dict(l=210, r=30, t=70, b=60),
+        plot_bgcolor="white", paper_bgcolor="white", font_color="black",
     )
     return fig
 
@@ -6442,7 +8754,7 @@ def render_ai_classification_mode(
         )
     else:
         if not available_categories:
-            st.warning("Susp. Epilepsy category has enough subjects for subgroup analysis.")
+            st.warning("Unknown category has enough subjects for subgroup analysis.")
             return
         index_disease = st.selectbox(
             "Index disease", available_categories,
@@ -6559,6 +8871,8 @@ def render_ai_classification_mode(
                 metrics_df, x="Representation", y="Value", color="Metric",
                 barmode="group", range_y=[0, 1], text_auto=".3f",
                 title="Held-out classification performance by feature representation",
+            ).update_layout(
+                plot_bgcolor="white", paper_bgcolor="white", font_color="black",
             ),
             use_container_width=True, theme=None,
         )
@@ -6612,6 +8926,8 @@ def render_ai_classification_mode(
                 distribution, x="diagnosis", y="value", color="diagnosis",
                 box=True, points="outliers",
                 title=f"{selected_feature} by diagnosis class",
+            ).update_layout(
+                plot_bgcolor="white", paper_bgcolor="white", font_color="black",
             ),
             use_container_width=True, theme=None,
         )
@@ -6633,6 +8949,8 @@ def render_ai_classification_mode(
                 latent_plot, x="AE dimension 1", y="AE dimension 2",
                 color="diagnosis", hover_name="patient_id",
                 title="Autoencoder latent projection by diagnosis",
+            ).update_layout(
+                plot_bgcolor="white", paper_bgcolor="white", font_color="black",
             ),
             use_container_width=True, theme=None,
         )
@@ -6658,7 +8976,8 @@ def render_ai_classification_mode(
             title="Physiological meaning of autoencoder dimensions (Pearson r)",
         )
         correlation_figure.update_layout(
-            height=650, margin=dict(l=220, r=30, t=70, b=70)
+            height=650, margin=dict(l=220, r=30, t=70, b=70),
+            plot_bgcolor="white", paper_bgcolor="white", font_color="black",
         )
         st.plotly_chart(correlation_figure, use_container_width=True, theme=None)
 
@@ -6861,6 +9180,16 @@ def _parse_cli_mode() -> Optional[str]:
     return parsed.mode
 
 
+def _parse_cli_gt10() -> Optional[bool]:
+    """Return the ``--gt10`` CLI override for the ≥10-electrode toggle, if any."""
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--gt10", type=str, default=None)
+    parsed, _unknown = parser.parse_known_args(sys.argv[1:])
+    if parsed.gt10 is None:
+        return None
+    return parsed.gt10.strip().lower() in ("1", "true", "yes", "on")
+
+
 def main() -> None:
     st.set_page_config(page_title="HEP Diagnosis × Sleep Stage", layout="wide")
     st.title("🫀🧠 HEP Diagnosis × Sleep Stage Comparison")
@@ -6879,13 +9208,15 @@ def main() -> None:
         st.warning("Select at least one HEP group.")
         return
 
+    diagnosis_hep_mode = "Diagnosis comparison — HEP + HR/T-wave features"
     non_diagnosis_mode = "Non-diagnosis patients — complete analysis"
-    healthy_sick_delta_mode = "Susp. Epilepsy vs diagnosed — patient stage deltas"
-    patient_pipeline_mode = "Single clean patient — HEP construction pipeline"
+    healthy_sick_delta_mode = "Unknown vs diagnosed — patient stage deltas"
+    hr_psd_mode = "HR × EEG power modulation across sleep stages"
     analysis_modes = [
+        diagnosis_hep_mode,
         non_diagnosis_mode,
         healthy_sick_delta_mode,
-        patient_pipeline_mode,
+        hr_psd_mode,
         "Summary metrics",
         "Pairwise HEP waveforms",
         "Electrode HEP + significant topomaps",
@@ -6896,16 +9227,16 @@ def main() -> None:
     default_mode_index = (
         analysis_modes.index(requested_mode)
         if requested_mode in analysis_modes
-        else 1
+        else 0
     )
     analysis_mode = st.sidebar.radio(
         "Analysis mode",
         analysis_modes,
         index=default_mode_index,
         help=(
-            "The default non-diagnosis mode combines all sleep-stage waveform tests, "
-            "per-electrode analysis, significant scalp topomaps, brain maps, and "
-            "window-level statistics."
+            "The default diagnosis-comparison mode groups patients by exclusive "
+            "diagnosis category and compares average-electrode HEP, per-electrode "
+            "HEP, and HR-peak/T-wave features across diagnoses."
         ),
     )
     _GROUPING_MODES = [
@@ -6916,10 +9247,16 @@ def main() -> None:
         "By Sex",
         "Exclusive Diagnosis Category",
     ]
-    if analysis_mode in (
-        non_diagnosis_mode, healthy_sick_delta_mode, patient_pipeline_mode,
+    if analysis_mode == diagnosis_hep_mode:
+        grouping_mode = "Exclusive Diagnosis Category"
+        st.sidebar.caption(
+            "Each patient is assigned to one exclusive diagnosis category "
+            "(or Unknown) for cross-diagnosis comparison."
+        )
+    elif analysis_mode in (
+        non_diagnosis_mode, healthy_sick_delta_mode, hr_psd_mode,
     ):
-        grouping_mode = "Susp. Epilepsy cohort"
+        grouping_mode = "Unknown cohort"
         st.sidebar.caption(
             "Cohorts are assigned from the presence or absence of recorded diagnoses."
         )
@@ -6928,7 +9265,7 @@ def main() -> None:
             "Grouping mode", _GROUPING_MODES,
             index=_GROUPING_MODES.index("Exclusive Diagnosis Category"),
         )
-    min_patients = int(st.sidebar.number_input("Min patients per group", 2, 200, 150, 1))
+    min_patients = int(st.sidebar.number_input("Min patients per group", 2, 200, 20, 1))
 
     available_stages = list_stages(BASE_PATH, selected_groups)
     default_stages = [s for s in STAGE_ORDER if s in available_stages] or available_stages
@@ -6978,9 +9315,13 @@ def main() -> None:
         "Apply ICA ECG-artifact removal", value=False,
         help="Passed through to get_group_individuals(apply_ica=...).",
     )
+    _cli_gt10 = _parse_cli_gt10()
+    _default_gt10 = (
+        _cli_gt10 if _cli_gt10 is not None else analysis_mode != healthy_sick_delta_mode
+    )
     _only_gt10_eeg = st.sidebar.toggle(
         "Only patients with ≥10 standard 10-20 EEG channels",
-        value=True,
+        value=_default_gt10,
         help=(
             "A patient must have at least 10 distinct channels from the exact "
             "24-channel 10-20 list shown below. Other EEG labels do not count. "
@@ -6992,6 +9333,10 @@ def main() -> None:
             "Active: ≥10 listed 10-20 EEG channels · separate `min10_1020eeg` cache"
         )
     if _force_rebuild:
+        # The on-disk cache is rebuilt below; discard all in-memory views so a
+        # later rerun cannot retain tuples from before the rebuild.
+        load_patient_data.clear()
+        extract_metric_frame.clear()
         st.session_state.pop("_automatic_pairwise_hep_cache", None)
         st.session_state.pop("_automatic_pairwise_electrode_cache", None)
         st.session_state.pop("_electrode_pairwise_hep_cache", None)
@@ -7004,11 +9349,20 @@ def main() -> None:
         else "Loading HEP data (get_group_individuals)…"
     )
     with st.spinner(loading_message):
-        raw_df = load_patient_data(
-            hep_mod, selected_groups, selected_stages,
-            force_rebuild=_force_rebuild, apply_ica=_apply_ica,
-            min_eeg_channels=10 if _only_gt10_eeg else None,
+        load_args = (
+            tuple(selected_groups), tuple(selected_stages), bool(_apply_ica),
+            10 if _only_gt10_eeg else None,
         )
+        if _force_rebuild:
+            raw_df = _load_patient_data_uncached(
+                hep_mod, load_args[0], load_args[1], force_rebuild=True,
+                apply_ica=load_args[2], min_eeg_channels=load_args[3],
+            )
+            # Populate the hot in-memory cache from the freshly written disk
+            # caches without forcing another source-data rebuild.
+            raw_df = load_patient_data(hep_mod, *load_args)
+        else:
+            raw_df = load_patient_data(hep_mod, *load_args)
 
     if _force_rebuild:
         st.sidebar.success("Cache rebuilt.")
@@ -7026,14 +9380,7 @@ def main() -> None:
     )
 
     # Restrict analysis controls to canonical international 10-20 electrodes.
-    # Both legacy temporal names (T3/T4/T5/T6) and their modern equivalents
-    # (T7/T8/P7/P8) are accepted when present in the processed data.
-    montage_1020_channel_order = [
-        "Fp1", "Fp2", "F7", "F3", "Fz", "F4", "F8",
-        "T3", "T7", "C3", "Cz", "C4", "T4", "T8",
-        "T5", "P7", "P3", "Pz", "P4", "T6", "P8",
-        "O1", "Oz", "O2",
-    ]
+    montage_1020_channel_order = MONTAGE_1020_CHANNEL_ORDER
     montage_1020_by_lower = {
         channel.lower(): channel for channel in montage_1020_channel_order
     }
@@ -7065,30 +9412,17 @@ def main() -> None:
 
     # Keep the individual tuple in the working frame so waveform mode uses
     # the exact same patient/stage records and diagnosis assignments.
-    metric_rows = []
-    progress = st.progress(0) if analysis_mode == "Summary metrics" else None
-    for i, (_, row) in enumerate(raw_df.iterrows()):
-        if progress is not None:
-            progress.progress((i + 1) / len(raw_df))
-        individual = row["individual"]
-        if individual is None:
-            continue
-        val = (
-            extract_metric(hep_mod, individual, metric, t_window, selected_channels)
-            if analysis_mode == "Summary metrics" else np.nan
-        )
-        metric_rows.append({
-            "group": row["group"],
-            "stage": row["stage"],
-            "patient_id": row["patient_id"],
-            "metric_value": val,
-            "individual": individual,
-        })
-    if progress is not None:
-        progress.empty()
-    metric_df_base = pd.DataFrame(metric_rows)
     if analysis_mode == "Summary metrics":
-        metric_df_base = metric_df_base.dropna(subset=["metric_value"])
+        with st.spinner("Extracting patient metrics…"):
+            metric_df_base = extract_metric_frame(
+                hep_mod, raw_df, load_args, metric, tuple(t_window),
+                tuple(selected_channels),
+            )
+    else:
+        # Avoid copying the large individual tuples through a Python row loop
+        # in waveform modes, where no scalar metric is needed.
+        metric_df_base = raw_df.copy(deep=False)
+        metric_df_base["metric_value"] = np.nan
 
     if metric_df_base.empty:
         message = (
@@ -7097,10 +9431,6 @@ def main() -> None:
             else "No valid HEP waveforms were loaded. Check channel settings."
         )
         st.error(message)
-        return
-
-    if analysis_mode == patient_pipeline_mode:
-        render_patient_hep_pipeline_mode(raw_df, selected_channels, hep_mod)
         return
 
     # Load EHR / clinical data
@@ -7121,6 +9451,12 @@ def main() -> None:
         )
         return
 
+    if analysis_mode == hr_psd_mode:
+        render_hr_psd_modulation_mode(
+            raw_df, ehr_df, selected_stages, selected_channels, hep_mod,
+        )
+        return
+
     # ── Grouping ──────────────────────────────────────────────────────────────
     grouped_df = pd.DataFrame()
     comorbidity_overview_df = pd.DataFrame()
@@ -7128,7 +9464,7 @@ def main() -> None:
     comorbidity_subgroup_order: List[str] = []
 
     if analysis_mode == non_diagnosis_mode:
-        # Match the dashboard's established "Susp. Epilepsy" semantics: patients
+        # Match the dashboard's established "Unknown" semantics: patients
         # with an empty diagnosis list, including cohorts without mapped EHR
         # diagnosis rows, form one cohort for paired sleep-stage comparisons.
         grouped_df = select_non_diagnosis_cohort(metric_df_base, ehr_df)
@@ -7170,7 +9506,7 @@ def main() -> None:
                         rows.append(r)
                 else:
                     r = row.to_dict()
-                    r["diagnosis_group"] = "Susp. Epilepsy"
+                    r["diagnosis_group"] = "Unknown"
                     rows.append(r)
             grouped_df = pd.DataFrame(rows)
             if not grouped_df.empty:
@@ -7331,19 +9667,16 @@ def main() -> None:
         if ehr_df.empty:
             st.warning("No EHR data available for Harvard group.")
         else:
-            dx_map = dict(zip(ehr_df["patient_id"], ehr_df["dx_names"]))
-            cat_keys = list(_DIAG_CATEGORIES.keys())
-            rows = []
-            for _, row in metric_df_base.iterrows():
-                dx_names = dx_map.get(row["patient_id"], [])
-                assigned = next(
-                    (cat for cat in cat_keys if any(_DIAG_CATEGORIES[cat](dx) for dx in dx_names)),
-                    "Susp. Epilepsy",
-                )
-                r = row.to_dict()
-                r["diagnosis_group"] = assigned
-                rows.append(r)
-            grouped_df = pd.DataFrame(rows)
+            # Inclusive per-category membership: a patient with Anxiety + OSA
+            # gets one row per matched category, so they count toward Anxiety
+            # AND toward OSA. A specific pairwise contrast (e.g. Anxiety vs
+            # Obesity) then only needs to exclude patients present on BOTH
+            # sides of that pair, not every comorbid patient globally —
+            # prepare_waveform_contrast already drops patients shared between
+            # group_a and group_b before an unpaired (disease-pair) test.
+            patient_ids = tuple(sorted(metric_df_base["patient_id"].unique()))
+            category_rows = _diagnosis_category_rows(ehr_df, patient_ids)
+            grouped_df = metric_df_base.merge(category_rows, on="patient_id", how="inner")
             if not grouped_df.empty:
                 counts = grouped_df.groupby("diagnosis_group")["patient_id"].nunique()
                 valid = counts[counts >= min_patients].index
@@ -7362,6 +9695,17 @@ def main() -> None:
         f"**Groups:** {', '.join(all_groups)} | "
         f"**Stages:** {', '.join(STAGE_LABELS.get(s, s) for s in selected_stages)}"
     )
+
+    if analysis_mode == diagnosis_hep_mode:
+        render_diagnosis_category_hep_mode(
+            grouped_df,
+            all_groups,
+            selected_stages,
+            selected_channels,
+            hep_mod,
+            apply_ica=_apply_ica,
+        )
+        return
 
     if analysis_mode == non_diagnosis_mode:
         render_non_diagnosis_complete_mode(
@@ -7421,13 +9765,14 @@ def main() -> None:
         st.plotly_chart(fig_overview, use_container_width=True, theme=None)
 
     # ── Tabs ──────────────────────────────────────────────────────────────────
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
         "📊 Sleep Stage Comparison",
         "📈 Cross-Stage Comparison",
         "🗺️ Group × Stage Heatmap",
         "📋 Statistical Details",
         "🔵 Patient Overview",
         "ℹ️ Methodology",
+        "🫀 Patient HEP Pipeline",
     ])
 
     with tab1:
@@ -7518,11 +9863,17 @@ def main() -> None:
             .groupby("diagnosis_group", group_keys=False)
             .head(5)
             .sort_values(["diagnosis_group", "patient_id"])
+            # The internal tuple contains NumPy waveform arrays and cannot be
+            # represented as a scalar Arrow table column.
+            .drop(columns=["individual"], errors="ignore")
         )
-        st.dataframe(sample_df, use_container_width=True)
+        st.dataframe(sample_df, use_container_width=True, hide_index=True)
 
     with tab6:
         _render_methodology_tab(metric, t_window)
+
+    with tab7:
+        render_patient_hep_pipeline_mode(raw_df, selected_channels, hep_mod)
 
 
 if __name__ == "__main__":

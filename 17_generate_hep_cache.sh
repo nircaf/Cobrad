@@ -1,5 +1,6 @@
 #!/bin/bash
-# Launch normal and >=10-standard-10-20-channel HEP caches in one tmux session.
+# Launch normal and channel-filtered HEP caches in parallel. The filtered cache
+# defaults to >=5 canonical 10-20 EEG electrodes.
 # Usage:
 #   ./17_generate_hep_cache.sh          # uses 1/4 of available CPUs in total
 #   ./17_generate_hep_cache.sh --force  # rebuild from scratch
@@ -17,9 +18,15 @@
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SESSION="hep-cache"
+RUN_FOREGROUND="${RUN_FOREGROUND:-0}"
+MIN_EEG_CHANNELS="${HEP_MIN_EEG_CHANNELS:-5}"
 
-# Kill existing session if already running
-if tmux has-session -t "$SESSION" 2>/dev/null; then
+if ! [[ "$MIN_EEG_CHANNELS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "HEP_MIN_EEG_CHANNELS must be a positive integer." >&2
+    exit 2
+fi
+
+if [[ "$RUN_FOREGROUND" != "1" ]] && tmux has-session -t "$SESSION" 2>/dev/null; then
     echo "Session '$SESSION' already exists."
     echo "  Attach : tmux attach -t $SESSION"
     echo "  Kill   : tmux kill-session -t $SESSION"
@@ -77,18 +84,30 @@ fi
 COMMON_PREFIX="cd $(printf '%q' "$SCRIPT_DIR") && source venv/bin/activate &&"
 THREAD_LIMITS="OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1"
 NORMAL_CMD="$COMMON_PREFIX $THREAD_LIMITS python 17_generate_hep_cache.py$QUOTED_ARGS --workers $NORMAL_WORKERS; status=\$?; echo '--- NORMAL CACHE DONE ---'; exit \$status"
-COHORT_CMD="$COMMON_PREFIX $THREAD_LIMITS python 17_generate_hep_cache.py$QUOTED_ARGS --min-eeg-channels 10 --workers $COHORT_WORKERS; status=\$?; echo '--- >=10 STANDARD 10-20 EEG CACHE DONE ---'; exit \$status"
+COHORT_CMD="$COMMON_PREFIX $THREAD_LIMITS python 17_generate_hep_cache.py$QUOTED_ARGS --min-eeg-channels $MIN_EEG_CHANNELS --workers $COHORT_WORKERS; status=\$?; echo '--- >=$MIN_EEG_CHANNELS STANDARD 10-20 EEG CACHE DONE ---'; exit \$status"
+
+if [[ "$RUN_FOREGROUND" == "1" ]]; then
+    echo "Running both cache builders in the foreground..."
+    bash -lc "$NORMAL_CMD" &
+    normal_pid=$!
+    bash -lc "$COHORT_CMD" &
+    cohort_pid=$!
+    status=0
+    wait "$normal_pid" || status=1
+    wait "$cohort_pid" || status=1
+    exit "$status"
+fi
 
 tmux new-session -d -s "$SESSION" -n "all-patients" -x 220 -y 50
 tmux send-keys -t "$SESSION:all-patients" "$NORMAL_CMD" Enter
-tmux new-window -d -t "$SESSION" -n "min10-1020eeg"
-tmux send-keys -t "$SESSION:min10-1020eeg" "$COHORT_CMD" Enter
+tmux new-window -d -t "$SESSION" -n "min${MIN_EEG_CHANNELS}-1020eeg"
+tmux send-keys -t "$SESSION:min${MIN_EEG_CHANNELS}-1020eeg" "$COHORT_CMD" Enter
 
 echo "Cache generation started in tmux session '$SESSION'."
 echo "  CPUs   : $AVAILABLE_CPUS available; $TOTAL_WORKERS total workers requested"
-echo "  Split  : $NORMAL_WORKERS all-patient workers + $COHORT_WORKERS min10-1020eeg workers"
+echo "  Split  : $NORMAL_WORKERS all-patient workers + $COHORT_WORKERS min${MIN_EEG_CHANNELS}-1020eeg workers"
 echo "  Attach : tmux attach -t $SESSION"
 echo "  Output : tmux attach -t $SESSION  (Ctrl+B D to detach without stopping)"
-echo "  Windows: all-patients and min10-1020eeg (Ctrl+B N/P to switch)"
+echo "  Windows: all-patients and min${MIN_EEG_CHANNELS}-1020eeg (Ctrl+B N/P to switch)"
 
 tmux attach -t "$SESSION"

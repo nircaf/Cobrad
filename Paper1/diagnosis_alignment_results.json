@@ -1,0 +1,346 @@
+{
+  "n_cohort_a": 2634,
+  "n_cohort_b_pool_6ch": 8240,
+  "diag_n": {
+    "Atrial Fibrillation": 1240,
+    "Heart Failure": 1658,
+    "Stroke / Cerebrovascular": 1701,
+    "Cognitive Impairment / Dementia": 947
+  },
+  "selected_channels": [
+    "Fp1",
+    "Fp2",
+    "F7",
+    "F3",
+    "Fz",
+    "F4",
+    "F8",
+    "T3",
+    "T7",
+    "C3",
+    "Cz",
+    "C4",
+    "T4",
+    "T8",
+    "T5",
+    "P7",
+    "P3",
+    "Pz",
+    "P4",
+    "T6",
+    "P8",
+    "O1",
+    "Oz",
+    "O2"
+  ],
+  "alignment_results": {
+    "Atrial Fibrillation": {
+      "n_a": 2082,
+      "n_sub": 825,
+      "obs_distance": 0.007067576434362622,
+      "p_perm": 0.9396,
+      "pearson_r": 0.9995237663634687,
+      "pearson_p": 0.019648182846284067,
+      "cosine_sim": 0.997719954587459,
+      "mean_delta_a": [
+        -0.018018196927661604,
+        0.03776483500905769,
+        0.019746638081396147
+      ],
+      "mean_delta_sub": [
+        -0.013543901896252071,
+        0.032371609023684134,
+        0.018827707127432092
+      ],
+      "null_distances_summary": {
+        "mean": 0.02576522457724402,
+        "sd": 0.013850731807966645,
+        "p5": 0.006530279923768554,
+        "p95": 0.051061347144412336
+      },
+      "q_perm": 0.9396
+    },
+    "Heart Failure": {
+      "n_a": 2082,
+      "n_sub": 1135,
+      "obs_distance": 0.024309082057025214,
+      "p_perm": 0.4136,
+      "pearson_r": 0.999440080510733,
+      "pearson_p": 0.021304835204335265,
+      "cosine_sim": 0.9968788909195152,
+      "mean_delta_a": [
+        -0.018018196927661604,
+        0.03776483500905769,
+        0.019746638081396147
+      ],
+      "mean_delta_sub": [
+        -0.009827532772495734,
+        0.018012220256931482,
+        0.008184687484435774
+      ],
+      "null_distances_summary": {
+        "mean": 0.023055573503911773,
+        "sd": 0.012159396616196912,
+        "p5": 0.005851747739978913,
+        "p95": 0.045196819099691844
+      },
+      "q_perm": 0.5968
+    },
+    "Stroke / Cerebrovascular": {
+      "n_a": 2082,
+      "n_sub": 1174,
+      "obs_distance": 0.023275419732294692,
+      "p_perm": 0.4476,
+      "pearson_r": 0.9826703378457223,
+      "pearson_p": 0.11869142731389958,
+      "cosine_sim": 0.8753846865881364,
+      "mean_delta_a": [
+        -0.018018196927661604,
+        0.03776483500905769,
+        0.019746638081396147
+      ],
+      "mean_delta_sub": [
+        -0.03228688327411606,
+        0.03402829853447711,
+        0.0017414152603609612
+      ],
+      "null_distances_summary": {
+        "mean": 0.022706488900405632,
+        "sd": 0.012065050662722546,
+        "p5": 0.005438302241499997,
+        "p95": 0.04412247842921094
+      },
+      "q_perm": 0.5968
+    },
+    "Cognitive Impairment / Dementia": {
+      "n_a": 2082,
+      "n_sub": 657,
+      "obs_distance": 0.060157034024925754,
+      "p_perm": 0.024,
+      "pearson_r": 0.9718035161048062,
+      "pearson_p": 0.15153689338825982,
+      "cosine_sim": 0.7906455161444745,
+      "mean_delta_a": [
+        -0.018018196927661604,
+        0.03776483500905769,
+        0.019746638081396147
+      ],
+      "mean_delta_sub": [
+        -0.06699573550711346,
+        0.05903880922572526,
+        -0.007956926281388334
+      ],
+      "null_distances_summary": {
+        "mean": 0.02708001286228987,
+        "sd": 0.014605213543057317,
+        "p5": 0.0065207937259960155,
+        "p95": 0.053377327233175065
+      },
+      "q_perm": 0.096
+    }
+  },
+  "age_overall": {
+    "n1": 2616,
+    "n2": 3407,
+    "U": 162383.0,
+    "p": 0.0,
+    "median1": 21.6,
+    "median2": 69.7,
+    "iqr1": [
+      18.0,
+      25.7
+    ],
+    "iqr2": [
+      58.95,
+      77.5
+    ]
+  },
+  "age_results": {
+    "Atrial Fibrillation": {
+      "n1": 2616,
+      "n2": 1240,
+      "U": 37716.0,
+      "p": 0.0,
+      "median1": 21.6,
+      "median2": 73.7,
+      "iqr1": [
+        18.0,
+        25.7
+      ],
+      "iqr2": [
+        66.2,
+        80.1
+      ],
+      "q": 0.0
+    },
+    "Heart Failure": {
+      "n1": 2616,
+      "n2": 1658,
+      "U": 59721.5,
+      "p": 0.0,
+      "median1": 21.6,
+      "median2": 71.85,
+      "iqr1": [
+        18.0,
+        25.7
+      ],
+      "iqr2": [
+        62.525,
+        78.9
+      ],
+      "q": 0.0
+    },
+    "Stroke / Cerebrovascular": {
+      "n1": 2616,
+      "n2": 1701,
+      "U": 88222.0,
+      "p": 0.0,
+      "median1": 21.6,
+      "median2": 68.6,
+      "iqr1": [
+        18.0,
+        25.7
+      ],
+      "iqr2": [
+        57.5,
+        77.0
+      ],
+      "q": 0.0
+    },
+    "Cognitive Impairment / Dementia": {
+      "n1": 2616,
+      "n2": 947,
+      "U": 42654.5,
+      "p": 0.0,
+      "median1": 21.6,
+      "median2": 72.2,
+      "iqr1": [
+        18.0,
+        25.7
+      ],
+      "iqr2": [
+        61.4,
+        80.0
+      ],
+      "q": 0.0
+    }
+  },
+  "psd_kw_table": [
+    {
+      "band": "delta",
+      "stage": "light_sleep",
+      "H_stat": 4.5621036396707835,
+      "p_value": 0.3352469776524972,
+      "n_groups": 5,
+      "q_value": 0.35224620899293074
+    },
+    {
+      "band": "delta",
+      "stage": "N3",
+      "H_stat": 4.419116358732279,
+      "p_value": 0.3522462089929307,
+      "n_groups": 5,
+      "q_value": 0.35224620899293074
+    },
+    {
+      "band": "delta",
+      "stage": "R",
+      "H_stat": 5.188482157925362,
+      "p_value": 0.26849896637304416,
+      "n_groups": 5,
+      "q_value": 0.322198759647653
+    },
+    {
+      "band": "theta",
+      "stage": "light_sleep",
+      "H_stat": 48.76073912880421,
+      "p_value": 6.549949822715769e-10,
+      "n_groups": 5,
+      "q_value": 7.859939787258923e-09
+    },
+    {
+      "band": "theta",
+      "stage": "N3",
+      "H_stat": 40.53285069293654,
+      "p_value": 3.358132284642875e-08,
+      "n_groups": 5,
+      "q_value": 2.0148793707857252e-07
+    },
+    {
+      "band": "theta",
+      "stage": "R",
+      "H_stat": 38.45739089426022,
+      "p_value": 9.016781568985232e-08,
+      "n_groups": 5,
+      "q_value": 3.606712627594093e-07
+    },
+    {
+      "band": "alpha",
+      "stage": "light_sleep",
+      "H_stat": 11.92065935982293,
+      "p_value": 0.017951118771562,
+      "n_groups": 5,
+      "q_value": 0.026926678157343002
+    },
+    {
+      "band": "alpha",
+      "stage": "N3",
+      "H_stat": 12.572369976425847,
+      "p_value": 0.013565779093770216,
+      "n_groups": 5,
+      "q_value": 0.023255621303606085
+    },
+    {
+      "band": "alpha",
+      "stage": "R",
+      "H_stat": 8.108765830973773,
+      "p_value": 0.08767424059769617,
+      "n_groups": 5,
+      "q_value": 0.1168989874635949
+    },
+    {
+      "band": "beta",
+      "stage": "light_sleep",
+      "H_stat": 33.38281439741982,
+      "p_value": 9.971863776322497e-07,
+      "n_groups": 5,
+      "q_value": 2.9915591328967494e-06
+    },
+    {
+      "band": "beta",
+      "stage": "N3",
+      "H_stat": 26.742197366713718,
+      "p_value": 2.2412773200730904e-05,
+      "n_groups": 5,
+      "q_value": 5.379065568175417e-05
+    },
+    {
+      "band": "beta",
+      "stage": "R",
+      "H_stat": 24.75097809822046,
+      "p_value": 5.6455084950986154e-05,
+      "n_groups": 5,
+      "q_value": 0.00011291016990197231
+    }
+  ],
+  "psd_n_by_group_stage": {
+    "Atrial Fibrillation|N3": 40,
+    "Atrial Fibrillation|R": 40,
+    "Atrial Fibrillation|light_sleep": 40,
+    "Cognitive Impairment / Dementia|N3": 40,
+    "Cognitive Impairment / Dementia|R": 40,
+    "Cognitive Impairment / Dementia|light_sleep": 40,
+    "Heart Failure|N3": 40,
+    "Heart Failure|R": 40,
+    "Heart Failure|light_sleep": 40,
+    "Stroke / Cerebrovascular|N3": 40,
+    "Stroke / Cerebrovascular|R": 40,
+    "Stroke / Cerebrovascular|light_sleep": 40,
+    "Susp. Epilepsy|N3": 40,
+    "Susp. Epilepsy|R": 40,
+    "Susp. Epilepsy|light_sleep": 40
+  },
+  "psd_fig_path": "/storage/pblab_shared_data2/Nir/Cobrad/Paper1/figures/diagnosis_alignment_psd_curves.png",
+  "n_perm": 5000,
+  "psd_max_per_group_stage": 40
+}

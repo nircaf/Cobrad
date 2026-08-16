@@ -1,0 +1,148 @@
+{
+  "amp_window": [
+    0.15,
+    0.5
+  ],
+  "n_by_group_stage": {
+    "Unknown|light_sleep": 3598,
+    "Unknown|N3": 3407,
+    "Unknown|R": 3429,
+    "Non-neurological|light_sleep": 5720,
+    "Non-neurological|N3": 5156,
+    "Non-neurological|R": 5463,
+    "Neurological|light_sleep": 2380,
+    "Neurological|N3": 2066,
+    "Neurological|R": 2209
+  },
+  "kw_table": [
+    {
+      "stage": "light_sleep",
+      "H_stat": 101.55051500908303,
+      "p_value": 8.883535630259454e-23,
+      "n_groups": 3,
+      "q_value": 1.3325303445389182e-22
+    },
+    {
+      "stage": "N3",
+      "H_stat": 141.1949592738274,
+      "p_value": 2.1872788694790276e-31,
+      "n_groups": 3,
+      "q_value": 6.561836608437083e-31
+    },
+    {
+      "stage": "R",
+      "H_stat": 85.90642158654373,
+      "p_value": 2.2164481309871853e-19,
+      "n_groups": 3,
+      "q_value": 2.2164481309871853e-19
+    }
+  ],
+  "kw_table_single_category": [
+    {
+      "stage": "light_sleep",
+      "H_stat": 74.92240375460642,
+      "p_value": 5.3803030608252005e-17,
+      "n_groups": 3,
+      "q_value": 5.380303060825201e-17
+    },
+    {
+      "stage": "N3",
+      "H_stat": 81.5192779478839,
+      "p_value": 1.9875300758815505e-18,
+      "n_groups": 3,
+      "q_value": 2.9812951138223255e-18
+    },
+    {
+      "stage": "R",
+      "H_stat": 94.403846297997,
+      "p_value": 3.1656670885986295e-21,
+      "n_groups": 3,
+      "q_value": 9.497001265795889e-21
+    }
+  ],
+  "n_single_category_by_group_stage": {
+    "Unknown|light_sleep": 3598,
+    "Unknown|N3": 3407,
+    "Unknown|R": 3429,
+    "Non-neurological|light_sleep": 1106,
+    "Non-neurological|N3": 1034,
+    "Non-neurological|R": 1074,
+    "Neurological|light_sleep": 53,
+    "Neurological|N3": 46,
+    "Neurological|R": 50
+  },
+  "summary_table": [
+    {
+      "stage": "light_sleep",
+      "group": "Unknown",
+      "n": 3598,
+      "median": 0.03536667708376849,
+      "iqr_lo": -0.03516141678537379,
+      "iqr_hi": 0.14141766443995282
+    },
+    {
+      "stage": "light_sleep",
+      "group": "Non-neurological",
+      "n": 5720,
+      "median": 0.08325901883335485,
+      "iqr_lo": -0.04242540986623049,
+      "iqr_hi": 0.28718510423184224
+    },
+    {
+      "stage": "light_sleep",
+      "group": "Neurological",
+      "n": 2380,
+      "median": 0.05424470400977499,
+      "iqr_lo": -0.07481223478152887,
+      "iqr_hi": 0.23819941649254034
+    },
+    {
+      "stage": "N3",
+      "group": "Unknown",
+      "n": 3407,
+      "median": 0.015196123852634292,
+      "iqr_lo": -0.04284198309211304,
+      "iqr_hi": 0.09800189141734549
+    },
+    {
+      "stage": "N3",
+      "group": "Non-neurological",
+      "n": 5156,
+      "median": 0.06764416748175976,
+      "iqr_lo": -0.044248136517471046,
+      "iqr_hi": 0.2227997367520312
+    },
+    {
+      "stage": "N3",
+      "group": "Neurological",
+      "n": 2066,
+      "median": 0.031007736656303818,
+      "iqr_lo": -0.08369278664749367,
+      "iqr_hi": 0.18134752352420228
+    },
+    {
+      "stage": "R",
+      "group": "Unknown",
+      "n": 3429,
+      "median": 0.04814086117584921,
+      "iqr_lo": -0.033384233141684594,
+      "iqr_hi": 0.1859167018634869
+    },
+    {
+      "stage": "R",
+      "group": "Non-neurological",
+      "n": 5463,
+      "median": 0.10609658082250792,
+      "iqr_lo": -0.049620832646887186,
+      "iqr_hi": 0.34800973313237243
+    },
+    {
+      "stage": "R",
+      "group": "Neurological",
+      "n": 2209,
+      "median": 0.05773812837827862,
+      "iqr_lo": -0.10141243673394496,
+      "iqr_hi": 0.29851986334779324
+    }
+  ]
+}

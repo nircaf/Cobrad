@@ -8,10 +8,11 @@ cd "$SCRIPT_DIR"
 source venv/bin/activate
 
 # Open three independent dashboard modes, like 06_hep_group_comparison.sh.
+# Each entry is "label|mode|gt10", gt10 overrides the ≥10-electrode toggle default.
 MODES=(
-    "Non-diagnosis patients — complete analysis"
-    "Susp. Epilepsy vs diagnosed — patient stage deltas"
-    "Single clean patient — HEP construction pipeline"
+    "Non-diagnosis patients — complete analysis (≥10 EEG channels)|Non-diagnosis patients — complete analysis|true"
+    "Non-diagnosis patients — complete analysis (all channels)|Non-diagnosis patients — complete analysis|false"
+    "Diagnosis comparison — HEP + HR/T-wave features (all channels)|Diagnosis comparison — HEP + HR/T-wave features|false"
 )
 
 BASE_PORT="${BASE_PORT:-${PORT:-8501}}"
@@ -86,17 +87,18 @@ PY
 echo "Opening ${#MODES[@]} dashboard modes asynchronously..."
 
 port="$BASE_PORT"
-for mode in "${MODES[@]}"; do
+for entry in "${MODES[@]}"; do
+    IFS='|' read -r label mode gt10 <<< "$entry"
     port="$(next_free_port "$port")"
     url="http://localhost:${port}/"
 
-    echo "  Starting: ${mode} on ${url}"
+    echo "  Starting: ${label} on ${url}"
     streamlit run 16_diagnosis_sleep_stage_comparison_dashboard.py \
         --server.port "$port" \
         --server.headless true \
         --server.fileWatcherType none \
         --browser.gatherUsageStats false \
-        -- --mode "$mode" &
+        -- --mode "$mode" --gt10 "$gt10" &
     PIDS+=("$!")
     URLS+=("$url")
 

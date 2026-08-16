@@ -1324,7 +1324,15 @@ def process_patients_n1_stage_hep(edf_root="EDF_Format/EDF", step_sec=5, n1_dura
                 stage_segments_in_file = None  # will be set once a valid electrode is found
                 epoch_duration_sec = 30
                 min_stage_epochs = int(n1_duration_min * 60 / epoch_duration_sec)
-                minimum_usable_streak = 15
+                # Diagnosed-cohort recovery can lower this to 10 epochs
+                # (5 minutes) for a missing third stage. The normal pipeline
+                # keeps the stricter 15-epoch threshold.
+                minimum_usable_streak = max(
+                    10,
+                    int(os.environ.get(
+                        "HEP_MINIMUM_USABLE_STREAK_EPOCHS", "15"
+                    )),
+                )
 
                 def evaluate_candidate(candidate):
                     log_stage(
@@ -1400,7 +1408,7 @@ def process_patients_n1_stage_hep(edf_root="EDF_Format/EDF", step_sec=5, n1_dura
                         patient_id=patient_id,
                         file_path=file_path
                     )
-                    if lon_len > minimum_usable_streak:
+                    if lon_len >= minimum_usable_streak:
                         usable_results.append(result)
                     else:
                         tried_electrodes.append(candidate)
@@ -1717,10 +1725,10 @@ def prep_for_yasa(raw, eeg_name):
 
 def clean_duplicate_pickles(base_dir="pickles_sleep_stage"):
     """
-    Remove duplicate patient pickles from the same sleep stage,
-    keeping only the one with the longest duration.
-    Human Sleep Project files are grouped by the SUB-I... subject ID; other
-    datasets keep the exact patient ID prefix from the pickle filename.
+    Remove duplicate pickles from the same recording and sleep stage, keeping
+    only the longest duration. BIDS outputs with session/run/task entities are
+    kept as distinct recordings; legacy subject-only outputs retain the prior
+    subject-level cleanup behavior.
     """
     files = glob.glob(os.path.join(base_dir, "**", "*.pkl"), recursive=True)
     groups = {}
@@ -1730,7 +1738,10 @@ def clean_duplicate_pickles(base_dir="pickles_sleep_stage"):
             continue
 
         bare_patient_id = parsed['patient_id']
-        patient_key = _extract_patient_id_from_name(bare_patient_id)
+        if re.search(r'_SES-[^_]+', bare_patient_id, flags=re.IGNORECASE):
+            patient_key = bare_patient_id.upper()
+        else:
+            patient_key = _extract_patient_id_from_name(bare_patient_id)
 
         # Group by canonical ID, stage, and the parent directory to avoid cross-project merging
         key = (patient_key, parsed['stage'], os.path.dirname(f))
