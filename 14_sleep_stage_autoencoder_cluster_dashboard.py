@@ -672,6 +672,100 @@ def load_or_extract_features(
     return df, log_df
 
 
+def resumable_cache_key(
+    base_path: Path,
+    window_s: float,
+    step_s: float,
+    max_windows_per_file: int,
+    include_eeg: bool,
+    include_ecg: bool,
+) -> str:
+    """Cache key deliberately excludes groups/stages/file-count limits, so the
+    same on-disk cache keeps growing as more files are processed across runs
+    instead of being invalidated every time the file cap changes."""
+    payload = {
+        "base": str(base_path), "window_s": window_s, "step_s": step_s,
+        "max_windows_per_file": max_windows_per_file,
+        "include_eeg": include_eeg, "include_ecg": include_ecg, "version": 1,
+    }
+    return hashlib.sha256(repr(payload).encode("utf-8")).hexdigest()[:20]
+
+
+def extend_resumable_feature_cache(
+    base_path: Path,
+    groups: Sequence[str],
+    stages: Sequence[str],
+    window_s: float,
+    step_s: float,
+    max_windows_per_file: int,
+    include_eeg: bool,
+    include_ecg: bool,
+    max_new_files: int,
+    batch_size: int = 25,
+    progress_callback: Optional[Any] = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame, int]:
+    """Extract features for up to `max_new_files` not-yet-cached patient files,
+    checkpointing the parquet cache and log every `batch_size` files (atomic
+    write-then-rename) so a crash mid-run loses at most one batch, and the
+    next call resumes from the files already logged rather than restarting."""
+    base = Path(base_path)
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    key = resumable_cache_key(base, window_s, step_s, max_windows_per_file, include_eeg, include_ecg)
+    cache_path = CACHE_DIR / f"resumable_{key}.parquet"
+    log_path = CACHE_DIR / f"resumable_{key}_log.csv"
+
+    cached_df = pd.read_parquet(cache_path) if cache_path.exists() else pd.DataFrame()
+    cached_log = (
+        pd.read_csv(log_path) if log_path.exists()
+        else pd.DataFrame(columns=["group", "stage", "file", "status", "n_windows", "error"])
+    )
+    done_files = set(cached_log["file"].astype(str)) if not cached_log.empty else set()
+
+    todo: List[Tuple[str, str, Path]] = []
+    for group in groups:
+        for stage in stages:
+            for file_path in list_patient_files(base, group, stage):
+                if str(file_path) not in done_files:
+                    todo.append((group, stage, file_path))
+    todo = todo[:max_new_files]
+
+    pending_rows: List[Dict[str, Any]] = []
+    pending_logs: List[Dict[str, Any]] = []
+
+    def checkpoint() -> None:
+        nonlocal cached_df, cached_log, pending_rows, pending_logs
+        if pending_rows:
+            batch_df = pd.DataFrame(pending_rows)
+            cached_df = pd.concat([cached_df, batch_df], ignore_index=True) if not cached_df.empty else batch_df
+            tmp_path = cache_path.with_suffix(".tmp.parquet")
+            cached_df.to_parquet(tmp_path, index=False)
+            tmp_path.replace(cache_path)
+            pending_rows = []
+        if pending_logs:
+            batch_log = pd.DataFrame(pending_logs)
+            cached_log = pd.concat([cached_log, batch_log], ignore_index=True) if not cached_log.empty else batch_log
+            cached_log.to_csv(log_path, index=False)
+            pending_logs = []
+
+    for processed, (group, stage, file_path) in enumerate(todo, start=1):
+        try:
+            file_rows = extract_windows_from_file(
+                file_path=file_path, group=group, stage=stage,
+                window_s=window_s, step_s=step_s, max_windows=max_windows_per_file,
+                include_eeg=include_eeg, include_ecg=include_ecg,
+            )
+            pending_rows.extend(file_rows)
+            pending_logs.append({"group": group, "stage": stage, "file": str(file_path), "status": "ok", "n_windows": len(file_rows), "error": ""})
+        except Exception as exc:
+            pending_logs.append({"group": group, "stage": stage, "file": str(file_path), "status": "error", "n_windows": 0, "error": str(exc)})
+        if progress_callback is not None:
+            progress_callback(processed, len(todo))
+        if processed % batch_size == 0 or processed == len(todo):
+            checkpoint()
+
+    return cached_df, cached_log, len(todo)
+
+
 def feature_columns(df: pd.DataFrame, modality: str) -> List[str]:
     exclude = {
         "group", "stage", "patient_id", "patient_stage_id", "file_path",

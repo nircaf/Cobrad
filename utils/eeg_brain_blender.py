@@ -102,6 +102,20 @@ CMAPS = {
         (0.78, (0.960, 0.520, 0.150)),
         (1.00, (1.000, 0.940, 0.750)),
     ],
+    # diverging: low = blue (below expected), mid = gray (0), high = red (above
+    # expected) -- for signed residuals around zero
+    "blue_white_red": [
+        (0.00, (0.110, 0.330, 0.880)),
+        (0.50, (0.600, 0.600, 0.600)),
+        (1.00, (0.870, 0.130, 0.110)),
+    ],
+    # low = gray, rising through yellow -> red -> black at vmax ("more is darker")
+    "graphite": [
+        (0.00, (0.780, 0.780, 0.780)),
+        (0.35, (0.960, 0.820, 0.180)),
+        (0.68, (0.820, 0.130, 0.100)),
+        (1.00, (0.020, 0.020, 0.020)),
+    ],
 }
 DEFAULT_CMAP = "spectral"
 
@@ -156,7 +170,11 @@ def scalp_interpolate(dirs, elec_dirs, values, sigma=0.42):
 
     sigma is in radians of great-circle distance; smaller = tighter hot spots.
     """
-    cos = np.clip(np.asarray(dirs) @ np.asarray(elec_dirs).T, -1.0, 1.0)
+    # einsum, not @: Blender's bundled numpy/BLAS returns garbage (silently
+    # clipped to +-1) for this (N,3)@(3,K) matrix-matrix shape at large N —
+    # confirmed on a 40k-vertex mesh, reproducible, verified against a
+    # manual per-row loop. Matrix-vector shapes elsewhere are unaffected.
+    cos = np.clip(np.einsum("nd,ed->ne", np.asarray(dirs), np.asarray(elec_dirs)), -1.0, 1.0)
     w = np.exp(-((np.arccos(cos) / sigma) ** 2))
     w = np.maximum(w, 1e-9)
     return (w @ np.asarray(values, dtype=float)) / w.sum(axis=1)
@@ -275,6 +293,29 @@ def _brain_mesh(col, subdiv=6):
     return ob, dirs
 
 
+def _new_color_attr(mesh, name="EEG"):
+    """Create a per-vertex color layer on both the >=3.2 API (color_attributes,
+    POINT domain) and the older per-loop vertex_colors, returning an object
+    with a `.data[i].color` set-able the same way in either case for the
+    still-render path (point domain -> 1 entry per vertex)."""
+    if hasattr(mesh, "color_attributes"):
+        attr = mesh.color_attributes.new(name=name, type="FLOAT_COLOR", domain="POINT")
+        mesh.attributes.active_color = attr
+        return attr, None
+    vc = mesh.vertex_colors.new(name=name)
+    loop_vert = np.empty(len(mesh.loops), dtype=np.int64)
+    mesh.loops.foreach_get("vertex_index", loop_vert)
+    return vc, loop_vert
+
+
+def _set_colors(attr, loop_vert, rgba):
+    """Push a per-vertex RGBA array through whichever attr `_new_color_attr` made."""
+    if loop_vert is None:
+        attr.data.foreach_set("color", np.asarray(rgba).ravel())
+    else:
+        attr.data.foreach_set("color", np.asarray(rgba)[loop_vert].ravel())
+
+
 def _brain_material(name="EEG_Cortex", attr="EEG"):
     mat = bpy.data.materials.get(name) or bpy.data.materials.new(name)
     mat.use_nodes = True
@@ -285,6 +326,7 @@ def _brain_material(name="EEG_Cortex", attr="EEG"):
     bsdf = nt.nodes.new("ShaderNodeBsdfPrincipled")
     bsdf.location = (100, 0)
     a = nt.nodes.new("ShaderNodeAttribute")
+    a.attribute_type = "GEOMETRY"  # vertex-color layer, not an object/instancer custom prop
     a.attribute_name = attr
     a.location = (-250, 0)
     nt.links.new(a.outputs["Color"], bsdf.inputs["Base Color"])
@@ -292,10 +334,10 @@ def _brain_material(name="EEG_Cortex", attr="EEG"):
         nt.links.new(a.outputs["Color"], bsdf.inputs["Emission Color"])
     elif "Emission" in bsdf.inputs:
         nt.links.new(a.outputs["Color"], bsdf.inputs["Emission"])
-    _socket(bsdf, ["Emission Strength"], 0.08)  # a lift off pure black, not a light source
-    _socket(bsdf, ["Roughness"], 0.52)  # lower = a specular haze over the value ramp
-    _socket(bsdf, ["Specular IOR Level", "Specular"], 0.30)
-    _socket(bsdf, ["Subsurface Weight"], 0.15)
+    _socket(bsdf, ["Emission Strength"], 0.01)  # a lift off pure black, not a light source
+    _socket(bsdf, ["Roughness"], 0.75)  # higher = tighter specular, less blown-out haze
+    _socket(bsdf, ["Specular IOR Level", "Specular"], 0.15)
+    _socket(bsdf, ["Subsurface Weight"], 0.05)
     nt.links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
     return mat
 
@@ -318,9 +360,9 @@ def _electrode_material(name="EEG_Electrode"):
 def _lights(col):
     for name, loc, energy, color, size in [
         # keep the sum well under clipping or the value colours wash out to white
-        ("EEG_Key", (2.6, 2.2, 2.8), 110.0, (1.0, 0.96, 0.92), 2.4),
-        ("EEG_Fill", (-2.9, 0.6, 0.5), 45.0, (0.62, 0.78, 1.0), 3.5),
-        ("EEG_Rim", (-0.6, -3.2, 1.6), 85.0, (1.0, 0.72, 0.55), 2.0),
+        ("EEG_Key", (2.6, 2.2, 2.8), 26.0, (1.0, 0.96, 0.92), 2.4),
+        ("EEG_Fill", (-2.9, 0.6, 0.5), 11.0, (0.62, 0.78, 1.0), 3.5),
+        ("EEG_Rim", (-0.6, -3.2, 1.6), 20.0, (1.0, 0.72, 0.55), 2.0),
     ]:
         d = bpy.data.lights.new(name, type="AREA")
         d.energy = energy
@@ -504,9 +546,8 @@ def render_eeg_brain(channels, out_path=None, vmin=None, vmax=None, sigma=0.42,
     vt = scalp_interpolate(dirs, elec_dirs, t, sigma=sigma)
     rgba = np.ones((len(vt), 4))
     rgba[:, :3] = colormap(vt, stops)
-    attr = brain.data.color_attributes.new(name="EEG", type="FLOAT_COLOR", domain="POINT")
-    attr.data.foreach_set("color", rgba.ravel())
-    brain.data.attributes.active_color = attr
+    attr, loop_vert = _new_color_attr(brain.data)
+    _set_colors(attr, loop_vert, rgba)
     brain.data.materials.append(_brain_material())
 
     if show_electrodes:
@@ -538,7 +579,7 @@ def render_eeg_brain(channels, out_path=None, vmin=None, vmax=None, sigma=0.42,
     world.use_nodes = True
     bg = world.node_tree.nodes.get("Background")
     if bg:
-        bg.inputs[0].default_value = (0.010, 0.013, 0.022, 1.0)
+        bg.inputs[0].default_value = (1.0, 1.0, 1.0, 1.0)
         bg.inputs[1].default_value = 1.0
 
     # AgX/Filmic desaturate the highlights, which is exactly what a value ramp
@@ -566,7 +607,9 @@ def render_eeg_brain(channels, out_path=None, vmin=None, vmax=None, sigma=0.42,
 def render_eeg_brain_video(channel_series, out_path, views="top", duration=None,
                            fps=24, vmin=None, vmax=None, cmap=None, sigma=0.42,
                            subdiv=7, samples=48, resolution=(1600, 1000),
-                           fill=0.80, denoise=True, clear_scene=True):
+                           fill=0.80, denoise=False, clear_scene=True):
+    # ponytail: denoise defaults off, not on -- OIDN silently blanks renders on
+    # this host's Blender/driver combo (confirmed on the still-image path).
     """Render an .mp4 of the cortex heat-map animating over time and camera angle.
 
     channel_series: {"Fp1": [v0, v1, ...], ...}. Each channel's samples are
@@ -613,8 +656,7 @@ def render_eeg_brain_video(channel_series, out_path, views="top", duration=None,
 
     brain, dirs = _brain_mesh(col, subdiv=subdiv)
     brain.data.materials.append(_brain_material())
-    attr = brain.data.color_attributes.new(name="EEG", type="FLOAT_COLOR", domain="POINT")
-    brain.data.attributes.active_color = attr
+    attr, loop_vert = _new_color_attr(brain.data)
 
     verts = _mesh_vertex_array(brain)
     center = 0.5 * (verts.min(axis=0) + verts.max(axis=0))
@@ -627,7 +669,7 @@ def render_eeg_brain_video(channel_series, out_path, views="top", duration=None,
     world.use_nodes = True
     bg = world.node_tree.nodes.get("Background")
     if bg:
-        bg.inputs[0].default_value = (0.010, 0.013, 0.022, 1.0)
+        bg.inputs[0].default_value = (1.0, 1.0, 1.0, 1.0)
         bg.inputs[1].default_value = 1.0
     try:
         scene.view_settings.view_transform = "Standard"
@@ -660,7 +702,7 @@ def render_eeg_brain_video(channel_series, out_path, views="top", duration=None,
         vt = scalp_interpolate(dirs, elec_dirs, [vals[n] for n in names], sigma=sigma)
         tnorm = np.zeros_like(vt) + 0.5 if hi <= lo else np.clip((vt - lo) / (hi - lo), 0.0, 1.0)
         rgba[:, :3] = colormap(tnorm, stops)
-        attr.data.foreach_set("color", rgba.ravel())
+        _set_colors(attr, loop_vert, rgba)
         _place_camera(cam, verts, center, _direction_at(view_kfs, t), cam.data.lens,
                      fill, resolution)
 

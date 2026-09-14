@@ -41,8 +41,9 @@ from scipy.ndimage import label as connected_components
 from scipy.signal import savgol_filter, welch
 from sklearn.cluster import AgglomerativeClustering, MiniBatchKMeans
 from sklearn.decomposition import PCA
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
 from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     accuracy_score,
     balanced_accuracy_score,
@@ -57,6 +58,9 @@ from sklearn.preprocessing import LabelEncoder, StandardScaler
 # Import 6_hep_group_comparison.py as a module (reuse its loading/stats code)
 # =============================================================================
 _HEP_MODULE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "6_hep_group_comparison.py")
+_AUTOENCODER_MODULE_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "14_sleep_stage_autoencoder_cluster_dashboard.py"
+)
 
 
 @st.cache_resource(show_spinner="Loading HEP analysis module...")
@@ -92,6 +96,19 @@ def _load_hep_module():
         # original renderers so statistical labels are not mistaken for titles.
         st.pyplot = real_pyplot
         st.plotly_chart = real_plotly_chart
+    return mod
+
+
+@st.cache_resource(show_spinner="Loading feature-extraction module...")
+def _load_autoencoder_extraction_module():
+    """Import 14_sleep_stage_autoencoder_cluster_dashboard.py for its resumable
+    feature-extraction functions. Unlike 6_hep_group_comparison.py, file 14's
+    Streamlit calls all live inside main(), guarded by __main__, so a plain
+    import is safe here."""
+    spec = importlib.util.spec_from_file_location("autoencoder_dashboard_mod", _AUTOENCODER_MODULE_PATH)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["autoencoder_dashboard_mod"] = mod
+    spec.loader.exec_module(mod)
     return mod
 
 # =============================================================================
@@ -759,6 +776,7 @@ def build_ai_target_labels(
 
 def _train_dense_autoencoder_features(
     x_train: np.ndarray,
+    x_val: np.ndarray,
     x_test: np.ndarray,
     x_all: np.ndarray,
     latent_dim: int,
@@ -813,9 +831,36 @@ def _train_dense_autoencoder_features(
             tensor = torch.tensor(values, dtype=torch.float32)
             return model.encoder(tensor).cpu().numpy()
         latent_train = encode(x_train)
+        latent_val = encode(x_val)
         latent_test = encode(x_test)
         latent_all = encode(x_all)
-    return latent_train, latent_test, latent_all
+    return latent_train, latent_val, latent_test, latent_all
+
+
+def _algorithm_factories(n_estimators: int) -> Dict[str, Any]:
+    """Factories (not instances) so every representation gets a fresh, unfit model."""
+    n_jobs = max(1, min(8, os.cpu_count() or 1))
+    return {
+        "Random Forest": lambda: RandomForestClassifier(
+            n_estimators=int(n_estimators), random_state=42,
+            class_weight="balanced_subsample", n_jobs=n_jobs, min_samples_leaf=2,
+        ),
+        "Logistic Regression": lambda: LogisticRegression(
+            max_iter=2000, class_weight="balanced", random_state=42,
+        ),
+        "Gradient Boosting": lambda: GradientBoostingClassifier(
+            n_estimators=min(300, int(n_estimators)), random_state=42,
+        ),
+    }
+
+
+def _feature_importance(model: Any, n_features: int) -> np.ndarray:
+    """Feature/dimension importance, generalized across tree and linear models."""
+    if hasattr(model, "feature_importances_"):
+        return np.asarray(model.feature_importances_)
+    if hasattr(model, "coef_"):
+        return np.abs(np.asarray(model.coef_)).mean(axis=0)
+    return np.zeros(n_features)
 
 
 def train_ai_feature_models(
@@ -826,8 +871,14 @@ def train_ai_feature_models(
     latent_dim: int,
     autoencoder_epochs: int,
     n_estimators: int,
+    val_fraction: float = 0.15,
 ) -> dict:
-    """Train leakage-controlled classifiers on engineered and autoencoder features."""
+    """Train leakage-controlled classifiers on engineered and autoencoder features.
+
+    Uses a subject-level train / validation / test split and fits several
+    algorithms per feature representation (engineered physiology vs.
+    autoencoder latent features vs. their combination).
+    """
     common_ids = feature_df.index.intersection(labels.index)
     x_frame = feature_df.loc[common_ids].replace([np.inf, -np.inf], np.nan)
     y_text = labels.loc[common_ids].astype(str)
@@ -842,54 +893,75 @@ def train_ai_feature_models(
     encoder = LabelEncoder()
     y = encoder.fit_transform(y_text)
     indices = np.arange(len(x_frame))
-    train_idx, test_idx = train_test_split(
-        indices, test_size=test_fraction, random_state=42, stratify=y,
+    holdout_fraction = min(0.6, test_fraction + val_fraction)
+    train_idx, holdout_idx = train_test_split(
+        indices, test_size=holdout_fraction, random_state=42, stratify=y,
     )
-    y_train, y_test = y[train_idx], y[test_idx]
+    val_share_of_holdout = val_fraction / holdout_fraction if holdout_fraction > 0 else 0.0
+    val_idx, test_idx = train_test_split(
+        holdout_idx, test_size=1 - val_share_of_holdout, random_state=42,
+        stratify=y[holdout_idx],
+    )
+    y_train, y_val, y_test = y[train_idx], y[val_idx], y[test_idx]
     imputer = SimpleImputer(strategy="median")
     x_train = imputer.fit_transform(x_frame.iloc[train_idx])
+    x_val = imputer.transform(x_frame.iloc[val_idx])
     x_test = imputer.transform(x_frame.iloc[test_idx])
     x_all = imputer.transform(x_frame)
     scaler = StandardScaler()
     x_train_scaled = scaler.fit_transform(x_train)
+    x_val_scaled = scaler.transform(x_val)
     x_test_scaled = scaler.transform(x_test)
     x_all_scaled = scaler.transform(x_all)
 
-    def fit_random_forest(train_values, test_values, names):
-        model = RandomForestClassifier(
-            n_estimators=int(n_estimators), random_state=42,
-            class_weight="balanced_subsample",
-            n_jobs=max(1, min(8, os.cpu_count() or 1)),
-            min_samples_leaf=2,
-        )
-        model.fit(train_values, y_train)
-        prediction = model.predict(test_values)
+    algorithm_factories = _algorithm_factories(n_estimators)
+
+    def _score(y_true, prediction) -> dict:
         return {
-            "model": model,
-            "prediction": prediction,
-            "feature_names": list(names),
-            "accuracy": float(accuracy_score(y_test, prediction)),
-            "balanced_accuracy": float(balanced_accuracy_score(y_test, prediction)),
-            "macro_f1": float(f1_score(y_test, prediction, average="macro")),
+            "accuracy": float(accuracy_score(y_true, prediction)),
+            "balanced_accuracy": float(balanced_accuracy_score(y_true, prediction)),
+            "macro_f1": float(f1_score(y_true, prediction, average="macro")),
         }
 
-    all_model = fit_random_forest(x_train, x_test, x_frame.columns)
-    importance_order = np.argsort(all_model["model"].feature_importances_)[::-1]
+    def fit_representation(train_values, val_values, test_values, names) -> dict:
+        """Fit every algorithm on one feature representation."""
+        by_algorithm = {}
+        for algorithm_name, make_model in algorithm_factories.items():
+            model = make_model()
+            model.fit(train_values, y_train)
+            val_prediction = model.predict(val_values)
+            test_prediction = model.predict(test_values)
+            by_algorithm[algorithm_name] = {
+                "model": model,
+                "prediction": test_prediction,
+                "val_prediction": val_prediction,
+                "feature_names": list(names),
+                "importance": _feature_importance(model, len(names)),
+                **_score(y_test, test_prediction),
+                "val_accuracy": float(accuracy_score(y_val, val_prediction)),
+                "val_balanced_accuracy": float(balanced_accuracy_score(y_val, val_prediction)),
+            }
+        return by_algorithm
+
+    all_by_algorithm = fit_representation(x_train, x_val, x_test, x_frame.columns)
+    # Rank features by the Random Forest's importances for the "top features" subset.
+    importance_order = np.argsort(all_by_algorithm["Random Forest"]["importance"])[::-1]
     top_count = max(2, min(int(top_feature_count), len(importance_order)))
     top_indices = importance_order[:top_count]
     top_names = x_frame.columns[top_indices].tolist()
-    top_model = fit_random_forest(
-        x_train[:, top_indices], x_test[:, top_indices], top_names
+    top_by_algorithm = fit_representation(
+        x_train[:, top_indices], x_val[:, top_indices], x_test[:, top_indices], top_names
     )
 
-    latent_train, latent_test, latent_all = _train_dense_autoencoder_features(
-        x_train_scaled, x_test_scaled, x_all_scaled,
+    latent_train, latent_val, latent_test, latent_all = _train_dense_autoencoder_features(
+        x_train_scaled, x_val_scaled, x_test_scaled, x_all_scaled,
         latent_dim=latent_dim, epochs=autoencoder_epochs,
     )
     latent_names = [f"AE latent {index + 1}" for index in range(latent_train.shape[1])]
-    latent_model = fit_random_forest(latent_train, latent_test, latent_names)
-    combined_model = fit_random_forest(
+    latent_by_algorithm = fit_representation(latent_train, latent_val, latent_test, latent_names)
+    combined_by_algorithm = fit_representation(
         np.column_stack([x_train[:, top_indices], latent_train]),
+        np.column_stack([x_val[:, top_indices], latent_val]),
         np.column_stack([x_test[:, top_indices], latent_test]),
         top_names + latent_names,
     )
@@ -898,13 +970,16 @@ def train_ai_feature_models(
     feature_latent_correlations = correlations[
         :x_all_scaled.shape[1], x_all_scaled.shape[1]:
     ]
+    representations = {
+        "All engineered features": all_by_algorithm,
+        "Top engineered features": top_by_algorithm,
+        "Autoencoder latent features": latent_by_algorithm,
+        "Top features + autoencoder": combined_by_algorithm,
+    }
     return {
-        "models": {
-            "All engineered features": all_model,
-            "Top engineered features": top_model,
-            "Autoencoder latent features": latent_model,
-            "Top features + autoencoder": combined_model,
-        },
+        "representations": representations,
+        "algorithm_names": list(algorithm_factories),
+        "y_val": y_val,
         "y_test": y_test,
         "class_names": encoder.classes_.tolist(),
         "feature_frame": x_frame,
@@ -915,6 +990,7 @@ def train_ai_feature_models(
         "feature_latent_correlations": feature_latent_correlations,
         "all_feature_names": x_frame.columns.tolist(),
         "train_size": len(train_idx),
+        "val_size": len(val_idx),
         "test_size": len(test_idx),
     }
 
@@ -2347,17 +2423,18 @@ def plot_electrode_overview(
         coverage_a = result.get("coverage_fraction_a", np.nan)
         coverage_b = result.get("coverage_fraction_b", np.nan)
         subplot_titles.append(
-            f"{channel} | "
-            f"N={len(result['patient_ids_a'])}/{result.get('coverage_denominator_a', '?')} "
+            f"{channel} | p={format_p(result['contrast_p'])}, "
+            f"q={format_p(result.get('q_value'))}<br>"
+            f"<span style='font-size:9px'>N="
+            f"{len(result['patient_ids_a'])}/{result.get('coverage_denominator_a', '?')} "
             f"({coverage_a:.0%}) vs "
             f"{len(result['patient_ids_b'])}/{result.get('coverage_denominator_b', '?')} "
-            f"({coverage_b:.0%}) | p={format_p(result['contrast_p'])}, "
-            f"q={format_p(result.get('q_value'))}"
+            f"({coverage_b:.0%})</span>"
         )
     fig = make_subplots(
         rows=n_rows, cols=n_cols, shared_xaxes=True,
         subplot_titles=subplot_titles,
-        vertical_spacing=min(0.12, 0.32 / n_rows),
+        vertical_spacing=min(0.16, 0.4 / n_rows),
         horizontal_spacing=0.08,
     )
     for channel_index, channel in enumerate(channels):
@@ -2403,7 +2480,7 @@ def plot_electrode_overview(
     fig.update_yaxes(title_text=y_title, showgrid=False, showline=False, mirror=False)
     fig.update_xaxes(showgrid=False, showline=False, mirror=False)
     fig.update_layout(
-        height=max(420, 285 * n_rows),
+        height=max(460, 310 * n_rows),
         title=(
             "Per-electrode HEP means and A − B differences "
             f"(≥{ELECTRODE_MIN_PATIENT_COVERAGE_FRACTION:.0%} patient coverage)"
@@ -2627,8 +2704,10 @@ def add_topomap_inset_to_waveform(
         xanchor="left", yanchor="top",
         sizing="contain", opacity=1.0, layer="above",
     ))
+    # ponytail: caption goes *below* the inset (image spans y 0.66 -> 0.28); above it
+    # the label collided with the legend, whose height grows with the trace count.
     waveform_figure.add_annotation(
-        x=1.22, y=0.69, xref="paper", yref="paper",
+        x=1.22, y=0.26, xref="paper", yref="paper", yanchor="top",
         text="Electrode significance", showarrow=False,
         font=dict(size=11, color="black"),
         bgcolor="rgba(255,255,255,0.88)", borderpad=2,
@@ -8644,9 +8723,14 @@ def plot_ai_confusion_matrix(
     return fig
 
 
-def plot_ai_feature_importance(model_result: dict, title: str, top_n: int = 20) -> go.Figure:
-    """Plot Random Forest importance for one feature representation."""
-    importance = np.asarray(model_result["model"].feature_importances_, dtype=float)
+def plot_ai_feature_importance(
+    model_result: dict, title: str, top_n: int = 20, axis_label: str = "Importance",
+) -> go.Figure:
+    """Plot per-feature/dimension importance for one trained model."""
+    importance = np.asarray(
+        model_result.get("importance", _feature_importance(model_result["model"], 0)),
+        dtype=float,
+    )
     names = np.asarray(model_result["feature_names"], dtype=object)
     order = np.argsort(importance)[-min(top_n, len(importance)):]
     fig = go.Figure(go.Bar(
@@ -8654,7 +8738,7 @@ def plot_ai_feature_importance(model_result: dict, title: str, top_n: int = 20) 
         marker=dict(color=importance[order], colorscale="Viridis"),
     ))
     fig.update_layout(
-        title=title, xaxis_title="Random Forest importance",
+        title=title, xaxis_title=axis_label,
         yaxis_title="Feature", height=max(430, 25 * len(order) + 120),
         margin=dict(l=210, r=30, t=70, b=60),
         plot_bgcolor="white", paper_bgcolor="white", font_color="black",
@@ -8688,9 +8772,47 @@ def render_ai_classification_mode(
         feature_df = load_ai_physiological_features(
             tuple(selected_groups), tuple(selected_stages)
         )
+
+    with st.expander(
+        "📥 Extract more patient data (resumable, crash-safe)", expanded=feature_df.empty
+    ):
+        st.caption(
+            "Processes more patient recordings for the selected HEP groups/stages into the "
+            "same engineered EEG/ECG feature cache, checkpointing to disk every 25 files — a "
+            "crash or manual stop mid-run loses at most one checkpoint, and re-running this "
+            "continues from the files already cached rather than starting over."
+        )
+        max_new_files = int(st.number_input(
+            "Max new files to process this run", 10, 5000, 300, 10, key="ai_extract_max_new_files"
+        ))
+        if st.button("Fetch & cache more patients", key="ai_extract_button"):
+            autoencoder_mod = _load_autoencoder_extraction_module()
+            progress_bar = st.progress(0.0)
+            status_text = st.empty()
+
+            def _report_extraction_progress(done: int, total: int) -> None:
+                progress_bar.progress(done / total if total else 1.0)
+                status_text.text(f"Processed {done}/{total} new files this run…")
+
+            with st.spinner("Extracting features (checkpointed every 25 files)…"):
+                _, extract_log, n_attempted = autoencoder_mod.extend_resumable_feature_cache(
+                    Path(BASE_PATH), tuple(selected_groups), tuple(selected_stages),
+                    window_s=30.0, step_s=30.0, max_windows_per_file=20,
+                    include_eeg=True, include_ecg=True,
+                    max_new_files=max_new_files, batch_size=25,
+                    progress_callback=_report_extraction_progress,
+                )
+            if n_attempted == 0:
+                st.info("No new, uncached files found for the selected groups/stages.")
+            else:
+                ok_count = int((extract_log["status"] == "ok").sum()) if not extract_log.empty else 0
+                st.success(f"Processed {n_attempted} new files this run ({ok_count} ok). Reloading…")
+                st.rerun()
+
     if feature_df.empty:
         st.error(
-            "No cached autoencoder/physiological features match the selected cohorts and stages."
+            "No cached autoencoder/physiological features match the selected cohorts and stages. "
+            "Use the extractor above to build the cache."
         )
         return
     with st.spinner("Joining BDSP diagnoses to feature subjects…"):
@@ -8807,30 +8929,36 @@ def render_ai_classification_mode(
         return
     model_features = feature_df[selected_feature_columns]
 
-    settings = st.columns(5)
+    settings = st.columns(6)
     with settings[0]:
-        test_fraction = st.slider("Test fraction", 0.20, 0.40, 0.25, 0.05, key="ai_test_fraction")
+        test_fraction = st.slider("Test fraction", 0.15, 0.35, 0.20, 0.05, key="ai_test_fraction")
     with settings[1]:
+        val_fraction = st.slider("Validation fraction", 0.10, 0.30, 0.15, 0.05, key="ai_val_fraction")
+    with settings[2]:
         top_feature_count = int(st.number_input(
             "Top features", 2, 50, 15, 1, key="ai_top_features"
         ))
-    with settings[2]:
+    with settings[3]:
         latent_dim = int(st.number_input(
             "AE dimensions", 2, 16, 6, 1, key="ai_latent_dim"
         ))
-    with settings[3]:
+    with settings[4]:
         autoencoder_epochs = int(st.number_input(
             "AE epochs", 20, 300, 80, 10, key="ai_epochs"
         ))
-    with settings[4]:
+    with settings[5]:
         n_estimators = int(st.number_input(
-            "RF trees", 100, 1000, 300, 100, key="ai_trees"
+            "RF/GB trees", 100, 1000, 300, 100, key="ai_trees"
         ))
+    st.caption(
+        f"Remaining {1 - test_fraction - val_fraction:.0%} of subjects train each model; "
+        f"{val_fraction:.0%} validate it; {test_fraction:.0%} are held out for the final test metrics."
+    )
 
     training_key = (
-        "ai_diagnosis_v1", tuple(selected_groups), tuple(selected_stages), target_kind,
+        "ai_diagnosis_v2", tuple(selected_groups), tuple(selected_stages), target_kind,
         tuple(sorted(selected_target_labels)), tuple(selected_feature_columns),
-        test_fraction, top_feature_count, latent_dim, autoencoder_epochs, n_estimators,
+        test_fraction, val_fraction, top_feature_count, latent_dim, autoencoder_epochs, n_estimators,
     )
     cached_training = st.session_state.get("_ai_diagnosis_training_cache")
     retrain = st.button("Train / retrain AI classifiers", type="primary")
@@ -8839,7 +8967,7 @@ def render_ai_classification_mode(
             with st.spinner("Training engineered-feature and autoencoder classifiers…"):
                 bundle = train_ai_feature_models(
                     model_features, labels, test_fraction, top_feature_count,
-                    latent_dim, autoencoder_epochs, n_estimators,
+                    latent_dim, autoencoder_epochs, n_estimators, val_fraction,
                 )
             st.session_state["_ai_diagnosis_training_cache"] = {
                 "key": training_key, "bundle": bundle,
@@ -8852,6 +8980,13 @@ def render_ai_classification_mode(
         st.info("Configure the task, then click **Train / retrain AI classifiers**.")
         return
     bundle = cached_training["bundle"]
+    representations = bundle["representations"]
+    algorithm_names = bundle["algorithm_names"]
+
+    split_columns = st.columns(3)
+    split_columns[0].metric("Training subjects", bundle["train_size"])
+    split_columns[1].metric("Validation subjects", bundle["val_size"])
+    split_columns[2].metric("Test subjects (held out)", bundle["test_size"])
 
     result_tabs = st.tabs([
         "Accuracy comparison", "Confusion matrices",
@@ -8859,58 +8994,92 @@ def render_ai_classification_mode(
     ])
     with result_tabs[0]:
         metric_rows = []
-        for representation, result in bundle["models"].items():
-            metric_rows.extend([
-                {"Representation": representation, "Metric": "Accuracy", "Value": result["accuracy"]},
-                {"Representation": representation, "Metric": "Balanced accuracy", "Value": result["balanced_accuracy"]},
-                {"Representation": representation, "Metric": "Macro F1", "Value": result["macro_f1"]},
-            ])
+        for representation, by_algorithm in representations.items():
+            for algorithm, result in by_algorithm.items():
+                metric_rows.extend([
+                    {"Representation": representation, "Algorithm": algorithm, "Split": "Validation",
+                     "Metric": "Accuracy", "Value": result["val_accuracy"]},
+                    {"Representation": representation, "Algorithm": algorithm, "Split": "Validation",
+                     "Metric": "Balanced accuracy", "Value": result["val_balanced_accuracy"]},
+                    {"Representation": representation, "Algorithm": algorithm, "Split": "Test",
+                     "Metric": "Accuracy", "Value": result["accuracy"]},
+                    {"Representation": representation, "Algorithm": algorithm, "Split": "Test",
+                     "Metric": "Balanced accuracy", "Value": result["balanced_accuracy"]},
+                    {"Representation": representation, "Algorithm": algorithm, "Split": "Test",
+                     "Metric": "Macro F1", "Value": result["macro_f1"]},
+                ])
         metrics_df = pd.DataFrame(metric_rows)
+        chart_columns = st.columns(2)
+        with chart_columns[0]:
+            metric_choice = st.selectbox(
+                "Metric", ["Accuracy", "Balanced accuracy", "Macro F1"], key="ai_metric_choice"
+            )
+        with chart_columns[1]:
+            split_choice = st.radio(
+                "Split", ["Test (held out)", "Validation"], horizontal=True, key="ai_split_choice"
+            )
+        split_label = "Test" if split_choice.startswith("Test") else "Validation"
+        plot_df = metrics_df[
+            (metrics_df["Metric"] == metric_choice) & (metrics_df["Split"] == split_label)
+        ]
         st.plotly_chart(
             px.bar(
-                metrics_df, x="Representation", y="Value", color="Metric",
+                plot_df, x="Representation", y="Value", color="Algorithm",
                 barmode="group", range_y=[0, 1], text_auto=".3f",
-                title="Held-out classification performance by feature representation",
+                title=f"{split_label} {metric_choice.lower()} by feature representation and algorithm",
             ).update_layout(
                 plot_bgcolor="white", paper_bgcolor="white", font_color="black",
             ),
             use_container_width=True, theme=None,
         )
         st.dataframe(
-            metrics_df.pivot(index="Representation", columns="Metric", values="Value")
-            .reset_index(),
+            metrics_df.pivot_table(
+                index=["Representation", "Algorithm"], columns=["Split", "Metric"], values="Value"
+            ).reset_index(),
             use_container_width=True, hide_index=True,
         )
         st.caption(
-            f"Subject-level split: {bundle['train_size']} training and "
-            f"{bundle['test_size']} held-out test subjects."
+            f"Subject-level split: {bundle['train_size']} training, {bundle['val_size']} "
+            f"validation, {bundle['test_size']} held-out test subjects. Validation metrics "
+            f"never influenced feature selection or hyperparameters; test metrics are reported "
+            f"purely for final comparison."
         )
 
     with result_tabs[1]:
-        confusion_tabs = st.tabs(list(bundle["models"]))
-        for confusion_tab, (representation, result) in zip(
-            confusion_tabs, bundle["models"].items()
-        ):
+        representation_choice = st.selectbox(
+            "Feature representation", list(representations), key="ai_confusion_representation"
+        )
+        confusion_tabs = st.tabs(algorithm_names)
+        for confusion_tab, algorithm in zip(confusion_tabs, algorithm_names):
             with confusion_tab:
+                result = representations[representation_choice][algorithm]
                 figure = plot_ai_confusion_matrix(
                     bundle["y_test"], result["prediction"], bundle["class_names"]
                 )
-                figure.update_layout(title=representation)
+                figure.update_layout(title=f"{representation_choice} — {algorithm} (test set)")
                 st.plotly_chart(
                     figure, use_container_width=True, theme=None,
-                    key=f"ai_confusion_{representation}",
+                    key=f"ai_confusion_{representation_choice}_{algorithm}",
                 )
 
     with result_tabs[2]:
-        importance_tabs = st.tabs(list(bundle["models"]))
-        for importance_tab, (representation, result) in zip(
-            importance_tabs, bundle["models"].items()
-        ):
+        importance_representation = st.selectbox(
+            "Feature representation", list(representations), key="ai_importance_representation"
+        )
+        importance_tabs = st.tabs(algorithm_names)
+        for importance_tab, algorithm in zip(importance_tabs, algorithm_names):
             with importance_tab:
+                result = representations[importance_representation][algorithm]
+                axis_label = (
+                    "|coefficient| (mean over classes)" if algorithm == "Logistic Regression"
+                    else "Feature importance"
+                )
                 st.plotly_chart(
-                    plot_ai_feature_importance(result, representation),
+                    plot_ai_feature_importance(
+                        result, f"{importance_representation} — {algorithm}", axis_label=axis_label
+                    ),
                     use_container_width=True, theme=None,
-                    key=f"ai_importance_{representation}",
+                    key=f"ai_importance_{importance_representation}_{algorithm}",
                 )
         st.subheader("Distribution of an AI-selected physiological feature")
         selected_feature = st.selectbox(
@@ -8956,8 +9125,8 @@ def render_ai_classification_mode(
         )
         st.plotly_chart(
             plot_ai_feature_importance(
-                bundle["models"]["Autoencoder latent features"],
-                "Which autoencoder dimensions classify diagnosis?",
+                representations["Autoencoder latent features"]["Random Forest"],
+                "Which autoencoder dimensions classify diagnosis? (Random Forest)",
                 top_n=len(bundle["latent_names"]),
             ),
             use_container_width=True, theme=None,
