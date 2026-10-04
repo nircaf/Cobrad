@@ -34,6 +34,7 @@ __pycache__/
 cache/
 errors/
 *_cache/
+*_cache*/
 backup/
 backups/
 *_backup/
@@ -54,6 +55,7 @@ pickles_sleep_stage/
 temps_*/
 WNV_figures/
 west_nile_virus/
+utils/blender-*/
 
 # Additional file types
 *.pyc

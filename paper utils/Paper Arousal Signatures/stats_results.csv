@@ -1,0 +1,100 @@
+feature,n_classes,kruskal_p,pair,mannwhitney_p
+delta_hr,5.0,3.6197372766441555e-32,,
+delta_hr,,,spontaneous vs RERA,1.5475597102243797e-09
+delta_hr,,,spontaneous vs obstructive apnea,0.02070785412005659
+delta_hr,,,spontaneous vs central apnea,0.022772044088224048
+delta_hr,,,spontaneous vs PLM,4.0780754164457624e-27
+delta_hr,,,RERA vs obstructive apnea,0.003161281457099432
+delta_hr,,,RERA vs central apnea,4.3144040050142576e-09
+delta_hr,,,RERA vs PLM,0.8503143701633651
+delta_hr,,,obstructive apnea vs central apnea,0.0007257787437322741
+delta_hr,,,obstructive apnea vs PLM,0.00010379779416410813
+delta_hr,,,central apnea vs PLM,8.567651787292643e-14
+hr_latency_s,5.0,2.7240694666392687e-08,,
+hr_latency_s,,,spontaneous vs RERA,0.002141033079505787
+hr_latency_s,,,spontaneous vs obstructive apnea,7.153148256263758e-06
+hr_latency_s,,,spontaneous vs central apnea,0.0036377777174581797
+hr_latency_s,,,spontaneous vs PLM,0.3488064799614454
+hr_latency_s,,,RERA vs obstructive apnea,0.26975978325888883
+hr_latency_s,,,RERA vs central apnea,0.7780576979335401
+hr_latency_s,,,RERA vs PLM,2.0037602758535756e-05
+hr_latency_s,,,obstructive apnea vs central apnea,0.42457406777834084
+hr_latency_s,,,obstructive apnea vs PLM,5.036909000611106e-07
+hr_latency_s,,,central apnea vs PLM,0.00043822205232405166
+eeg_delta_mean,5.0,7.196604860810799e-29,,
+eeg_delta_mean,,,spontaneous vs RERA,4.129703199020412e-12
+eeg_delta_mean,,,spontaneous vs obstructive apnea,4.8036298818063994e-14
+eeg_delta_mean,,,spontaneous vs central apnea,0.24424353171063906
+eeg_delta_mean,,,spontaneous vs PLM,7.592294235776925e-06
+eeg_delta_mean,,,RERA vs obstructive apnea,0.8743779741516544
+eeg_delta_mean,,,RERA vs central apnea,1.4513381476756628e-08
+eeg_delta_mean,,,RERA vs PLM,2.3772892489425353e-18
+eeg_delta_mean,,,obstructive apnea vs central apnea,2.0753340756903908e-09
+eeg_delta_mean,,,obstructive apnea vs PLM,1.588363813247092e-20
+eeg_delta_mean,,,central apnea vs PLM,0.22516337560547572
+eeg_alpha_mean,5.0,8.028416167093524e-37,,
+eeg_alpha_mean,,,spontaneous vs RERA,0.23457342653799307
+eeg_alpha_mean,,,spontaneous vs obstructive apnea,0.40712093687229445
+eeg_alpha_mean,,,spontaneous vs central apnea,1.3313510609513794e-26
+eeg_alpha_mean,,,spontaneous vs PLM,3.591292256269788e-17
+eeg_alpha_mean,,,RERA vs obstructive apnea,0.13224415116811342
+eeg_alpha_mean,,,RERA vs central apnea,1.1937190188866975e-17
+eeg_alpha_mean,,,RERA vs PLM,3.491113466338316e-08
+eeg_alpha_mean,,,obstructive apnea vs central apnea,1.724847703759341e-14
+eeg_alpha_mean,,,obstructive apnea vs PLM,4.743521196266582e-05
+eeg_alpha_mean,,,central apnea vs PLM,7.218758823431702e-09
+eeg_beta_mean,5.0,3.7225336563590687e-45,,
+eeg_beta_mean,,,spontaneous vs RERA,0.016368292442469685
+eeg_beta_mean,,,spontaneous vs obstructive apnea,0.07413824264960756
+eeg_beta_mean,,,spontaneous vs central apnea,7.355110362224747e-43
+eeg_beta_mean,,,spontaneous vs PLM,2.0750184710761702e-10
+eeg_beta_mean,,,RERA vs obstructive apnea,0.45411809244166645
+eeg_beta_mean,,,RERA vs central apnea,2.768272486727404e-16
+eeg_beta_mean,,,RERA vs PLM,0.2892802854595353
+eeg_beta_mean,,,obstructive apnea vs central apnea,3.1494722030858252e-21
+eeg_beta_mean,,,obstructive apnea vs PLM,0.035010477426810536
+eeg_beta_mean,,,central apnea vs PLM,2.1664184152715545e-21
+eeg_entropy_delta,5.0,7.864905620450405e-17,,
+eeg_entropy_delta,,,spontaneous vs RERA,0.00010622571604010338
+eeg_entropy_delta,,,spontaneous vs obstructive apnea,1.0516315861034299e-16
+eeg_entropy_delta,,,spontaneous vs central apnea,0.7208955247201008
+eeg_entropy_delta,,,spontaneous vs PLM,0.042033468999169675
+eeg_entropy_delta,,,RERA vs obstructive apnea,0.0016306045244178931
+eeg_entropy_delta,,,RERA vs central apnea,0.004589237459936424
+eeg_entropy_delta,,,RERA vs PLM,0.016915836534176765
+eeg_entropy_delta,,,obstructive apnea vs central apnea,3.18424792530247e-09
+eeg_entropy_delta,,,obstructive apnea vs PLM,2.0948382241087584e-10
+eeg_entropy_delta,,,central apnea vs PLM,0.17286981909731358
+eeg_delta_spread,5.0,3.5144773568458327e-63,,
+eeg_delta_spread,,,spontaneous vs RERA,3.888592856974779e-18
+eeg_delta_spread,,,spontaneous vs obstructive apnea,4.777245673339375e-25
+eeg_delta_spread,,,spontaneous vs central apnea,1.1656234878693403e-15
+eeg_delta_spread,,,spontaneous vs PLM,7.318095978161253e-13
+eeg_delta_spread,,,RERA vs obstructive apnea,3.4076602224010736e-45
+eeg_delta_spread,,,RERA vs central apnea,3.8283123294901127e-35
+eeg_delta_spread,,,RERA vs PLM,1.7746232657410904e-32
+eeg_delta_spread,,,obstructive apnea vs central apnea,0.3542802224812509
+eeg_delta_spread,,,obstructive apnea vs PLM,1.2919707189107327e-07
+eeg_delta_spread,,,central apnea vs PLM,0.00022919832193270885
+eeg_alpha_spread,5.0,1.1954624578986603e-09,,
+eeg_alpha_spread,,,spontaneous vs RERA,0.0011407336971824874
+eeg_alpha_spread,,,spontaneous vs obstructive apnea,0.031444575219384825
+eeg_alpha_spread,,,spontaneous vs central apnea,0.0848872238012896
+eeg_alpha_spread,,,spontaneous vs PLM,1.9522284582723756e-08
+eeg_alpha_spread,,,RERA vs obstructive apnea,0.31257525707551437
+eeg_alpha_spread,,,RERA vs central apnea,0.0001627173597238479
+eeg_alpha_spread,,,RERA vs PLM,0.9818841895179764
+eeg_alpha_spread,,,obstructive apnea vs central apnea,0.0031925710879849175
+eeg_alpha_spread,,,obstructive apnea vs PLM,0.18899955528054202
+eeg_alpha_spread,,,central apnea vs PLM,2.570509806169415e-06
+eeg_beta_spread,5.0,0.00018358344829014054,,
+eeg_beta_spread,,,spontaneous vs RERA,5.1779460421601595e-06
+eeg_beta_spread,,,spontaneous vs obstructive apnea,0.19131977895641838
+eeg_beta_spread,,,spontaneous vs central apnea,0.9496207621860933
+eeg_beta_spread,,,spontaneous vs PLM,0.23312870060180457
+eeg_beta_spread,,,RERA vs obstructive apnea,0.006540087228089474
+eeg_beta_spread,,,RERA vs central apnea,0.0007911918712499167
+eeg_beta_spread,,,RERA vs PLM,0.00031457005062788927
+eeg_beta_spread,,,obstructive apnea vs central apnea,0.3729773769954461
+eeg_beta_spread,,,obstructive apnea vs PLM,0.6092565166101256
+eeg_beta_spread,,,central apnea vs PLM,0.5710802398541439
