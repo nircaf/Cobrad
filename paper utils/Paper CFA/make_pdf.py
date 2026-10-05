@@ -30,6 +30,9 @@ with open(os.path.join(HERE, "window_stage_sensitivity_stats.json")) as f:
 
 COHORT, CFA, ICA, STRAT, TOPO = S["cohort"], S["cfa"], S["ica"], S["stratified"], S["topomap"]
 DOSE = S["dose_response"]
+SRC = S["cohort"]["source_counts"]
+DXS = S["stratified"]["dx_by_site"]
+ZL = S["crosscorr_mi"]["zero_lag_r2_full_epoch"]
 R2_SNR_P_STR = "&lt; 1e-300" if ICA["r2_vs_snr_p"] == 0 else f"= {ICA['r2_vs_snr_p']:.2g}"
 STAGE_LABEL = {"W": "Wake", "light_sleep": "Light (N1+N2)", "N3": "N3", "R": "REM"}
 
@@ -94,30 +97,30 @@ story.append(Spacer(1, 10))
 # ---------------------------------------------------------------------
 story.append(Paragraph("Abstract", styles["H1"]))
 story.append(Paragraph(
-    f"Heartbeat-evoked potentials (HEPs) are used to study cardiac interoception, but the "
-    f"electrical field of the heart is time-locked to the same R-peak and contaminates scalp EEG. "
-    f"Previous CFA characterisations come from small, single-cohort samples (typically tens of "
-    f"participants) and treat the residual contamination after standard QRS exclusion as fixed; "
-    f"yet how much this contamination varies across medical conditions, sex, "
-    f"and age — and whether short recordings understate it — is largely unknown. We closed this gap by "
-    f"quantifying cardiac field artifact (CFA) in {CFA['n_patients']:,} polysomnography recordings "
-    f"({CFA['n_rows']:,} channel-recordings) from The Human Sleep Project dataset."
-    f" For each channel, the R-peak-locked EEG "
-    f"average was regressed against the simultaneous ECG average over -300 to 400 ms, "
-    f"excluding the ±50-ms QRS interval. An ECG-informed independent component analysis "
-    f"(ICA) measured the variance removed with the ECG component. Outside the QRS interval, "
-    f"ECG still explained mean R² = {CFA['r2_excl_qrs_mean']:.2f} (full epoch "
-    f"{CFA['r2_full_mean']:.2f}); ICA removal reduced "
-    f"HEP-evoked variance by a median {ICA['hep_pct_drop_median']*100:.0f}%. CFA differed across "
-    f"electrodes and was higher in male than female patients ({STRAT['sex_means']['Male']:.2f} vs. "
-    f"{STRAT['sex_means']['Female']:.2f}) and in patients with versus without a linked diagnosis "
-    f"({STRAT['any_dx_mean']:.2f} vs. {STRAT['no_dx_mean']:.2f}). Obesity showed the largest "
-    f"difference. In {DOSE['n_common_patients']:,} matched patients, mean CFA "
-    f"R² increased from {DOSE['lengths'][0]['mean']:.2f} at 5 min to "
-    f"{DOSE['lengths'][-1]['mean']:.2f} at {DOSE['lengths'][-1]['window_minutes']:.0f} min, so short segments underestimate "
-    f"contamination. CFA is a participant- and channel-dependent "
-    f"confound, not a fixed nuisance. Therefore, HEP studies should model ECG-derived contamination per "
-    f"channel and consider BMI, clinical obesity, and sex when cleaning EEG and comparing groups.",
+    f"Heartbeat-evoked potentials (HEPs) are used to study cardiac interoception; however, "
+    f"the cardiac electrical field is time-locked to the same R-peak and contaminates scalp EEG. "
+    f"Previous studies have characterised this cardiac field artifact (CFA) in small, single-cohort "
+    f"samples and implicitly treated residual contamination after QRS exclusion as constant; yet "
+    f"the extent to which CFA varies with BMI, medical conditions, sex, and age, and whether short "
+    f"segments underestimate it, have not been examined. To address this gap, we quantified CFA in "
+    f"{CFA['n_patients']:,} polysomnography patients ({CFA['n_rows']:,} "
+    f"channel-recordings), predominantly from the Human Sleep Project, a publicly available, curated "
+    f"dataset. Per channel, the R-peak-locked EEG average was regressed on the ECG "
+    f"average (-300 to 400 ms), excluding a ±50 ms QRS interval. Outside "
+    f"the QRS interval, the ECG explained a mean R² of {CFA['r2_excl_qrs_mean']:.2f} (full epoch: "
+    f"{CFA['r2_full_mean']:.2f}), and removing the ECG-related independent component reduced HEP "
+    f"variance by a median of "
+    f"{ICA['hep_pct_drop_median']*100:.0f}%. CFA varied across electrodes and was greater in male "
+    f"than in female patients ({STRAT['sex_means']['Male']:.2f} vs. "
+    f"{STRAT['sex_means']['Female']:.2f}) and in patients with than without a linked diagnosis "
+    f"({STRAT['any_dx_mean']:.2f} vs. {STRAT['no_dx_mean']:.2f}; confounded by recording site); among diagnoses, it was highest for "
+    f"obesity. BMI correlated weakly with CFA (exploratory; r = {STRAT['bmi']['r_pearson']:.2f}); "
+    f"age showed no linear trend. In {DOSE['n_common_patients']:,} duration-matched "
+    f"patients, mean R² increased from {DOSE['lengths'][0]['mean']:.2f} at 5 min to "
+    f"{DOSE['lengths'][-1]['mean']:.2f} at {DOSE['lengths'][-1]['window_minutes']:.0f} min, "
+    f"suggesting that short segments underestimate contamination. CFA is a participant- and "
+    f"channel-dependent confound. HEP studies should therefore model ECG-derived contamination per "
+    f"channel and account for BMI, clinical obesity, and sex when comparing groups.",
     styles["Body"]))
 story.append(Paragraph(
     "Keywords: cardiac field artifact; heartbeat-evoked potential; interoception; "
@@ -130,52 +133,57 @@ story.append(PageBreak())
 # ---------------------------------------------------------------------
 story.append(Paragraph("1. Introduction", styles["H1"]))
 story.append(Paragraph(
-    "Every heartbeat volume-conducts an electrical field into scalp EEG electrodes with a fixed phase "
-    "relationship to the R-peak — the same event used to time-lock heartbeat-evoked potential (HEP) "
-    "epochs. This cardiac field artifact (CFA) survives ordinary trial averaging as well as genuine "
-    "cortical interoceptive signal does,<super>1</super> and the standard mitigation is to exclude a "
-    "short window around the QRS complex (commonly ±30-50 ms) from analysis.<super>3-5</super> What that "
-    "mitigation has not been given at population scale is a number: how much of the HEP that survives QRS exclusion is "
-    "still explainable by the cardiac field, and whether that fraction depends on who the patient is "
-    "(age, sex, diagnosis) or is a fixed instrumental constant. Existing CFA characterisations are small "
-    "(typically tens of participants) and single-cohort, too underpowered to answer either question.",
+    "The electrical field generated by each heartbeat is volume-conducted to scalp EEG electrodes "
+    "with a fixed phase relationship to the R-peak, the same event used to time-lock "
+    "heartbeat-evoked potential (HEP) epochs. This cardiac field artifact (CFA) is therefore "
+    "preserved by trial averaging to the same degree as genuine cortical interoceptive "
+    "activity.<super>1</super> The standard mitigation is to exclude a short interval around the QRS "
+    "complex (typically ±30–50 ms) from analysis.<super>2-4</super> Previous studies have "
+    "characterised the topography and morphology of CFA in single cohorts of a few tens of "
+    "participants,<super>1,5</super> samples underpowered to detect modest between-participant "
+    "differences; yet, to our knowledge, no study has quantified the proportion of HEP variance that "
+    "remains shared with the ECG after QRS exclusion at the population level, nor examined whether "
+    "this proportion varies with BMI, medical conditions, sex, and age, or with the length of the "
+    "analysed segment. Instead, residual contamination after QRS exclusion has largely been treated "
+    "as an approximately constant property of the recording.",
     styles["Body"]))
 story.append(Paragraph(
-    "This distinction matters because an R-peak-locked scalp waveform is a mixture, not a direct "
-    "measurement of one source. Neural responses to baroreceptor and somatosensory input may coexist "
-    "with passive cardiac volume conduction, and both survive heartbeat-locked averaging.<super>2,3,8</super> "
-    "Consequently, a group difference in HEP amplitude can reflect cortical processing, cardiac "
-    "electrophysiology, tissue conduction, electrode geometry, or a combination of these factors. "
-    "Recent reviews document substantial heterogeneity in CFA handling and warn that inconsistent "
-    "preprocessing limits reproducibility and clinical interpretation.<super>4,5,9</super> Quantifying "
-    "the residual ECG-related variance is therefore a prerequisite for interpreting HEPs as neural "
-    "biomarkers rather than merely a technical refinement.",
+    "The assumption of constant contamination matters because the R-peak-locked scalp waveform is a mixture of sources "
+    "rather than a measurement of a single generator. Neural responses to baroreceptor and "
+    "somatosensory input coexist with passive cardiac volume conduction, and both are preserved by "
+    "heartbeat-locked averaging.<super>2,5,6</super> A group difference in HEP amplitude may "
+    "therefore reflect cortical processing, cardiac electrophysiology, tissue conductivity, "
+    "electrode geometry, or a combination of these factors. Recent reviews have documented "
+    "considerable heterogeneity in how CFA is handled and have noted that inconsistent preprocessing "
+    "limits reproducibility and clinical interpretation.<super>3,4,7</super> Quantifying the residual "
+    "ECG-related variance is therefore a prerequisite for interpreting HEPs as neural biomarkers, "
+    "not merely a technical refinement.",
     styles["Body"]))
 story.append(Paragraph(
-    "CFA may also vary systematically between people. Body composition alters the geometry and "
-    "conductive path between heart and scalp. In surface ECG, subcutaneous fat attenuates cardiac "
-    "voltage, and correcting voltage for measured body fat changes its relationship with cardiac "
-    "structure and ambulatory blood pressure.<super>10</super> Sex, age, and disease burden covary with body "
-    "composition, cardiac morphology, rhythm, and medication exposure. Clinical obesity and BMI are "
-    "therefore of particular interest, but neither directly measures body-fat distribution; the present "
-    "data cannot isolate fat mass from correlated cardiometabolic conditions. If these characteristics "
-    "predict CFA, they are potential confounders in between-group HEP analyses and should be measured "
-    "or modelled rather than assumed to disappear after a fixed QRS exclusion.",
+    "CFA may also differ systematically between individuals. Body composition alters the geometry "
+    "and conductivity of the path between the heart and the scalp. In surface ECG, subcutaneous fat "
+    "attenuates cardiac voltage, and correcting voltage for measured body fat alters its "
+    "relationship with cardiac structure and ambulatory blood pressure.<super>8</super> Clinical "
+    "obesity and BMI are therefore of particular interest, although neither directly measures "
+    "body-fat distribution. Sex, age, and disease burden also covary with body composition, cardiac "
+    "morphology, rhythm, and medication exposure. If body composition or these characteristics predict CFA, they constitute "
+    "potential confounders in between-group HEP analyses and should be measured or modelled rather "
+    "than assumed to be eliminated by a fixed QRS exclusion.",
     styles["Body"]))
 story.append(Paragraph(
-    f"We answer both questions using this project's clinical polysomnography corpus, applying two "
-    f"independent estimators to the same HEP epoch window used throughout this project's other "
-    f"analyses. A model-free estimator regresses each channel's own R-peak-locked HEP evoked average "
-    f"directly on that patient's R-peak-locked ECG evoked average, requiring no assumption that ICA "
-    f"correctly separates cardiac from neural sources. A model-based estimator runs an ECG-informed ICA "
-    f"artifact-removal pipeline and measures both the flagged component's share of HEP-evoked variance "
-    f"and the actual variance drop from removing it. Applied across {CFA['n_patients']:,} patients — to "
-    f"our knowledge the largest cohort in which CFA's HEP variance contribution has been quantified — "
-    f"this lets us test population stability with statistical power no prior single-site CFA study has "
-    f"had. We further test whether recording duration changes the apparent contamination, because a "
-    f"short segment may contain too few heartbeats to stabilize an evoked average. Our prespecified "
-    f"expectations were that ECG-related variance would remain outside QRS, would vary by channel and "
-    f"patient characteristics, and would increase as longer windows revealed a more stable shared signal.",
+    f"Here, we addressed these questions in clinical polysomnography recordings drawn predominantly from "
+    f"the Human Sleep Project, a publicly available, curated dataset,<super>9</super> using two "
+    f"complementary estimators applied to a common HEP epoch window. A model-free estimator regresses "
+    f"each channel's R-peak-locked evoked average on the same patient's R-peak-locked ECG evoked "
+    f"average and therefore requires no assumption that ICA correctly separates cardiac from neural "
+    f"sources. A model-based estimator applies ECG-informed ICA and quantifies both the share of "
+    f"HEP variance carried by the ECG-related component and the variance reduction obtained by "
+    f"removing it. To our knowledge, this {CFA['n_patients']:,}-patient cohort is the largest in which "
+    f"the contribution of CFA to HEP variance has been quantified. We additionally examined whether "
+    f"segment duration affects the apparent contamination, as short segments may contain too few "
+    f"heartbeats to yield a stable evoked average. We hypothesised that ECG-related variance would "
+    f"persist outside the QRS interval, would vary across channels and patient characteristics, and "
+    f"would increase with segment length as the shared signal became more stable.",
     styles["Body"]))
 
 # ---------------------------------------------------------------------
@@ -183,107 +191,153 @@ story.append(Paragraph(
 # ---------------------------------------------------------------------
 story.append(Paragraph("2. Methods", styles["H1"]))
 story.append(Paragraph("2.1 Cohort and recordings", styles["H2"]))
-cohort_sex_str = ", ".join(f"{k} n={v:,}" for k, v in COHORT["sex_counts"].items())
 story.append(Paragraph(
-    f"Demographics were available for {COHORT['n_demographics']:,} patients (median age "
-    f"{COHORT['age_median']:.0f} years, range {COHORT['age_min']:.0f}-{COHORT['age_max']:.0f}; "
-    f"{cohort_sex_str}), drawn from The Human Sleep Project.<super>14</super> BMI was derived from "
-    f"median patient height and weight recorded in the longitudinal vitals flowsheet and hospital "
-    f"admission table; values outside 10-80 kg/m² were excluded as implausible. "
-    f"EDF recordings were drawn from this project's multi-source clinical polysomnography corpus "
-    f"(predominantly this cohort's EEG/EHR-linked group, with smaller "
-    f"contributions from other project source cohorts). This multi-hospital design parallels prior "
-    f"multicentre epilepsy imaging work.<super>15</super> For each recording, one reproducible, "
-    f"quality-controlled 10-minute window was selected (seeded random search; EEG/ECG signal-quality "
-    f"and physiological-plausibility thresholds), matching the "
-    f"window-selection procedure used throughout this project's HEP pipeline so both estimators score "
-    f"the same kind of data the project's HEP science itself uses. "
-    f"EEG/ECG channels were identified by a whitelist match against standard 10-20/10-10 electrode "
-    f"names (to exclude iEEG depth electrodes and auxiliary/DC channels present in this heterogeneous "
-    f"corpus) and an ECG/EKG channel-name pattern match. Signals were read and band-pass filtered "
-    f"1-100 Hz with MNE-Python.<super>7</super> "
-    f"HEP epochs spanned -300 to 400 ms around each detected R-peak, matching this project's own HEP "
-    f"cluster-statistics pipeline; the ±50 ms QRS-exclusion window used there, following standard "
-    f"HEP methodology,<super>5</super> was reused unchanged here.",
+    f"This study is a secondary analysis of existing polysomnography recordings; no recordings were "
+    f"acquired for this study. Most patients ({SRC['Harvard_Electroencephalography']:,}) were "
+    f"obtained from the Human Sleep Project,<super>9</super> a publicly available, curated dataset "
+    f"of clinical polysomnography recordings with linked electronic health records (EHR), "
+    f"distributed through the Brain Data Science Platform. The remaining patients came from the CAP "
+    f"Sleep Database<super>10,11</super> (n = {SRC['CAP_Sleep_Database']}), a sleep dataset from "
+    f"[AUTHOR: Berkeley dataset source and citation] (n = {SRC['Berkeley_data']}), and clinical "
+    f"polysomnography recordings from Rabin Medical Center (n = {SRC['EDF']}); because these "
+    f"cohorts lack EHR linkage, they contributed only to the cohort-wide CFA estimates and not to "
+    f"demographic, diagnosis, or BMI analyses. BMI was "
+    f"computed from each patient's median height and weight recorded in the EHR vitals and admission "
+    f"tables; values outside 10–80 kg/m² were excluded as implausible. EEG channels were identified by matching channel labels against standard "
+    f"10-20/10-10 electrode names, thereby excluding intracranial depth electrodes and auxiliary/DC "
+    f"channels; at least two EEG channels were required. The ECG channel was identified by label "
+    f"pattern matching (ECG/EKG), and the first matching lead was used. Cohort characteristics are "
+    f"reported in §3.1.",
     styles["Body"]))
-story.append(Paragraph("2.2 EEG cleaning pipeline", styles["H2"]))
+story.append(Paragraph("2.2 Window selection, R-peak detection, and preprocessing", styles["H2"]))
 story.append(Paragraph(
-    "Each EDF's quality-controlled window was cleaned before CFA estimation using the same standard "
-    "EEG cleaning pipeline used throughout the project's HEP analyses. "
-    "Channels were renamed/typed and resampled to 256 Hz; a 0.5 Hz-Nyquist band-pass and a harmonic "
-    "notch filter at the recording's detected line frequency were applied. Bad EEG channels were "
-    "flagged and re-referenced or repaired via the "
-    "PREP pipeline where it converged, then interpolated; remaining artifact was removed with "
-    "AutoReject. EEG channels were then standardized per channel before downstream analysis. This "
-    "cleaning is independent of the two CFA estimators themselves (§2.3-2.4): the model-based "
-    "estimator's own ICA decomposition (§2.4) runs on top of this already-cleaned signal.",
+    "For each recording, a single 10-min analysis window was selected by a seeded, reproducible "
+    "random search (uniformly distributed start times; up to 10 attempts). R-peaks were detected on "
+    "the ECG of each candidate window before the analysis filter described below: the "
+    "median-subtracted signal was band-pass "
+    "filtered at 5–25 Hz (third-order zero-phase Butterworth), rectified, and peaks were identified "
+    "with a minimum inter-peak distance of 300 ms and a prominence threshold of three times the "
+    "median absolute deviation of the rectified signal; rectification made detection insensitive to "
+    "ECG polarity. A window was accepted if (i) at least 70% of EEG "
+    "channels passed signal-quality criteria (≥99.9% finite samples; standard deviation 0.1–500 µV; "
+    "peak-to-peak amplitude ≤5,000 µV; &lt;20% flat samples), (ii) the mean heart rate was 35–180 "
+    "beats/min, and (iii) at least 70% of R-R intervals lay between 0.33 and 2.0 s. The accepted "
+    "window was then band-pass filtered between 1 Hz and min(100 Hz, Nyquist − 0.5 Hz) using a "
+    "zero-phase FIR filter in MNE-Python;<super>12</super> because 86% of recordings were sampled at "
+    "200 Hz, the upper edge lay just below the Nyquist frequency in most recordings. The same filter "
+    "was applied to the EEG and ECG channels, and signals were analysed in µV at their native "
+    "sampling rate without re-referencing, channel interpolation, or amplitude-based rejection, so "
+    "that CFA was estimated in minimally processed data.",
     styles["Body"]))
 story.append(Paragraph("2.3 Model-free CFA estimator: HEP-vs-ECG regression", styles["H2"]))
 story.append(Paragraph(
+    "HEP epochs spanned -300 to 400 ms relative to each detected R-peak; epochs extending beyond the "
+    "window edges were discarded, no baseline correction was applied, and recordings with fewer than "
+    "20 epochs were excluded (median 940 epochs per 10-min window). "
     "For each patient and EEG channel, the R-peak-locked evoked average (mean across epochs) was "
-    "computed for that channel and, separately, for the patient's own ECG lead over the identical "
-    "epoch window. The squared zero-lag Pearson correlation (R²) between the two evoked waveforms was "
-    "taken as the fraction of that channel's HEP-evoked variance explainable by the cardiac field, "
-    "reported both over the full epoch and restricted to samples outside the ±50 ms QRS window. This "
-    "estimator makes no assumption about ICA's ability to isolate a cardiac source; it asks directly "
-    "whether the averaged scalp deflection is, in effect, a scaled copy of the averaged heartbeat.",
+    "computed, together with the evoked average of the patient's ECG lead over the same epoch "
+    "window. The squared zero-lag Pearson correlation (R²) between the two evoked waveforms was "
+    "taken as the fraction of HEP variance in that channel shared with the ECG and used as an index "
+    "of CFA. R² "
+    "was computed over the full epoch and over the samples outside a ±50 ms QRS-exclusion window, as "
+    "is standard in HEP analysis.<super>4</super> This estimator "
+    "does not depend on the ability of ICA to isolate a cardiac source; rather, it tests directly "
+    "the extent to which the averaged scalp waveform is a linearly scaled (and offset) copy of the "
+    "averaged ECG. For patient-level analyses (§2.7), channel-level R² values were averaged across "
+    "each patient's channels at the six well-covered sites (§2.5) and, for patients with more than "
+    "one recording, across recordings (patient-mean CFA R²).",
     styles["Body"]))
 story.append(Paragraph("2.4 Model-based CFA estimator: ECG-informed ICA", styles["H2"]))
 story.append(Paragraph(
-    "Independently, ICA<super>6</super> (Picard,<super>11</super> extended-Infomax fallback; up to 15 components) was "
-    "fit on the same "
-    "quality-controlled window, and the component most correlated with the ECG channel was flagged as "
-    "the cardiac-artifact component (MNE's<super>7</super> ECG-correlation scoring, matching this project's own "
-    "artifact-removal pipeline). Rather than reporting the component's share of raw continuous-signal "
-    "variance, each component's mixing-weighted contribution was evaluated on its own R-peak-locked "
-    "evoked average, i.e. how much of the heartbeat-evoked (not generic continuous) signal the "
-    "component explains. Separately, the actual cleaning effect was measured directly: each channel's "
-    "HEP-evoked variance was compared before and after excluding the flagged component via ICA "
-    "back-projection, giving the realised percentage variance drop rather than only the component's "
-    "notional share.",
+    "In parallel, ICA<super>13</super> (extended Picard algorithm<super>14</super>; "
+    "min(15, number of EEG channels − 1) components; 500 iterations; fixed "
+    "random seed) was fitted to the filtered EEG of the same 10-min window used for the regression "
+    "estimator. "
+    "Components whose correlation with the ECG channel exceeded the default threshold were identified "
+    "as ECG-related using the correlation-based scoring implemented in "
+    "MNE-Python;<super>12</super> if none did, the component with "
+    "the highest absolute score was used (two components were flagged in 49 of 13,624 recordings). Rather than each component's share "
+    "of continuous-signal variance, its mixing-weighted contribution to each channel was evaluated on "
+    "the R-peak-locked evoked average, thereby quantifying the fraction of heartbeat-evoked signal "
+    "that the component explains. In addition, the effect of artifact removal was measured directly "
+    "by comparing the HEP variance of each channel before and after excluding the ECG-related "
+    "component through ICA back-projection, yielding the realised percentage reduction in variance, "
+    "100 × (pre - post)/pre, rather than the nominal share of the component. For Figure 1b, the "
+    "ratio of ECG-related component variance to residual variance (SNR) was also computed for each "
+    "channel-recording.",
     styles["Body"]))
-story.append(Paragraph("2.5 Statistics", styles["H2"]))
+story.append(Paragraph("2.5 Channel canonicalisation and minimum coverage", styles["H2"]))
 story.append(Paragraph(
-    "Age was tested two ways against patient-mean CFA R² (outside QRS): as a continuous variable via "
-    "Pearson correlation, and by tertile via one-way ANOVA. Sex and linked-diagnosis differences, "
-    "being two-group comparisons, were tested with the Mann-Whitney U test given the right-skewed R² "
-    "distribution. Diagnosis-category comparisons (§3.3) used the Kruskal-Wallis omnibus test with "
-    "pairwise Mann-Whitney tests, Benjamini-Hochberg FDR corrected<super>13</super> across all pairwise comparisons. "
-    "BMI was tested continuously with Pearson correlation. To include all sites without duplicating "
-    "patients, the BMI analysis selected each patient's longest available CFA window, retaining "
-    "exactly one patient-level observation. BMI correlations were then "
-    "estimated separately by sex, and an ordinary least-squares BMI-by-sex interaction tested whether "
-    "the slopes differed. A supplementary ordinary least-squares "
-    "model compared the sex coefficient before and after adjustment for BMI in the same matched subset.",
-    styles["Body"]))
-
-# ---------------------------------------------------------------------
-# Results
-# ---------------------------------------------------------------------
-story.append(Paragraph("2.6 Channel canonicalisation and minimum coverage", styles["H2"]))
-story.append(Paragraph(
-    "Raw channel labels were canonicalised to their scalp-side 10-20 site; labels representing only "
-    "a reference electrode were excluded. Figure 2 reports every canonical site with at least "
-    f"{TOPO['min_patients']} patients. Figures "
-    "requiring a cross-condition or cross-estimator comparison at a shared set of electrodes (§3.3-3.4, "
-    "S2-S4) instead keep only canonical sites present in at least 50% of that figure's patients; in "
-    "practice this restricts those figures to six sites (F3, F4, C3, C4, O1, O2, each covering "
-    "96-100% of patients) that dominate this corpus's montage.",
+    "Channel labels were mapped to their scalp-side 10-20 site, and labels corresponding only to a "
+    "reference electrode were excluded. Figure 2 includes all canonical sites recorded in at least "
+    f"{TOPO['min_patients']} patients. Analyses requiring comparison across conditions or estimators "
+    "at a common set of electrodes (§3.3–3.4, S2–S4) were restricted to sites present in at least "
+    "50% of the patients included in that analysis. In practice, this criterion retained six sites "
+    "(F3, F4, C3, C4, O1, O2; each present in 96–100% of patients), which constitute the predominant "
+    "montage of the dataset.",
     styles["Body"]))
 
-story.append(Paragraph("2.7 EEG-ECG cross-correlation and mutual information", styles["H2"]))
+story.append(Paragraph("2.6 EEG-ECG cross-correlation and mutual information", styles["H2"]))
 story.append(Paragraph(
-    "Supplementary Figures S3-S4 measure the EEG-ECG relationship further ways, on an independent "
-    "150-patient subsample. Lag-resolved cross-correlation: Pearson correlation between each channel's "
-    "evoked waveform and the concurrent ECG evoked average at lags spanning &plusmn;100 ms in 5 ms "
-    "steps (rather than only the zero-lag value used in §2.3), reporting the peak absolute correlation "
-    "and its lag (sign-flipped per channel first, since reference polarity is arbitrary). Mutual "
-    "information: the Kraskov k-nearest-neighbour estimator,<super>12</super> capturing nonlinear as well as linear "
-    "EEG-ECG dependence. Both run on three conditions: pre-ICA, post-ICA, and a non-heartbeat-locked "
-    "control that re-epochs the same quality-controlled window around random pseudo-event times "
-    "instead of true R-peaks. A fourth condition, the patient's own ECG evoked average, is added for the "
-    "power-spectral-density comparison only (Figure S4): Welch PSD (dB) of each condition, restricted "
-    "to the six well-covered electrodes (§2.6) plus ECG.",
+    "The EEG-ECG relationship was further characterised in a separate subsample of 150 patients "
+    f"(Supplementary Figures S3–S4; {S['crosscorr_mi']['n_patients']} with usable cross-correlation "
+    "and mutual-information data). Lag-resolved cross-correlation was computed as the Pearson "
+    "correlation between each channel's evoked waveform and the concurrent ECG evoked average at "
+    "lags of &plusmn;100 ms in 5 ms steps, extending the zero-lag analysis of §2.3; the peak absolute "
+    "correlation and its lag were reported after per-channel sign alignment, as reference polarity "
+    "is arbitrary. Mutual information was estimated with the Kraskov k-nearest-neighbour "
+    "estimator<super>15</super> to capture both linear and nonlinear EEG-ECG dependence. Both measures "
+    "were computed for three conditions: pre-ICA, post-ICA, and a non-heartbeat-locked control in "
+    "which the same window was re-epoched around an equal number of pseudo-events placed uniformly at "
+    "random instead of R-peaks; in this subsample, ICA was refitted and R-peaks were re-detected on "
+    "the band-pass-filtered ECG. For the "
+    "power spectral density (PSD) comparison (Figure S4), the patient's ECG evoked average was added "
+    "as a fourth condition, and Welch PSD (dB) was computed for each condition at the six "
+    "well-covered electrodes (§2.5). Two further random subsamples supported Figure S2: in one "
+    f"({S['post_ica_variance']['n_patients_control']:,} patients), the ICA windows were re-epoched "
+    "around the same number of pseudo-events, without ICA refitting, to estimate a variance noise "
+    f"floor; in the other ({S['post_ica_variance']['n_patients_entropy']:,} patients), ICA was "
+    "refitted and the spectral entropy of each evoked waveform (Shannon entropy of its Welch power "
+    "spectrum, normalised to 0–1) was computed for the pre-ICA, post-ICA, and pseudo-event conditions.",
+    styles["Body"]))
+story.append(Paragraph("2.7 Statistics", styles["H2"]))
+story.append(Paragraph(
+    "Diagnoses were assigned to 15 predefined categories by case-insensitive keyword matching on EHR "
+    "diagnosis descriptions (Supplementary Table S1); a patient could belong to several categories. "
+    "Patients were classified as having a linked diagnosis if any diagnosis was recorded in the EHR, "
+    "and as having no linked diagnosis if they were EHR-linked but had no recorded diagnosis (a "
+    "group that, owing to incomplete diagnosis linkage, included patients from a site without "
+    "diagnosis tables; see Limitations); "
+    "patients without an EHR link were excluded from diagnosis analyses. "
+    "The association between age and patient-mean CFA R² (outside QRS) was assessed as a continuous "
+    "variable using Pearson correlation and by tertile using one-way ANOVA. Because the R² "
+    "distribution was right-skewed, differences by sex and by presence of a linked diagnosis were "
+    "assessed with the Mann-Whitney U test. Differences among diagnosis categories (§3.3) were "
+    "assessed with the Kruskal-Wallis test followed by pairwise Mann-Whitney tests, with "
+    "Benjamini-Hochberg false discovery rate (FDR) correction<super>16</super> across all pairwise "
+    "comparisons. The association with continuous BMI, an exploratory (not prespecified) analysis, was "
+    "assessed using Pearson correlation. To retain one "
+    "observation per patient, the BMI analysis used the longest available CFA window for each "
+    "patient (30 min for 98% of patients), so absolute R² values in the BMI and BMI-adjusted sex "
+    "analyses are not directly comparable with the 10-min estimates. BMI correlations were also "
+    "estimated separately by sex, and a BMI-by-sex interaction "
+    "term in an ordinary least-squares (OLS) model was used to test whether the slopes differed. A "
+    "supplementary OLS model compared the sex coefficient before and after adjustment for BMI in the "
+    "same subset. The relationship between model-free R² and the log-transformed ICA SNR (§2.4) "
+    "was assessed with Pearson correlation across channel-recordings (Figure 1b). Sensitivity to "
+    "segment duration (Supplementary §S6) was assessed in patients with usable data at all six "
+    "durations (5–60 min), using all EEG channels rather than only the six well-covered sites "
+    "(Figure S6a reports channel-level means), comparing sexes and diagnosis groups with "
+    "Mann-Whitney tests at each "
+    "duration. Windows of each length were drawn with the same seeded procedure, so that shorter "
+    "windows were usually nested within longer ones; the 45- and 60-min analyses used one recording "
+    "per patient. Sample sizes differ between analyses because each requires different data: the "
+    f"model-free estimator included all patients with a valid window ({CFA['n_patients']:,}); the ICA "
+    f"estimator, patients with a converged decomposition ({ICA['n_patients']:,}); age, sex, and "
+    f"diagnosis analyses, EHR-linked patients with known age and at least one well-covered site "
+    f"({STRAT['n_with_age']:,}); BMI analyses, patients with a plausible BMI "
+    f"({STRAT['bmi']['n']:,}); and the duration analysis, patients with data at all six durations "
+    f"({DOSE['n_common_patients']:,}).",
     styles["Body"]))
 story.append(Paragraph("3. Results", styles["H1"]))
 story.append(Paragraph("3.1 Cohort", styles["H2"]))
@@ -291,112 +345,119 @@ sex_str = ", ".join(f"{k} n={v:,}" for k, v in COHORT["sex_counts"].items())
 top3_dx = list(COHORT["top_diagnoses"].items())[:3]
 top3_str = "; ".join(f"{k} (n={v:,})" for k, v in top3_dx)
 story.append(Paragraph(
-    f"Demographics were available for {COHORT['n_demographics']:,} patients (median age "
-    f"{COHORT['age_median']:.0f} years, range {COHORT['age_min']:.0f}-{COHORT['age_max']:.0f}; "
-    f"{sex_str}). This is a clinically referred polysomnography population with a high diagnostic "
-    f"burden, not a healthy community sample — the most prevalent categories were {top3_str} "
-    f"(diagnosis categories are not mutually exclusive). Full cohort composition is given in "
-    f"Supplementary Figure S1.",
+    f"Of the {CFA['n_patients']:,} analysed patients, {SRC['Harvard_Electroencephalography']:,} came "
+    f"from the Human Sleep Project (§2.1). Demographic data were available for {COHORT['n_age']:,} "
+    f"of them (median age "
+    f"{COHORT['age_median']:.0f} years, range {COHORT['age_min']:.0f}–{COHORT['age_max']:.0f}; "
+    f"{sex_str}). This EHR-linked cohort consisted of clinically referred polysomnography patients with a high "
+    f"diagnostic burden rather than a healthy community sample; the most prevalent diagnosis "
+    f"categories were {top3_str} (categories are not mutually exclusive). Cohort composition is "
+    f"shown in Supplementary Figure S1.",
     styles["Body"]))
 
-story.append(Paragraph("3.2 Model-free and ICA-based CFA variance explained", styles["H2"]))
+story.append(Paragraph("3.2 Model-free and ICA-based CFA estimates", styles["H2"]))
 story.append(KeepTogether([
     Image(os.path.join(FIG_DIR, "fig1_cfa_r2.png"), width=6.6 * inch, height=6.6 * inch / (9 / 4)),
     Paragraph(
-    f"Figure 1. CFA variance explained by two independent estimators across "
+    f"Figure 1. Cardiac field artifact (CFA) estimates from two complementary estimators across "
     f"{CFA['n_patients']:,} patients ({CFA['n_rows']:,} channel-recordings). (a) Model-free: "
     f"distribution of per-channel R² between the HEP evoked average and the ECG evoked average, over "
-    f"the full epoch (mean {CFA['r2_full_mean']:.2f}) versus restricted to outside the ±50 ms "
-    f"QRS-exclusion window already used for this project's HEP cluster statistics "
-    f"(mean {CFA['r2_excl_qrs_mean']:.2f}). (b) Model-based (interim ICA snapshot, "
-    f"{ICA['n_patients']:,} patients): the ECG-flagged ICA component's variance ratio plotted against "
-    f"that same channel-recording's model-free CFA R² from panel (a) (all channels, SNR axis log "
-    f"scale, trend line = least-squares fit of log SNR on R²; r = {ICA['r2_vs_snr_r']:.2f}, "
-    f"p {R2_SNR_P_STR}, n = {ICA['r2_vs_snr_n']:,}). No channel-level variance threshold was applied.",
+    f"the full epoch (mean {CFA['r2_full_mean']:.2f}) and outside the ±50 ms QRS-exclusion window "
+    f"(mean {CFA['r2_excl_qrs_mean']:.2f}). (b) Model-based estimator ({ICA['n_patients']:,} "
+    f"patients): ICA SNR (ECG-related component variance relative to residual variance; §2.4) plotted against the model-free CFA "
+    f"R² of the same channel-recording (all channels; logarithmic SNR axis; line, least-squares fit "
+    f"of log SNR on R²; r = {ICA['r2_vs_snr_r']:.2f}, p {R2_SNR_P_STR}, "
+    f"n = {ICA['r2_vs_snr_n']:,}). No channel-level variance threshold was applied.",
         styles["Caption"]),
 ]))
 story.append(Paragraph(
-    f"Even outside the conventional QRS-exclusion window, the ECG evoked average still explained a "
-    f"substantial share of channel HEP-evoked variance (mean R² = {CFA['r2_excl_qrs_mean']:.2f}, "
-    f"median {CFA['r2_excl_qrs_median']:.2f}) — somewhat less than the full-epoch estimate "
-    f"(mean R² = {CFA['r2_full_mean']:.2f}), but the drop is modest, not the order-of-magnitude "
-    f"reduction QRS exclusion is implicitly assumed to achieve. The two independent estimators agree "
-    f"in direction: a substantial share of HEP-evoked variance is attributable to the cardiac field by "
-    f"both a model-free regression against the patient's own ECG and a model-based ICA decomposition "
-    f"with actual component removal.",
+    f"Outside the conventional QRS-exclusion window, the ECG evoked average explained a substantial "
+    f"proportion of HEP variance (mean R² = {CFA['r2_excl_qrs_mean']:.2f}, median "
+    f"{CFA['r2_excl_qrs_median']:.2f}). This value was modestly lower than the full-epoch "
+    f"estimate (mean R² = {CFA['r2_full_mean']:.2f}), indicating that QRS exclusion removed only approximately "
+    f"{(1 - CFA['r2_excl_qrs_mean']/CFA['r2_full_mean'])*100:.0f}% of the ECG-explained variance. In the {ZL['non_locked']['n']}-patient "
+    f"subsample with a chance-level reference (§2.6), full-epoch R² at F3/F4/C3/C4 was "
+    f"{ZL['pre_ica']['mean']:.2f} for R-peak-locked averages but {ZL['non_locked']['mean']:.2f} "
+    f"(median {ZL['non_locked']['median']:.2f}) for averages around random pseudo-events, so the "
+    f"observed R² far exceeded chance similarity between finite-length evoked waveforms.",
     styles["Body"]))
 story.append(Paragraph(
-    f"Across all channels, without discarding small component loadings, the ECG-flagged component "
-    f"carried a median {ICA['component_variance_fraction_median_unfiltered']*100:.0f}% of "
-    f"HEP-evoked variance. The realised cleaning effect was larger: excluding that component reduced "
-    f"channel HEP-evoked variance by a median {ICA['hep_pct_drop_median']*100:.0f}%. The dispersion in "
-    f"Figure 1b is expected because one globally selected ICA source does not load equally on every "
-    f"electrode and because ICA source variance and the change after back-projection are related but "
-    f"not identical quantities. Accordingly, the per-channel ECG regression is the primary estimate, "
-    f"and ICA removal provides convergent evidence rather than a threshold-based definition of CFA.",
+    f"Across all channels (no loading threshold applied), the ECG-related component "
+    f"accounted for a median of {ICA['component_variance_fraction_median_unfiltered']*100:.0f}% of "
+    f"HEP variance. The realised effect of removal was larger: excluding this component "
+    f"reduced HEP variance by a median of {ICA['hep_pct_drop_median']*100:.0f}%. The "
+    f"dispersion in Figure 1b is expected, because a single, globally selected ICA source does not "
+    f"load equally on all electrodes, and because source variance and the change after "
+    f"back-projection are related but distinct quantities. We therefore regard the per-channel ECG "
+    f"regression as the primary estimate and the ICA-based removal as convergent evidence.",
     styles["Body"]))
 
 story.append(KeepTogether([
     Image(os.path.join(FIG_DIR, "fig2_topomap_channel_distribution.png"), width=6.6 * inch, height=6.6 * inch / (2000 / 836)),
     Paragraph(
-    f"Figure 2. Scalp distribution of CFA variance explained ({TOPO['n_sites']} canonical "
+    f"Figure 2. Scalp distribution of CFA R² ({TOPO['n_sites']} canonical "
     f"10-20 sites with at least {TOPO['min_patients']} patients, {TOPO['n_rows']:,} "
     f"channel-recordings; bipolar/mastoid-referenced "
     f"channel labels were canonicalised to their scalp-side site; "
     f"{', '.join(TOPO['dropped_sites'])} were dropped for falling below the {TOPO['min_patients']}-patient "
-    f"floor). (a) Topomap of mean CFA R² (outside "
-    f"QRS) per site. (b) Full per-channel R² distribution, sorted by median (orange line); box = IQR; "
-    f"n per site shown — coverage is uneven, from the six montage-standard sites "
-    f"(F3/F4/C3/C4/O1/O2, n &gt; 12,000 each) down to sites near the {TOPO['min_patients']}-patient "
-    f"floor, so the low-n sites' point estimates are noisier.",
+    f"floor). (a) Topographic map of mean CFA R² (outside QRS) per site. (b) Distribution of "
+    f"per-channel R² per site, sorted by median (orange line); box, interquartile range; n per site "
+    f"is indicated. Coverage is uneven, ranging from the six standard montage sites "
+    f"(F3/F4/C3/C4/O1/O2; n &gt; 12,000 each) to sites near the {TOPO['min_patients']}-patient "
+    f"threshold, for which estimates are less precise.",
         styles["Caption"]),
 ]))
 story.append(Paragraph(
-    f"CFA is not uniform across the scalp: it is highest at {TOPO['highest_site']} "
+    f"CFA was not uniformly distributed across the scalp; it was highest at {TOPO['highest_site']} "
     f"(mean R² = {TOPO['highest_mean']:.2f}) and lowest at {TOPO['lowest_site']} "
-    f"(mean R² = {TOPO['lowest_mean']:.2f}), roughly a "
-    f"{TOPO['highest_mean']/max(TOPO['lowest_mean'], 1e-6):.1f}-fold range. A fixed, site-independent "
-    f"CFA correction is therefore a worse approximation at some electrodes than others; the "
-    f"per-channel regression correction this paper uses (§2.3) automatically adapts to it.",
+    f"(mean R² = {TOPO['lowest_mean']:.2f}), an approximately "
+    f"{TOPO['highest_mean']/max(TOPO['lowest_mean'], 1e-6):.1f}-fold range. Because sites outside the standard montage came from a minority of recordings "
+    f"with different montages and references, part of this range reflects montage and referencing "
+    f"rather than electrode position; within the six standard, mastoid-referenced sites, mean R² "
+    f"ranged from {TOPO['site_means']['F3']:.2f} (F3) to {TOPO['site_means']['F4']:.2f} (F4). A site-independent CFA "
+    f"correction would therefore be expected to perform unevenly across electrodes, which argues "
+    f"for channel-level assessment.",
     styles["Body"]))
 
-story.append(Paragraph("3.3 CFA variance explained by diagnosis category", styles["H2"]))
+story.append(Paragraph("3.3 CFA R² by diagnosis category", styles["H2"]))
 DX = S["diagnosis"]
 story.append(KeepTogether([
     Image(os.path.join(FIG_DIR, "fig3_diagnosis.png"), width=6.6 * inch, height=6.6 * inch / (15 / 6.5)),
     Paragraph(
-    f"Figure 3. (a) Forest plot: mean patient-mean CFA R² (outside QRS) per clinical diagnosis "
-    f"category, sorted by value; point = mean, error bar = 95% CI (Welch, unequal-variance). Patients "
-    f"with no linked diagnosis at all have mean CFA R² = {DX['no_dx_mean']:.2f} "
-    f"(n = {DX['no_dx_n']:,}; patients may carry more than one "
-    f"diagnosis category). Categories are drawn from the same fifteen used throughout this project's "
-    f"diagnosis-based dashboards, sorted by mean; categories with fewer than 10 patients "
-    f"are omitted, as is Heart Transplant (n = 133; its CI crossed the no-diagnosis mean and its "
-    f"removal tightens the axis for the remaining {DX['n_categories_total']} categories, all of which "
-    f"sit above the no-diagnosis mean). Kruskal-Wallis "
-    f"across all groups: p = {DX['p_kruskal']:.2g}. (b) The same categories tested against each other, "
-    f"not only against the no-diagnosis reference: pairwise Mann-Whitney FDR p-values "
-    f"(BH-corrected across all {DX['pairwise']['n_pairs']} tests; color scale, white = q &ge; 0.5, "
-    f"red = q = 0; {DX['pairwise']['n_significant_fdr']} pairs significant at q &lt; 0.05), "
-    f"categories ordered as in (a).",
+    f"Figure 3. (a) Forest plot of patient-mean cardiac field artifact (CFA) R² (outside the QRS-exclusion window) per clinical diagnosis "
+    f"category; point = mean, error bar = 95% CI (Welch, unequal-variance). EHR-linked patients "
+    f"with no recorded diagnosis (reference; confounded by recording site, see Limitations) had "
+    f"mean CFA R² = {DX['no_dx_mean']:.2f} "
+    f"(n = {DX['no_dx_n']:,}); patients may belong to more than one diagnosis category. Categories "
+    f"are drawn from fifteen predefined diagnosis groups and sorted by mean; categories with fewer "
+    f"than 10 patients are omitted. Heart Transplant (n = 133; mean 0.31, 95% CI 0.27–0.35; "
+    f"Mann-Whitney p = 0.053 vs. the reference) is also omitted to improve axis resolution. "
+    f"Kruskal-Wallis test across all groups: p = {DX['p_kruskal']:.2g}. (b) Pairwise comparisons "
+    f"among categories: Mann-Whitney p-values, Benjamini-Hochberg corrected across all "
+    f"{DX['pairwise']['n_pairs']} tests (colour scale: white, q &ge; 0.5; red, q = 0; "
+    f"{DX['pairwise']['n_significant_fdr']} pairs significant at q &lt; 0.05); categories ordered "
+    f"as in (a).",
         styles["Caption"]),
 ]))
 story.append(Paragraph(
-    f"Every one of the {DX['n_categories_total']} categories sits above the no-diagnosis reference "
-    f"line, and {DX['n_categories_significant']} of {DX['n_categories_total']} individually clear "
-    f"p &lt; 0.05 (Mann-Whitney vs. the reference group); all {DX['n_categories_significant_fdr']} "
-    f"remain significant after FDR correction. So the diagnosed population's higher CFA R² recurs "
-    f"broadly across the diagnostic spectrum, not driven by one or two outlier conditions. The largest "
-    f"gap is in patients with {DX['highest_category']} (+{DX['highest_diff']:.2f} R² units, "
-    f"n = {DX['categories'][DX['highest_category']]['n']:,}); the smallest is {DX['lowest_category']} "
-    f"({DX['lowest_diff']:+.2f}, n = {DX['categories'][DX['lowest_category']]['n']:,}). Categories also "
-    f"differ from each other, not only from the no-diagnosis reference (Figure 3b): of "
-    f"{DX['pairwise']['n_pairs']} pairwise comparisons, {DX['pairwise']['n_significant_fdr']} remain "
-    f"significant after FDR correction, driven mostly by Obesity, whose gap is both the largest in "
-    f"panel (a) and significantly larger than every low-gap category.",
+    f"All {DX['n_categories_total']} displayed categories lay above the no-diagnosis reference, "
+    f"and all of these differences remained significant (Mann-Whitney) "
+    f"after FDR correction. Because these comparisons were unadjusted for age, sex, and BMI, and the "
+    f"reference group is confounded by recording site (see Limitations), they should not be "
+    f"interpreted as disease effects; the category-versus-category comparisons below are not "
+    f"affected by the site confound. Relative to the reference, the largest "
+    f"difference was observed in patients with {DX['highest_category']} "
+    f"(+{DX['highest_diff']:.2f} R² units, n = {DX['categories'][DX['highest_category']]['n']:,}) "
+    f"and the smallest in {DX['lowest_category']} ({DX['lowest_diff']:+.2f}, "
+    f"n = {DX['categories'][DX['lowest_category']]['n']:,}). Categories also differed from one "
+    f"another (Figure 3b): of {DX['pairwise']['n_pairs']} pairwise comparisons, "
+    f"{DX['pairwise']['n_significant_fdr']} remained significant after FDR correction, of which "
+    f"{sum('Obesity' in (q['a'], q['b']) for q in DX['pairwise']['significant_pairs'])} involved "
+    f"Obesity, which differed significantly from every other category; the remainder involved "
+    f"Obstructive Sleep Apnea.",
     styles["Body"]))
 
-story.append(Paragraph("3.4 CFA variance explained varies modestly with sex, diagnosis, age, and BMI", styles["H2"]))
+story.append(Paragraph("3.4 CFA R² varies modestly with sex, age, and BMI", styles["H2"]))
 BMI_STRAT = STRAT["bmi"]
 BMI_WINDOW_COUNTS = ", ".join(
     f"{minutes} min: n={count:,}" for minutes, count in sorted(
@@ -409,7 +470,7 @@ story.append(KeepTogether([
     f"Figure 4. Patient-mean CFA R² (outside QRS) vs. (a) age, continuous "
     f"(n = {STRAT['n_with_age']:,}; Pearson r = {STRAT['r_age_pearson']:.2f}, "
     f"p = {STRAT['p_age_pearson']:.2g}; line = least-squares fit), (b) sex "
-    f"(Mann-Whitney p = {STRAT['p_sex_mannwhitney']:.3g}), and (c) BMI, continuous "
+    f"(Mann-Whitney p = {STRAT['p_sex_mannwhitney']:.1e}), and (c) BMI, continuous "
     f"(n = {BMI_STRAT['n']:,}; Pearson r = {BMI_STRAT['r_pearson']:.2f}, "
     f"p = {BMI_STRAT['p_pearson']:.2g}; one observation per patient, longest available window; "
     f"{BMI_WINDOW_COUNTS}; line = least-squares fit). Panel b: box shows quartiles; "
@@ -425,22 +486,20 @@ story.append(Paragraph(
     f"Patient-mean CFA R² was higher in male than female patients "
     f"({STRAT['sex_means']['Male']:.2f} vs. {STRAT['sex_means']['Female']:.2f}, "
     f"p = {STRAT['p_sex_mannwhitney']:.1e}), higher with a linked clinical diagnosis "
-    f"({STRAT['any_dx_mean']:.2f} vs. {STRAT['no_dx_mean']:.2f}, p = {STRAT['p_dx_mannwhitney']:.1e}), "
+    f"({STRAT['any_dx_mean']:.2f} vs. {STRAT['no_dx_mean']:.2f}, p = {STRAT['p_dx_mannwhitney']:.1e}; confounded by recording site, see Limitations), "
     f"and slightly lower in the oldest age tertile than the younger two "
     f"({STRAT['age_tertile_means']['Older']:.2f} vs. "
     f"{STRAT['age_tertile_means']['Younger']:.2f}/{STRAT['age_tertile_means']['Middle']:.2f}, "
-    f"p = {STRAT['p_age_anova']:.1e}) — real but modest effects (absolute gaps 0.02-0.09 R² units) "
-    f"only this sample size has the power to resolve. Age as a continuous variable shows essentially "
-    f"no linear relationship to CFA R² (Figure 4a; Pearson r = {STRAT['r_age_pearson']:.2f}, "
-    f"p = {STRAT['p_age_pearson']:.2g}): the tertile means are non-monotonic, flat across the younger "
-    f"two tertiles before dropping only in the oldest, consistent with a threshold effect rather than "
-    f"a graded trend. BMI showed a positive association with CFA R² (Figure 4c; n = "
+    f"p = {STRAT['p_age_anova']:.1e}). These effects were statistically significant but modest in "
+    f"magnitude (absolute differences of 0.02–0.05 R² units for sex and age) and were detectable owing to the large "
+    f"sample size. Age as a continuous variable showed no appreciable linear relationship with CFA "
+    f"R² (Figure 4a; Pearson r = {STRAT['r_age_pearson']:.2f}, p = {STRAT['p_age_pearson']:.2g}); "
+    f"tertile means were similar in the two younger tertiles and lower only in the oldest, a pattern "
+    f"that does not indicate a graded trend. In an exploratory analysis, BMI was positively "
+    f"associated with CFA R² (Figure 4c; n = "
     f"{BMI_STRAT['n']:,}, Pearson r = {BMI_STRAT['r_pearson']:.2f}, "
-    f"p = {BMI_STRAT['p_pearson']:.1e}). Mean BMI was {BMI_STRAT['bmi_mean']:.1f} kg/m² overall, "
-    f"{BMI_STRAT['by_sex']['Female']['bmi_mean']:.1f} kg/m² in female patients, and "
-    f"{BMI_STRAT['by_sex']['Male']['bmi_mean']:.1f} kg/m² in male patients. This directly supports "
-    f"a BMI-related contribution in "
-    f"addition to the obesity-diagnosis comparison. The association was positive in both female "
+    f"p = {BMI_STRAT['p_pearson']:.1e}; mean BMI {BMI_STRAT['bmi_mean']:.1f} kg/m²). This association, although weak "
+    f"(r² ≈ {BMI_STRAT['r_pearson']**2:.2f}), is consistent with the obesity-diagnosis comparison (§3.3). The association was positive in both female "
     f"patients (r = {BMI_STRAT['by_sex']['Female']['r_pearson']:.2f}, "
     f"p = {BMI_STRAT['by_sex']['Female']['p_pearson']:.1e}) and male patients "
     f"(r = {BMI_STRAT['by_sex']['Male']['r_pearson']:.2f}, "
@@ -454,119 +513,185 @@ story.append(Paragraph(
 # ---------------------------------------------------------------------
 story.append(Paragraph("4. Discussion", styles["H1"]))
 story.append(Paragraph(
-    "Two independent estimators — one a direct regression against the patient's own ECG, the other a "
-    "full ICA decomposition with actual component removal — converge on the same conclusion: cardiac "
-    "field artifact accounts for a substantial share of scalp HEP-evoked variance even after the "
-    "field's standard QRS-exclusion mitigation. That share is not a fixed instrumental constant: it is "
-    "reliably higher in male than female patients and in patients carrying a linked clinical diagnosis, "
-    "and modestly lower in the oldest age tertile. Because CFA's magnitude tracks exactly the variables "
-    "many HEP group comparisons are organised around, studies reporting a sex or diagnosis difference "
-    "in raw HEP amplitude without a per-channel CFA correction cannot rule out that some of that "
-    "difference is cardiac-field contamination rather than cortical response. The effect sizes are "
-    "modest in absolute R² terms, so this is not grounds to discount larger sleep-stage and age HEP "
-    "effects reported elsewhere — but it is grounds for per-channel CFA correction.",
+    "Consistent with our first hypothesis, two complementary estimators, a direct regression on the patient's ECG and an ICA decomposition "
+    "with component removal, converged on the same conclusion: a substantial "
+    "proportion of scalp HEP variance is shared with the ECG even after standard QRS exclusion. "
+    "In line with the second hypothesis, this proportion was not a fixed property of the recording. "
+    f"It varied approximately {TOPO['highest_mean']/max(TOPO['lowest_mean'], 1e-6):.1f}-fold across "
+    "scalp sites (partly reflecting montage and reference differences; §3.2), extending earlier "
+    "topographic descriptions in small samples<super>1,5</super> to the "
+    "population level; it was higher in male than in female patients at every segment duration; and "
+    "it was modestly lower in the oldest age tertile. The main-analysis difference between patients "
+    "with and without a linked clinical "
+    "diagnosis reversed within the site that had diagnosis records and was not "
+    "reproduced in the duration-matched subset (Supplementary §S6; Limitations), so we do not "
+    "interpret it further. "
+    "Because the magnitude of CFA covaries with the variables around which "
+    "many HEP group comparisons are organised, studies reporting sex-, BMI-, or diagnosis-related "
+    "differences in HEP amplitude without channel-level CFA correction cannot exclude the "
+    "possibility that part of the difference reflects cardiac-field contamination rather than "
+    "cortical activity. The effect sizes are modest in absolute R² terms and do not by themselves "
+    "invalidate larger HEP effects reported previously; they do, however, "
+    "support routine channel-level CFA correction.",
     styles["Body"]))
 story.append(Paragraph(
-    "The concentration of noise around the QRS complex is visually and quantitatively prominent, but "
-    "QRS exclusion alone is insufficient. Removing ±50 ms reduced mean explained variance only from "
-    f"{CFA['r2_full_mean']:.2f} to {CFA['r2_excl_qrs_mean']:.2f}; a large ECG-correlated component "
-    "therefore extends into the nominal analysis interval. The positive relationship between the "
-    "model-free R² and ICA-attributed CFA-to-residual variance ratio further indicates that the two "
-    "methods are detecting a shared contamination process. This is the central signal-to-noise result: "
-    "channels that look more ECG-like by direct waveform correlation also contain more variance "
-    "assigned to the ECG-correlated ICA source. Neither estimator proves that every residual "
-    "heartbeat-locked deflection is artifactual, but their convergence shows that uncorrected HEP "
-    "variance cannot be assumed to be cortical.",
+    "Although the artifact is most prominent around the QRS complex, the conventional ±30–50 ms "
+    "exclusion<super>2-4</super> did not remove it: excluding ±50 ms reduced mean ECG-shared variance (R²) "
+    f"only from {CFA['r2_full_mean']:.2f} to {CFA['r2_excl_qrs_mean']:.2f}, indicating that a "
+    "substantial ECG-correlated component extends into the nominal analysis interval. "
+    "The positive relationship "
+    "between the model-free R² and the ICA-derived SNR suggests "
+    "that both methods detect a common contamination process; channels whose waveforms "
+    "more closely resemble the ECG also contain more variance assigned to the ECG-related ICA "
+    "source. Neither estimator establishes that every residual heartbeat-locked deflection is "
+    "artifactual, and genuine cortical heartbeat-evoked activity is well documented.<super>2,6</super> "
+    "Nevertheless, the convergence of the two estimators indicates that uncorrected HEP variance "
+    "cannot be assumed to be of cortical origin.",
     styles["Body"]))
 story.append(Paragraph(
-    "The clinical-obesity result gives BMI and obesity status particular methodological relevance. "
-    "Clinically obese patients had the "
-    f"largest diagnosis-associated difference (+{DX['highest_diff']:.2f} R² units relative to the "
-    "no-diagnosis reference), consistent with BMI or obesity-associated characteristics contributing to the conductive geometry that "
-    f"shapes the cardiac field. The independent continuous-BMI analysis supports this interpretation "
-    f"({BMI_STRAT['n']:,} patients; r = {BMI_STRAT['r_pearson']:.2f}). The BMI–CFA association was "
-    f"numerically stronger in women than in men (r = "
-    f"{BMI_STRAT['by_sex']['Female']['r_pearson']:.2f} vs. "
-    f"{BMI_STRAT['by_sex']['Male']['r_pearson']:.2f}), suggesting that women may be more sensitive to "
-    f"CFA variation with increasing BMI. However, the BMI-by-sex interaction was not significant "
-    f"(p = {BMI_STRAT['sex_interaction_p']:.2g}), so this apparent difference should not be interpreted "
-    "as a confirmed sex-specific effect and requires replication. BMI is a clinical anthropometric "
-    "measure rather than a direct measure of body fat. No direct fat-mass, thoracic-geometry, or electrode-impedance measure was "
-    "available, and diagnosis categories overlap. We therefore interpret these findings as evidence "
-    "that BMI and clinical obesity are plausible confounders, not as proof of a causal body-fat effect. Future HEP studies "
-    "should record BMI and preferably direct body-composition "
-    "measures and include them in CFA models. Sex, age, and diagnostic burden should be handled in the "
-    "same way: their associations may reflect anatomy, cardiac physiology, medication, comorbidity, "
-    "or recording conditions, and none should be given a uniquely biological interpretation from the "
-    "present observational analysis.",
+    "Clinically obese patients showed the "
+    f"highest mean CFA R² of all diagnosis categories and differed significantly from every other "
+    "category (§3.3), consistent with a contribution of BMI or obesity-related "
+    "characteristics to the conductive geometry that shapes the cardiac field. The "
+    f"exploratory continuous-BMI analysis points in the same direction ({BMI_STRAT['n']:,} patients; "
+    f"r = {BMI_STRAT['r_pearson']:.2f}). Because R² indexes waveform similarity rather than "
+    "amplitude, these findings do not conflict with the attenuation of surface ECG voltage by "
+    "subcutaneous fat;<super>8</super> the underlying mechanism cannot be determined from the present data. The BMI–CFA association was numerically stronger in women "
+    f"than in men (r = {BMI_STRAT['by_sex']['Female']['r_pearson']:.2f} vs. "
+    f"{BMI_STRAT['by_sex']['Male']['r_pearson']:.2f}); however, the BMI-by-sex interaction was not "
+    f"significant (p = {BMI_STRAT['sex_interaction_p']:.2g}), and this difference should not be "
+    "interpreted as a sex-specific effect without replication. The sex difference itself persisted "
+    "after adjustment for BMI (Supplementary §S5) and is therefore unlikely to be explained by BMI.",
     styles["Body"]))
 story.append(Paragraph(
-    f"Recording duration also changed what was measurable. In the matched {DOSE['n_common_patients']:,}-patient "
-    f"analysis, mean R² was {DOSE['lengths'][1]['mean']:.2f} at 10 min and "
-    f"{DOSE['lengths'][-1]['mean']:.2f} at {DOSE['lengths'][-1]['window_minutes']:.0f} min, a difference of "
-    f"{DOSE['lengths'][-1]['mean']-DOSE['lengths'][1]['mean']:.2f} R² units; the 5-min estimate was "
-    f"lower still ({DOSE['lengths'][0]['mean']:.2f}). Longer segments contain more heartbeats and "
-    "produce a more stable evoked waveform, allowing shared EEG-ECG structure to emerge from background "
-    "noise. Five- and 10-min windows are therefore inadequate for estimating the full detectable CFA "
-    "burden in these data. This duration dependence does not imply that 30 min is universally optimal, "
-    "but it does require HEP studies to justify segment length and to test stability across durations.",
+    "However, BMI is an anthropometric index rather "
+    "than a direct measure of adiposity; no direct measures of fat mass, thoracic geometry, or "
+    "electrode impedance were available, and diagnosis categories overlap. We therefore interpret "
+    "these findings as evidence that BMI and clinical obesity are plausible confounders, not as "
+    "evidence of a causal effect of body fat. Likewise, the associations of sex, age, and diagnosis category "
+    "with CFA may reflect anatomy, cardiac "
+    "physiology, medication, comorbidity, or recording conditions, and none can be assigned a "
+    "specific biological interpretation on the basis of the present observational analysis.",
     styles["Body"]))
 story.append(Paragraph(
-    "Practically, EEG cleaning should combine explicit ECG recording, channel-wise assessment of the "
-    "R-peak-locked EEG-ECG relationship, and removal or regression of cardiac components, followed by "
-    "verification that the cleaned signal is reduced relative to pre-cleaning data but remains above a "
-    "non-heartbeat-locked noise floor. Reporting only a QRS mask or a selected ICA component is not "
-    "enough. Authors should report the retained time interval, number of heartbeats, channel-level "
-    "pre/post-cleaning metrics, and whether results survive adjustment for demographic and clinical "
-    "variables that predict CFA.",
+    f"Segment duration also affected the detectable contamination. In the duration-matched {DOSE['n_common_patients']:,}-patient "
+    f"analysis, mean R² rose from {DOSE['lengths'][0]['mean']:.2f} at 5 min and "
+    f"{DOSE['lengths'][1]['mean']:.2f} at 10 min to {DOSE['lengths'][-1]['mean']:.2f} at "
+    f"{DOSE['lengths'][-1]['window_minutes']:.0f} min; the increase was already present between 5 and "
+    "30 min, where channel composition was nearly constant (§S6). Longer segments contain more heartbeats and yield a "
+    "more stable evoked waveform, which presumably allows shared EEG-ECG structure to emerge from "
+    "background noise; this pattern is consistent with our third hypothesis. "
+    "Windows of 5 and 10 min, including the 10-min windows of the main analysis, therefore probably "
+    "underestimate the detectable CFA burden in these data (see Limitations). This duration "
+    "dependence does not identify a universally optimal segment length, but it indicates that HEP "
+    "studies should justify the chosen segment length and assess the stability of their results "
+    "across durations. In addition, because R² depends on the number of averaged heartbeats, "
+    "between-group differences in heart rate could contribute to between-group differences in R²; "
+    "this was not examined in the present analysis.",
+    styles["Body"]))
+story.append(Paragraph(
+    "In practice, EEG preprocessing for HEP analysis should combine concurrent ECG recording, "
+    "channel-level assessment of the R-peak-locked EEG-ECG relationship, and removal or regression "
+    "of ECG-related components, followed by verification that heartbeat-locked variance in the "
+    "cleaned signal is reduced relative to the uncleaned data while remaining above a non-heartbeat-locked noise floor. Reporting only the "
+    "QRS mask or the selected ICA component is insufficient. We recommend that studies report the "
+    "analysis interval, the number of heartbeats, channel-level metrics before and after cleaning, "
+    "and whether results are robust to adjustment for demographic and clinical variables that "
+    "predict CFA, including BMI or, preferably, direct body-composition measures. These "
+    "recommendations extend recent methodological reviews of HEP analysis and reporting.<super>4,7</super>",
     styles["Body"]))
 
 story.append(Paragraph("5. Conclusions", styles["H1"]))
 story.append(Paragraph(
-    f"Cardiac contamination is a major, structured component of heartbeat-locked scalp EEG: ECG "
-    f"explained mean R² = {CFA['r2_excl_qrs_mean']:.2f} even outside the QRS mask, and ICA cleaning "
-    f"removed a median {ICA['hep_pct_drop_median']*100:.0f}% of HEP-evoked variance. The contamination "
-    "varied by electrode, sex, age grouping, obesity, and diagnostic burden, and became more visible in "
-    "30-min than in 5- or 10-min recordings. CFA must therefore be treated as a participant-specific "
-    "confound in HEP research. Robust inference requires sufficiently long recordings, ECG-informed "
-    "channel-wise cleaning, quantitative pre/post-cleaning validation, and adjustment for body "
-    "composition and clinical characteristics. Without these safeguards, apparent neural group "
-    "differences may partly reflect the heart's electrical field rather than cortical interoception.",
+    f"Cardiac contamination is a substantial and systematic component of heartbeat-locked scalp EEG: the ECG "
+    f"explained a mean R² of {CFA['r2_excl_qrs_mean']:.2f} outside the QRS-exclusion window, and ICA-based "
+    f"removal of the ECG-related component reduced HEP variance by a median of {ICA['hep_pct_drop_median']*100:.0f}%. The "
+    "contamination varied with electrode, sex, obesity, and BMI, but only weakly with age; its "
+    "apparent association with diagnostic burden was confounded by recording site. Estimated CFA "
+    "also increased with segment duration up to the longest window examined (60 min). CFA should therefore be treated as a "
+    "participant- and channel-dependent confound in HEP research. Robust inference requires "
+    "ECG-informed channel-level cleaning with quantitative before-and-after validation, justified "
+    "segment lengths checked for stability across durations, and adjustment for BMI (ideally direct body-composition measures) and clinical characteristics. Without these "
+    "safeguards, apparent group differences in neural responses may partly reflect the electrical "
+    "field of the heart rather than cortical interoceptive processing.",
     styles["Body"]))
 
 story.append(Paragraph("Limitations", styles["H2"]))
 story.append(Paragraph(
-    f"Estimator coverage. The ICA estimate includes {ICA['n_patients']:,} patients, slightly "
-    f"fewer than the regression estimate ({CFA['n_patients']:,}); comparisons between estimators are "
-    f"therefore not perfectly cohort-identical. "
-    f"Window length is a lower bound, not a validated optimum. An interim cohort-matched rerun at "
-    f"{len(DOSE['lengths'])} available lengths (Supplementary Figure S6, n = {DOSE['n_common_patients']:,} patients "
-    f"common to all lengths) "
-    f"found CFA R² increases with window length: mean R² rises monotonically from "
-    f"{DOSE['lengths'][0]['mean']:.2f} at {DOSE['lengths'][0]['window_minutes']:.0f} min to "
-    f"{DOSE['lengths'][-1]['mean']:.2f} at {DOSE['lengths'][-1]['window_minutes']:.0f} min. The main "
-    f"analysis's 10-minute default is therefore a conservative rather than an inflated estimate, but "
-    f"the exact reported R² values should not be read as an asymptotic ceiling. "
-    f"Referred, not community, population. This is a "
-    f"clinically referred polysomnography cohort with a high diagnostic burden (Figure S1c), which is "
-    f"the appropriate population for testing whether CFA tracks diagnosis, but limits generalisation of "
-    f"absolute R² magnitudes to healthy-volunteer HEP studies.",
+    f"Several limitations should be noted. First, diagnosis records were available for only part "
+    f"of the Human Sleep Project, so the no-diagnosis reference group consisted largely of patients "
+    f"from a site without linked diagnosis tables (mean R² {DXS['I0003_no_dx']['mean']:.2f}, "
+    f"n = {DXS['I0003_no_dx']['n']}). Within the site with diagnosis records, patients without a "
+    f"recorded diagnosis had higher R² than those with one ({DXS['I0002_no_dx']['mean']:.2f}, "
+    f"n = {DXS['I0002_no_dx']['n']}, vs. {DXS['I0002_any_dx']['mean']:.2f}, "
+    f"n = {DXS['I0002_any_dx']['n']:,}). The comparison of patients with and without a linked "
+    f"diagnosis is therefore confounded by recording site and should not be interpreted as a disease "
+    f"effect; comparisons among diagnosis categories are not affected by this confound. Second, the "
+    f"detected heart rate was high for sleep recordings (median "
+    f"{CFA['bpm_quartiles']['0.5']:.0f} beats/min, interquartile range "
+    f"{CFA['bpm_quartiles']['0.25']:.0f}–{CFA['bpm_quartiles']['0.75']:.0f}); the custom R-peak "
+    f"detector was not validated against an established algorithm, and occasional detection of T "
+    f"waves would mix T-wave-locked epochs into the averages. Third, R² does not distinguish "
+    f"volume-conducted CFA from neural activity whose time course resembles the ECG, and epochs "
+    f"ended at 400 ms after the R-peak, so the estimates do not cover later HEP intervals that "
+    f"overlap the T wave. Fourth, CFA was estimated in the native recording references, "
+    f"predominantly contralateral-mastoid derivations (e.g., F3-M2, F4-M1); because the cardiac "
+    f"field projects differently onto each reference electrode, site-level values and hemispheric "
+    f"asymmetries may not generalise to average-referenced HEP data.",
     styles["Body"]))
 story.append(Paragraph(
-    f"Underweight under-representation. Only 16 patients in the EHR-linked cohort had an explicit "
-    f"underweight diagnosis (13 with ICD-10 R63.6 and 3 with ICD-9 783.22), and only "
-    f"{BMI_STRAT['underweight_n']:,} of the "
-    f"{BMI_STRAT['n']:,} patients with measured BMI had BMI &lt;18.5 kg/m² "
-    f"({BMI_STRAT['underweight_pct']:.2f}%). Underweight patients are therefore sparsely represented, "
-    f"limiting inference at the low end of the BMI distribution. Diagnosis counts may also "
-    f"underestimate prevalence because underweight is not necessarily coded at every encounter.",
+    f"Fifth, 10-min estimates are likely lower bounds with respect to segment duration, because mean "
+    f"CFA R² increased monotonically with duration, including from 5 to 30 min, where channel "
+    f"composition was nearly constant (§4; Supplementary §S6). Sixth, the chance-level "
+    f"(pseudo-event) R² was estimated only in a subsample of {ZL['non_locked']['n']} patients and "
+    f"only over the full epoch (§3.2); a null for the outside-QRS estimate was not computed. "
+    f"Seventh, windows were not selected by sleep stage, so vigilance state was not controlled and "
+    f"may differ between groups and segment durations. Eighth, the cohort was predominantly a "
+    f"clinically referred population with a high diagnostic burden (Figure S1c), which limits the "
+    f"generalisability of absolute R² values to healthy volunteers; underweight patients were also "
+    f"under-represented ({BMI_STRAT['underweight_n']:,} of {BMI_STRAT['n']:,} patients with "
+    f"measured BMI had a BMI &lt;18.5 kg/m²). Finally, because this was a secondary analysis of "
+    f"existing datasets, recording parameters and clinical annotations could not be controlled by "
+    f"the authors.",
+    styles["Body"]))
+
+story.append(Paragraph("Ethics statement", styles["H2"]))
+story.append(Paragraph(
+    "Human Sleep Project data were de-identified under the HIPAA Safe Harbor standard and made "
+    "available under an approved institutional review board protocol (IRB protocol #2022P000417) "
+    "with a waiver of informed consent; they were accessed under the Brain Data Science Platform "
+    "data use agreement. CAP Sleep Database recordings are publicly available, de-identified data "
+    "distributed through PhysioNet. [AUTHOR: ethics approval for the Berkeley dataset.] Use of the "
+    "Rabin Medical Center recordings was approved by the institutional Helsinki committee "
+    "[AUTHOR: approval number]. No attempt was made to re-identify participants.",
     styles["Body"]))
 
 story.append(Paragraph("Data availability statement", styles["H2"]))
 story.append(Paragraph(
-    "Data available upon approval from the Brain Data Science Platform "
-    "(<font face='Courier'>https://bdsp.io/content/hsp/3.0/</font>). Analysis scripts available from "
-    "the author (nircafri@mail.tau.ac.il).",
+    "The Human Sleep Project dataset is publicly available, subject to a data use agreement, from "
+    "the Brain Data Science Platform (<font face='Courier'>https://bdsp.io/content/hsp/</font>), "
+    "and the CAP Sleep Database is publicly available from PhysioNet. The Rabin Medical Center and "
+    "Berkeley recordings are not publicly available because of privacy restrictions. Analysis code is available from "
+    "the corresponding author upon reasonable request (nircafri@mail.tau.ac.il).",
+    styles["Body"]))
+
+story.append(Paragraph("Funding", styles["H2"]))
+story.append(Paragraph(
+    "This research received no specific grant from any funding agency in the public, commercial, "
+    "or not-for-profit sectors.",
+    styles["Body"]))
+
+story.append(Paragraph("Declaration of competing interests", styles["H2"]))
+story.append(Paragraph(
+    "The authors declare no competing interests.",
+    styles["Body"]))
+
+story.append(Paragraph("Author contributions (CRediT)", styles["H2"]))
+story.append(Paragraph(
+    "Nir Cafri: Conceptualization, Methodology, Software, Formal analysis, Data curation, "
+    "Visualization, Writing – original draft. Felix Benninger: Conceptualization, Supervision, "
+    "Writing – review &amp; editing. Pablo Blinder: Conceptualization, Supervision, "
+    "Writing – review &amp; editing.",
     styles["Body"]))
 
 # ---------------------------------------------------------------------
@@ -579,90 +704,112 @@ story.append(Paragraph("S1. Cohort composition", styles["H2"]))
 story.append(KeepTogether([
     Image(os.path.join(FIG_DIR, "figS1_cohort.png"), width=6.6 * inch, height=6.6 * inch / (11 / 3.6)),
     Paragraph(
-    f"Figure S1. Cohort composition of the {COHORT['n_demographics']:,} EHR-linked patients. "
+    f"Figure S1. Cohort composition of the {COHORT['n_demographics']:,} Human Sleep Project patients. "
     f"(a) Age distribution (median {COHORT['age_median']:.0f} years, range "
-    f"{COHORT['age_min']:.0f}-{COHORT['age_max']:.0f}). (b) Sex ({sex_str}). "
-    f"(c) The ten most prevalent broad clinical diagnosis categories, of which the largest were "
-    f"{top3_str}. This is a clinically referred polysomnography population, not a healthy community "
-    f"sample; diagnosis categories are not mutually exclusive.",
+    f"{COHORT['age_min']:.0f}–{COHORT['age_max']:.0f}). (b) Sex ({sex_str}). "
+    f"(c) The ten most prevalent clinical diagnosis categories, the largest of which were "
+    f"{top3_str}. The cohort is a clinically referred polysomnography population rather than a "
+    f"healthy community sample; diagnosis categories are not mutually exclusive.",
         styles["Caption"]),
+]))
+DX_RULES = [  # mirrors DIAG_CATEGORIES in build_dataset.py
+    ("Obstructive Sleep Apnea", "sleep apnea"), ("Hypertension", "hypertension"),
+    ("Diabetes", "diabetes"), ("Heart Failure", "heart failure"),
+    ("Coronary Artery Disease", "coronary; atherosclerotic heart"),
+    ("Heart Transplant", "heart transplant; transplant status"),
+    ("Atrial Fibrillation", "atrial fibrillation; atrial flutter"), ("COPD", "chronic obstructive"),
+    ("Obesity", "obesity; obese"), ("Depression", "depressive; depression"), ("Anxiety", "anxiety"),
+    ("Cognitive Impairment / Dementia", "cognitive; alzheimer; dementia"),
+    ("Stroke / Cerebrovascular", "infarction; cerebrovascular; stroke; hemorrhage"),
+    ("Kidney Disease", "kidney; renal"), ("Anemia", "anemia"),
+]
+dx_table = Table(
+    [[Paragraph("Category", styles["Caption"]), Paragraph("Keywords (any match)", styles["Caption"])]]
+    + [[Paragraph(c, styles["Caption"]), Paragraph(k, styles["Caption"])] for c, k in DX_RULES],
+    colWidths=[2.4 * inch, 4.2 * inch])
+dx_table.setStyle(TableStyle([("LINEBELOW", (0, 0), (-1, 0), 0.6, colors.black),
+                              ("VALIGN", (0, 0), (-1, -1), "TOP")]))
+story.append(KeepTogether([
+    Paragraph(
+        "Table S1. Diagnosis categories and the case-insensitive keywords matched against EHR "
+        "diagnosis descriptions. Keyword matching is inclusive; for example, \"infarction\" also "
+        "matches myocardial infarction.",
+        styles["Caption"]),
+    dx_table,
 ]))
 
 story.append(Paragraph("S2. Variance and entropy vs. a non-heartbeat-locked noise floor", styles["H2"]))
 story.append(KeepTogether([
     Image(os.path.join(FIG_DIR, "figS3_post_ica_variance.png"), width=6.6 * inch, height=6.6 * inch / (11 / 8.8)),
     Paragraph(
-    f"Figure S2. Absolute HEP-evoked EEG variance before vs. after excluding the ECG-flagged "
+    f"Figure S2. Absolute HEP variance before vs. after excluding the ECG-related "
     f"ICA component, alongside a non-heartbeat-locked control (n = {S['post_ica_variance']['n_patients']:,} "
-    f"patients ICA; {S['post_ica_variance']['n_patients_control']:,}-patient control subsample; "
+    f"ICA patients with at least one well-covered site; "
+    f"{S['post_ica_variance']['n_patients_control']:,}-patient control subsample, §2.6; "
     f"distributions are right-skewed, so medians on a log axis are reported rather than means). "
-    f"(a) Averaged over the core bilateral frontal-central quad "
+    f"(a) Pooled over channels at the four core frontal-central electrodes "
     f"({'/'.join(S['post_ica_variance']['core_electrodes'])}): median "
     f"{S['post_ica_variance']['core_pre_median']:.2f} µV² pre-ICA to "
     f"{S['post_ica_variance']['core_post_median']:.2f} µV² post-ICA (a "
     f"{S['post_ica_variance']['core_pct_drop']:.0f}% drop) vs. "
-    f"{S['post_ica_variance']['core_non_locked_median']:.2f} µV² for the non-locked control — the "
-    f"same quality-controlled windows re-epoched around random pseudo-events instead of true R-peaks. "
-    f"(b) The same three-way comparison broken out per electrode, all six sites (§2.6). "
+    f"{S['post_ica_variance']['core_non_locked_median']:.2f} µV² for the non-locked control (the "
+    f"same windows re-epoched around random pseudo-events instead of R-peaks). "
+    f"(b) The same three-way comparison broken out per electrode, all six sites (§2.5). "
     f"(c) Spectral entropy (normalised Shannon entropy of the evoked waveform's Welch power spectrum, "
-    f"0-1) of the same three conditions, core electrode average (n = {S['post_ica_variance']['n_patients_entropy']:,} "
+    f"0–1) of the same three conditions, core electrode average (n = {S['post_ica_variance']['n_patients_entropy']:,} "
     f"patients, separate subsample). (d) Spectral entropy per electrode.",
         styles["Caption"]),
 ]))
 story.append(Paragraph(
-    f"Removing the flagged component cut core-electrode HEP-evoked variance by "
-    f"{S['post_ica_variance']['core_pct_drop']:.0f}% at the median, consistent with the fractional "
-    f"cleaning-effect reported in §3.2 (median {ICA['hep_pct_drop_median']*100:.0f}%). The "
-    f"non-heartbeat-locked control gives the finite-sample noise floor this comparison is measured "
-    f"against ({S['post_ica_variance']['core_non_locked_median']:.2f} µV²), well below both "
-    f"pre-ICA ({S['post_ica_variance']['core_pre_median']:.2f} µV²) and post-ICA "
-    f"({S['post_ica_variance']['core_post_median']:.2f} µV²) — both still contain "
-    f"genuinely R-peak-locked structure, and post-ICA sitting clearly above the floor at every "
-    f"electrode (panel S2b) shows the flagged component's removal did not simply average the signal "
-    f"down to noise. Spectral entropy gives an independent, variance-free view of the same comparison: "
-    f"entropy fell from pre-ICA ({S['post_ica_variance']['core_entropy_pre_median']:.2f}) to post-ICA "
-    f"({S['post_ica_variance']['core_entropy_post_median']:.2f}) to the non-locked control "
-    f"({S['post_ica_variance']['core_entropy_non_locked_median']:.2f}), dropping only partially from "
-    f"pre- to post-ICA and remaining above the control at every electrode (panel S2d) — "
-    f"reinforcing §3.2's conclusion from a second, independent signal property.",
+    f"Removal of the ECG-related component reduced median core-electrode HEP variance by "
+    f"{S['post_ica_variance']['core_pct_drop']:.0f}%; this ratio of group medians is larger than, and not "
+    f"directly comparable to, the median per-channel reduction reported in §3.2 "
+    f"({ICA['hep_pct_drop_median']*100:.0f}%). The non-heartbeat-locked control defines the "
+    f"finite-sample noise floor ({S['post_ica_variance']['core_non_locked_median']:.2f} µV²), which "
+    f"was well below both the pre-ICA ({S['post_ica_variance']['core_pre_median']:.2f} µV²) and "
+    f"post-ICA ({S['post_ica_variance']['core_post_median']:.2f} µV²) values. Both conditions "
+    f"therefore retained R-peak-locked structure; post-ICA variance remained above the noise floor "
+    f"at every electrode (panel S2b), indicating that component removal did not reduce the "
+    f"heartbeat-locked signal to noise level. Spectral entropy provided a complementary, variance-independent measure: "
+    f"entropy decreased from pre-ICA ({S['post_ica_variance']['core_entropy_pre_median']:.2f}) to "
+    f"post-ICA ({S['post_ica_variance']['core_entropy_post_median']:.2f}) to the non-locked control "
+    f"({S['post_ica_variance']['core_entropy_non_locked_median']:.2f}); the post-ICA decrease was "
+    f"small, and post-ICA values exceeded the control at every electrode (panel S2d).",
     styles["Body"]))
 
-story.append(Paragraph("S3. How much of the EEG is heart data: cross-correlation and mutual information", styles["H2"]))
+story.append(Paragraph("S3. EEG-ECG cross-correlation and mutual information", styles["H2"]))
 CC = S["crosscorr_mi"]
 story.append(KeepTogether([
     Image(os.path.join(FIG_DIR, "figS4_crosscorr_mi.png"), width=6.6 * inch, height=6.6 * inch / (2000 / 1600)),
     Paragraph(
-    f"Figure S3. How much of the EEG is heart data: EEG-ECG cross-correlation and mutual "
-    f"information, pre-ICA, post-ICA, and a non-heartbeat-locked control (n = {CC['n_patients']:,} "
-    f"patients, separate subsample re-fitting ICA to recover the paired evoked waveforms, which the "
-    f"main batch does not persist; §2.7). The control re-epochs the same pre-ICA EEG around random "
-    f"pseudo-events instead of true R-peaks and correlates it against the same real "
-    f"R-peak-locked ECG evoked average — the chance-level relationship expected if the EEG evoked "
-    f"waveform carried no genuine R-peak-locked structure at all. "
-    f"(a) Lag-resolved cross-correlation between the core-electrode "
-    f"({'/'.join(CC['core_electrodes'])}) HEP evoked average and the concurrent ECG evoked average, "
-    f"sign-aligned per channel before averaging (reference polarity is arbitrary; magnitude is not) "
-    f"and shown mean ± SEM across patients. (b) Mean peak |cross-correlation| (maximum over lag) per "
-    f"electrode, all three conditions. (c) Mutual information between the same waveform pairs, "
-    f"core-electrode average. (d) Mutual information per electrode.",
+    f"Figure S3. EEG-ECG cross-correlation and mutual information for pre-ICA, post-ICA, and "
+    f"non-heartbeat-locked control conditions (n = {CC['n_patients']:,} patients; separate "
+    f"subsample in which ICA was refitted to obtain paired evoked waveforms; §2.6). In the control "
+    f"condition, the same pre-ICA EEG was re-epoched around random pseudo-events and correlated with "
+    f"the R-peak-locked ECG evoked average, providing the chance-level relationship expected in the "
+    f"absence of R-peak-locked structure. (a) Lag-resolved cross-correlation between the "
+    f"core-electrode ({'/'.join(CC['core_electrodes'])}) HEP evoked average and the concurrent ECG "
+    f"evoked average, sign-aligned per channel before averaging; mean ± SEM across patients. "
+    f"(b) Mean peak |cross-correlation| (maximum over lags) per electrode for all three conditions. "
+    f"(c) Mutual information between the same waveform pairs, core-electrode average. (d) Mutual "
+    f"information per electrode.",
         styles["Caption"]),
 ]))
 story.append(Paragraph(
-    f"Cross-correlation peaks close to zero lag in both real conditions (median peak lag "
-    f"{CC['core_peak_lag_ms_pre_median']:.0f} ms pre-ICA, {CC['core_peak_lag_ms_post_median']:.0f} ms "
-    f"post-ICA), consistent with the near-instantaneous volume-conduction assumption behind the "
-    f"zero-lag regression estimator (§2.3). Peak correlation strength drops from pre-ICA "
+    f"Cross-correlation peaked near zero lag in both heartbeat-locked conditions (median peak lag "
+    f"{CC['core_peak_lag_ms_pre_median']:.0f} ms pre-ICA and {CC['core_peak_lag_ms_post_median']:.0f} "
+    f"ms post-ICA), consistent with the near-instantaneous volume conduction assumed by the zero-lag "
+    f"regression estimator (§2.3). Peak correlation decreased from pre-ICA "
     f"(mean |r| = {CC['core_peak_r_pre_mean']:.2f}) to post-ICA "
     f"(mean |r| = {CC['core_peak_r_post_mean']:.2f}) to the non-locked control "
-    f"(mean |r| = {CC['core_peak_r_non_locked_mean']:.2f}), and mutual information drops the same way, "
-    f"from {CC['core_mi_pre_median']:.2f} to {CC['core_mi_post_median']:.2f} to "
-    f"{CC['core_mi_non_locked_median']:.2f} nats (panel c). Post-ICA sits clearly above the non-locked "
-    f"floor at every well-covered electrode (panels S3b, S3d): a non-trivial EEG-ECG relationship "
-    f"remains after cleaning, the same conclusion the realised cleaning-effect view (§3.2) and "
-    f"Supplementary Figure S2's noise-floor comparison independently reach. Because mutual information "
-    f"captures nonlinear as well as linear dependence, its post-ICA persistence rules out a nonlinear "
-    f"EEG-ECG relationship invisible to zero-lag Pearson correlation explaining away the R²-based "
-    f"result (§3.2).",
+    f"(mean |r| = {CC['core_peak_r_non_locked_mean']:.2f}), and mutual information decreased "
+    f"correspondingly, from {CC['core_mi_pre_median']:.2f} to {CC['core_mi_post_median']:.2f} to "
+    f"{CC['core_mi_non_locked_median']:.2f} nats (panel c). Post-ICA values remained above the "
+    f"non-locked floor at every well-covered electrode (panels S3b, S3d), indicating that a "
+    f"non-trivial EEG-ECG relationship persists after cleaning, in agreement with §3.2 and "
+    f"Supplementary Figure S2. Mutual information, which is also sensitive to nonlinear dependence, "
+    f"followed the same ordering as peak correlation, giving no indication of substantial EEG-ECG "
+    f"dependence beyond that captured by the linear measures of §3.2.",
     styles["Body"]))
 
 
@@ -670,41 +817,42 @@ story.append(Paragraph(
 PSD = S["psd_comparison"]
 story.append(Paragraph("S4. Power spectral density: pre-ICA, post-ICA, non-locked control, and ECG", styles["H2"]))
 story.append(Paragraph(
-    f"A fourth view of the same question: the raw spectral shape of each evoked waveform, "
-    f"rather than a single correlation or variance summary. Welch power spectral density was "
-    f"computed on the same pre-ICA, post-ICA, and non-locked evoked waveforms as §S3, plus the "
-    f"patient\u2019s own ECG evoked average, on the same {PSD['n_patients']:,}-patient subsample.",
+    f"To complement the correlation- and variance-based summaries, we compared the spectral content "
+    f"of each evoked waveform. Welch power spectral density was computed for the pre-ICA, post-ICA, "
+    f"and non-locked evoked waveforms described in §S3 and for the patient’s ECG evoked "
+    f"average, in the same {PSD['n_patients']:,}-patient subsample.",
     styles["Body"]))
 story.append(KeepTogether([
     Image(os.path.join(FIG_DIR, "figS5_psd_comparison.png"), width=6.6 * inch, height=6.6 * inch / (2000 / 1450)),
     Paragraph(
     f"Figure S4. Power spectral density (Welch, dB) of the pre-ICA, post-ICA, "
     f"non-heartbeat-locked control, and ECG evoked waveforms (n = {PSD['n_patients']:,} patients). "
-    f"(a) Group-overall: core 4-electrode ({'/'.join(PSD['core_electrodes'])}) average, all four "
+    f"(a) Group average: core four-electrode ({'/'.join(PSD['core_electrodes'])}) average, all four "
     f"conditions overlaid (mean \u00b1 SEM). (b) Per-electrode: the same four-way overlay for each "
-    f"of the six well-covered sites (\u00a72.6).",
+    f"of the six well-covered sites (\u00a72.5).",
         styles["Caption"]),
 ]))
 story.append(Paragraph(
-    "The ECG's own spectrum is broadband and structured (dominated by the QRS complex's sharp "
-    "transient) compared to the flatter non-locked EEG control. Pre-ICA and post-ICA EEG spectra sit "
-    "between these two references, both shaped more like the ECG than like the non-locked floor \u2014 "
-    "a spectral-domain view of the same conclusion as \u00a73.2 and \u00a7S3. Spectral shape is "
-    "broadly similar across the six electrodes (panel b), consistent with Figure 2's finding that CFA "
-    "varies in magnitude but not qualitatively in character across the scalp.",
+    "The ECG spectrum was broadband and structured, dominated by the sharp QRS transient, whereas "
+    "the non-locked EEG control lacked this QRS-dominated structure. Pre-ICA and post-ICA EEG spectra lay between these two "
+    "references and appeared visually closer to the ECG than the non-locked floor did, providing "
+    "spectral-domain support for the conclusions of \u00a73.2 and \u00a7S3. Spectral shape was "
+    "visually similar across the six electrodes (panel b), suggesting that CFA varies across the "
+    "scalp mainly in magnitude (Figure 2) rather than in spectral content.",
     styles["Body"]))
 
 CONF = S["sex_bmi_confound"]
-story.append(Paragraph("S5. Is the sex effect on CFA R² confounded by BMI?", styles["H2"]))
+story.append(Paragraph("S5. Adjustment of the sex effect for BMI", styles["H2"]))
 story.append(Paragraph(
-    f"Male patients had higher CFA R² than female patients (§3.4), and men in this cohort "
-    f"skew heavier, raising the question of whether the sex gap is really a BMI effect. On the "
-    f"BMI-available subsample (n = {CONF['n']:,}; derived from EHR height/weight vitals), an OLS "
-    f"regression of patient-mean CFA "
-    f"R² (outside QRS) on sex alone gave a male-vs-female coefficient of "
+    f"Male patients had higher CFA R² than female patients (§3.4), whereas mean BMI was higher in "
+    f"female patients ({BMI_STRAT['by_sex']['Female']['bmi_mean']:.1f} vs. "
+    f"{BMI_STRAT['by_sex']['Male']['bmi_mean']:.1f} kg/m²); because BMI was itself associated with "
+    f"CFA, the sex comparison could be confounded by BMI. In the "
+    f"subsample with available BMI (n = {CONF['n']:,}), an OLS regression of patient-mean CFA R² "
+    f"(outside QRS) on sex alone yielded a male-versus-female coefficient of "
     f"{CONF['sex_unadj_coef']:.3f} (95% CI {CONF['sex_unadj_ci_lo']:.3f} to "
-    f"{CONF['sex_unadj_ci_hi']:.3f}, p = {CONF['sex_unadj_p']:.2g}); adding BMI as a covariate left the "
-    f"sex coefficient essentially unchanged, {CONF['sex_adj_coef']:.3f} (95% CI "
+    f"{CONF['sex_unadj_ci_hi']:.3f}, p = {CONF['sex_unadj_p']:.2g}). Inclusion of BMI as a covariate "
+    f"did not attenuate the sex coefficient ({CONF['sex_adj_coef']:.3f}; 95% CI "
     f"{CONF['sex_adj_ci_lo']:.3f} to {CONF['sex_adj_ci_hi']:.3f}, p = {CONF['sex_adj_p']:.2g}), while "
     f"BMI itself was an independent, significant predictor (coefficient {CONF['bmi_coef']:.4f} per "
     f"BMI unit, p = {CONF['bmi_p']:.2g}).",
@@ -712,23 +860,19 @@ story.append(Paragraph(
 story.append(KeepTogether([
     Image(os.path.join(FIG_DIR, "figS6_sex_bmi_confound.png"), width=4.5 * inch, height=4.5 * inch / (5 / 3.6)),
     Paragraph(
-    f"Figure S5. Male-vs-female CFA R² (outside QRS) OLS coefficient, unadjusted vs. "
+    f"Figure S5. Male-versus-female CFA R² (outside QRS) OLS coefficient, unadjusted vs. "
     f"BMI-adjusted, same BMI-available subsample (n = {CONF['n']:,}); points = coefficient, error bars "
     f"= 95% CI.",
         styles["Caption"]),
 ]))
 story.append(Paragraph(
-    f"The sex coefficient does not shrink after adjusting for BMI — if anything it is slightly "
-    f"larger — which argues against BMI being the driver of the sex effect seen in the full "
-    f"cohort. Although this subset is smaller than the full sex comparison "
-    f"(n = {CONF['n']:,} vs. n = {STRAT['n_with_age']:,} in Figure 4b, which reached "
-    f"p = {STRAT['p_sex_mannwhitney']:.1e}), the expanded matched analysis now estimates both the "
-    f"unadjusted and BMI-adjusted sex coefficients precisely (p = {CONF['sex_unadj_p']:.1e} and "
-    f"p = {CONF['sex_adj_p']:.1e}, respectively). BMI and sex therefore contribute independently in "
-    f"this observational model; adjustment does not support BMI as the explanation for the sex gap.",
+    f"The sex coefficient did not decrease after adjustment for BMI and, if anything, increased "
+    f"slightly, as expected given the higher BMI of female patients, arguing against BMI as the explanation for the sex effect observed in the full "
+    f"cohort. In this observational model, sex and BMI were thus "
+    f"independently associated with CFA.",
     styles["Body"]))
 
-story.append(Paragraph("S6. Time-domain sensitivity to recording duration", styles["H2"]))
+story.append(Paragraph("S6. Sensitivity to segment duration", styles["H2"]))
 dose_str = "; ".join(f"{int(r['window_minutes'])} min: {r['mean']:.2f}" for r in DOSE["lengths"])
 dose_minutes = [int(r["window_minutes"]) for r in DOSE["lengths"]]
 dose_minutes_text = ", ".join(map(str, dose_minutes[:-1])) + f", and {dose_minutes[-1]}"
@@ -739,28 +883,38 @@ p_dx_dose_max = max(r["p_dx"] for r in DOSE["stratified_by_length"])
 story.append(KeepTogether([
     Image(os.path.join(FIG_DIR, "figS2_window_stage_sensitivity.png"), width=6.6 * inch, height=6.6 * inch / (11.5 / 4)),
     Paragraph(
-    f"Figure S6. Time-domain sensitivity of CFA estimation to recording duration "
+    f"Figure S6. Sensitivity of CFA estimates to segment duration "
     f"(n = {DOSE['n_common_patients']:,} patients with usable data at every duration). "
-    f"(a) Mean CFA R² at {dose_minutes_text} min ({dose_str}). "
+    f"(a) Mean channel-level CFA R² (all EEG channels) at {dose_minutes_text} min ({dose_str}). "
     f"(b) Sex-stratified and "
     f"(c) diagnosis-stratified estimates. The sex difference was present at every available duration "
-    f"(Mann-Whitney, all p &lt; {p_sex_dose:.2g}); diagnosis differences were not significant "
+    f"(Mann-Whitney, all p &le; {p_sex_dose:.3g}); diagnosis differences were not significant "
     f"(p = {p_dx_dose_min:.2g}–{p_dx_dose_max:.2g}).",
         styles["Caption"]),
 ]))
 story.append(Paragraph(
-    f"Recording duration had a clear time-domain effect on the detectable cardiac contribution. Mean "
+    f"Segment duration had a clear effect on the detectable cardiac contribution. Mean "
     f"CFA R² increased from {dose_by_min[5]['mean']:.2f} at 5 min to "
     f"{dose_by_min[10]['mean']:.2f} at 10 min, {dose_by_min[20]['mean']:.2f} at 20 min, "
     f"{dose_by_min[30]['mean']:.2f} at 30 min, {dose_by_min[45]['mean']:.2f} at 45 min, and "
-    f"{dose_by_min[60]['mean']:.2f} at 60 min. Thus, 5-minute and 10-minute windows miss shared EEG-ECG "
-    f"structure that becomes detectable when more heartbeats are averaged. The incremental gain "
+    f"{dose_by_min[60]['mean']:.2f} at 60 min, consistent with incomplete "
+    f"averaging of heartbeat-locked structure over fewer beats in shorter windows. The "
+    f"incremental gain "
     f"decreased from {dose_by_min[20]['mean']-dose_by_min[10]['mean']:.2f} R² units between "
     f"10 and 20 min to {dose_by_min[30]['mean']-dose_by_min[20]['mean']:.2f} between 20 and "
     f"30 min and {dose_by_min[60]['mean']-dose_by_min[45]['mean']:.2f} between 45 and 60 min, "
-    f"supporting a plateau after approximately 30 min. The sex difference persisted "
+    f"indicating diminishing returns with longer windows, although no plateau was reached within 60 min. "
+    f"Fewer channel-recordings contributed at 45 and 60 min ({dose_by_min[45]['n_rows']:,} vs. "
+    f"{dose_by_min[30]['n_rows']:,} at 30 min), so the longest-window means may partly reflect a "
+    f"different channel composition; between 5 and 30 min, however, channel composition was nearly "
+    f"constant ({dose_by_min[5]['n_rows']:,} to {dose_by_min[30]['n_rows']:,} channel-recordings), "
+    f"and R² still increased monotonically. The sex difference persisted "
     f"across all tested durations, whereas "
-    f"diagnosis differences were not significant in this matched subset.",
+    f"diagnosis differences were not significant in this matched subset. Unlike in the main analysis, "
+    f"the no-diagnosis mean was numerically higher than the any-diagnosis mean at every duration "
+    f"(e.g. {DOSE['stratified_by_length'][0]['no_dx_mean']:.2f} vs. "
+    f"{DOSE['stratified_by_length'][0]['any_dx_mean']:.2f} at 5 min), consistent with the within-site reversal described in the Limitations; the "
+    f"diagnosis association should therefore not be interpreted as a disease effect.",
     styles["Body"]))
 
 # ---------------------------------------------------------------------
@@ -784,38 +938,41 @@ story.append(Paragraph("References", styles["H1"]))
 refs = [
     "1. Dirlich G, Vogl L, Plaschke M, Strian F. Cardiac field effects on the EEG. "
     "Electroencephalogr Clin Neurophysiol. 1997;102(4):307-315.",
-    "2. Kern M, Aertsen A, Schulze-Bonhage A, Ball T. Heart cycle-related effects on event-related "
-    "potentials, spectral power changes, and connectivity patterns in the human ECoG. NeuroImage. "
-    "2013;81:178-190.",
-    "3. Park H-D, Blanke O. Heartbeat-evoked cortical responses: underlying mechanisms, functional "
+    "2. Park H-D, Blanke O. Heartbeat-evoked cortical responses: underlying mechanisms, functional "
     "roles, and methodological considerations. NeuroImage. 2019;197:502-511.",
-    "4. Coll M-P, Hobson H, Bird G, Murphy J. Systematic review and meta-analysis of the relationship "
+    "3. Coll M-P, Hobson H, Bird G, Murphy J. Systematic review and meta-analysis of the relationship "
     "between the heartbeat-evoked potential and interoception. Neurosci Biobehav Rev. 2021;122:190-200.",
-    "5. Steinfath TP, et al. Heartbeat-evoked responses in M/EEG: a systematic review of methods with "
+    "4. Steinfath TP, et al. Heartbeat-evoked responses in M/EEG: a systematic review of methods with "
     "suggestions for analysis and reporting. Psychophysiology. 2026;63(4):e70297. "
     "doi:10.1111/psyp.70297.",
-    "6. Hyvarinen A, Oja E. Independent component analysis: algorithms and applications. Neural Netw. "
-    "2000;13(4-5):411-430.",
-    "7. Gramfort A, et al. MEG and EEG data analysis with MNE-Python. Front Neurosci. 2013;7:267.",
-    "8. Dirlich G, Dietl T, Vogl L, Strian F. Topography and morphology of heart action-related EEG "
+    "5. Dirlich G, Dietl T, Vogl L, Strian F. Topography and morphology of heart action-related EEG "
     "potentials. Electroencephalogr Clin Neurophysiol. 1998;108(3):299-305.",
-    "9. Virjee R-I, Kandasamy R, Garfinkel SN, Carmichael DW, Yogarajah M. Review of methods to "
+    "6. Kern M, Aertsen A, Schulze-Bonhage A, Ball T. Heart cycle-related effects on event-related "
+    "potentials, spectral power changes, and connectivity patterns in the human ECoG. NeuroImage. "
+    "2013;81:178-190.",
+    "7. Virjee R-I, Kandasamy R, Garfinkel SN, Carmichael DW, Yogarajah M. Review of methods to "
     "derive the heartbeat-evoked potential: past practices and future directions. Soc Cogn Affect "
     "Neurosci. 2026:nsag057. doi:10.1093/scan/nsag057.",
-    "10. Tochikubo O, Miyajima E, Shigemasa T, Ishii M. Relation between body fat-corrected ECG "
+    "8. Tochikubo O, Miyajima E, Shigemasa T, Ishii M. Relation between body fat-corrected ECG "
     "voltage and ambulatory blood pressure in patients with essential hypertension. Hypertension. "
     "1999;33(5):1159-1163. doi:10.1161/01.HYP.33.5.1159.",
-    "11. Ablin P, Cardoso J-F, Gramfort A. Faster independent component analysis by preconditioning "
+    "9. Li Q, Wen S, Sun H, Ganglberger W, Tripathi A, Turley N, et al.; Westover MB. The Human "
+    "Sleep Project (HSP). Brain Data Science Platform. 2026. doi:10.60508/m3sw-rz13.",
+    "10. Terzano MG, Parrino L, Smerieri A, Chervin R, Chokroverty S, Guilleminault C, et al. Atlas, "
+    "rules, and recording techniques for the scoring of cyclic alternating pattern (CAP) in human "
+    "sleep. Sleep Med. 2001;2(6):537-553.",
+    "11. Goldberger AL, Amaral LAN, Glass L, Hausdorff JM, Ivanov PCh, Mark RG, et al. PhysioBank, "
+    "PhysioToolkit, and PhysioNet: components of a new research resource for complex physiologic "
+    "signals. Circulation. 2000;101(23):e215-e220.",
+    "12. Gramfort A, et al. MEG and EEG data analysis with MNE-Python. Front Neurosci. 2013;7:267.",
+    "13. Hyvarinen A, Oja E. Independent component analysis: algorithms and applications. Neural Netw. "
+    "2000;13(4-5):411-430.",
+    "14. Ablin P, Cardoso J-F, Gramfort A. Faster independent component analysis by preconditioning "
     "with Hessian approximations. IEEE Trans Signal Process. 2018;66(15):4040-4049.",
-    "12. Kraskov A, Stögbauer H, Grassberger P. Estimating mutual information. Phys Rev E. "
+    "15. Kraskov A, Stögbauer H, Grassberger P. Estimating mutual information. Phys Rev E. "
     "2004;69(6):066138.",
-    "13. Benjamini Y, Hochberg Y. Controlling the false discovery rate: a practical and powerful "
+    "16. Benjamini Y, Hochberg Y. Controlling the false discovery rate: a practical and powerful "
     "approach to multiple testing. J R Stat Soc Series B. 1995;57(1):289-300.",
-    "14. The Human Sleep Project, v2.0. Brain Data Science Platform (BDSP). "
-    "https://bdsp.io/content/hsp/2.0/",
-    "15. Cafri N, Mirloo S, Zarhin D, Kamintsky L, Serlin Y, Alhadeed L, et al.; Benninger F. "
-    "Imaging blood-brain barrier dysfunction in drug-resistant epilepsy: a multi-center feasibility "
-    "study. Epilepsia. 2025;66(1):195-206.",
 ]
 for r in refs:
     story.append(Paragraph(r, styles["Ref"]))

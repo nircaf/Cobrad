@@ -179,6 +179,14 @@ S["crosscorr_mi"] = {
     "per_site_mi_post": {c: float(per_site_mi.loc[c, "post"]) for c in order_mi},
     "per_site_mi_non_locked": {c: float(per_site_mi.loc[c, "non_locked"]) for c in order_mi},
 }
+# Zero-lag R^2 per condition (patient mean over sites): the pseudo-event
+# condition is the chance-level null for the main zero-lag R^2 estimator.
+zl = curve[curve.lag_ms == 0].assign(r2=lambda d: d.r ** 2)
+zl_pt = zl.groupby(["condition", "patient_id"]).r2.mean().reset_index()
+S["crosscorr_mi"]["zero_lag_r2_full_epoch"] = {
+    c: {"mean": float(g.r2.mean()), "median": float(g.r2.median()), "n": int(g.patient_id.nunique())}
+    for c, g in zl_pt.groupby("condition")
+}
 with open(os.path.join(HERE, "paper_stats.json"), "w") as f:
     json.dump(S, f, indent=2, default=float)
 print(f"Core peak |r|: pre={core_summary['peak_r_pre'].abs().mean():.3f} post={core_summary['peak_r_post'].abs().mean():.3f}")

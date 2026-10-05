@@ -202,6 +202,8 @@ STATS["cfa"] = {
     "r2_full_median": float(cfa.cfa_r2_full_epoch.median()),
     "r2_excl_qrs_mean": float(cfa.cfa_r2_excl_qrs.mean()), "r2_excl_qrs_sd": float(cfa.cfa_r2_excl_qrs.std()),
     "r2_excl_qrs_median": float(cfa.cfa_r2_excl_qrs.median()),
+    "bpm_quartiles": {str(q): float(v) for q, v in
+                      cfa.drop_duplicates("edf_path").qc_ecg_bpm.quantile([.25, .5, .75]).items()},
 }
 
 drop = ica_flag["channel_hep_variance_pct_drop"].dropna()
@@ -221,7 +223,8 @@ STATS["ica"] = {
 # =============================================================================
 dx_exploded = cfa_pt.dropna(subset=["cfa_r2_excl_qrs"]).explode("diagnosis_categories")
 top_categories = [c for c in STATS["cohort"]["top_diagnoses"].keys() if c != "Heart Transplant"]
-no_dx = cfa_pt.loc[cfa_pt["n_diagnoses"].fillna(0) == 0, "cfa_r2_excl_qrs"].dropna().values
+# EHR-linked patients (age known) with no recorded diagnosis; unlinked patients have unknown status
+no_dx = cfa_pt.loc[(cfa_pt["n_diagnoses"] == 0) & cfa_pt["age"].notna(), "cfa_r2_excl_qrs"].dropna().values
 no_dx_mean, no_dx_n = float(np.mean(no_dx)), len(no_dx)
 no_dx_var = float(np.var(no_dx, ddof=1))
 
@@ -503,6 +506,18 @@ STATS["stratified"] = {
         "n_with_sex": int(len(interaction_data)),
     },
 }
+# Diagnosis tables exist only for some HSP sites, so "no diagnosis" is partly
+# a site marker; report the reference split by site (patient-ID prefix).
+_site = strat["patient_id"].astype(str).str[:5]
+_dx = np.where(strat["n_diagnoses"] > 0, "any_dx", "no_dx")
+STATS["stratified"]["dx_by_site"] = {
+    f"{s}_{d}": {"mean": float(g["cfa_r2_excl_qrs"].mean()), "n": int(len(g))}
+    for (s, d), g in strat.groupby([_site, _dx])
+}
+STATS["cohort"]["source_counts"] = (
+    cfa.drop_duplicates("patient_id")["edf_path"].str.split("EDF_Format/").str[1]
+    .str.split("/").str[0].value_counts().to_dict()
+)
 
 # =============================================================================
 # Figure S5: is the sex effect on CFA R^2 confounded by BMI?
