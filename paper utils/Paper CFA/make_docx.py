@@ -14,14 +14,14 @@ import re
 import runpy
 
 from docx import Document
-from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK, WD_LINE_SPACING
 from docx.shared import Inches, Pt
 from reportlab.platypus import (
     HRFlowable, Image, KeepTogether, PageBreak, Paragraph, Spacer, Table,
 )
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-OUT_DOCX = os.path.join(HERE, "Cafri_CFA_variance_explained_paper.docx")
+OUT_DOCX = os.path.join(HERE, "Cafri_CFA_EEG_paper_v2.docx")
 
 # Map reportlab ParagraphStyle name -> docx rendering.
 STYLE_MAP = {
@@ -31,13 +31,13 @@ STYLE_MAP = {
     "AffilList": {"align": "center", "size": 8},
     "H1": {"heading": 1},
     "H2": {"heading": 2},
-    "Body": {"align": "justify", "size": 11},
-    "Caption": {"size": 9, "italic": False},
-    "Kw": {"italic": True, "size": 9},
-    "Ref": {"size": 9},
+    "Body": {"align": "justify", "size": 11, "space": (0, 6)},
+    "Caption": {"size": 9, "italic": False, "space": (4, 12)},
+    "Kw": {"italic": True, "size": 9, "space": (6, 6)},
+    "Ref": {"size": 9, "space": (0, 4)},
 }
 
-TAG_RE = re.compile(r"<(/?)(super|br\s*/?|font[^>]*)>")
+TAG_RE = re.compile(r"<(/?)(super|b|br\s*/?|font[^>]*)>")
 
 
 def add_markup_runs(paragraph, raw_text):
@@ -46,16 +46,20 @@ def add_markup_runs(paragraph, raw_text):
     pos = 0
     superscript = False
     monospace = False
+    bold = False
     for m in TAG_RE.finditer(raw_text):
         chunk = raw_text[pos:m.start()]
         if chunk:
             run = paragraph.add_run(html.unescape(chunk))
             run.font.superscript = superscript
+            run.bold = bold or None
             if monospace:
                 run.font.name = "Courier New"
         closing, tag = m.group(1), m.group(2)
         if tag == "super":
             superscript = not closing
+        elif tag == "b":
+            bold = not closing
         elif tag.startswith("br"):
             paragraph.add_run().add_break(WD_BREAK.LINE)
         elif tag.startswith("font"):
@@ -89,6 +93,17 @@ def render_paragraph(doc, flowable):
             run.italic = True
         if "size" in spec and "heading" not in spec:
             run.font.size = Pt(spec["size"])
+    if "heading" not in spec:
+        # exact line height: otherwise Word grows lines that hold a superscript
+        # citation, so reference-dense paragraphs look unevenly spaced
+        p.paragraph_format.line_spacing_rule = WD_LINE_SPACING.EXACTLY
+        p.paragraph_format.line_spacing = Pt(spec.get("size", 11) * 1.35)
+        before, after = spec.get("space", (0, 6))
+        p.paragraph_format.space_before = Pt(before)
+        p.paragraph_format.space_after = Pt(after)
+    if style_name == "Ref":
+        p.paragraph_format.left_indent = Inches(0.25)
+        p.paragraph_format.first_line_indent = Inches(-0.25)
     if "heading" in spec and spec["heading"] == 0:
         for run in p.runs:
             run.font.size = Pt(spec["size"])
@@ -98,18 +113,27 @@ def render_paragraph(doc, flowable):
 def render_image(doc, flowable):
     width_in = flowable.drawWidth / 72.0
     doc.add_picture(flowable.filename, width=Inches(min(width_in, 6.5)))
-    doc.paragraphs[-1].alignment = WD_ALIGN_PARAGRAPH.CENTER
+    p = doc.paragraphs[-1]
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    p.paragraph_format.space_before = Pt(8)
+    p.paragraph_format.space_after = Pt(0)
+    p.paragraph_format.keep_with_next = True
 
 
 def render_table(doc, flowable):
-    for row in flowable._cellvalues:
-        for cell in row:
-            if isinstance(cell, Paragraph):
-                render_paragraph(doc, cell)
-            elif isinstance(cell, list):
-                for sub in cell:
-                    if isinstance(sub, Paragraph):
-                        render_paragraph(doc, sub)
+    rows = flowable._cellvalues
+    table = doc.add_table(rows=len(rows), cols=len(rows[0]))
+    table.style = "Table Grid"
+    for r, row in enumerate(rows):
+        for c, cell in enumerate(row):
+            table.cell(r, c).width = Inches(flowable._colWidths[c] / 72.0)
+            p = table.cell(r, c).paragraphs[0]
+            if isinstance(cell, (list, tuple)):  # reportlab wraps laid-out cells
+                cell = cell[0]
+            add_markup_runs(p, cell.text if isinstance(cell, Paragraph) else str(cell))
+            for run in p.runs:
+                run.font.size = Pt(9)
+                run.bold = r == 0
 
 
 def walk(doc, flowables):

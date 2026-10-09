@@ -87,7 +87,7 @@ ax.set_yscale("log")
 ax.set_xticks([1, 2, 3])
 ax.set_xticklabels(["Pre-ICA", "Post-ICA\n(ECG component removed)", "Non-heartbeat-locked\ncontrol"])
 ax.set_ylabel("Evoked variance (µV², log scale)")
-ax.set_title(f"a  Core 4-electrode average ({'/'.join(CORE_FOUR)})", loc="left", fontsize=10, fontweight="bold")
+ax.set_title("a", loc="left", fontsize=10, fontweight="bold")
 pre_med, post_med = core["channel_hep_variance_pre_ica"].median(), core["channel_hep_variance_post_ica"].median()
 nl_med = core_nl["channel_hep_variance_non_locked"].median()
 pct_drop = (pre_med - post_med) / pre_med * 100
@@ -121,7 +121,7 @@ xmin = per_site.loc[order, ["pre_median", "post_median", "non_locked_median"]].m
 xmax = per_site.loc[order, ["pre_median", "post_median", "non_locked_median"]].max().max()
 ax.set_xlim(xmin * 0.7, xmax * 1.3)
 ax.set_xlabel("Median evoked variance (µV², log scale)")
-ax.set_title(f"b  Per-electrode ({len(order)} sites)", loc="left", fontsize=10, fontweight="bold")
+ax.set_title("b", loc="left", fontsize=10, fontweight="bold")
 ax.legend(fontsize=7.5, frameon=False, loc="lower right")
 
 # ---------------------------------------------------------------------
@@ -143,7 +143,7 @@ for median in bp["medians"]:
 ax.set_xticks([1, 2, 3])
 ax.set_xticklabels(["Pre-ICA", "Post-ICA\n(ECG component removed)", "Non-heartbeat-locked\ncontrol"])
 ax.set_ylabel("Spectral entropy (normalised, 0-1)")
-ax.set_title(f"c  Entropy, core 4-electrode average ({'/'.join(CORE_FOUR)})", loc="left", fontsize=10, fontweight="bold")
+ax.set_title("c", loc="left", fontsize=10, fontweight="bold")
 ent_pre_med = core_ent["entropy_pre_ica"].median()
 ent_post_med = core_ent["entropy_post_ica"].median()
 ent_nl_med = core_ent["entropy_non_locked"].median()
@@ -170,7 +170,7 @@ ax.barh(y2 - h, ent_per_site.loc[ent_order, "non_locked_entropy"], height=h, col
 ax.set_yticks(y2)
 ax.set_yticklabels(ent_order, fontsize=7.5)
 ax.set_xlabel("Median spectral entropy (0-1)")
-ax.set_title(f"d  Entropy, per-electrode ({len(ent_order)} sites)", loc="left", fontsize=10, fontweight="bold")
+ax.set_title("d", loc="left", fontsize=10, fontweight="bold")
 # ponytail: bars span the full width, so reserve a blank band above them for the legend
 ax.set_ylim(-0.6, len(ent_order) - 1 + 1.5)
 ax.legend(fontsize=7.5, frameon=False, loc="upper right")

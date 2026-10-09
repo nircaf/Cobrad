@@ -134,7 +134,7 @@ ax.errorbar(overall.window_minutes, overall["mean"], yerr=overall["sem"] * 1.96,
             marker="o", capsize=4, color=PALETTE[0], lw=1.6)
 ax.set_xlabel("Window length (min)")
 ax.set_ylabel("Mean CFA R², full cohort ± 95% CI")
-ax.set_title("a  Dose-response", loc="left", fontsize=9.5, fontweight="bold")
+ax.set_title("d", loc="left", fontsize=9.5, fontweight="bold")
 ax.set_xticks([5, 10, 20, 30, 45, 60])
 ax.set_xlim(3, 62)
 if 60 in pending_lengths:
@@ -149,7 +149,7 @@ ax.set_ylabel("Mean CFA R²")
 ax.set_xticks([5, 10, 20, 30, 45, 60])
 ax.set_xlim(3, 62)
 p_sex_range = f"{strat.p_sex.max():.2g}"
-ax.set_title(f"b  By sex (all p < {p_sex_range})", loc="left", fontsize=9.5, fontweight="bold")
+ax.set_title("e", loc="left", fontsize=9.5, fontweight="bold")
 ax.legend(fontsize=7, frameon=False)
 
 ax = axes[2]
@@ -160,7 +160,7 @@ ax.set_ylabel("Mean CFA R²")
 ax.set_xticks([5, 10, 20, 30, 45, 60])
 ax.set_xlim(3, 62)
 p_dx_lo, p_dx_hi = strat.p_dx.min(), strat.p_dx.max()
-ax.set_title(f"c  By diagnosis (p = {p_dx_lo:.2g}–{p_dx_hi:.2g})",
+ax.set_title("f",
              loc="left", fontsize=9.5, fontweight="bold")
 ax.legend(fontsize=7, frameon=False)
 

@@ -95,7 +95,7 @@ ax = axes[0]
 ax.hist(demo_age.age, bins=30, color=PALETTE[0], edgecolor="white", linewidth=0.4)
 ax.set_xlabel("Age (years)")
 ax.set_ylabel("Patients")
-ax.set_title("a  Age distribution", loc="left", fontsize=10, fontweight="bold")
+ax.set_title("a", loc="left", fontsize=10, fontweight="bold")
 # ponytail: headroom so the n/median label clears the tallest bars
 _lo, _hi = ax.get_ylim()
 ax.set_ylim(_lo, _hi * 1.15)
@@ -107,13 +107,13 @@ sex_counts = demo_sex.sex.value_counts()
 ax.pie(sex_counts.values, labels=[f"{i} ({v:,})" for i, v in sex_counts.items()],
        colors=[PALETTE[0], PALETTE[1], PALETTE[2]][:len(sex_counts)], autopct="%1.0f%%",
        textprops={"fontsize": 8}, wedgeprops={"linewidth": 0.6, "edgecolor": "white"})
-ax.set_title("b  Sex", loc="left", fontsize=10, fontweight="bold")
+ax.set_title("b", loc="left", fontsize=10, fontweight="bold")
 
 ax = axes[2]
 top_dx = dx_counts.tail(10)
 ax.barh(top_dx.index, top_dx.values, color=PALETTE[3])
 ax.set_xlabel("Patients with diagnosis")
-ax.set_title("c  Top diagnoses", loc="left", fontsize=10, fontweight="bold")
+ax.set_title("c", loc="left", fontsize=10, fontweight="bold")
 ax.tick_params(axis="y", labelsize=7.5)
 
 fig.suptitle(f"Figure S1. Cohort composition (Harvard EHR-linked subset, n = {len(demo):,})", fontsize=10)
@@ -149,7 +149,7 @@ for key in ("cmedians", "cbars", "cmins", "cmaxes"):
 ax.set_xticks([1, 2])
 ax.set_xticklabels(["Full HEP epoch\n(−300 to 400 ms)", "Outside ±50 ms\nQRS window"])
 ax.set_ylabel("Channel HEP-evoked R² vs. ECG evoked average")
-ax.set_title("a  CFA variance explained, per channel", loc="left", fontsize=10, fontweight="bold")
+ax.set_title("a", loc="left", fontsize=10, fontweight="bold")
 # ponytail: headroom so the mean±sd label clears the violins' max bars
 _lo, _hi = ax.get_ylim()
 ax.set_ylim(_lo, _hi + 0.18 * (_hi - _lo))
@@ -183,7 +183,7 @@ ax.plot(xs, 10 ** (slope * xs + intercept), color=PALETTE[1], lw=1.8)
 ax.set_yscale("log")
 ax.set_xlabel("Model-free CFA R² (outside QRS)")
 ax.set_ylabel("ICA-attributed CFA SNR\n(variance ratio, CFA:residual)")
-ax.set_title("b  Model-free R² vs. ICA-attributed SNR", loc="left", fontsize=10, fontweight="bold")
+ax.set_title("b", loc="left", fontsize=10, fontweight="bold")
 p_scatter_str = "< 1e-300" if p_scatter == 0 else f"= {p_scatter:.2g}"
 ax.text(0.03, 0.05, f"r (log SNR) = {r_scatter:.2f}, p {p_scatter_str}\nn = {len(merged):,}",
         transform=ax.transAxes, va="bottom", fontsize=7.5)
@@ -222,7 +222,7 @@ STATS["ica"] = {
 # Figure 3: CFA variance explained by diagnosis category
 # =============================================================================
 dx_exploded = cfa_pt.dropna(subset=["cfa_r2_excl_qrs"]).explode("diagnosis_categories")
-top_categories = [c for c in STATS["cohort"]["top_diagnoses"].keys() if c != "Heart Transplant"]
+top_categories = list(STATS["cohort"]["top_diagnoses"].keys())
 # EHR-linked patients (age known) with no recorded diagnosis; unlinked patients have unknown status
 no_dx = cfa_pt.loc[(cfa_pt["n_diagnoses"] == 0) & cfa_pt["age"].notna(), "cfa_r2_excl_qrs"].dropna().values
 no_dx_mean, no_dx_n = float(np.mean(no_dx)), len(no_dx)
@@ -295,7 +295,7 @@ for yi, row in zip(y, forest.itertuples()):
     ax.text(n_col_x, yi, f"n={row.n:,}", va="center", ha="left", fontsize=7.5)
 ax.text(n_col_x, len(forest) - 0.3, "N", va="center", ha="left", fontsize=7.5, fontweight="bold")
 ax.set_xlabel(f"Mean CFA R² (outside QRS)\n(no linked diagnosis: mean = {no_dx_mean:.2f}, n = {no_dx_n:,})")
-ax.set_title("a  By diagnosis category", loc="left", fontsize=10, fontweight="bold")
+ax.set_title("a", loc="left", fontsize=10, fontweight="bold")
 
 ax = axes[1]
 mask = np.triu(np.ones_like(qmat, dtype=bool))
@@ -308,7 +308,7 @@ ax.set_yticks(range(n_cats))
 ax.set_yticklabels(order_cats, fontsize=7.5)
 cbar = fig.colorbar(im, ax=ax, shrink=0.75, pad=0.03, extend="max")
 cbar.set_label("FDR p-value", fontsize=8)
-ax.set_title("b  Category vs. category", loc="left", fontsize=10, fontweight="bold")
+ax.set_title("b", loc="left", fontsize=10, fontweight="bold")
 
 fig.suptitle(
     f"Figure 3. CFA variance explained by diagnosis category\n"
@@ -358,7 +358,7 @@ xs = np.linspace(age_x.min(), age_x.max(), 100)
 ax.plot(xs, slope * xs + intercept, color=PALETTE[1], lw=1.8)
 ax.set_xlabel("Age (years)")
 ax.set_ylabel("Patient-mean CFA R² (outside QRS)")
-ax.set_title(f"a  vs. age (r = {r_age:.2f}, p = {p_age_pearson:.2g})", loc="left", fontsize=10, fontweight="bold")
+ax.set_title("a", loc="left", fontsize=10, fontweight="bold")
 ax.text(0.03, 0.97, f"n = {len(age_x):,}", transform=ax.transAxes, va="top", fontsize=7.5)
 
 ax = axes[1]
@@ -377,7 +377,7 @@ p_sex = np.nan
 if len(sex_groups) == 2:
     vals2 = list(sex_groups.values())
     _, p_sex = stats.mannwhitneyu(vals2[0], vals2[1])
-ax.set_title(f"b  By sex (p = {p_sex:.3g})", loc="left", fontsize=10, fontweight="bold")
+ax.set_title("b", loc="left", fontsize=10, fontweight="bold")
 
 # Diagnostic-burden stats (used in text/abstract) computed but no longer plotted as a fig4 panel.
 strat["any_dx"] = strat["n_diagnoses"].fillna(0) > 0
@@ -423,7 +423,7 @@ bmi_data["bdsp_patient_id"] = pd.to_numeric(
 )
 target_bmi_ids = bmi_data["bdsp_patient_id"].dropna().astype("int64").unique().tolist()
 ehr_sex = pd.read_parquet(
-    os.path.join(HERE, "..", "cache", "ehr_demographics.parquet"),
+    os.path.join(HERE, "..", "..", "cache", "ehr_demographics.parquet"),
     columns=["patient_id", "sex"],
     filters=[("patient_id", "in", target_bmi_ids)],
 )
@@ -472,7 +472,7 @@ bmi_sex_interaction = smf.ols(
 p_bmi_sex_interaction = float(bmi_sex_interaction.pvalues["bmi:sex_male"])
 ax.set_xlabel("BMI (kg/m²)")
 ax.set_ylabel("Patient-mean CFA R² (outside QRS)")
-ax.set_title("c  BMI association stratified by sex",
+ax.set_title("c",
              loc="left", fontsize=10, fontweight="bold")
 ax.legend(frameon=False, fontsize=7, loc="upper left")
 
@@ -611,8 +611,11 @@ fig.savefig(os.path.join(FIG_DIR, "fig0_headline.pdf"))
 fig.savefig(os.path.join(FIG_DIR, "fig0_headline.png"))
 plt.close(fig)
 
+with open(os.path.join(HERE, "paper_stats.json")) as f:
+    ALL_STATS = json.load(f)  # keep keys written by the other figure scripts
+ALL_STATS.update(STATS)
 with open(os.path.join(HERE, "paper_stats.json"), "w") as f:
-    json.dump(STATS, f, indent=2)
+    json.dump(ALL_STATS, f, indent=2)
 
 print("Figures written to", FIG_DIR)
 for fn in sorted(os.listdir(FIG_DIR)):

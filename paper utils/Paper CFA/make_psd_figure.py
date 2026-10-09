@@ -38,6 +38,7 @@ plt.rcParams.update({
 })
 
 psd = pd.read_parquet(os.path.join(HERE, "psd_curve.parquet"))
+psd = psd[psd.freq_hz <= 100]  # analysis band-pass upper edge (§2.2); above is filter roll-off
 psd["canon"] = np.where(psd.eeg_channel == "ECG", "ECG", canonicalize(psd["eeg_channel"]))
 n_patients = psd.patient_id.nunique()
 print(f"{len(psd):,} PSD rows, {n_patients:,} patients")
@@ -61,7 +62,7 @@ for condition, color, label in CONDITIONS:
                      color=color, alpha=0.2, linewidth=0)
 ax.set_xlabel("Frequency (Hz)")
 ax.set_ylabel("Power (dB)")
-ax.set_title(f"a  Group-overall PSD ({'/'.join(CORE_FOUR)} average + ECG)", loc="left", fontsize=10, fontweight="bold")
+ax.set_title("a", loc="left", fontsize=10, fontweight="bold")
 ax.legend(fontsize=7.5, frameon=False)
 
 # ---------------------------------------------------------------------
@@ -84,12 +85,9 @@ for idx, ch in enumerate(CORE_FOUR + ["O1", "O2"]):
         ax.set_xlabel("Hz", fontsize=7)
     if idx % 2 == 0:
         ax.set_ylabel("dB", fontsize=7)
-    if idx == 0:
-        ax.legend(fontsize=6, frameon=False, loc="upper right")
-fig.text(0.63, 0.93, "b  Per-electrode PSD (6 sites)", fontsize=10, fontweight="bold")
+fig.text(0.53, 0.9, "b", fontsize=10, fontweight="bold")
 
-fig.suptitle(f"Figure S5. Power spectral density: pre-ICA, post-ICA, non-locked control, and ECG\n"
-             f"(n = {n_patients:,} patients, subsample)", fontsize=10)
+# no suptitle: the manuscript caption carries the figure number
 fig.savefig(os.path.join(FIG_DIR, "figS5_psd_comparison.pdf"))
 fig.savefig(os.path.join(FIG_DIR, "figS5_psd_comparison.png"))
 plt.close(fig)

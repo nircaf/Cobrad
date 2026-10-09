@@ -80,7 +80,7 @@ ax.axvline(0, color="grey", lw=0.7, linestyle="--")
 ax.axhline(0, color="grey", lw=0.5)
 ax.set_xlabel("Lag (ms); ECG relative to EEG")
 ax.set_ylabel("Cross-correlation r (sign-aligned, mean ± SEM)")
-ax.set_title(f"a  Cross-correlation vs. lag ({'/'.join(CORE_FOUR)} average)", loc="left", fontsize=10, fontweight="bold")
+ax.set_title("a", loc="left", fontsize=10, fontweight="bold")
 ax.legend(fontsize=8, frameon=False)
 
 # ---------------------------------------------------------------------
@@ -101,7 +101,7 @@ ax.barh(y - h, per_site_cc.loc[order, "non_locked"], height=h, color=PALETTE[7],
 ax.set_yticks(y)
 ax.set_yticklabels(order, fontsize=7.5)
 ax.set_xlabel("Mean peak |cross-correlation|")
-ax.set_title(f"b  Peak |cross-correlation|, per electrode ({len(order)} sites)", loc="left", fontsize=10, fontweight="bold")
+ax.set_title("b", loc="left", fontsize=10, fontweight="bold")
 # ponytail: bars span the full width, so reserve a blank band above them for the legend
 ax.set_ylim(-0.6, len(order) - 1 + 1.5)
 ax.legend(fontsize=7.5, frameon=False, loc="upper right")
@@ -123,7 +123,7 @@ for median in bp["medians"]:
 ax.set_xticks([1, 2, 3])
 ax.set_xticklabels(["Pre-ICA", "Post-ICA", "Non-locked\ncontrol"])
 ax.set_ylabel("Mutual information (nats)")
-ax.set_title(f"c  Mutual information ({'/'.join(CORE_FOUR)} average)", loc="left", fontsize=10, fontweight="bold")
+ax.set_title("c", loc="left", fontsize=10, fontweight="bold")
 mi_pre_med, mi_post_med = core_summary["mi_pre"].median(), core_summary["mi_post"].median()
 mi_nl_med = core_summary["mi_non_locked"].median()
 # ponytail: headroom + top placement so the summary line clears the whiskers
@@ -146,7 +146,7 @@ ax.barh(y2 - h, per_site_mi.loc[order_mi, "non_locked"], height=h, color=PALETTE
 ax.set_yticks(y2)
 ax.set_yticklabels(order_mi, fontsize=7.5)
 ax.set_xlabel("Median mutual information (nats)")
-ax.set_title(f"d  Mutual information, per electrode ({len(order_mi)} sites)", loc="left", fontsize=10, fontweight="bold")
+ax.set_title("d", loc="left", fontsize=10, fontweight="bold")
 # ponytail: bars span the full width, so reserve a blank band above them for the legend
 ax.set_ylim(-0.6, len(order_mi) - 1 + 1.5)
 ax.legend(fontsize=7.5, frameon=False, loc="upper right")
