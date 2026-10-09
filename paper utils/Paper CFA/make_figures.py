@@ -297,6 +297,11 @@ ax.text(n_col_x, len(forest) - 0.3, "N", va="center", ha="left", fontsize=7.5, f
 ax.set_xlabel(f"Mean CFA R² (outside QRS)\n(no linked diagnosis: mean = {no_dx_mean:.2f}, n = {no_dx_n:,})")
 ax.set_title("a", loc="left", fontsize=10, fontweight="bold")
 
+# panel data for Figure 2e-f (make_v2_figures.py)
+forest.to_parquet(os.path.join(HERE, "fig2_dx_forest.parquet"))
+qmat.to_parquet(os.path.join(HERE, "fig2_dx_qmat.parquet"))
+pd.DataFrame({"no_dx_mean": [no_dx_mean], "no_dx_n": [no_dx_n]}).to_parquet(os.path.join(HERE, "fig2_dx_ref.parquet"))
+
 ax = axes[1]
 mask = np.triu(np.ones_like(qmat, dtype=bool))
 plot_mat = qmat.mask(mask)
@@ -464,6 +469,9 @@ for sex, color in [("Female", PALETTE[3]), ("Male", PALETTE[0])]:
     ax.plot(xs_group, slope_group * xs_group + intercept_group, color=color, lw=1.8,
             label=f"{sex}: n={len(group):,}, r={r_group:.2f}, p={p_group:.1e}")
 
+# panel data for make_fig3.py (combined BMI/sex/duration figure)
+strat[["patient_id", "age", "sex", "cfa_r2_excl_qrs"]].to_parquet(os.path.join(HERE, "fig3_strat.parquet"))
+bmi_data[["patient_id", "bmi", "sex", "cfa_r2_excl_qrs"]].to_parquet(os.path.join(HERE, "fig3_bmi.parquet"))
 interaction_data = bmi_data[bmi_data["sex"].isin(["Male", "Female"])].copy()
 interaction_data["sex_male"] = (interaction_data["sex"] == "Male").astype(int)
 bmi_sex_interaction = smf.ols(

@@ -55,9 +55,13 @@ with open(os.path.join(HERE, "window_stage_sensitivity_stats.json")) as f:
     SENS = json.load(f)
 
 COHORT, CFA, ICA, STRAT, TOPO = S["cohort"], S["cfa"], S["ica"], S["stratified"], S["topomap"]
+DX = S["diagnosis"]
 EX, WT = S["v2"]["examples"], S["v2"]["window_test"]
 WT_PAIR = {(q["a"], q["b"]): q for q in WT["pairs"]}
 BMIHR = S["v2"]["bmi_hr"]
+CD = S["cleaning_demo"]
+CD_INJ_UV = 2.0  # matches INJECT_UV in make_cleaning_demo.py
+CD_GAP = (CD["r2_pre_mean"] - CD["r2_clean_mean"]) / (CD["r2_pre_mean"] - CD["r2_own_mean"]) * 100
 WT_P_STR = "&lt; 1e-300" if WT["friedman_p"] == 0 else f"= {WT['friedman_p']:.2g}"
 DOSE = S["dose_response"]
 SRC = S["cohort"]["source_counts"]
@@ -104,8 +108,7 @@ story = []
 # Title page
 # ---------------------------------------------------------------------
 story.append(Paragraph(
-    "Cardiac Field Artifact in Scalp EEG: A Large-Scale Study of Its Dependence on BMI, Sex, "
-    "and Segment Duration",
+    "Cleaning the Heart's Noise from Brain Signals: A Large-Cohort Study of Cardiac Field Artifact in EEG",
     styles["PaperTitle"]))
 story.append(Spacer(1, 6))
 story.append(Paragraph(
@@ -414,6 +417,26 @@ story.append(Paragraph(
     f"stretches of that stage, and CFA R² was computed as in Section 2.3. Stage and duration were "
     f"compared with one-way ANOVA.",
     styles["Body"]))
+story.append(Paragraph("2.8 Proof of concept: ECG-free CFA cleaning", styles["H2"]))
+story.append(Paragraph(
+    f"Many EEG datasets have no ECG channel. We therefore tested whether the cohort can supply "
+    f"what such recordings lack. Single-beat CFA was too weak relative to ongoing EEG to detect "
+    f"heartbeats reliably from the EEG itself, but CFA has a largely fixed scalp pattern, which "
+    f"allows cleaning without locating individual beats. In Human Sleep Project recordings with "
+    f"the standard six-channel montage (F3, F4, C3, C4, O1, O2, mastoid-referenced), the dominant "
+    f"spatial pattern of each patient's R-peak-locked EEG average (first singular vector) was "
+    f"computed in a training set of {CD['n_train']} patients, sign-aligned, and averaged into one "
+    f"population CFA pattern. For {CD['n_test']} different held-out patients, this pattern was "
+    f"projected out of every EEG sample (signal-space projection); the ECG was not used for "
+    f"cleaning. The held-out ECG was then used only for scoring: CFA R² (outside QRS) before "
+    f"and after cleaning, compared with an upper bound obtained by projecting out each patient's "
+    f"own ECG-derived pattern and with the pseudo-event chance level (see Section 2.6). To measure "
+    f"preservation of brain activity, a synthetic neural HEP (Gaussian, −{CD_INJ_UV:.0f} µV at "
+    f"+300 ms, frontal &gt; central &gt; occipital) was added before cleaning and the retained "
+    f"fraction was measured; the cost to ongoing EEG was measured as the change in Welch power "
+    f"(1–40 Hz). Patterns specific to sex and BMI group (&lt;27, 27–35, ≥35 kg/m²) were "
+    f"also learned to test whether conditioning on these variables improves cleaning.",
+    styles["Body"]))
 story.append(Paragraph("3. Results", styles["H1"]))
 story.append(Paragraph("3.1 Cohort", styles["H2"]))
 sex_str = ", ".join(f"{k} n={v:,}" for k, v in COHORT["sex_counts"].items())
@@ -476,7 +499,7 @@ story.append(Paragraph(
 
 story.append(Paragraph("3.3 CFA across the cohort", styles["H2"]))
 story.append(KeepTogether([
-    fig("fig2_cfa_overview.png"),
+    fig("fig2_cfa_overview.png", crop=False),
     Paragraph(
     f"<b>Figure 2.</b> Cardiac field artifact (CFA) across {CFA['n_patients']:,} patients "
     f"({CFA['n_rows']:,} channel-recordings, 10-min segments). (a) Model-free estimator: "
@@ -493,7 +516,16 @@ story.append(KeepTogether([
     f"falling below the patient floor). (d) Distribution of per-channel R² per site, sorted by "
     f"median (orange line); box, interquartile range; n per site is indicated. Coverage is "
     f"uneven, from the six standard montage sites (F3/F4/C3/C4/O1/O2; n &gt; 12,000 each) to "
-    f"sites near the {TOPO['min_patients']}-patient threshold, whose estimates are less precise.",
+    f"sites near the {TOPO['min_patients']}-patient threshold, whose estimates are less precise. "
+    f"(e) Patient-mean CFA R² per clinical diagnosis category (mean, 95% CI, Welch; number of "
+    f"patients in brackets); dotted line, EHR-linked patients with no recorded diagnosis "
+    f"(mean {DX['no_dx_mean']:.2f}, n = {DX['no_dx_n']:,}; confounded by recording site, see "
+    f"Limitations). Patients may belong to more than one category; categories are drawn from "
+    f"fifteen predefined groups, and those with fewer than 10 patients are omitted; Kruskal-Wallis "
+    f"test across all groups, p = {DX['p_kruskal']:.2g}. (f) Pairwise comparisons among "
+    f"categories: Mann-Whitney p-values, Benjamini-Hochberg corrected across all "
+    f"{DX['pairwise']['n_pairs']} tests ({DX['pairwise']['n_significant_fdr']} pairs significant "
+    f"at q &lt; 0.05; colour scale saturates at q = 0.5); categories ordered as in (e).",
         styles["Caption"]),
 ]))
 story.append(Paragraph(
@@ -550,8 +582,7 @@ p_dx_dose_min = min(r["p_dx"] for r in DOSE["stratified_by_length"])
 p_dx_dose_max = max(r["p_dx"] for r in DOSE["stratified_by_length"])
 max_adjacent_p = max(WT_PAIR[(a, b)]["p_holm"] for a, b in [(5, 10), (10, 20), (20, 30), (30, 45), (45, 60)])
 story.append(KeepTogether([
-    fig("fig4_stratified.png"),
-    fig("figS2_window_stage_sensitivity.png"),
+    fig("fig3_bmi_sex_duration.png", crop=False),
     Paragraph(
     f"<b>Figure 3.</b> Dependence of CFA on patient characteristics (a–c) and segment duration (d–f). "
     f"Patient-mean CFA R² (outside QRS) vs. (a) age, continuous "
@@ -639,25 +670,8 @@ story.append(Paragraph(
     styles["Body"]))
 
 story.append(Paragraph("3.6 CFA by diagnosis category", styles["H2"]))
-DX = S["diagnosis"]
-story.append(KeepTogether([
-    fig("fig3_diagnosis.png"),
-    Paragraph(
-    f"<b>Figure 4.</b> (a) Forest plot of patient-mean CFA R² (outside the QRS-exclusion window) per "
-    f"clinical diagnosis category; point = mean, error bar = 95% CI (Welch, unequal-variance). "
-    f"EHR-linked patients with no recorded diagnosis (reference; confounded by recording site, see "
-    f"Limitations) had mean CFA R² = {DX['no_dx_mean']:.2f} (n = {DX['no_dx_n']:,}); patients may "
-    f"belong to more than one diagnosis category. Categories are drawn from fifteen predefined "
-    f"diagnosis groups and sorted by mean; categories with fewer than 10 patients are omitted. "
-    f"Kruskal-Wallis test across all "
-    f"groups: p = {DX['p_kruskal']:.2g}. (b) Pairwise comparisons among categories: Mann-Whitney "
-    f"p-values, Benjamini-Hochberg corrected across all {DX['pairwise']['n_pairs']} tests (colour "
-    f"scale: white, q &ge; 0.5; red, q = 0; {DX['pairwise']['n_significant_fdr']} pairs "
-    f"significant at q &lt; 0.05); categories ordered as in (a).",
-        styles["Caption"]),
-]))
 story.append(Paragraph(
-    f"Among diagnosis categories, CFA was highest in patients with {DX['highest_category']} "
+    f"Among diagnosis categories (Figure 2e–f), CFA was highest in patients with {DX['highest_category']} "
     f"(+{DX['highest_diff']:.2f} R² units relative to the no-diagnosis reference, "
     f"n = {DX['categories'][DX['highest_category']]['n']:,}) and lowest in "
     f"{DX['lowest_category']} ({DX['lowest_diff']:+.2f}, "
@@ -673,6 +687,44 @@ story.append(Paragraph(
     f"interpreted as disease effects.",
     styles["Body"]))
 
+story.append(Paragraph("3.7 ECG-free cleaning with a cohort-trained spatial filter", styles["H2"]))
+story.append(KeepTogether([
+    fig("fig5_cleaning_demo.png"),
+    Paragraph(
+    f"<b>Figure 4.</b> ECG-free cleaning of CFA with a spatial filter learned from the cohort "
+    f"(see Section 2.8). (a) Six seconds of EEG from Patient B (Figure 1) before (orange) and after "
+    f"(black) cleaning; the ECG (*) is shown for reference only and was not used; dotted lines "
+    f"mark R-peaks. (b) Population CFA pattern learned from {CD['n_train']} training patients. "
+    f"(c) Heartbeat-locked average of Patient B at the channel with the largest reduction, before "
+    f"and after cleaning (grey band, ±50 ms QRS window). (d) Patient-mean CFA R² in "
+    f"{CD['n_test']} held-out patients before and after ECG-free cleaning, compared with an upper "
+    f"bound that uses each patient's own ECG and with the pseudo-event chance level; grey lines "
+    f"connect the same patient. (e) Mean CFA R² (± SEM) before and after cleaning across BMI bins "
+    f"(bins with at least 10 patients).",
+        styles["Caption"]),
+]))
+story.append(Paragraph(
+    f"The CFA scalp pattern was highly consistent across patients (median absolute cosine "
+    f"similarity between individual patterns and the population pattern, "
+    f"{CD['pattern_consistency_median_cos']:.2f}; Figure 4b). Projecting this single learned "
+    f"pattern out of held-out recordings, with no ECG, reduced mean CFA R² from "
+    f"{CD['r2_pre_mean']:.2f} to {CD['r2_clean_mean']:.2f} (a {CD['pct_reduction_mean']:.0f}% "
+    f"reduction; Wilcoxon p = {CD['p_pre_vs_clean']:.1e}), and R² decreased in "
+    f"{CD['pct_patients_reduced']:.0f}% of patients (Figure 4d). The ECG-based upper bound reached "
+    f"{CD['r2_own_mean']:.2f} and the chance level was {CD['r2_null_mean']:.2f}, so the ECG-free "
+    f"filter closed {CD_GAP:.0f}% of the gap between uncleaned data and the upper bound. In "
+    f"Patient B, mean R² fell from {CD['example_r2_pre']:.2f} to {CD['example_r2_clean']:.2f}, and "
+    f"the heartbeat-locked deflections visible in the raw EEG were largely removed (Figure 4a, c). "
+    f"Cleaning reduced CFA at every BMI level, although residual CFA remained higher at higher BMI "
+    f"(Figure 4e). Patterns learned separately by sex and BMI group gave a small further gain "
+    f"(mean R² {CD['r2_grp_mean']:.2f} vs. {CD['r2_clean_mean']:.2f}; p = {CD['p_grp_vs_pop']:.2g}), "
+    f"consistent with BMI and sex mainly changing the amount of CFA rather than its scalp pattern. "
+    f"The cleaning retained a median of {CD['hep_retained_median']*100:.0f}% of an injected "
+    f"synthetic neural HEP and changed ongoing EEG power by a median of "
+    f"{CD['psd_change_db_median']:.1f} dB (1–40 Hz), the cost of removing one of six spatial "
+    f"dimensions.",
+    styles["Body"]))
+
 # ---------------------------------------------------------------------
 # Discussion
 # ---------------------------------------------------------------------
@@ -685,7 +737,7 @@ story.append(Paragraph(
     f"generic nuisance and to show that it is a variable property of each person and each "
     f"analysis: it ranged from negligible to near-complete between individual patients (Figure 1), "
     f"varied approximately {TOPO['highest_mean']/max(TOPO['lowest_mean'], 1e-6):.1f}-fold across "
-    f"scalp sites (Figure 2), increased with BMI, was higher in men than in women (Figure 3a–c), and "
+    f"scalp sites (Figure 2c–d), increased with BMI, was higher in men than in women (Figure 3a–c), and "
     f"depended strongly on segment duration (Figure 3d–f). These factors are common grouping "
     f"variables or analysis choices in EEG research, so uncorrected CFA can create, mask, or "
     f"inflate group differences in heartbeat-locked EEG measures.",
@@ -787,6 +839,16 @@ story.append(Paragraph(
     "preferably, direct body-composition measures) and sex. These recommendations extend recent "
     "methodological reviews of HEP analysis and reporting<super>8,9</super> to EEG analyses more "
     "generally.",
+    styles["Body"]))
+story.append(Paragraph(
+    f"For recordings without ECG, the proof of concept in Section 3.7 suggests a practical route: "
+    f"because the scalp pattern of CFA is consistent across people, a spatial filter learned from "
+    f"a large cohort with ECG removed about {CD['pct_reduction_mean']:.0f}% of CFA in new patients "
+    f"without any cardiac reference. The filter is specific to the montage and reference on which "
+    f"it was trained, it removes one spatial dimension of the EEG, and it does not remove all CFA. "
+    f"It should therefore be validated on other montages, and it is best regarded as a first "
+    f"step towards a trained tool that combines learned cardiac patterns with information about "
+    f"the participant, such as BMI and sex, and the recording length.",
     styles["Body"]))
 
 story.append(Paragraph("5. Conclusions", styles["H1"]))
@@ -1132,7 +1194,7 @@ doc = SimpleDocTemplate(
     OUT_PDF, pagesize=LETTER,
     topMargin=0.8 * inch, bottomMargin=0.8 * inch,
     leftMargin=0.9 * inch, rightMargin=0.9 * inch,
-    title="Large-Scale Associations of BMI and Clinical Obesity With Cardiac Field Artifact in Scalp EEG",
+    title="Cleaning the Heart's Noise from Brain Signals: A Large-Cohort Study of Cardiac Field Artifact in EEG",
     author="Nir Cafri",
 )
 

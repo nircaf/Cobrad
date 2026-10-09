@@ -138,8 +138,8 @@ print(json.dumps(window_test, indent=1))
 cfa = durations[10]
 cfa_full = pd.read_parquet(os.path.join(HERE, "cfa_combined.parquet"))
 ica = pd.read_parquet(os.path.join(HERE, "ica_combined.parquet"))
-fig = plt.figure(figsize=(11, 8.6))
-gs = fig.add_gridspec(2, 2, width_ratios=[1, 1.35], hspace=0.38, wspace=0.3)
+fig = plt.figure(figsize=(11, 13.6))
+gs = fig.add_gridspec(3, 2, width_ratios=[1, 1.35], height_ratios=[1, 1, 1.15], hspace=0.42, wspace=0.3)
 
 ax = fig.add_subplot(gs[0, 0])
 data = [cfa_full["cfa_r2_full_epoch"].dropna().values, cfa_full["cfa_r2_excl_qrs"].dropna().values]
@@ -209,9 +209,34 @@ ax.set_xlabel("CFA R² (outside QRS window)")
 ax.set_title("d", loc="left", fontsize=10, fontweight="bold")
 ax.tick_params(axis="y", labelsize=7.5)
 
-fig.suptitle(f"Figure 2. Cardiac field artifact across the cohort "
-             f"(n = {cfa_full.patient_id.nunique():,} patients, {len(cfa_full):,} channel-recordings)",
-             fontsize=10)
+# e-f: CFA by diagnosis category (panel data from make_figures.py)
+forest = pd.read_parquet(os.path.join(HERE, "fig2_dx_forest.parquet"))
+qmat = pd.read_parquet(os.path.join(HERE, "fig2_dx_qmat.parquet"))
+ref = pd.read_parquet(os.path.join(HERE, "fig2_dx_ref.parquet")).iloc[0]
+ax = fig.add_subplot(gs[2, 0])
+y = np.arange(len(forest))
+ax.errorbar(forest["mean"], y, xerr=[forest["mean"] - forest["ci_lo"], forest["ci_hi"] - forest["mean"]],
+            fmt="none", ecolor="black", elinewidth=1, capsize=2.5, zorder=1)
+ax.scatter(forest["mean"], y, color=PALETTE[0], s=30, zorder=2, edgecolor="black", linewidth=0.5)
+ax.axvline(ref["no_dx_mean"], color="0.5", ls=":", lw=1)
+ax.set_yticks(y)
+ax.set_yticklabels([f"{c} ({n:,})" for c, n in zip(forest["category"], forest["n"])], fontsize=7)
+ax.set_xlabel("Patient-mean CFA R² (outside QRS; mean, 95% CI)")
+ax.set_title("e", loc="left", fontsize=10, fontweight="bold")
+
+ax = fig.add_subplot(gs[2, 1])
+order_cats = forest["category"].tolist()[::-1]  # top row = top of panel e
+qm = qmat.loc[order_cats, order_cats]
+im = ax.imshow(qm.mask(np.triu(np.ones(qm.shape, dtype=bool))).values, cmap="Reds_r", vmin=0, vmax=0.5)
+ax.set_xticks(range(len(order_cats)))
+ax.set_xticklabels(order_cats, rotation=90, fontsize=7)
+ax.set_yticks(range(len(order_cats)))
+ax.set_yticklabels(order_cats, fontsize=7)
+ax.spines[["left", "bottom"]].set_visible(False)
+cb = fig.colorbar(im, ax=ax, shrink=0.75, pad=0.03, extend="max")
+cb.set_label("FDR-corrected p-value", fontsize=8)
+ax.set_title("f", loc="left", fontsize=10, fontweight="bold")
+
 fig.savefig(os.path.join(FIG_DIR, "fig2_cfa_overview.png"), bbox_inches="tight")
 fig.savefig(os.path.join(FIG_DIR, "fig2_cfa_overview.pdf"), bbox_inches="tight")
 plt.close(fig)
