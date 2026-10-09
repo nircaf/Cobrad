@@ -75,7 +75,9 @@ for minutes, fname in DURATION_FILES.items():
 demo = pd.read_parquet(os.path.join(HERE, "demographics_combined.parquet"))
 bmi = pd.read_parquet(os.path.join(HERE, "bmi_combined.parquet"))
 minutes_all = sorted(DURATION_FILES)
-fig, axes = plt.subplots(2, len(minutes_all) + 1, figsize=(11, 3.9))
+SHOW = [5, 60]
+fig, ax = plt.subplots(figsize=(4.2, 3.6))
+BAR_COLORS = {5: "#E69F00", 60: "#D55E00"}
 examples_meta = []
 for row, (label, pid) in enumerate(EXAMPLES):
     rec = durations[60].loc[durations[60].patient_id == pid, "recording_id"].iat[0]
@@ -86,28 +88,22 @@ for row, (label, pid) in enumerate(EXAMPLES):
         maps[m] = d.groupby("canon")["cfa_r2_excl_qrs"].mean().to_dict()
     sites = set.intersection(*(set(v) for v in maps.values()))
     maps = {m: {c: v[c] for c in sites} for m, v in maps.items()}
-    for col, m in enumerate(minutes_all):
-        im_r2 = topo(axes[row, col], maps[m], (0, 1), "Reds")
-        axes[row, col].set_title(f"{m} min\nmean R² = {np.mean(list(maps[m].values())):.2f}", fontsize=8)
-    diff = {c: maps[60][c] - maps[5][c] for c in sites}
-    im_diff = topo(axes[row, -1], diff, (-0.3, 0.3), "RdBu_r")
-    axes[row, -1].set_title(f"Δ 60 − 5 min\nmean Δ = {np.mean(list(diff.values())):+.2f}", fontsize=8)
+    for j, m in enumerate(SHOW):  # bar = mean over electrodes, error bar = SD over electrodes
+        v = np.array(list(maps[m].values()))
+        ax.bar(row + (j - 0.5) * 0.36, v.mean(), yerr=v.std(), width=0.36, color=BAR_COLORS[m],
+               edgecolor="black", linewidth=0.5, capsize=3, label=f"{m} min" if row == 0 else None)
     p = demo[demo.patient_id == pid].iloc[0]
     p_bmi = float(bmi.loc[bmi.bdsp_patient_id == p.bdsp_patient_id, "bmi"].iat[0])
-    axes[row, 0].text(-0.45, 0.5, f"Patient {label}\n{p.sex}, {p.age:.0f} y\nBMI {p_bmi:.1f}",
-                      transform=axes[row, 0].transAxes, ha="center", va="center",
-                      fontsize=8.5, fontweight="bold")
     examples_meta.append({
         "label": label, "sex": str(p.sex), "age": float(p.age), "bmi": p_bmi, "n_sites": len(sites),
         "mean_r2": {str(m): float(np.mean(list(maps[m].values()))) for m in minutes_all},
     })
-fig.subplots_adjust(left=0.1, right=0.86, top=0.84, bottom=0.04, wspace=0.15, hspace=0.45)
-cb = fig.colorbar(im_r2, cax=fig.add_axes([0.875, 0.12, 0.01, 0.62]))
-cb.set_label("CFA R² (outside QRS)", fontsize=7.5)
-cb2 = fig.colorbar(im_diff, cax=fig.add_axes([0.945, 0.12, 0.01, 0.62]))
-cb2.set_label("Δ R² (60 − 5 min)", fontsize=7.5)
-fig.suptitle("Figure 1. Cardiac field artifact in two individual patients across segment durations",
-             fontsize=10)
+ax.set_xticks([0, 1])
+ax.set_xticklabels([f"Patient {m['label']}\nBMI {m['bmi']:.1f}" for m in examples_meta])
+ax.set_ylim(0, 1.05)
+ax.set_ylabel("Mean CFA R² across electrodes\n(outside QRS)")
+ax.legend(frameon=False, fontsize=8, loc="upper left")
+fig.tight_layout()
 fig.savefig(os.path.join(FIG_DIR, "fig1_patient_examples.png"), bbox_inches="tight")
 fig.savefig(os.path.join(FIG_DIR, "fig1_patient_examples.pdf"), bbox_inches="tight")
 plt.close(fig)

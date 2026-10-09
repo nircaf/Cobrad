@@ -160,13 +160,19 @@ for h in [
     f"{CFA['n_rows']:,} EEG channel-recordings), the ECG explained a mean "
     f"{CFA['r2_excl_qrs_mean']*100:.0f}% of heartbeat-locked EEG variance even after QRS exclusion.",
     f"CFA increased with BMI (r = {STRAT['bmi']['r_pearson']:.2f}, "
-    f"p = {STRAT['bmi']['p_pearson']:.1e}) and was higher in men than in women "
+    f"p = {STRAT['bmi']['p_pearson']:.1e}), was higher in men than in women "
     f"({STRAT['sex_means']['Male']:.2f} vs. {STRAT['sex_means']['Female']:.2f}, "
-    f"p = {STRAT['p_sex_mannwhitney']:.1e}); the sex difference was independent of BMI "
-    f"(BMI-adjusted p = {S['sex_bmi_confound']['sex_adj_p']:.1e}).",
-    f"Segment duration significantly changed CFA estimates (mean R² {DOSE['lengths'][0]['mean']:.2f} "
-    f"at 5 min vs. {DOSE['lengths'][-1]['mean']:.2f} at 60 min), so the analysis window must be "
-    f"reported and justified.",
+    f"p = {STRAT['p_sex_mannwhitney']:.1e}; independent of BMI, adjusted "
+    f"p = {S['sex_bmi_confound']['sex_adj_p']:.1e}), and rose with segment duration (mean R² "
+    f"{DOSE['lengths'][0]['mean']:.2f} at 5 min vs. {DOSE['lengths'][-1]['mean']:.2f} at 60 min, "
+    f"Friedman p {WT_P_STR}), so participant characteristics and the analysis window must be "
+    f"reported and accounted for.",
+    f"CFA can be cleaned without an ECG: a spatial filter learned from {CD['n_train']} patients "
+    f"reduced CFA R² in {CD['n_test']} new patients from {CD['r2_pre_mean']:.2f} to "
+    f"{CD['r2_clean_mean']:.2f} ({CD['pct_reduction_mean']:.0f}% reduction, "
+    f"p = {CD['p_pre_vs_clean']:.1e}; lower in {CD['pct_patients_reduced']:.0f}% of patients), "
+    f"while retaining {CD['hep_retained_median']*100:.0f}% of a simulated neural heartbeat "
+    f"response.",
 ]:
     story.append(Paragraph("• " + h, styles["Body"]))
 story.append(Paragraph(
@@ -470,29 +476,27 @@ story.append(Paragraph(
 story.append(Paragraph("3.2 CFA in individual patients", styles["H2"]))
 EXA, EXB = EX
 story.append(KeepTogether([
-    fig("fig1_patient_examples.png"),
+    fig("fig1_patient_examples.png", 3.4 * inch, crop=False),
     Paragraph(
-    f"<b>Figure 1.</b> Cardiac field artifact (CFA) in two example patients. Each head map shows the "
-    f"per-channel CFA R² (variance of the R-peak-locked EEG average explained by the ECG average, "
-    f"outside the ±50 ms QRS window) at each recorded electrode, computed from segments of 5, 10, "
-    f"20, 30, 45, and 60 min drawn from the same recording; the last column shows the change "
-    f"from 5 to 60 min. Patient A ({EXA['sex'].lower()}, {EXA['age']:.0f} years, BMI "
-    f"{EXA['bmi']:.1f} kg/m²) showed almost no CFA at any duration (mean R² "
-    f"{EXA['mean_r2']['5']:.2f}–{max(EXA['mean_r2'].values()):.2f}). Patient B "
+    f"<b>Figure 1.</b> Cardiac field artifact (CFA) in two example patients. Bars show CFA R² "
+    f"(variance of the R-peak-locked EEG average explained by the ECG average, outside the ±50 ms "
+    f"QRS window) averaged over the {EXA['n_sites']} recorded electrodes (error bars, SD across "
+    f"electrodes), computed from a 5-min and a 60-min segment of the same recording. Patient A ({EXA['sex'].lower()}, "
+    f"{EXA['age']:.0f} years, BMI {EXA['bmi']:.1f} kg/m²) showed almost no CFA at either "
+    f"duration (mean R² {EXA['mean_r2']['5']:.2f} and {EXA['mean_r2']['60']:.2f}). Patient B "
     f"({EXB['sex'].lower()}, {EXB['age']:.0f} years, BMI {EXB['bmi']:.1f} kg/m²) showed high CFA "
     f"at every electrode, which increased from {EXB['mean_r2']['5']:.2f} at 5 min to "
-    f"{EXB['mean_r2']['60']:.2f} at 60 min. Colour maps are interpolated from "
-    f"{EXA['n_sites']} electrodes; electrode names mark the recording sites.",
+    f"{EXB['mean_r2']['60']:.2f} at 60 min.",
         styles["Caption"]),
 ]))
 story.append(Paragraph(
     f"Figure 1 illustrates how much CFA can differ between people. In a lean man (Patient A, BMI "
-    f"{EXA['bmi']:.1f} kg/m²), the ECG explained only {EXA['mean_r2']['10']*100:.0f}% of the "
-    f"heartbeat-locked EEG variance at 10 min, and this value did not change with segment "
-    f"duration. In a man with severe obesity (Patient B, BMI {EXB['bmi']:.1f} kg/m²), the ECG "
-    f"explained {EXB['mean_r2']['10']*100:.0f}% at 10 min, so the heartbeat-locked EEG was almost "
-    f"a scaled copy of the ECG at every electrode. In Patient B, CFA also increased with segment "
-    f"duration, from {EXB['mean_r2']['5']:.2f} at 5 min to {EXB['mean_r2']['60']:.2f} at 60 min. "
+    f"{EXA['bmi']:.1f} kg/m²), the ECG explained only {EXA['mean_r2']['60']*100:.0f}% of the "
+    f"heartbeat-locked EEG variance even in a 60-min segment. In a man with severe obesity "
+    f"(Patient B, BMI {EXB['bmi']:.1f} kg/m²), the ECG explained {EXB['mean_r2']['5']*100:.0f}% "
+    f"in a 5-min segment and {EXB['mean_r2']['60']*100:.0f}% in a 60-min segment of the same "
+    f"recording, so the heartbeat-locked EEG was almost a scaled copy of the ECG at every "
+    f"electrode, and the longer segment revealed more of it. "
     f"The cohort-level analyses below test whether these patterns, higher CFA with higher BMI and "
     f"with longer segments, hold across the population.",
     styles["Body"]))
