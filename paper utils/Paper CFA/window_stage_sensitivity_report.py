@@ -116,6 +116,8 @@ for minutes in lengths:
         "no_dx_mean": np.mean(dx_groups[0]) if len(dx_groups[0]) else np.nan,
         "any_dx_mean": np.mean(dx_groups[1]) if len(dx_groups[1]) else np.nan,
         "p_dx": p_dx,
+        "n_male": int((pt.sex == "Male").sum()), "n_female": int((pt.sex == "Female").sum()),
+        "n_no_dx": len(dx_groups[0]), "n_any_dx": len(dx_groups[1]),
     })
     print(f"{minutes} min: n={fdf.patient_id.nunique():,} mean R2={fdf.cfa_r2_excl_qrs.mean():.3f} "
           f"| p_sex={p_sex:.2g} p_dx={p_dx:.2g}")

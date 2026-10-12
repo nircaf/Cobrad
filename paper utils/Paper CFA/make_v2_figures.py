@@ -38,7 +38,10 @@ DURATION_FILES = {
 }
 # Chosen from the HSP patients with BMI and data at every duration (one
 # recording each): sex-matched men at the two BMI extremes with low vs. high CFA.
-EXAMPLES = [("A", "I0002150033042"), ("B", "I0002150024023")]
+# Sex-matched women with >=10 electrodes at 5 and 60 min, from the low and high ends
+# of BMI; the very highest-BMI patients with >=10 electrodes (BMI 53-58) had low
+# CFA, so these are illustrative, not the most extreme BMI values.
+EXAMPLES = [("A", "I0002150032832"), ("B", "I0002150034554")]
 
 plt.rcParams.update({
     "font.family": "sans-serif", "font.sans-serif": ["Arial", "Helvetica", "DejaVu Sans"],
@@ -76,34 +79,31 @@ demo = pd.read_parquet(os.path.join(HERE, "demographics_combined.parquet"))
 bmi = pd.read_parquet(os.path.join(HERE, "bmi_combined.parquet"))
 minutes_all = sorted(DURATION_FILES)
 SHOW = [5, 60]
-fig, ax = plt.subplots(figsize=(4.2, 3.6))
-BAR_COLORS = {5: "#E69F00", 60: "#D55E00"}
+fig, axes = plt.subplots(2, 2, figsize=(5.6, 5.4))
 examples_meta = []
 for row, (label, pid) in enumerate(EXAMPLES):
     rec = durations[60].loc[durations[60].patient_id == pid, "recording_id"].iat[0]
     maps = {}
-    for m in minutes_all:
+    for m in SHOW:
         d = durations[m]
         d = d[(d.patient_id == pid) & (d.recording_id == rec)].dropna(subset=["canon"])
         maps[m] = d.groupby("canon")["cfa_r2_excl_qrs"].mean().to_dict()
     sites = set.intersection(*(set(v) for v in maps.values()))
     maps = {m: {c: v[c] for c in sites} for m, v in maps.items()}
-    for j, m in enumerate(SHOW):  # bar = mean over electrodes, error bar = SD over electrodes
-        v = np.array(list(maps[m].values()))
-        ax.bar(row + (j - 0.5) * 0.36, v.mean(), yerr=v.std(), width=0.36, color=BAR_COLORS[m],
-               edgecolor="black", linewidth=0.5, capsize=3, label=f"{m} min" if row == 0 else None)
+    for col, m in enumerate(SHOW):
+        im = topo(axes[row, col], maps[m], (0, 1), "Reds")
+        axes[row, col].set_title(f"{m} min\nmean R² = {np.mean(list(maps[m].values())):.2f}", fontsize=9)
     p = demo[demo.patient_id == pid].iloc[0]
     p_bmi = float(bmi.loc[bmi.bdsp_patient_id == p.bdsp_patient_id, "bmi"].iat[0])
+    axes[row, 0].text(-0.42, 0.5, f"Patient {label}\n{p.sex}, {p.age:.0f} y\nBMI {p_bmi:.1f}",
+                      transform=axes[row, 0].transAxes, ha="center", va="center", fontsize=9, fontweight="bold")
     examples_meta.append({
         "label": label, "sex": str(p.sex), "age": float(p.age), "bmi": p_bmi, "n_sites": len(sites),
-        "mean_r2": {str(m): float(np.mean(list(maps[m].values()))) for m in minutes_all},
+        "mean_r2": {str(m): float(np.mean(list(maps[m].values()))) for m in SHOW},
     })
-ax.set_xticks([0, 1])
-ax.set_xticklabels([f"Patient {m['label']}\nBMI {m['bmi']:.1f}" for m in examples_meta])
-ax.set_ylim(0, 1.05)
-ax.set_ylabel("Mean CFA R² across electrodes\n(outside QRS)")
-ax.legend(frameon=False, fontsize=8, loc="upper left")
-fig.tight_layout()
+fig.subplots_adjust(left=0.2, right=0.84, top=0.9, bottom=0.04, wspace=0.12, hspace=0.35)
+cb = fig.colorbar(im, cax=fig.add_axes([0.87, 0.2, 0.025, 0.55]))
+cb.set_label("CFA R² (outside QRS)", fontsize=8)
 fig.savefig(os.path.join(FIG_DIR, "fig1_patient_examples.png"), bbox_inches="tight")
 fig.savefig(os.path.join(FIG_DIR, "fig1_patient_examples.pdf"), bbox_inches="tight")
 plt.close(fig)
@@ -152,6 +152,7 @@ ax.set_xticks([1, 2])
 ax.set_xticklabels(["Full HEP epoch\n(−300 to 400 ms)", "Outside ±50 ms\nQRS window"])
 ax.set_ylabel("Channel CFA R² (HEP vs. ECG evoked average)")
 ax.set_title("a", loc="left", fontsize=10, fontweight="bold")
+ax.set_title(f"CFA per channel (n = {len(data[1]):,})", fontsize=9)
 _lo, _hi = ax.get_ylim()
 ax.set_ylim(_lo, _hi + 0.18 * (_hi - _lo))
 ax.text(0.03, 0.97,
@@ -176,6 +177,7 @@ ax.set_yscale("log")
 ax.set_xlabel("Model-free CFA R² (outside QRS)")
 ax.set_ylabel("ICA-attributed CFA SNR\n(variance ratio, CFA:residual)")
 ax.set_title("b", loc="left", fontsize=10, fontweight="bold")
+ax.set_title(f"Model-free R² vs. ICA SNR (r = {r_sc:.2f})", fontsize=9)
 ax.text(0.03, 0.05, f"r (log SNR) = {r_sc:.2f}, p {'< 1e-300' if p_sc == 0 else f'= {p_sc:.2g}'}\n"
         f"n = {len(merged):,}", transform=ax.transAxes, va="bottom", fontsize=7.5)
 
@@ -189,6 +191,7 @@ im = topo(ax, per_site["mean"].to_dict(), (0, float(per_site["mean"].max())), "R
 cb = fig.colorbar(im, ax=ax, shrink=0.7, pad=0.02)
 cb.set_label("Mean CFA R² (outside QRS)", fontsize=8)
 ax.set_title("c", loc="left", fontsize=10, fontweight="bold")
+ax.set_title("Mean CFA by electrode", fontsize=9)
 
 ax = fig.add_subplot(gs[1, 1])
 order = per_site["median"].sort_values().index.tolist()
@@ -203,6 +206,7 @@ for patch, v in zip(bp["boxes"], (m - m.min()) / (m.max() - m.min())):
     patch.set_facecolor(plt.get_cmap("Reds")(0.25 + 0.65 * v))
 ax.set_xlabel("CFA R² (outside QRS window)")
 ax.set_title("d", loc="left", fontsize=10, fontweight="bold")
+ax.set_title("CFA distribution by electrode", fontsize=9)
 ax.tick_params(axis="y", labelsize=7.5)
 
 # e-f: CFA by diagnosis category (panel data from make_figures.py)
@@ -219,6 +223,7 @@ ax.set_yticks(y)
 ax.set_yticklabels([f"{c} ({n:,})" for c, n in zip(forest["category"], forest["n"])], fontsize=7)
 ax.set_xlabel("Patient-mean CFA R² (outside QRS; mean, 95% CI)")
 ax.set_title("e", loc="left", fontsize=10, fontweight="bold")
+ax.set_title("CFA by diagnosis", fontsize=9)
 
 ax = fig.add_subplot(gs[2, 1])
 order_cats = forest["category"].tolist()[::-1]  # top row = top of panel e
@@ -232,6 +237,7 @@ ax.spines[["left", "bottom"]].set_visible(False)
 cb = fig.colorbar(im, ax=ax, shrink=0.75, pad=0.03, extend="max")
 cb.set_label("FDR-corrected p-value", fontsize=8)
 ax.set_title("f", loc="left", fontsize=10, fontweight="bold")
+ax.set_title("Pairwise diagnosis differences", fontsize=9)
 
 fig.savefig(os.path.join(FIG_DIR, "fig2_cfa_overview.png"), bbox_inches="tight")
 fig.savefig(os.path.join(FIG_DIR, "fig2_cfa_overview.pdf"), bbox_inches="tight")

@@ -96,6 +96,7 @@ ax.hist(demo_age.age, bins=30, color=PALETTE[0], edgecolor="white", linewidth=0.
 ax.set_xlabel("Age (years)")
 ax.set_ylabel("Patients")
 ax.set_title("a", loc="left", fontsize=10, fontweight="bold")
+ax.set_title("Age", fontsize=9)
 # ponytail: headroom so the n/median label clears the tallest bars
 _lo, _hi = ax.get_ylim()
 ax.set_ylim(_lo, _hi * 1.15)
@@ -108,12 +109,14 @@ ax.pie(sex_counts.values, labels=[f"{i} ({v:,})" for i, v in sex_counts.items()]
        colors=[PALETTE[0], PALETTE[1], PALETTE[2]][:len(sex_counts)], autopct="%1.0f%%",
        textprops={"fontsize": 8}, wedgeprops={"linewidth": 0.6, "edgecolor": "white"})
 ax.set_title("b", loc="left", fontsize=10, fontweight="bold")
+ax.set_title("Sex", fontsize=9)
 
 ax = axes[2]
 top_dx = dx_counts.tail(10)
 ax.barh(top_dx.index, top_dx.values, color=PALETTE[3])
 ax.set_xlabel("Patients with diagnosis")
 ax.set_title("c", loc="left", fontsize=10, fontweight="bold")
+ax.set_title("Most common diagnoses", fontsize=9)
 ax.tick_params(axis="y", labelsize=7.5)
 
 fig.suptitle(f"Figure S1. Cohort composition (Harvard EHR-linked subset, n = {len(demo):,})", fontsize=10)
@@ -569,6 +572,7 @@ data_range = data_hi - data_lo
 ax.set_xlim(data_lo - 0.08 * data_range, data_hi + 0.08 * data_range)
 ax.text(0.03, 0.03, f"n = {len(confound):,}\nBMI coefficient = {bmi_coef:.4f} (p = {bmi_p:.2g})",
         transform=ax.transAxes, va="bottom", fontsize=7.5)
+ax.set_title("Sex effect with and without BMI adjustment", fontsize=9)
 fig.suptitle(
     "Figure S5. Adjusting for BMI does not shrink the sex coefficient\n"
     "(BMI-available subsample only, underpowered vs. Fig. 4b)", fontsize=10)

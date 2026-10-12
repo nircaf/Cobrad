@@ -63,6 +63,7 @@ for condition, color, label in CONDITIONS:
 ax.set_xlabel("Frequency (Hz)")
 ax.set_ylabel("Power (dB)")
 ax.set_title("a", loc="left", fontsize=10, fontweight="bold")
+ax.set_title("Power spectrum, core electrodes", fontsize=9)
 ax.legend(fontsize=7.5, frameon=False)
 
 # ---------------------------------------------------------------------
@@ -86,6 +87,7 @@ for idx, ch in enumerate(CORE_FOUR + ["O1", "O2"]):
     if idx % 2 == 0:
         ax.set_ylabel("dB", fontsize=7)
 fig.text(0.53, 0.9, "b", fontsize=10, fontweight="bold")
+fig.text(0.76, 0.935, "Power spectrum by electrode", fontsize=9, ha="center")
 
 # no suptitle: the manuscript caption carries the figure number
 fig.savefig(os.path.join(FIG_DIR, "figS5_psd_comparison.pdf"))
