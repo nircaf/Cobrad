@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Figures and stats for the v2 (general CFA-in-EEG) manuscript.
 
-  Figure 1  fig1_patient_examples.png  two example patients (low BMI / low CFA,
-            high BMI / high CFA): MNE topomaps of per-channel CFA R^2 at every
-            segment duration, plus the 60 - 5 min difference map.
+  Figure 1  fig1_patient_examples.png  four example patients, 60-min MNE topomaps
+            of per-channel CFA R^2: a demographically matched pair with different
+            CFA and a demographically different pair with similar CFA.
   Figure 2  fig2_cfa_overview.png      old Figures 1 + 2 combined: R^2
             distribution, R^2 vs. ICA SNR, MNE scalp topomap of mean R^2
             per site, and the per-site distribution.
@@ -35,13 +35,13 @@ DURATION_FILES = {
     5: "cfa_variance_explained_5min.parquet", 10: "cfa_combined.parquet",
     20: "cfa_variance_explained_20min.parquet", 30: "cfa_variance_explained_30min.parquet",
     45: "cfa_variance_explained_45min.parquet", 60: "cfa_variance_explained_60min.parquet",
+    75: "cfa_variance_explained_75min.parquet", 90: "cfa_variance_explained_90min.parquet",
 }
-# Chosen from the HSP patients with BMI and data at every duration (one
-# recording each): sex-matched men at the two BMI extremes with low vs. high CFA.
-# Sex-matched women with >=10 electrodes at 5 and 60 min, from the low and high ends
-# of BMI; the very highest-BMI patients with >=10 electrodes (BMI 53-58) had low
-# CFA, so these are illustrative, not the most extreme BMI values.
-EXAMPLES = [("A", "I0002150032832"), ("B", "I0002150034554")]
+# Figure 1 pairs, from the 60-min patients with BMI and >=12 electrodes:
+# row 1 matched on sex, age (+-2 y) and BMI (+-1) but with very different CFA;
+# row 2 differing in sex, age (>=35 y) and BMI (>=15) but with near-equal CFA.
+EXAMPLES = [("A", "I0002150035125"), ("B", "I0002150002994"),
+            ("C", "I0002150031792"), ("D", "I0002150006420")]
 
 plt.rcParams.update({
     "font.family": "sans-serif", "font.sans-serif": ["Arial", "Helvetica", "DejaVu Sans"],
@@ -73,37 +73,33 @@ for minutes, fname in DURATION_FILES.items():
     durations[minutes] = d
 
 # =============================================================================
-# Figure 1: example patients across segment durations
+# Figure 1: four example patients, 60-min segment
 # =============================================================================
 demo = pd.read_parquet(os.path.join(HERE, "demographics_combined.parquet"))
 bmi = pd.read_parquet(os.path.join(HERE, "bmi_combined.parquet"))
 minutes_all = sorted(DURATION_FILES)
-SHOW = [5, 60]
-fig, axes = plt.subplots(2, 2, figsize=(5.6, 5.4))
+ROW_TITLES = ["Same sex, age and BMI, different CFA", "Different sex, age and BMI, similar CFA"]
+fig, axes = plt.subplots(2, 2, figsize=(5.6, 6.0))
 examples_meta = []
-for row, (label, pid) in enumerate(EXAMPLES):
-    rec = durations[60].loc[durations[60].patient_id == pid, "recording_id"].iat[0]
-    maps = {}
-    for m in SHOW:
-        d = durations[m]
-        d = d[(d.patient_id == pid) & (d.recording_id == rec)].dropna(subset=["canon"])
-        maps[m] = d.groupby("canon")["cfa_r2_excl_qrs"].mean().to_dict()
-    sites = set.intersection(*(set(v) for v in maps.values()))
-    maps = {m: {c: v[c] for c in sites} for m, v in maps.items()}
-    for col, m in enumerate(SHOW):
-        im = topo(axes[row, col], maps[m], (0, 1), "Reds")
-        axes[row, col].set_title(f"{m} min\nmean R² = {np.mean(list(maps[m].values())):.2f}", fontsize=9)
+d60 = durations[60]
+for i, (label, pid) in enumerate(EXAMPLES):
+    ax = axes.flat[i]
+    d = d60[d60.patient_id == pid].dropna(subset=["canon"])
+    d = d[d.recording_id == d.recording_id.iat[0]]
+    site_map = d.groupby("canon")["cfa_r2_excl_qrs"].mean().to_dict()
+    im = topo(ax, site_map, (0, 1), "Reds")
     p = demo[demo.patient_id == pid].iloc[0]
     p_bmi = float(bmi.loc[bmi.bdsp_patient_id == p.bdsp_patient_id, "bmi"].iat[0])
-    axes[row, 0].text(-0.42, 0.5, f"Patient {label}\n{p.sex}, {p.age:.0f} y\nBMI {p_bmi:.1f}",
-                      transform=axes[row, 0].transAxes, ha="center", va="center", fontsize=9, fontweight="bold")
-    examples_meta.append({
-        "label": label, "sex": str(p.sex), "age": float(p.age), "bmi": p_bmi, "n_sites": len(sites),
-        "mean_r2": {str(m): float(np.mean(list(maps[m].values()))) for m in SHOW},
-    })
-fig.subplots_adjust(left=0.2, right=0.84, top=0.9, bottom=0.04, wspace=0.12, hspace=0.35)
+    r2 = float(np.mean(list(site_map.values())))
+    ax.set_title(f"Patient {label}: {p.sex}, {p.age:.0f} y, BMI {p_bmi:.1f}\nmean R² = {r2:.2f}", fontsize=8.5)
+    examples_meta.append({"label": label, "sex": str(p.sex), "age": float(p.age), "bmi": p_bmi,
+                          "n_sites": len(site_map), "mean_r2": r2})
+fig.subplots_adjust(left=0.02, right=0.84, top=0.88, bottom=0.02, wspace=0.12, hspace=0.45)
+for row, title in enumerate(ROW_TITLES):
+    y = axes[row, 0].get_position().y1 + 0.075
+    fig.text(0.43, y, title, ha="center", fontsize=10, fontweight="bold")
 cb = fig.colorbar(im, cax=fig.add_axes([0.87, 0.2, 0.025, 0.55]))
-cb.set_label("CFA R² (outside QRS)", fontsize=8)
+cb.set_label("CFA R² (outside QRS), 60 min", fontsize=8)
 fig.savefig(os.path.join(FIG_DIR, "fig1_patient_examples.png"), bbox_inches="tight")
 fig.savefig(os.path.join(FIG_DIR, "fig1_patient_examples.pdf"), bbox_inches="tight")
 plt.close(fig)
@@ -116,7 +112,7 @@ common = set.intersection(*(set(d.patient_id) for d in durations.values()))
 pt = pd.DataFrame({m: d[d.patient_id.isin(common)].groupby("patient_id")["cfa_r2_excl_qrs"].mean()
                    for m, d in durations.items()}).dropna()
 fr_stat, fr_p = stats.friedmanchisquare(*(pt[m] for m in minutes_all))
-pairs = list(zip(minutes_all[:-1], minutes_all[1:])) + [(5, 60), (10, 60)]
+pairs = list(zip(minutes_all[:-1], minutes_all[1:])) + [(5, minutes_all[-1]), (10, minutes_all[-1])]
 wil = [stats.wilcoxon(pt[a], pt[b]) for a, b in pairs]
 p_holm = multipletests([w.pvalue for w in wil], method="holm")[1]
 window_test = {

@@ -29,6 +29,11 @@ Besides heartbeat-locked R^2, the cardiac share of the continuous (non-locked)
 EEG variance is scored: the ECG-locked template is overlap-added at every beat
 and its variance divided by the total EEG variance.
 
+CFAR is trained on raw EEG. For comparison, ECG-informed ICA (same as Section 2.4) is scored alone
+and combined with CFAR in both orders (ICA->CFAR, CFAR->ICA; benchmark_ica_cfar.py found CFAR->ICA
+best). Besides shape-based R^2, CFA power (R^2 x evoked variance outside QRS, uV^2) measures how
+much ECG-shaped signal is left, which R^2 alone cannot show.
+
 Writes cleaning_demo.parquet, figures/fig5_cleaning_demo.png and
 paper_stats.json["cleaning_demo"].
 
@@ -64,6 +69,9 @@ SITES = ["F3", "F4", "C3", "C4", "O1", "O2"]
 # Figure 4a example: chosen by scratch search over the 60 patients with most CFA removed, for the
 # 5-s single-channel window where cleaning most reduces variance and the removed part is beat-locked
 EXAMPLE, EXAMPLE_SITE, EXAMPLE_T0 = "I0002150406452", "C4", 443.0
+# Figure 4b example: chosen by scratch search over benchmark patients with high CFA power and <10% left
+# after CFAR, for the clearest ECG-shaped HEP (P-QRS-T) that CFAR flattens
+HEP_EXAMPLE, HEP_SITE = "I0002150007970", "F4"
 N_FOLDS, SEED, N_WORKERS = 5, 1, 64
 INJECT_LAT, INJECT_SD, INJECT_UV = 0.30, 0.05, 2.0  # synthetic neural HEP (Gaussian)
 INJECT_W = np.array([1.0, 1.0, 0.7, 0.7, 0.3, 0.3])  # frontal > central > occipital
@@ -93,6 +101,42 @@ def load(job):
         return (pid, data[:-1][order], data[-1], peaks, sfreq) if len(peaks) >= 20 else None
     except Exception:  # noqa: BLE001 -- unreadable EDFs are skipped
         return None
+
+
+def ica_clean(eeg, ecg, sfreq):
+    """ECG-informed ICA as in ica_ecg_component_variance.py (Section 2.4), on arrays (uV)."""
+    info = mne.create_info(SITES + ["ECG"], sfreq, ["eeg"] * len(SITES) + ["ecg"])
+    raw = mne.io.RawArray(np.vstack([eeg, ecg[None]]) * 1e-6, info, verbose="ERROR")
+    ica = mne.preprocessing.ICA(n_components=len(SITES) - 1, method="picard",
+                                fit_params={"ortho": False, "extended": True}, random_state=42, max_iter=500)
+    ica.fit(raw, picks="eeg", verbose="ERROR")
+    bad, scores = ica.find_bads_ecg(raw, ch_name="ECG", method="correlation", verbose="ERROR")
+    bad = bad or [int(np.nanargmax(np.abs(scores)))]
+    return ica.apply(raw, exclude=bad, verbose="ERROR").get_data(picks="eeg") * 1e6
+
+
+def ica_iclabel(eeg, sfreq, return_n=False):
+    """Standard ECG-free ICA: same ICA as ica_clean, components labelled "heart beat" by ICLabel removed.
+    ponytail: data kept on its mastoid reference (ICLabel warns; it was trained on average reference), so
+    scores stay comparable with raw; no heart component found -> nothing removed."""
+    from mne_icalabel import label_components
+    info = mne.create_info(SITES, sfreq, "eeg")
+    raw = mne.io.RawArray(eeg * 1e-6, info, verbose="ERROR")
+    raw.set_montage("standard_1020", verbose="ERROR")
+    ica = mne.preprocessing.ICA(n_components=len(SITES) - 1, method="picard",
+                                fit_params={"ortho": False, "extended": True}, random_state=42, max_iter=500)
+    ica.fit(raw, verbose="ERROR")
+    labels = label_components(raw, ica, method="iclabel")["labels"]
+    bad = [i for i, lab in enumerate(labels) if lab == "heart beat"]
+    out = ica.apply(raw, exclude=bad, verbose="ERROR").get_data() * 1e6
+    return (out, len(bad)) if return_n else out
+
+
+def cfa_power(eeg, ecg, peaks, sfreq):
+    """ECG-shaped evoked power outside QRS (uV^2): R^2 x evoked variance, channel mean."""
+    r2, ev, _ = cfa_r2(eeg, ecg, peaks, sfreq)
+    keep = np.abs(epoch_times(sfreq)) > QRS_EXCLUDE_SEC
+    return float(np.mean(r2 * ev[:, keep].var(1)))
 
 
 def cfa_pattern(eeg, peaks, sfreq):
@@ -165,9 +209,12 @@ def evaluate(rec, u_pop, u_cov, seed):
     pid, eeg, ecg, peaks, sfreq = rec
     tt = epoch_times(sfreq)
     clean = project_out(eeg, u_pop)
+    ica = ica_clean(eeg, ecg, sfreq)
+    combos = {"ica": ica, "ica_cfar": project_out(ica, u_pop), "cfar_ica": ica_clean(clean, ecg, sfreq)}
+    own = project_out(eeg, cfa_pattern(eeg, peaks, sfreq))
     r2_pre, ev_pre, ecg_ev = cfa_r2(eeg, ecg, peaks, sfreq)
     r2_clean, ev_clean, _ = cfa_r2(clean, ecg, peaks, sfreq)
-    r2_own, ev_own, _ = cfa_r2(project_out(eeg, cfa_pattern(eeg, peaks, sfreq)), ecg, peaks, sfreq)
+    r2_own, ev_own, _ = cfa_r2(own, ecg, peaks, sfreq)
     cov = project_out(eeg, u_cov)
     r2_cov, _, _ = cfa_r2(cov, ecg, peaks, sfreq)
     rng = np.random.default_rng(seed)
@@ -188,7 +235,10 @@ def evaluate(rec, u_pop, u_cov, seed):
     _, p_clean = welch(clean, sfreq, nperseg=int(4 * sfreq), axis=1)
     band = (f >= 1) & (f <= 40)
     return {
-        "patient_id": pid, "r2_pre": r2_pre.mean(), "r2_clean": r2_clean.mean(), "r2_own": r2_own.mean(),
+        "patient_id": pid, **{f"r2_{k}": cfa_r2(x, ecg, peaks, sfreq)[0].mean() for k, x in combos.items()},
+        **{f"pow_{k}": cfa_power(x, ecg, peaks, sfreq) for k, x in
+           {"pre": eeg, "clean": clean, "own": own, **combos}.items()},
+        "r2_pre": r2_pre.mean(), "r2_clean": r2_clean.mean(), "r2_own": r2_own.mean(),
         "r2_cov": r2_cov.mean(), "r2_null": r2_null.mean(),
         "frac_pre": cardiac_fraction(eeg, peaks, sfreq), "frac_clean": cardiac_fraction(clean, peaks, sfreq),
         "frac_cov": cardiac_fraction(cov, peaks, sfreq),
@@ -196,6 +246,34 @@ def evaluate(rec, u_pop, u_cov, seed):
         "psd_change_db": float(np.median(10 * np.log10(p_clean[:, band] / p_pre[:, band]))),
     }, {"eeg": eeg, "clean": clean, "ecg": ecg, "sfreq": sfreq, "peaks": peaks, "tt": tt,
         "ev_pre": ev_pre, "ev_clean": ev_clean, "ev_own": ev_own, "r2_pre": r2_pre, "r2_clean": r2_clean}
+
+
+# Figure 4d pipelines from benchmark_ica_cfar.py: (column, label, uses ECG, color)
+BENCH = [("ica_iclabel", "ICA", False, PALETTE[5]), ("ica", "ECG-informed ICA", True, PALETTE[5]), ("ecgreg", "ECG regression", True, PALETTE[3]),
+         ("cfar", "CFAR", False, "black"), ("ica_cfar_raw", "ICA+CFAR", True, PALETTE[6]),
+         ("cfar_ica", "CFAR+ICA", True, PALETTE[0]), ("cfar_ecgreg_dir", "CFAR+ECG regression", True, PALETTE[6]),
+         ("own", "Patient-specific CFAR", True, PALETTE[2])]
+
+
+def bench_summary(n_boot=2000):
+    """Median CFA power left (% of raw) and synthetic HEP kept per pipeline, 95% bootstrap CIs."""
+    # all patients (benchmark_ica_cfar.py --all) when available, else the 438-patient benchmark
+    f = os.path.join(HERE, "benchmark_all.parquet")
+    b = pd.read_parquet(f if os.path.exists(f) else os.path.join(HERE, "benchmark_ica_cfar.parquet"))
+    rng = np.random.default_rng(SEED)
+    idx = rng.integers(0, len(b), (n_boot, len(b)))
+    out = {"n": int(len(b))}
+    for k, *_ in BENCH:
+        if f"pow_{k}" not in b:
+            continue
+        for name, v in [("pow_pct", (b[f"pow_{k}"] / b.pow_raw * 100).to_numpy()), ("hep", b[f"hep_{k}"].to_numpy())]:
+            boot = np.nanmedian(v[idx], axis=1)
+            out[f"{k}_{name}"] = float(np.nanmedian(v))
+            out[f"{k}_{name}_ci"] = [float(x) for x in np.percentile(boot, [2.5, 97.5])]
+    if "pow_ica_iclabel" in b:  # ICLabel found no heart component -> output identical to raw
+        v = b.dropna(subset=["pow_ica_iclabel"])
+        out["ica_iclabel_found_pct"] = float((~np.isclose(v.pow_ica_iclabel, v.pow_raw, rtol=1e-9)).mean() * 100)
+    return out
 
 
 def topo(ax, values, cmap="RdBu_r"):
@@ -246,6 +324,7 @@ def main():
     res = pd.DataFrame(rows).merge(meta[["patient_id", "bmi", "sex", "age"]], on="patient_id")
     res.to_parquet(os.path.join(HERE, "cleaning_demo.parquet"))
     _, ex_data = evaluate(load(jobs[EXAMPLE]), u_pop_of[EXAMPLE], u_cov_of[EXAMPLE], 0)
+    _, hx = evaluate(load(jobs[HEP_EXAMPLE]), u_pop_of[HEP_EXAMPLE], u_cov_of[HEP_EXAMPLE], 0)
 
     rb = res.dropna(subset=["bmi"])  # BMI-known subset for BMI statistics and Figure 4e
     with open(os.path.join(HERE, "paper_stats.json")) as f:
@@ -255,6 +334,12 @@ def main():
         "n_eligible": len(jobs), "n_test_with_bmi": int(len(rb)), "pattern_consistency_median_cos": consistency,
         "pattern_cos_pop_median": float(np.median(cos_pop)), "pattern_cos_cov_median": float(np.median(cos_cov)),
         "u_pop": dict(zip(SITES, map(float, u_pop_all))),
+        **{f"r2_{k}_mean": float(res[f"r2_{k}"].mean()) for k in ["ica", "ica_cfar", "cfar_ica"]},
+        **{f"pow_{k}_median": float(res[f"pow_{k}"].median()) for k in ["pre", "clean", "own", "ica", "ica_cfar", "cfar_ica"]},
+        **{f"pow_{k}_pct_of_raw_median": float((res[f"pow_{k}"] / res.pow_pre).median() * 100)
+           for k in ["clean", "own", "ica", "ica_cfar", "cfar_ica"]},
+        "p_pow_cfar_vs_ica": float(stats.wilcoxon(res.pow_clean, res.pow_ica).pvalue),
+        "p_pow_cfar_ica_vs_cfar": float(stats.wilcoxon(res.pow_cfar_ica, res.pow_clean).pvalue),
         "r2_pre_mean": float(res.r2_pre.mean()), "r2_clean_mean": float(res.r2_clean.mean()),
         "r2_own_mean": float(res.r2_own.mean()), "r2_cov_mean": float(res.r2_cov.mean()),
         "r2_null_mean": float(res.r2_null.mean()),
@@ -287,22 +372,26 @@ def main():
         "example_u_pop": list(map(float, u_pop_of[EXAMPLE])),
         "example_r2_pre": float(ex_data["r2_pre"].mean()), "example_r2_clean": float(ex_data["r2_clean"].mean()),
     }
+    S["cleaning_benchmark"] = bench_summary()
+    S["cleaning_demo"].update(example_site=EXAMPLE_SITE, hep_site=HEP_SITE)
     with open(os.path.join(HERE, "paper_stats.json"), "w") as f:
         json.dump(S, f, indent=2)
     print(json.dumps(S["cleaning_demo"], indent=1))
-    plot(res, ex_data, u_pop_all)
+    plot(res, ex_data, u_pop_all, hx)
 
 
-def plot(res, ex, u_pop):
+def plot(res, ex, u_pop, hx):
     plt.rcParams.update({"font.family": "sans-serif", "font.size": 9, "axes.spines.top": False,
                          "axes.spines.right": False, "figure.dpi": 300, "savefig.dpi": 300})
-    fig = plt.figure(figsize=(10, 7))
-    gs = fig.add_gridspec(2, 2, width_ratios=[1.6, 1], hspace=0.45, wspace=0.3)
+    fig = plt.figure(figsize=(13, 7))
+    rows = fig.add_gridspec(2, 1, hspace=0.45)
+    top = rows[0].subgridspec(1, 3, width_ratios=[1.6, 1, 0.9], wspace=0.35)
+    bot = rows[1].subgridspec(1, 2, width_ratios=[1.6, 1], wspace=0.3)
     sf = ex["sfreq"]
     i = int(np.argmax(ex["r2_pre"] - ex["r2_clean"]))  # channel where cleaning removes most CFA
 
     # a: example: 5 s of one channel, dirty vs cleaned; lines mark R-peaks (ECG used only for display)
-    ax = fig.add_subplot(gs[0, 0])
+    ax = fig.add_subplot(top[0])
     i = SITES.index(EXAMPLE_SITE)
     sl = slice(int(EXAMPLE_T0 * sf), int((EXAMPLE_T0 + 5) * sf))
     t = np.arange(sl.stop - sl.start) / sf
@@ -310,7 +399,7 @@ def plot(res, ex, u_pop):
         if sl.start <= p < sl.stop:
             ax.axvline((p - sl.start) / sf, color="0.75", lw=0.8, ls="--", zorder=0)
     ax.plot([], [], color="0.75", lw=0.8, ls="--", label="R-peak")
-    ax.plot(t, ex["eeg"][i, sl], color=PALETTE[1], lw=1.1, label="Before cleaning")
+    ax.plot(t, ex["eeg"][i, sl], color=PALETTE[1], lw=1.1, label="Raw EEG")
     ax.plot(t, ex["clean"][i, sl], color="black", lw=1.1, label="After CFAR (no ECG)")
     ax.set_xlabel("Time (s)")
     ax.set_ylabel(f"{EXAMPLE_SITE} (µV)")
@@ -320,49 +409,84 @@ def plot(res, ex, u_pop):
     pt = res.set_index("patient_id").loc[EXAMPLE]
     # R² is scale-free (shape match), so report patient-mean R² plus the amplitude drop shown here
     rms = np.sqrt(np.mean(ex["clean"][i, sl] ** 2) / np.mean(ex["eeg"][i, sl] ** 2))
-    ax.set_title(f"Example: {pt.sex.lower()}, {pt.age:.0f} y, BMI {pt.bmi:.1f}; R² "
+    ax.set_title(f"Example: {pt.sex.lower()}, {pt.age:.0f} y" + (f", BMI {pt.bmi:.1f}" if pd.notna(pt.bmi) else "") + "; R² "
                  f"{ex['r2_pre'].mean():.2f} → {ex['r2_clean'].mean():.2f}\n{EXAMPLE_SITE} amplitude "
                  f"−{(1 - rms) * 100:.0f}%", fontsize=9)
 
-    # b: the filter: the one cohort-learned scalp pattern subtracted from every sample
-    ax = fig.add_subplot(gs[0, 1])
+    # b: HEP (R-peak-locked average) of a second high-CFA patient, before vs. after CFAR
+    ax = fig.add_subplot(top[1])
+    j = SITES.index(HEP_SITE)
+    ms = hx["tt"] * 1000
+    ax.axvspan(-QRS_EXCLUDE_SEC * 1000, QRS_EXCLUDE_SEC * 1000, color="0.92", lw=0, zorder=0)
+    ax.axvline(0, color="0.75", lw=0.8, ls="--", zorder=0)
+    ax.axhline(0, color="0.75", lw=0.6, zorder=0)
+    ax.plot(ms, hx["ev_pre"][j], color=PALETTE[1], lw=1.4,
+            label=f"Raw EEG, R² {hx['r2_pre'][j]:.2f}")
+    ax.plot(ms, hx["ev_clean"][j], color="black", lw=1.4,
+            label=f"After CFAR, R² {hx['r2_clean'][j]:.2f}")
+    ax.set_xlim(ms[0], ms[-1])
+    ax.set_xlabel("Time from R-peak (ms)")
+    ax.set_ylabel(f"{HEP_SITE} HEP (µV)")
+    ax.legend(frameon=False, fontsize=7, loc="upper center", bbox_to_anchor=(0.5, -0.18))
+    ax.set_title("b", loc="left", fontsize=10, fontweight="bold")
+    hp = res.set_index("patient_id").loc[HEP_EXAMPLE]
+    bmi = f", BMI {hp.bmi:.1f}" if pd.notna(hp.bmi) else ""
+    ax.set_title(f"HEP: {hp.sex.lower()}, {hp.age:.0f} y{bmi}\n({len(hx['peaks']):,} beats; "
+                 f"grey: QRS excluded)", fontsize=9)
+
+    # c: the filter: the one cohort-learned scalp pattern subtracted from every sample
+    ax = fig.add_subplot(top[2])
     im = topo(ax, u_pop)
     cb = fig.colorbar(im, ax=ax, shrink=0.6, pad=0.02)
     cb.set_label("Weight (a.u.)", fontsize=7.5)
-    ax.set_title("b", loc="left", fontsize=10, fontweight="bold")
+    ax.set_title("c", loc="left", fontsize=10, fontweight="bold")
     ax.set_title("CFAR filter", fontsize=9)
 
-    # c: CFA R^2 across patients
-    ax = fig.add_subplot(gs[1, 0])
-    cols = [("r2_pre", "Before", PALETTE[1]), ("r2_clean", "After CFAR\n(no ECG)", "black"),
-("r2_own", "Gold standard\n(own ECG)", PALETTE[2])]
-    for j, (c, _, color) in enumerate(cols):
-        ax.boxplot(res[c], positions=[j], widths=0.55, showfliers=False, patch_artist=True,
-                   boxprops={"facecolor": color, "alpha": 0.35}, medianprops={"color": color, "lw": 1.8})
-    ax.set_xticks(range(len(cols)))
-    ax.set_xticklabels([c[1] for c in cols], fontsize=7.5)
-    ax.set_ylabel("Patient-mean CFA R² (outside QRS)")
-    ax.set_title(f"CFA R² {res.r2_pre.mean():.2f} → {res.r2_clean.mean():.2f} (n = {len(res):,})", fontsize=9)
-    ax.set_title("c", loc="left", fontsize=10, fontweight="bold")
+    # d: cleaning trade-off as two side-by-side bar charts (ICA+CFAR, CFAR+ECG regression kept in stats, not plotted),
+    # pipelines sorted by CFA left, most to least
+    from matplotlib.patches import Patch
+    B = bench_summary()
+    rows = sorted([b for b in BENCH if b[0] not in ("ica", "ica_cfar_raw", "cfar_ecgreg_dir")], key=lambda b: -B[f"{b[0]}_pow_pct"])
+    x = np.arange(len(rows))
+    dd = bot[0].subgridspec(1, 2, wspace=0.3)
+    for col, (metric, ylabel, scale) in enumerate([("pow_pct", "ECG-explained EEG variance left\n(% of raw EEG; lower = better)", 1),
+                                                   ("hep", "Neural signal preserved\n(%; higher = better)", 100)]):
+        ax = fig.add_subplot(dd[col])
+        for xi, (k, label, ecg, color) in zip(x, rows):
+            if f"{k}_{metric}" not in B:
+                continue
+            v = B[f"{k}_{metric}"] * scale
+            err = np.abs(np.array(B[f"{k}_{metric}_ci"]) * scale - v)[:, None]
+            ax.bar(xi, v, yerr=err, width=0.7, color=color, alpha=0.85, hatch="///" if ecg else None,
+                   edgecolor="white" if ecg else color, lw=0, error_kw={"lw": 1, "capsize": 2})
+            ax.text(xi, v + err[1, 0], f"{v:.0f}%", ha="center", va="bottom", fontsize=7.5)
+        ax.set_xticks(x)
+        ax.set_xticklabels([b[1].replace("-", "-\n").replace(" ", "\n") for b in rows], fontsize=7)
+        ax.set_ylabel(ylabel, fontsize=8)
+        ax.set_ylim(0, 115 if metric == "hep" else max(B[f"{b[0]}_pow_pct_ci"][1] for b in rows) * 1.2)
+        if col == 0:
+            ax.set_title("d", loc="left", fontsize=10, fontweight="bold")
+            ax.legend(handles=[Patch(facecolor="0.35", label="No ECG"),
+                               Patch(facecolor="0.35", hatch="///", edgecolor="white", lw=0, label="Uses ECG")],
+                      frameon=False, fontsize=7.5, loc="upper center", ncol=2, bbox_to_anchor=(1.15, -0.25))
+    fig.text(0.5 * (dd[0].get_position(fig).x0 + dd[1].get_position(fig).x1), dd[0].get_position(fig).y1 + 0.012,
+             f"Cleaning pipelines (n = {B['n']:,} patients; median, 95% CI)", ha="center", fontsize=9)
 
-    # d: who needs cleaning: CFA by BMI and sex, before (solid) and after (dashed)
-    ax = fig.add_subplot(gs[1, 1])
+    # e: who needs cleaning: CFA by BMI, all patients, before (solid) and after (dashed)
+    ax = fig.add_subplot(bot[1])
     edges = [15, 25, 30, 35, 40, 60]
-    for sex, color in [("Male", PALETTE[0]), ("Female", PALETTE[3])]:
-        g = res[res.sex == sex]
-        for col, ls, tag in [("r2_pre", "-", "before"), ("r2_clean", "--", "after")]:
-            mid, m_, s_ = [], [], []
-            for lo, hi in zip(edges[:-1], edges[1:]):
-                b_ = g[(g.bmi >= lo) & (g.bmi < hi)][col]
-                if len(b_) >= 10:
-                    mid.append((lo + hi) / 2); m_.append(b_.mean()); s_.append(b_.sem())
-            ax.errorbar(mid, m_, yerr=s_, color=color, ls=ls, marker="o", ms=4, capsize=2, lw=1.4,
-                        label=f"{sex} {tag} (n = {g.bmi.notna().sum():,})" if tag == "before" else f"{sex} {tag}")
+    for col, ls, color, tag in [("r2_pre", "-", PALETTE[1], "Raw EEG"), ("r2_clean", "--", "black", "After CFAR")]:
+        mid, m_, s_ = [], [], []
+        for lo, hi in zip(edges[:-1], edges[1:]):
+            b_ = res[(res.bmi >= lo) & (res.bmi < hi)][col]
+            if len(b_) >= 10:
+                mid.append((lo + hi) / 2); m_.append(b_.mean()); s_.append(b_.sem())
+        ax.errorbar(mid, m_, yerr=s_, color=color, ls=ls, marker="o", ms=4, capsize=2, lw=1.4, label=tag)
     ax.set_xlabel("BMI (kg/m²)")
     ax.set_ylabel("Mean CFA R² (± SEM)")
-    ax.legend(frameon=False, fontsize=7, ncol=2, loc="upper center", bbox_to_anchor=(0.5, -0.2))
-    ax.set_title("d", loc="left", fontsize=10, fontweight="bold")
-    ax.set_title(f"CFA by BMI and sex\n(n = {res.bmi.notna().sum():,})", fontsize=9)
+    ax.legend(frameon=False, fontsize=7.5, ncol=2, loc="upper center", bbox_to_anchor=(0.5, -0.2))
+    ax.set_title("e", loc="left", fontsize=10, fontweight="bold")
+    ax.set_title(f"CFA by BMI\n(n = {res.bmi.notna().sum():,})", fontsize=9)
 
     fig.savefig(os.path.join(FIG_DIR, "fig5_cleaning_demo.png"), bbox_inches="tight")
     fig.savefig(os.path.join(FIG_DIR, "fig5_cleaning_demo.pdf"), bbox_inches="tight")
@@ -379,13 +503,17 @@ def replot():
     r = cfa[cfa.patient_id == EXAMPLE].iloc[0]
     # ponytail: population pattern, not the example's fold pattern (cos ~0.999); full run uses the fold one
     _, ex = evaluate(load((EXAMPLE, r.edf_path, float(r.window_start_s))), u_pop, u_pop, 0)
+    r = cfa[cfa.patient_id == HEP_EXAMPLE].iloc[0]
+    _, hx = evaluate(load((HEP_EXAMPLE, r.edf_path, float(r.window_start_s))), u_pop, u_pop, 0)
     with open(os.path.join(HERE, "paper_stats.json")) as f:
         S = json.load(f)
     S["cleaning_demo"].update(example_r2_pre=float(ex["r2_pre"].mean()), example_r2_clean=float(ex["r2_clean"].mean()))
     S["cleaning_demo"].pop("example_u_pop", None)
+    S["cleaning_benchmark"] = bench_summary()
+    S["cleaning_demo"].update(example_site=EXAMPLE_SITE, hep_site=HEP_SITE)
     with open(os.path.join(HERE, "paper_stats.json"), "w") as f:
         json.dump(S, f, indent=2)
-    plot(res, ex, u_pop)
+    plot(res, ex, u_pop, hx)
 
 
 if __name__ == "__main__":

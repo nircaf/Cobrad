@@ -38,18 +38,19 @@ plt.rcParams.update({
 })
 
 psd = pd.read_parquet(os.path.join(HERE, "psd_curve.parquet"))
-psd = psd[psd.freq_hz <= 100]  # analysis band-pass upper edge (§2.2); above is filter roll-off
+psd = psd[psd.freq_hz <= 99]  # just below the 100 Hz band-pass edge (§2.2); the edge bin is filter roll-off
 psd["canon"] = np.where(psd.eeg_channel == "ECG", "ECG", canonicalize(psd["eeg_channel"]))
 n_patients = psd.patient_id.nunique()
 print(f"{len(psd):,} PSD rows, {n_patients:,} patients")
 
 fig = plt.figure(figsize=(11, 8))
 gs = fig.add_gridspec(1, 2, width_ratios=[1, 1.5], wspace=0.28)
+left = gs[0].subgridspec(2, 1, hspace=0.35)
 
 # ---------------------------------------------------------------------
-# Panel a: group-overall (core-4 EEG average) + ECG
+# Panel b: group-overall (core-4 EEG average) + ECG
 # ---------------------------------------------------------------------
-ax = fig.add_subplot(gs[0])
+ax = fig.add_subplot(left[1])
 ecg_psd = psd[psd.canon == "ECG"]
 for condition, color, label in CONDITIONS:
     if condition == "ecg":
@@ -62,12 +63,12 @@ for condition, color, label in CONDITIONS:
                      color=color, alpha=0.2, linewidth=0)
 ax.set_xlabel("Frequency (Hz)")
 ax.set_ylabel("Power (dB)")
-ax.set_title("a", loc="left", fontsize=10, fontweight="bold")
+ax.set_title("b", loc="left", fontsize=10, fontweight="bold")
 ax.set_title("Power spectrum, core electrodes", fontsize=9)
 ax.legend(fontsize=7.5, frameon=False)
 
 # ---------------------------------------------------------------------
-# Panel b: per-electrode small multiples, each with the same 4-way overlay
+# Panel c: per-electrode small multiples, each with the same 4-way overlay
 # ---------------------------------------------------------------------
 inner = gs[1].subgridspec(3, 2, hspace=0.55, wspace=0.35)
 for idx, ch in enumerate(CORE_FOUR + ["O1", "O2"]):
@@ -86,8 +87,38 @@ for idx, ch in enumerate(CORE_FOUR + ["O1", "O2"]):
         ax.set_xlabel("Hz", fontsize=7)
     if idx % 2 == 0:
         ax.set_ylabel("dB", fontsize=7)
-fig.text(0.53, 0.9, "b", fontsize=10, fontweight="bold")
+fig.text(0.53, 0.9, "c", fontsize=10, fontweight="bold")
 fig.text(0.76, 0.935, "Power spectrum by electrode", fontsize=9, ha="center")
+
+# ---------------------------------------------------------------------
+# Panel a: one patient (Figure 4a example), continuous EEG: raw vs ICA vs ICA+CFAR
+# ---------------------------------------------------------------------
+import make_cleaning_demo as cd
+from scipy.signal import welch
+
+with open(os.path.join(HERE, "paper_stats.json")) as f:
+    u_pop = json.load(f)["cleaning_demo"]["u_pop"]
+u_pop = np.array([u_pop[s] for s in cd.SITES])
+row = pd.read_parquet(os.path.join(HERE, "cfa_combined.parquet"), columns=["patient_id", "edf_path", "window_start_s"])
+row = row[row.patient_id == cd.EXAMPLE].iloc[0]
+# ponytail: full-cohort pattern, not the example's held-out fold pattern (median cos between them ~0.93)
+_, raw_ex, ica_ex, _, _, sfreq = cd.load((row.patient_id, row.edf_path, float(row.window_start_s)))
+ch = cd.SITES.index(cd.EXAMPLE_SITE)
+ax = fig.add_subplot(left[0])
+for x, color, label in [(raw_ex, PALETTE[1], "Raw EEG"), (ica_ex, PALETTE[2], "ICA"),
+                        (cd.project_out(ica_ex, u_pop), PALETTE[3], "ICA+CFAR")]:
+    f_ex, p_ex = welch(x[ch], sfreq, nperseg=int(4 * sfreq))
+    keep = (f_ex >= 1) & (f_ex <= 99)
+    ax.plot(f_ex[keep], 10 * np.log10(p_ex[keep]), color=color, lw=1.2, label=label)
+# 1/f (pink noise) reference, level fit in dB to the ICA+CFAR spectrum over 1-40 Hz
+fit = (f_ex >= 1) & (f_ex <= 40)
+level = np.mean(10 * np.log10(p_ex[fit] * f_ex[fit]))
+ax.plot(f_ex[keep], level - 10 * np.log10(f_ex[keep]), color="grey", ls="--", lw=1.2, label="1/f reference")
+ax.set_xlabel("Frequency (Hz)")
+ax.set_ylabel("Power (dB re µV²/Hz)")
+ax.set_title("a", loc="left", fontsize=10, fontweight="bold")
+ax.set_title(f"Example patient (Figure 4a), {cd.EXAMPLE_SITE}, 10-min EEG", fontsize=9)
+ax.legend(fontsize=7.5, frameon=False)
 
 # no suptitle: the manuscript caption carries the figure number
 fig.savefig(os.path.join(FIG_DIR, "figS5_psd_comparison.pdf"))

@@ -78,6 +78,21 @@ def channel_names(raw: mne.io.BaseRaw) -> tuple[list[str], str]:
     return eeg, ecg
 
 
+def detect_r_peaks(signal: np.ndarray, sfreq: float) -> np.ndarray:
+    """R-peak samples: 5-25 Hz band-pass, |.| envelope, MAD-prominence peaks, 300 ms refractory."""
+    if np.isfinite(signal).mean() < .999 or np.nanstd(signal) <= 1e-9:
+        return np.array([], dtype=int)
+    centered = np.nan_to_num(signal - np.nanmedian(signal))
+    upper = min(25.0, sfreq / 2 - .5)
+    if upper <= 5:
+        return np.array([], dtype=int)
+    filtered = sosfiltfilt(butter(3, [5, upper], btype="bandpass", fs=sfreq, output="sos"), centered)
+    envelope = np.abs(filtered)
+    mad = np.median(np.abs(envelope - np.median(envelope)))
+    peaks, _ = find_peaks(envelope, distance=max(1, int(.30 * sfreq)), prominence=max(3 * mad, np.finfo(float).eps))
+    return peaks
+
+
 def quality(segment: mne.io.BaseRaw, eeg: list[str], ecg: str) -> tuple[bool, dict]:
     data_uv = segment.get_data(picks=eeg) * 1e6
     finite = np.isfinite(data_uv).mean(axis=1) >= .999
@@ -89,20 +104,13 @@ def quality(segment: mne.io.BaseRaw, eeg: list[str], ecg: str) -> tuple[bool, di
 
     signal = segment.get_data(picks=[ecg])[0]
     sfreq = float(segment.info["sfreq"])
-    peaks = np.array([], dtype=int)
+    peaks = detect_r_peaks(signal, sfreq)
     bpm = rr_fraction = 0.0
-    if np.isfinite(signal).mean() >= .999 and np.nanstd(signal) > 1e-9:
-        centered = np.nan_to_num(signal - np.nanmedian(signal))
-        upper = min(25.0, sfreq / 2 - .5)
-        if upper > 5:
-            filtered = sosfiltfilt(butter(3, [5, upper], btype="bandpass", fs=sfreq, output="sos"), centered)
-            envelope = np.abs(filtered)
-            mad = np.median(np.abs(envelope - np.median(envelope)))
-            peaks, _ = find_peaks(envelope, distance=max(1, int(.30 * sfreq)), prominence=max(3 * mad, np.finfo(float).eps))
-            bpm = float(len(peaks) / (len(signal) / sfreq / 60))
-            if len(peaks) > 1:
-                rr = np.diff(peaks) / sfreq
-                rr_fraction = float(np.mean((rr >= .33) & (rr <= 2)))
+    if len(peaks):
+        bpm = float(len(peaks) / (len(signal) / sfreq / 60))
+        if len(peaks) > 1:
+            rr = np.diff(peaks) / sfreq
+            rr_fraction = float(np.mean((rr >= .33) & (rr <= 2)))
     metrics = {"good_eeg_fraction": good_fraction, "ecg_beats": int(len(peaks)), "ecg_bpm": bpm, "plausible_rr_fraction": rr_fraction, "r_peak_samples": peaks}
     return good_fraction >= .70 and 35 <= bpm <= 180 and rr_fraction >= .70, metrics
 

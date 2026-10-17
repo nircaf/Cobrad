@@ -416,8 +416,193 @@ def compare_deep_models(ecg_epochs, target, train_idx, test_idx, epochs=12):
     return pd.DataFrame(rows).sort_values("Held-out R²", ascending=False), predictions, actual
 
 
+@st.cache_data(show_spinner="Loading candidate EDFs...")
+def fig4b_candidates(n: int = 10, max_left: float = 0.10):
+    """Benchmark patients with high CFA power and < max_left of it left after CFAR, with their HEPs."""
+    import json
+    from concurrent.futures import ProcessPoolExecutor
+
+    import make_cleaning_demo as cd
+    f = HERE / "benchmark_all.parquet"
+    b = pd.read_parquet(f if f.exists() else HERE / "benchmark_ica_cfar.parquet")
+    b = b[b.pow_cfar / b.pow_raw < max_left].sort_values("pow_raw", ascending=False).head(n)
+    with open(HERE / "paper_stats.json") as f:
+        u_pop = json.load(f)["cleaning_demo"]["u_pop"]
+    u = np.array([u_pop[s] for s in cd.SITES])
+    cfa = pd.read_parquet(HERE / "cfa_combined.parquet", columns=["patient_id", "edf_path", "window_start_s"])
+    cfa = cfa.drop_duplicates("patient_id").set_index("patient_id")
+    demo = pd.read_parquet(HERE / "demographics_combined.parquet")[["patient_id", "sex", "age"]].set_index("patient_id")
+    jobs = [(p, cfa.loc[p].edf_path, float(cfa.loc[p].window_start_s)) for p in b.patient_id if p in cfa.index]
+    with ProcessPoolExecutor(min(16, len(jobs))) as ex:
+        recs = list(ex.map(cd.load, jobs))
+    out = []
+    for rec in recs:
+        if rec is None:
+            continue
+        pid, eeg, ecg, peaks, sf = rec
+        keep = np.abs(cd.epoch_times(sf)) > QRS_EXCLUDE_SEC
+        r0, e0, _ = cd.cfa_r2(eeg, ecg, peaks, sf)
+        r1, e1, _ = cd.cfa_r2(cd.project_out(eeg, u), ecg, peaks, sf)
+        p0, p1 = r0 * e0[:, keep].var(1), r1 * e1[:, keep].var(1)
+        sex, age = (demo.loc[pid].sex, demo.loc[pid].age) if pid in demo.index else ("?", np.nan)
+        out.append({"pid": pid, "sex": sex, "age": age, "beats": len(peaks), "t": cd.epoch_times(sf) * 1000,
+                    "raw": e0, "cfar": e1, "r2_raw": r0, "r2_cfar": r1, "pow_raw": p0, "pow_cfar": p1,
+                    "best": int(np.argmax(p0 - p1))})
+    return out, cd.SITES
+
+
+def fig4b_picker() -> None:
+    import re
+    st.title("Figure 4b: choose the HEP example patient")
+    st.caption("Patients with the most ECG-explained variance and <10% of it left after CFAR (population "
+               "filter from paper_stats.json). Each plot shows the channel where CFAR removes the most "
+               "CFA power. Pick one below and save it to make_cleaning_demo.py.")
+    cands, sites = fig4b_candidates()
+    cols = st.columns(5)
+    for k, c in enumerate(cands):
+        i = c["best"]
+        fig = go.Figure()
+        fig.add_vrect(x0=-QRS_EXCLUDE_SEC * 1000, x1=QRS_EXCLUDE_SEC * 1000, fillcolor="lightgrey", opacity=0.4, line_width=0)
+        fig.add_trace(go.Scatter(x=c["t"], y=c["raw"][i], name="Raw EEG", line={"color": "#D55E00"}))
+        fig.add_trace(go.Scatter(x=c["t"], y=c["cfar"][i], name="After CFAR", line={"color": "black"}))
+        fig.update_layout(height=230, margin={"l": 10, "r": 10, "t": 50, "b": 10}, showlegend=False,
+                          title={"text": f"#{k + 1} {c['pid']} {sites[i]}<br><sub>{c['sex']}, {c['age']:.0f} y; "
+                                         f"R² {c['r2_raw'][i]:.2f}→{c['r2_cfar'][i]:.2f}; "
+                                         f"power left {c['pow_cfar'][i] / c['pow_raw'][i] * 100:.1f}%</sub>",
+                                 "font": {"size": 12}})
+        cols[k % 5].plotly_chart(fig, use_container_width=True)
+
+    st.subheader("Selection")
+    labels = [f"#{k + 1} {c['pid']}" for k, c in enumerate(cands)]
+    choice = st.selectbox("Patient", range(len(cands)), format_func=lambda k: labels[k])
+    c = cands[choice]
+    site = st.selectbox("Channel", sites, index=c["best"])
+    i = sites.index(site)
+    fig = go.Figure()
+    fig.add_vrect(x0=-QRS_EXCLUDE_SEC * 1000, x1=QRS_EXCLUDE_SEC * 1000, fillcolor="lightgrey", opacity=0.4, line_width=0)
+    fig.add_trace(go.Scatter(x=c["t"], y=c["raw"][i], name=f"Raw EEG, R² {c['r2_raw'][i]:.2f}", line={"color": "#D55E00"}))
+    fig.add_trace(go.Scatter(x=c["t"], y=c["cfar"][i], name=f"After CFAR, R² {c['r2_cfar'][i]:.2f}", line={"color": "black"}))
+    fig.update_layout(height=380, xaxis_title="Time from R-peak (ms)", yaxis_title=f"{site} HEP (µV)",
+                      title=f"{c['pid']} {site}: {c['sex']}, {c['age']:.0f} y, {c['beats']:,} beats")
+    st.plotly_chart(fig, use_container_width=True)
+
+    demo_py = HERE / "make_cleaning_demo.py"
+    current = re.search(r'HEP_EXAMPLE, HEP_SITE = "(\w+)", "(\w+)"', demo_py.read_text())
+    st.write(f"Current Figure 4b: **{current.group(1)} {current.group(2)}**" if current else "HEP_EXAMPLE not found")
+    if st.button(f"Use {c['pid']} {site} for Figure 4b"):
+        demo_py.write_text(re.sub(r'HEP_EXAMPLE, HEP_SITE = "\w+", "\w+"',
+                                  f'HEP_EXAMPLE, HEP_SITE = "{c["pid"]}", "{site}"', demo_py.read_text()))
+        st.success(f"Saved. Redraw: venv/bin/python \"paper utils/Paper CFA/make_cleaning_demo.py\" --plot-only")
+
+
+@st.cache_data(show_spinner="Loading candidate EDFs...")
+def fig4a_candidates(n: int = 10, max_left: float = 0.10, win_s: float = 5.0):
+    """High-CFA patients (not the Figure 4b one) with the channel and 5-s window where CFAR removes most."""
+    import json
+    import re
+    from concurrent.futures import ProcessPoolExecutor
+
+    import make_cleaning_demo as cd
+    f = HERE / "benchmark_all.parquet"
+    b = pd.read_parquet(f if f.exists() else HERE / "benchmark_ica_cfar.parquet")
+    hep = re.search(r'HEP_EXAMPLE, HEP_SITE = "(\w+)"', (HERE / "make_cleaning_demo.py").read_text())
+    b = b[(b.pow_cfar / b.pow_raw < max_left) & (b.patient_id != (hep.group(1) if hep else ""))]
+    b = b.sort_values("pow_raw", ascending=False).head(n)
+    with open(HERE / "paper_stats.json") as fh:
+        u_pop = json.load(fh)["cleaning_demo"]["u_pop"]
+    u = np.array([u_pop[s] for s in cd.SITES])
+    cfa = pd.read_parquet(HERE / "cfa_combined.parquet", columns=["patient_id", "edf_path", "window_start_s"])
+    cfa = cfa.drop_duplicates("patient_id").set_index("patient_id")
+    demo = pd.read_parquet(HERE / "demographics_combined.parquet")[["patient_id", "sex", "age"]].set_index("patient_id")
+    jobs = [(p, cfa.loc[p].edf_path, float(cfa.loc[p].window_start_s)) for p in b.patient_id if p in cfa.index]
+    with ProcessPoolExecutor(min(16, len(jobs))) as ex:
+        recs = list(ex.map(cd.load, jobs))
+    out = []
+    for rec in recs:
+        if rec is None:
+            continue
+        pid, eeg, ecg, peaks, sf = rec
+        clean = cd.project_out(eeg, u)
+        r0, r1 = cd.cfa_r2(eeg, ecg, peaks, sf)[0], cd.cfa_r2(clean, ecg, peaks, sf)[0]
+        # window score: removed signal must be heartbeat-locked (correlates with its beat template overlap-added
+        # at every R-peak) and the raw window must be artifact-free (peak < MAX_UV); score = var(removed) x corr^2
+        # ponytail: brute-force 1-s steps over 6 channels x ~600 windows, fine for 10 patients
+        MAX_UV = 150.0
+        rem = eeg - clean
+        ev = epoch_around_r_peaks(rem, peaks, sf).mean(0)
+        card, a0 = np.zeros_like(rem), int(round(-HEP_TMIN * sf))
+        for p in peaks:
+            if p - a0 >= 0 and p - a0 + ev.shape[1] <= rem.shape[1]:
+                card[:, p - a0:p - a0 + ev.shape[1]] += ev
+        n_win, step = int(win_s * sf), int(sf)
+        best = (-1.0, 0, 0)
+        for ch in range(eeg.shape[0]):
+            for a in range(0, eeg.shape[1] - n_win, step):
+                w = slice(a, a + n_win)
+                if np.abs(eeg[ch, w]).max() > MAX_UV:
+                    continue
+                r_w, c_w = rem[ch, w], card[ch, w]
+                rho = np.corrcoef(r_w, c_w)[0, 1] if c_w.std() > 0 else 0.0
+                score = r_w.var() * rho ** 2 * (eeg[ch, w].var() > clean[ch, w].var())
+                if score > best[0]:
+                    best = (score, ch, a)
+        _, ch, a = best
+        sl = slice(a, a + n_win)
+        sex, age = (demo.loc[pid].sex, demo.loc[pid].age) if pid in demo.index else ("?", np.nan)
+        rms = np.sqrt(np.mean(clean[ch, sl] ** 2) / np.mean(eeg[ch, sl] ** 2))
+        out.append({"pid": pid, "sex": sex, "age": age, "site": cd.SITES[ch], "t0": a / sf,
+                    "t": np.arange(n_win) / sf, "raw": eeg[ch, sl], "cfar": clean[ch, sl],
+                    "peaks": [(p - a) / sf for p in peaks if a <= p < a + n_win],
+                    "r2_raw": float(r0.mean()), "r2_cfar": float(r1.mean()), "amp_drop": float((1 - rms) * 100)})
+    return out
+
+
+def fig4a_picker() -> None:
+    import re
+    st.title("Figure 4a: choose the example trace")
+    st.caption("High-CFA patients (<10% of ECG-explained variance left after CFAR; Figure 4b patient excluded). "
+               "Each plot is the channel and 5-s window where CFAR removes the most; dashed lines, R-peaks. "
+               "Pick one below and save it to make_cleaning_demo.py.")
+    cands = fig4a_candidates()
+
+    def trace_fig(c, height):
+        fig = go.Figure()
+        for p in c["peaks"]:
+            fig.add_vline(x=p, line_dash="dash", line_color="lightgrey")
+        fig.add_trace(go.Scatter(x=c["t"], y=c["raw"], name="Raw EEG", line={"color": "#D55E00", "width": 1.2}))
+        fig.add_trace(go.Scatter(x=c["t"], y=c["cfar"], name="After CFAR", line={"color": "black", "width": 1.2}))
+        fig.update_layout(height=height, margin={"l": 10, "r": 10, "t": 50, "b": 10}, showlegend=height > 300,
+                          title={"text": f"{c['pid']} {c['site']} @ {c['t0']:.0f} s<br><sub>{c['sex']}, {c['age']:.0f} y; "
+                                         f"R² {c['r2_raw']:.2f}→{c['r2_cfar']:.2f}; amplitude {-c['amp_drop']:+.0f}%</sub>",
+                                 "font": {"size": 12}})
+        return fig
+
+    cols = st.columns(2)
+    for k, c in enumerate(cands):
+        fig = trace_fig(c, 240)
+        fig.update_layout(title_text=f"#{k + 1} " + fig.layout.title.text)
+        cols[k % 2].plotly_chart(fig, use_container_width=True)
+
+    st.subheader("Selection")
+    choice = st.selectbox("Patient", range(len(cands)), format_func=lambda k: f"#{k + 1} {cands[k]['pid']} {cands[k]['site']}")
+    c = cands[choice]
+    st.plotly_chart(trace_fig(c, 380), use_container_width=True)
+    demo_py = HERE / "make_cleaning_demo.py"
+    current = re.search(r'EXAMPLE, EXAMPLE_SITE, EXAMPLE_T0 = "(\w+)", "(\w+)", ([\d.]+)', demo_py.read_text())
+    st.write(f"Current Figure 4a: **{current.group(1)} {current.group(2)} @ {current.group(3)} s**" if current else "EXAMPLE not found")
+    if st.button(f"Use {c['pid']} {c['site']} @ {c['t0']:.0f} s for Figure 4a"):
+        demo_py.write_text(re.sub(r'EXAMPLE, EXAMPLE_SITE, EXAMPLE_T0 = "\w+", "\w+", [\d.]+',
+                                  f'EXAMPLE, EXAMPLE_SITE, EXAMPLE_T0 = "{c["pid"]}", "{c["site"]}", {c["t0"]:.1f}',
+                                  demo_py.read_text()))
+        st.success("Saved. Redraw: venv/bin/python \"paper utils/Paper CFA/make_cleaning_demo.py\" --plot-only")
+
+
 def main() -> None:
     st.set_page_config(page_title="Cardiac Field Artifact", layout="wide")
+    page = st.sidebar.radio("Page", ["Figure 4a picker", "Figure 4b picker", "CFA overview"])
+    if page != "CFA overview":
+        (fig4a_picker if page == "Figure 4a picker" else fig4b_picker)()
+        return
     st.title("🔗 Cardiac field artifact — direct variance explained")
     st.caption(
         "R² of each EEG channel's R-peak-locked HEP evoked average regressed on the ECG's own "

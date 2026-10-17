@@ -5,6 +5,7 @@ figures/*.png, using reportlab Platypus. Patterned on Paper1/make_pdf_v2.py.
   source venv/bin/activate && python3 "Paper CFA/make_pdf.py"
 """
 import json
+import math
 import os
 
 from reportlab.lib import colors
@@ -63,10 +64,13 @@ EX, WT = S["v2"]["examples"], S["v2"]["window_test"]
 WT_PAIR = {(q["a"], q["b"]): q for q in WT["pairs"]}
 BMIHR = S["v2"]["bmi_hr"]
 CD = S["cleaning_demo"]
+BM = S["cleaning_benchmark"]
 CD_INJ_UV = 2.0  # matches INJECT_UV in make_cleaning_demo.py
 CD_GAP = (CD["r2_pre_mean"] - CD["r2_clean_mean"]) / (CD["r2_pre_mean"] - CD["r2_own_mean"]) * 100
 WT_P_STR = "&lt; 1e-300" if WT["friedman_p"] == 0 else f"= {WT['friedman_p']:.2g}"
 DOSE = S["dose_response"]
+DMAX = int(DOSE["lengths"][-1]["window_minutes"])
+DFIT = S["dose_fit"]  # written by make_fig3.py  # longest segment duration analysed
 SRC = S["cohort"]["source_counts"]
 DXS = S["stratified"]["dx_by_site"]
 ZL = S["crosscorr_mi"]["zero_lag_r2_full_epoch"]
@@ -166,7 +170,7 @@ for h in [
     f"heartbeat-locked EEG variance after QRS exclusion.",
     f"CFA rose with BMI (r = {STRAT['bmi']['r_pearson']:.2f}, p = {STRAT['bmi']['p_pearson']:.1e}) "
     f"and segment duration (R² {DOSE['lengths'][0]['mean']:.2f} at 5 min, "
-    f"{DOSE['lengths'][-1]['mean']:.2f} at 60 min).",
+    f"{DOSE['lengths'][-1]['mean']:.2f} at {DMAX} min).",
     f"CFA was higher in men ({STRAT['sex_means']['Male']:.2f} vs. {STRAT['sex_means']['Female']:.2f}), "
     f"independent of BMI (p = {S['sex_bmi_confound']['sex_adj_p']:.1e}).",
     f"Without ECG, CFAR achieved {CD_GAP:.0f}% of ECG-based cleaning, and removed more CFA in obese "
@@ -221,7 +225,7 @@ story.append(Paragraph(
     f"which CFA has been measured. We used two estimators: a model-free regression of each channel's "
     f"R-peak-locked EEG average on the patient's R-peak-locked ECG average, and ECG-informed ICA. We "
     f"show the range of CFA in individual patients, map its scalp distribution, and test its "
-    f"dependence on BMI, sex, age, and segment duration (5–60 min). We hypothesised that "
+    f"dependence on BMI, sex, age, and segment duration (5–{DMAX} min). We hypothesised that "
     f"ECG-related variance would persist outside the QRS interval, increase with BMI, differ by sex, "
     f"and increase with segment duration. Finally, we developed CFAR (Cardiac "
     f"Field Artifact Removal), a model trained on the cohort's ECG-informed CFA patterns that "
@@ -256,12 +260,12 @@ story.append(Paragraph(
     "MNE-Python<super>16</super>; 86% of recordings were sampled at 200 Hz) and analysed in µV at "
     "native sampling rate, without re-referencing, interpolation, or amplitude-based rejection, so "
     "that CFA was estimated in minimally processed data. For the duration analysis, the procedure "
-    "was repeated with 5-, 20-, 30-, 45-, and 60-min windows (Section 2.7). Parameters are "
+    "was repeated with 5-, 20-, 30-, 45-, 60-, 75-, and 90-min windows (Section 2.7). Parameters are "
     "summarised in Table 1.",
     styles["Body"]))
 PREPROC = [
     ("Window selection", "Seeded random search, uniformly distributed start times, up to 10 attempts; "
-     "10 min (main analysis), 5–60 min (duration analysis, see Section 2.7)"),
+     "10 min (main analysis), 5–90 min (duration analysis, see Section 2.7)"),
     ("R-peak detection", "Median subtraction; 5–25 Hz third-order zero-phase Butterworth band-pass; "
      "rectification; minimum inter-peak distance 300 ms; prominence ≥3 × MAD"),
     ("EEG channel quality", "≥99.9% finite samples; SD 0.1–500 µV; peak-to-peak ≤5,000 µV; "
@@ -359,21 +363,22 @@ story.append(Paragraph(
     "slopes differed. A further OLS model compared the sex coefficient with and without BMI "
     "adjustment. Model-free R² and log ICA SNR (Section 2.4) were correlated across "
     "channel-recordings (Pearson; Figure 2b). Segment duration (Section 3.5) was tested in patients "
-    "with data at all six durations (5–60 min), using all EEG channels (Figure 3d shows "
+    "with data at all eight durations (5–90 min), using all EEG channels (Figure 3d shows "
     "channel-level means). Patient-mean R² was compared across durations with the Friedman test "
-    "(effect size, Kendall's W), and consecutive durations, 5 vs. 60 min, and 10 vs. 60 min with "
+    "(effect size, Kendall's W), and consecutive durations, 5 vs. 90 min, and 10 vs. 90 min with "
     "Holm-corrected paired Wilcoxon signed-rank tests. Sexes and diagnosis groups were compared at "
     "each duration with Mann-Whitney tests. Windows of each length were drawn with the same seeded "
-    "procedure, so shorter windows were usually nested within longer ones; the 45- and 60-min "
+    "procedure, so shorter windows were usually nested within longer ones; the 45- to 90-min "
     "analyses used one recording per patient. Sample sizes differ because analyses need different "
     f"data: model-free estimator, all patients with a valid window ({CFA['n_patients']:,}); ICA, "
     f"patients with a converged decomposition ({ICA['n_patients']:,}); age, sex, and diagnosis, "
     f"EHR-linked patients with known age and at least one well-covered site "
     f"({STRAT['n_with_age']:,}); BMI, patients with a plausible BMI ({STRAT['bmi']['n']:,}); "
-    f"duration, patients with data at all six durations ({DOSE['n_common_patients']:,}). For "
-    f"illustration (Figure 1), two patients with measured BMI and data from the same recording at "
-    f"all durations were chosen at the low and high ends of BMI and CFA; they were not used for "
-    f"inference. To test sleep stage (Section 3.1), a random subsample of {SENS['n_patients']} "
+    f"duration, patients with data at all eight durations ({DOSE['n_common_patients']:,}). For "
+    f"illustration (Figure 1), four patients with measured BMI and at least 12 electrodes in a "
+    f"60-min segment were chosen: a pair matched on sex, age (±2 years), and BMI (±1 kg/m²) with "
+    f"the largest CFA difference, and a pair differing in sex, age (≥35 years), and BMI "
+    f"(≥15 kg/m²) with near-equal CFA; they were not used for inference. To test sleep stage (Section 3.1), a random subsample of {SENS['n_patients']} "
     f"patients was staged in 30-s epochs with YASA<super>21</super>; for wake, light sleep "
     f"(N1+N2), N3, and REM, up to {SENS['draws_per_cell']} windows per duration "
     f"({', '.join(str(m) for m in SENS['window_lengths_min'])} min) were drawn from contiguous "
@@ -392,8 +397,7 @@ story.append(Paragraph(
     f"cross-fitting: each patient was cleaned with a pattern learned from the other folds (about "
     f"{CD['n_train']:,} patients), projected out of every sample of the continuous EEG "
     f"(signal-space projection). The ECG was used only for scoring: CFA R² (outside QRS) before and "
-    f"after cleaning, compared with a gold standard that projects out the patient's own ECG-derived "
-    f"pattern. Cardiac noise in the ongoing EEG was quantified as the share of continuous EEG "
+    f"after cleaning, compared with patient-specific CFAR (below). Cardiac noise in the ongoing EEG was quantified as the share of continuous EEG "
     f"variance carried by the ECG-locked template overlap-added at every beat. To measure "
     f"preservation of brain activity, a synthetic neural HEP (Gaussian, −{CD_INJ_UV:.0f} µV at "
     f"+300 ms, frontal &gt; central &gt; occipital) was added before cleaning and the retained "
@@ -401,6 +405,30 @@ story.append(Paragraph(
     f"test whether participant information helps, a ridge regression trained in the same folds "
     f"predicted each patient's pattern from BMI (median-imputed, with a missing indicator), age, "
     f"sex, number of diagnoses, and diagnosis categories.",
+    styles["Body"]))
+story.append(Paragraph(
+    f"<i>Patient-specific CFAR.</i> When the ECG is available, the same projection can use the "
+    f"patient's own CFA pattern instead of the population one: the ECG R-peaks give the "
+    f"R-peak-locked EEG average, its first singular vector is the patient's CFA pattern, and that "
+    f"pattern is projected out of every sample. This is the best a single spatial direction can do "
+    f"for a given patient and so bounds what population CFAR can reach. The pattern is learned "
+    f"from the same window it is scored on, so its performance is an optimistic estimate.",
+    styles["Body"]))
+story.append(Paragraph(
+    f"<i>Comparison of cleaning pipelines (Figure 4d).</i> In {BM['n']:,} patients, CFAR and "
+    f"patient-specific CFAR were compared with standard ECG-free ICA (the ICA of Section 2.4, with "
+    f"components labelled “heart beat” by ICLabel removed instead of selecting them with the "
+    f"ECG; data kept on the mastoid reference), with ECG-informed ICA (Section 2.4), with regression "
+    f"on the ECG (each channel regressed on the ECG at lags of ±20 ms plus an intercept, and the "
+    f"fit subtracted), and with CFAR followed by ECG-informed ICA fitted on the CFAR output "
+    f"(CFAR+ICA). The CFAR filter was cross-fitted ({CD['n_folds']} folds, unweighted mean of "
+    f"patterns), so each patient was cleaned by a filter learned from other patients. Two scores "
+    f"were computed per patient. ECG-explained EEG variance left was CFA R² multiplied by the "
+    f"variance of the R-peak-locked average outside the QRS, averaged over channels and expressed "
+    f"as a percentage of the raw EEG value; unlike R², which measures only how ECG-like the "
+    f"residual is, it falls when the artifact shrinks. Neural signal preserved was the share of "
+    f"the simulated heartbeat-locked brain response (above) recovered after cleaning. Medians "
+    f"are reported with 95% bootstrap confidence intervals.",
     styles["Body"]))
 story.append(Paragraph("3. Results", styles["H1"]))
 story.append(Paragraph("3.1 Cohort", styles["H2"]))
@@ -427,54 +455,41 @@ story.append(Paragraph(
     styles["Body"]))
 
 story.append(Paragraph("3.2 CFA in individual patients", styles["H2"]))
-EXA, EXB = EX
+EXA, EXB, EXC, EXD = EX
+ex_desc = lambda e: f"{e['sex'].lower()}, {e['age']:.0f} years, BMI {e['bmi']:.1f} kg/m², mean R² {e['mean_r2']:.2f}"
 story.append(KeepTogether([
     fig("fig1_patient_examples.png", 4.8 * inch, crop=False),
     Paragraph(
-    f"<b>Figure 1.</b> CFA in two example patients. Head maps show per-electrode CFA R² (variance "
-    f"of the R-peak-locked EEG average explained by the ECG average, outside the ±50 ms QRS window) "
-    f"at the {EXA['n_sites']} recorded electrodes, from a 5-min (left) and a 60-min (right) segment "
-    f"of the same recording; colour is interpolated between electrodes. Patient A "
-    f"({EXA['sex'].lower()}, {EXA['age']:.0f} years, BMI {EXA['bmi']:.1f} kg/m²): mean R² "
-    f"{EXA['mean_r2']['5']:.2f} at 5 min, {EXA['mean_r2']['60']:.2f} at 60 min. Patient B "
-    f"({EXB['sex'].lower()}, {EXB['age']:.0f} years, BMI {EXB['bmi']:.1f} kg/m²): "
-    f"{EXB['mean_r2']['5']:.2f} and {EXB['mean_r2']['60']:.2f}. Patients were chosen from "
-    f"recordings with at least 10 electrodes at the low and high ends of BMI; individually, BMI "
-    f"explains little of the variation in CFA (Section 3.4).",
+    f"<b>Figure 1.</b> CFA in four example patients. Per-electrode CFA R² (outside QRS) from a "
+    f"60-min segment. Top: patients matched on sex, age, and BMI with very different CFA. Bottom: "
+    f"patients differing in sex, age, and BMI with similar CFA. Patient A: {ex_desc(EXA)}. "
+    f"Patient B: {ex_desc(EXB)}. Patient C: {ex_desc(EXC)}. Patient D: {ex_desc(EXD)}.",
         styles["Caption"]),
 ]))
 story.append(Paragraph(
-    f"Figure 1 shows how CFA differs between people and segment lengths. In Patient A (BMI "
-    f"{EXA['bmi']:.1f} kg/m²), the ECG explained {EXA['mean_r2']['5']*100:.0f}% of heartbeat-locked "
-    f"EEG variance at 5 min and {EXA['mean_r2']['60']*100:.0f}% at 60 min; in Patient B (BMI "
-    f"{EXB['bmi']:.1f} kg/m²), {EXB['mean_r2']['5']*100:.0f}% and {EXB['mean_r2']['60']*100:.0f}%, "
-    f"so the longer segment revealed twice as much CFA, spread over most of the scalp. The analyses "
-    f"below test whether higher CFA with higher BMI and longer segments holds across the cohort.",
+    f"Figure 1 shows that CFA is a property of the individual that demographics alone do not "
+    f"predict. Patients A and B were both {EXA['sex'].lower()}, aged {EXA['age']:.0f} and "
+    f"{EXB['age']:.0f} years, with BMI {EXA['bmi']:.1f} and {EXB['bmi']:.1f} kg/m², yet in a 60-min "
+    f"segment the ECG explained {EXA['mean_r2']*100:.0f}% of heartbeat-locked EEG variance in "
+    f"Patient A and {EXB['mean_r2']*100:.0f}% in Patient B, spread over most of the scalp. "
+    f"Conversely, Patient C ({EXC['sex'].lower()}, {EXC['age']:.0f} years, BMI {EXC['bmi']:.1f} kg/m²) "
+    f"and Patient D ({EXD['sex'].lower()}, {EXD['age']:.0f} years, BMI {EXD['bmi']:.1f} kg/m²) "
+    f"differed in all three, but CFA was similar ({EXC['mean_r2']*100:.0f}% and "
+    f"{EXD['mean_r2']*100:.0f}%) with a different spatial pattern. The analyses below test how CFA "
+    f"relates to BMI, sex, age, and segment duration across the cohort.",
     styles["Body"]))
 
 story.append(Paragraph("3.3 CFA across the cohort", styles["H2"]))
 story.append(KeepTogether([
     fig("fig2_cfa_overview.png", crop=False),
     Paragraph(
-    f"<b>Figure 2.</b> CFA across {CFA['n_patients']:,} patients ({CFA['n_rows']:,} "
-    f"channel-recordings, 10-min segments). (a) Per-channel R² between R-peak-locked EEG and ECG "
-    f"averages, over the full epoch (mean {CFA['r2_full_mean']:.2f}) and outside the ±50 ms QRS "
-    f"window (mean {CFA['r2_excl_qrs_mean']:.2f}). (b) ICA SNR (ECG-component to residual "
-    f"variance; Section 2.4; {ICA['n_patients']:,} patients) vs. model-free R² of the same "
-    f"channel-recording (log axis; line, least-squares fit; r = {ICA['r2_vs_snr_r']:.2f}, "
-    f"p {R2_SNR_P_STR}, n = {ICA['r2_vs_snr_n']:,}). (c) Mean CFA R² (outside QRS) at the "
-    f"{TOPO['n_sites']} 10-20 sites recorded in at least {TOPO['min_patients']} patients "
-    f"({TOPO['n_rows']:,} channel-recordings; referenced labels mapped to their scalp site; "
-    f"{', '.join(TOPO['dropped_sites'])} fell below this floor). (d) Per-site R² distribution, "
-    f"sorted by median (orange line; box, interquartile range; n per site shown); the six standard "
-    f"sites (F3/F4/C3/C4/O1/O2) have n &gt; 12,000 each, and sites near the floor are less "
-    f"precise. (e) Patient-mean CFA R² per diagnosis category (mean, 95% CI, Welch; n in brackets; "
-    f"categories overlap; those with fewer than 10 patients omitted); dotted line, EHR-linked "
-    f"patients with no recorded diagnosis (mean {DX['no_dx_mean']:.2f}, n = {DX['no_dx_n']:,}; "
-    f"confounded by site, see Limitations); Kruskal-Wallis p = {DX['p_kruskal']:.2g}. (f) Pairwise "
-    f"Mann-Whitney p-values, Benjamini-Hochberg corrected across all {DX['pairwise']['n_pairs']} "
-    f"tests ({DX['pairwise']['n_significant_fdr']} significant at q &lt; 0.05; colour saturates at "
-    f"q = 0.5); order as in (e).",
+    f"<b>Figure 2.</b> CFA across {CFA['n_patients']:,} patients (10-min segments). (a) "
+    f"Per-channel R² between R-peak-locked EEG and ECG averages, full epoch and outside QRS. (b) "
+    f"ICA SNR vs. R² (log axis; r = {ICA['r2_vs_snr_r']:.2f}, p {R2_SNR_P_STR}). (c) Mean CFA R² "
+    f"per 10-20 site. (d) Per-site R² distribution (box, interquartile range). (e) Patient-mean "
+    f"CFA R² per diagnosis category (mean ± 95% CI); dotted line, no recorded diagnosis; "
+    f"Kruskal-Wallis p = {DX['p_kruskal']:.2g}. (f) Pairwise Mann-Whitney q-values "
+    f"(Benjamini-Hochberg).",
         styles["Caption"]),
 ]))
 story.append(Paragraph(
@@ -513,37 +528,21 @@ story.append(Paragraph(
 story.append(Paragraph("3.4 CFA increases with BMI and is higher in men", styles["H2"]))
 BMI_STRAT = STRAT["bmi"]
 CONF = S["sex_bmi_confound"]
-BMI_WINDOW_COUNTS = ", ".join(
-    f"{minutes} min: n={count:,}" for minutes, count in sorted(
-        ((int(k), v) for k, v in BMI_STRAT["window_counts"].items())
-    )
-)
-dose_str = "; ".join(f"{int(r['window_minutes'])} min: {r['mean']:.2f}" for r in DOSE["lengths"])
+# Fisher r-to-z test: female vs. male BMI-CFA correlation (matches make_fig3.py panel c)
+_f, _m = BMI_STRAT["by_sex"]["Female"], BMI_STRAT["by_sex"]["Male"]
+_z = (math.atanh(_f["r_pearson"]) - math.atanh(_m["r_pearson"])) / math.sqrt(1 / (_f["n"] - 3) + 1 / (_m["n"] - 3))
+P_R_SEX_DIFF = math.erfc(abs(_z) / math.sqrt(2))
 dose_by_min = {int(r["window_minutes"]): r for r in DOSE["lengths"]}
-p_sex_dose = max(r["p_sex"] for r in DOSE["stratified_by_length"])
-p_dx_dose_min = min(r["p_dx"] for r in DOSE["stratified_by_length"])
-p_dx_dose_max = max(r["p_dx"] for r in DOSE["stratified_by_length"])
-max_adjacent_p = max(WT_PAIR[(a, b)]["p_holm"] for a, b in [(5, 10), (10, 20), (20, 30), (30, 45), (45, 60)])
 story.append(KeepTogether([
     fig("fig3_bmi_sex_duration.png", crop=False),
     Paragraph(
     f"<b>Figure 3.</b> CFA vs. patient characteristics (a–c) and segment duration (d–f). "
-    f"Patient-mean CFA R² (outside QRS) vs. (a) age (n = {STRAT['n_with_age']:,}; "
-    f"r = {STRAT['r_age_pearson']:.2f}, p = {STRAT['p_age_pearson']:.2g}; line, least-squares fit), "
-    f"(b) sex (Mann-Whitney p = {STRAT['p_sex_mannwhitney']:.1e}; box, quartiles; outliers "
-    f"omitted), and (c) BMI with sex-specific fits (n = {BMI_STRAT['n']:,}; "
-    f"r = {BMI_STRAT['r_pearson']:.2f}, p = {BMI_STRAT['p_pearson']:.2g}; one observation per "
-    f"patient, longest window; {BMI_WINDOW_COUNTS}). Female: n = "
-    f"{BMI_STRAT['by_sex']['Female']['n']:,}, r = {BMI_STRAT['by_sex']['Female']['r_pearson']:.2f}, "
-    f"p = {BMI_STRAT['by_sex']['Female']['p_pearson']:.1e}; male: n = "
-    f"{BMI_STRAT['by_sex']['Male']['n']:,}, r = {BMI_STRAT['by_sex']['Male']['r_pearson']:.2f}, "
-    f"p = {BMI_STRAT['by_sex']['Male']['p_pearson']:.1e}; interaction "
-    f"p = {BMI_STRAT['sex_interaction_p']:.2g}. (d–f) Patients with data at every duration "
-    f"(n = {DOSE['n_common_patients']:,}). (d) Mean channel-level R² (all EEG channels; ± 95% CI) "
-    f"per duration ({dose_str}); Friedman p {WT_P_STR}; every consecutive step significant "
-    f"(Holm-corrected paired Wilcoxon, all p &le; {max_adjacent_p:.1g}). (e) By sex; men higher at "
-    f"every duration (Mann-Whitney, all p &le; {p_sex_dose:.3g}). (f) By diagnosis; not "
-    f"significant (p = {p_dx_dose_min:.2g}–{p_dx_dose_max:.2g}).",
+    f"Patient-mean CFA R² (outside QRS) vs. (a) age (r = {STRAT['r_age_pearson']:.2f}, "
+    f"p = {STRAT['p_age_pearson']:.2g}), (b) sex (Mann-Whitney p = {STRAT['p_sex_mannwhitney']:.1e}), "
+    f"and (c) BMI by sex (female r = {BMI_STRAT['by_sex']['Female']['r_pearson']:.2f}, male "
+    f"r = {BMI_STRAT['by_sex']['Male']['r_pearson']:.2f}; difference, Fisher z p = {P_R_SEX_DIFF:.2g}). "
+    f"(d–f) Patients with data at all eight durations (n = {DOSE['n_common_patients']:,}). (d) Mean "
+    f"R² ± 95% CI; Friedman p {WT_P_STR}. (e) By sex. (f) By diagnosis.",
         styles["Caption"]),
 ]))
 story.append(Paragraph(
@@ -555,7 +554,10 @@ story.append(Paragraph(
     f"p = {BMI_STRAT['by_sex']['Female']['p_pearson']:.1e}) and men "
     f"(r = {BMI_STRAT['by_sex']['Male']['r_pearson']:.2f}, "
     f"p = {BMI_STRAT['by_sex']['Male']['p_pearson']:.1e}), with no BMI-by-sex interaction "
-    f"(p = {BMI_STRAT['sex_interaction_p']:.2g}). Though weak individually "
+    f"(p = {BMI_STRAT['sex_interaction_p']:.2g}): CFA rose with BMI at the same rate in both sexes. "
+    f"The correlation was nonetheless stronger in women (Fisher z p = {P_R_SEX_DIFF:.2g}), meaning "
+    f"BMI explained more of the between-patient variation in women, not that CFA rose faster with "
+    f"BMI. Though weak individually "
     f"(r² ≈ {BMI_STRAT['r_pearson']**2:.2f}), it agrees with the diagnosis analysis, in which obese "
     f"patients had the highest CFA of all categories (Section 3.6).",
     styles["Body"]))
@@ -581,15 +583,16 @@ story.append(Paragraph(
     f"χ² = {WT['friedman_chi2']:,.0f}, p {WT_P_STR}, Kendall's W = {WT['kendall_w']:.2f}; "
     f"n = {WT['n']:,}). Mean CFA R² rose from {dose_by_min[5]['mean']:.2f} at 5 min to "
     f"{dose_by_min[10]['mean']:.2f} (10 min), {dose_by_min[20]['mean']:.2f} (20), "
-    f"{dose_by_min[30]['mean']:.2f} (30), {dose_by_min[45]['mean']:.2f} (45), and "
-    f"{dose_by_min[60]['mean']:.2f} at 60 min (Figure 3d), with every consecutive step significant "
-    f"after Holm correction. From 5 to 60 min, R² increased in "
-    f"{WT_PAIR[(5, 60)]['pct_patients_increase']:.0f}% of patients (mean "
-    f"+{WT_PAIR[(5, 60)]['mean_diff']:.2f}); from the 10-min main-analysis windows to 60 min, in "
-    f"{WT_PAIR[(10, 60)]['pct_patients_increase']:.0f}% (mean +{WT_PAIR[(10, 60)]['mean_diff']:.2f}). "
-    f"Gains shrank with duration, from {dose_by_min[20]['mean']-dose_by_min[10]['mean']:.2f} between "
-    f"10 and 20 min to {dose_by_min[60]['mean']-dose_by_min[45]['mean']:.2f} between 45 and 60 min, "
-    f"without reaching a plateau. Fewer channel-recordings contributed at 45 and 60 min "
+    f"{dose_by_min[30]['mean']:.2f} (30), {dose_by_min[45]['mean']:.2f} (45), "
+    f"{dose_by_min[60]['mean']:.2f} (60), {dose_by_min[75]['mean']:.2f} (75), and "
+    f"{dose_by_min[90]['mean']:.2f} at 90 min (Figure 3d), with every consecutive step significant "
+    f"after Holm correction. From 5 to {DMAX} min, R² increased in "
+    f"{WT_PAIR[(5, DMAX)]['pct_patients_increase']:.0f}% of patients (mean "
+    f"+{WT_PAIR[(5, DMAX)]['mean_diff']:.2f}); from the 10-min main-analysis windows to {DMAX} min, in "
+    f"{WT_PAIR[(10, DMAX)]['pct_patients_increase']:.0f}% (mean +{WT_PAIR[(10, DMAX)]['mean_diff']:.2f}). "
+    f"Gains shrank with duration, from {dose_by_min[20]['mean']-dose_by_min[10]['mean']:.3f} between "
+    f"10 and 20 min to {dose_by_min[90]['mean']-dose_by_min[75]['mean']:.3f} between 75 and 90 min, "
+    f"converging to R²∞ = {DFIT['asymptote']:.3f} (saturating fit). Fewer channel-recordings contributed at 45–90 min "
     f"({dose_by_min[45]['n_rows']:,} vs. {dose_by_min[30]['n_rows']:,} at 30 min), which may change "
     f"channel composition, but between 5 and 30 min composition was nearly constant "
     f"({dose_by_min[5]['n_rows']:,} to {dose_by_min[30]['n_rows']:,} channel-recordings) and R² "
@@ -600,7 +603,7 @@ story.append(Paragraph(
     f"{DOSE['stratified_by_length'][0]['male_mean']:.2f} vs. "
     f"{DOSE['stratified_by_length'][0]['female_mean']:.2f} at 5 min, "
     f"{DOSE['stratified_by_length'][-1]['male_mean']:.2f} vs. "
-    f"{DOSE['stratified_by_length'][-1]['female_mean']:.2f} at 60 min). Diagnosis differences were "
+    f"{DOSE['stratified_by_length'][-1]['female_mean']:.2f} at {DMAX} min). Diagnosis differences were "
     f"not significant (Figure 3f); the no-diagnosis mean was numerically higher at every duration, "
     f"consistent with the within-site reversal in the Limitations.",
     styles["Body"]))
@@ -626,31 +629,48 @@ story.append(KeepTogether([
     fig("fig5_cleaning_demo.png", crop=False),
     Paragraph(
     f"<b>Figure 4.</b> CFAR: ECG-free cardiac field artifact removal (Section 2.8). "
-    f"(a) Five seconds of continuous EEG at C4 from an example patient (male, 72 years, BMI "
-    f"34.2 kg/m²) before (orange) and after (black) CFAR; dashed lines, R-peaks (from the ECG, "
-    f"for display only); chosen as a clear high-CFA case. (b) The CFAR filter: the single CFA scalp "
-    f"pattern learned from the cohort and subtracted from every EEG sample. (c) Patient-mean CFA R² "
-    f"in {CD['n_test']:,} patients (cross-fitted, so each is held out from its own filter) before "
-    f"and after cleaning, and with the gold standard. (d) Mean CFA R² (± SEM) across BMI bins in men "
-    f"and women, before (solid) and after (dashed) cleaning (known BMI, "
-    f"n = {CD['n_test_with_bmi']:,}; bins with at least 10 patients).",
+    f"(a) Five seconds of EEG at {CD['example_site']} from an example patient: raw (orange) and after CFAR "
+    f"(black); dashed lines, R-peaks. (b) Heartbeat-evoked potential (R-peak-locked average, {CD['hep_site']}) of "
+    f"a second high-CFA patient before and after CFAR; grey, QRS window excluded from R². "
+    f"(c) CFAR filter: the CFA scalp pattern learned from the "
+    f"cohort. (d) Cleaning pipelines in {BM['n']:,} patients (CFAR filter "
+    f"cross-fitted, so each patient is cleaned by a filter learned from other patients), sorted by "
+    f"artifact left. Left panel, ECG-explained EEG variance left "
+    f"(CFA R² × heartbeat-evoked variance outside the QRS, % of raw EEG). Right panel, neural signal "
+    f"preserved: % of a simulated heartbeat-locked brain response (2 µV, 300 ms after each R-peak) "
+    f"recovered after cleaning. Medians with 95% bootstrap CIs; hatched, ECG used (ICA component "
+    f"selection, ECG regression, or the patient's own ECG-derived pattern for patient-specific CFAR). (e) Mean CFA R² (± SEM) by BMI across all patients with known BMI, before (solid) and after "
+    f"(dashed) CFAR.",
         styles["Caption"]),
 ]))
 story.append(Paragraph(
     f"The CFA scalp pattern was highly consistent across patients (median absolute cosine "
-    f"similarity to the population pattern, {CD['pattern_consistency_median_cos']:.2f}; Figure 4b). "
+    f"similarity to the population pattern, {CD['pattern_consistency_median_cos']:.2f}; Figure 4c). "
     f"CFAR, which projects this pattern out of held-out recordings without ECG, reduced mean CFA R² from "
     f"{CD['r2_pre_mean']:.2f} to {CD['r2_clean_mean']:.2f} ({CD['pct_reduction_mean']:.0f}% "
     f"reduction; Wilcoxon p {CD_P_STR}), and R² fell in {CD['pct_patients_reduced']:.0f}% of "
-    f"patients (Figure 4c). The gold standard reached {CD['r2_own_mean']:.2f}, so CFAR "
+    f"patients. Patient-specific CFAR reached {CD['r2_own_mean']:.2f}, so CFAR "
     f"closed {CD_GAP:.0f}% of the gap. In the example patient, mean R² fell from "
     f"{CD['example_r2_pre']:.2f} to {CD['example_r2_clean']:.2f}, and the deflection after every "
-    f"R-peak was removed (Figure 4a). Obese patients (BMI ≥ 30 kg/m², n = {CD['obese_n']:,}) had "
+    f"R-peak was removed (Figures 4a-b). Because R² measures the ECG-likeness of the residual "
+    f"rather than its size, we compared pipelines in {BM['n']:,} patients on the "
+    f"ECG-explained EEG variance left (CFA R² × heartbeat-evoked variance outside the QRS, relative to "
+    f"raw EEG) and on neural signal preserved (the share of a simulated heartbeat-locked brain "
+    f"response recovered after cleaning; Figure 4d). Standard ICA without the ECG found a "
+    f"heart-beat component in only {BM['ica_iclabel_found_pct']:.0f}% of patients and left a median "
+    f"{BM['ica_iclabel_pow_pct']:.0f}% of the ECG-explained variance; selecting the component with "
+    f"the ECG instead left {BM['ica_pow_pct']:.0f}%. CFAR left {BM['cfar_pow_pct']:.0f}% and "
+    f"regression on the ECG {BM['ecgreg_pow_pct']:.0f}%, preserving {BM['cfar_hep']*100:.0f}% and "
+    f"{BM['ecgreg_hep']*100:.0f}% of the neural signal. Applying ICA "
+    f"after CFAR left {BM['cfar_ica_pow_pct']:.0f}% (preserving {BM['cfar_ica_hep']*100:.0f}%), and "
+    f"patient-specific CFAR, which needs the patient's own ECG, left {BM['own_pow_pct']:.0f}% "
+    f"(preserving {BM['own_hep']*100:.0f}%). "
+    f"Obese patients (BMI ≥ 30 kg/m², n = {CD['obese_n']:,}) had "
     f"more CFA removed than lean patients (BMI &lt; 25, n = {CD['lean_n']:,}; R² "
     f"−{CD['obese_removed']:.2f} vs. −{CD['lean_removed']:.2f}, Mann-Whitney "
     f"p = {CD['p_removed_obese_vs_lean']:.2g}), because they had more to remove: the share removed "
     f"was similar ({CD['obese_pct_reduction']:.0f}% vs. {CD['lean_pct_reduction']:.0f}%). Residual CFA "
-    f"remained higher at high BMI and in men (Figure 4d). In the ongoing EEG, the cardiac share of "
+    f"remained higher at high BMI (Figure 4e). In the ongoing EEG, the cardiac share of "
     f"variance fell from a median of {CD['frac_pre_median']*100:.2f}% to "
     f"{CD['frac_clean_median']*100:.2f}% (mean {CD['frac_pre_mean']*100:.1f}% to "
     f"{CD['frac_clean_mean']*100:.1f}%; median reduction {CD['frac_drop_median_pct']:.0f}%) and "
@@ -691,8 +711,7 @@ story.append(Paragraph(
     styles["Body"]))
 story.append(Paragraph(
     f"BMI correlated positively with CFA in women and men, and obese patients had the highest CFA "
-    f"of all diagnosis categories; in Figure 1, CFA was low at a BMI of {EXA['bmi']:.0f} kg/m² and "
-    f"several times higher at {EXB['bmi']:.0f} kg/m². This seems counterintuitive: adipose tissue "
+    f"of all diagnosis categories. This seems counterintuitive: adipose tissue "
     f"conducts roughly ten times less than muscle<super>24</super>, and subcutaneous fat attenuates "
     f"the surface ECG, so obesity is associated with low QRS voltage<super>12,13</super>. If fat only "
     f"insulated, less cardiac field should reach the scalp. The resolution lies in what R² "
@@ -729,9 +748,9 @@ story.append(Paragraph(
 story.append(Paragraph(
     f"Segment duration had the largest, most consistent effect: in {WT['n']:,} duration-matched "
     f"patients, mean R² rose from {DOSE['lengths'][0]['mean']:.2f} at 5 min and "
-    f"{DOSE['lengths'][1]['mean']:.2f} at 10 min to {DOSE['lengths'][-1]['mean']:.2f} at 60 min, "
-    f"every step was significant, and R² increased from 5 to 60 min in "
-    f"{WT_PAIR[(5, 60)]['pct_patients_increase']:.0f}% of patients. Longer segments contain more "
+    f"{DOSE['lengths'][1]['mean']:.2f} at 10 min to {DOSE['lengths'][-1]['mean']:.2f} at {DMAX} min, "
+    f"every step was significant, and R² increased from 5 to {DMAX} min in "
+    f"{WT_PAIR[(5, DMAX)]['pct_patients_increase']:.0f}% of patients. Longer segments contain more "
     f"heartbeats and give a more stable average<super>14</super>, letting shared EEG-ECG structure "
     f"emerge from background EEG. Two consequences follow. First, short segments, including our "
     f"10-min main analysis, underestimate CFA, so a low estimate from a short recording does not "
@@ -769,8 +788,8 @@ story.append(Paragraph(
     f"ongoing EEG, not only heartbeat-locked averages, and can be applied retrospectively to "
     f"existing datasets. Conditioning on BMI, sex, age, and diagnoses gave no benefit, because these "
     f"change the amount of CFA, not its pattern; they remain useful for identifying who needs "
-    f"cleaning most, since CFA before and after cleaning was highest in men and at high BMI "
-    f"(Figure 4d). CFAR is specific to the montage and reference it was trained on, removes "
+    f"cleaning most, since CFA before and after cleaning was highest at high BMI "
+    f"(Figure 4e) and in men (Figure 3). CFAR is specific to the montage and reference it was trained on, removes "
     f"one of six spatial dimensions, retained {CD['hep_retained_median']*100:.0f}% of a simulated "
     f"neural HEP, and leaves some CFA; it should be validated on other montages before routine use.",
     styles["Body"]))
@@ -782,7 +801,7 @@ story.append(Paragraph(
     f"heartbeat-locked EEG variance outside the QRS window, and ICA removal of the ECG-related "
     f"component reduced this variance by a median of {ICA['hep_pct_drop_median']*100:.0f}%. CFA "
     f"increased with BMI, was higher in men independently of BMI, varied across electrodes, and "
-    f"increased with segment duration up to 60 min. It is therefore a participant-, channel-, and "
+    f"increased with segment duration up to {DMAX} min. It is therefore a participant-, channel-, and "
     f"duration-dependent noise source. Robust inference requires ECG-informed channel-level "
     f"cleaning with before-and-after validation<super>8,9</super>, reported and justified segment "
     f"lengths<super>14</super>, and adjustment for BMI and sex; without ECG, CFAR "
@@ -861,10 +880,7 @@ story.append(KeepTogether([
     fig("figS1_cohort.png", 6.6 * inch),
     Paragraph(
     f"<b>Figure S1.</b> Cohort composition ({COHORT['n_demographics']:,} Human Sleep Project "
-    f"patients). (a) Age (median {COHORT['age_median']:.0f} years, range "
-    f"{COHORT['age_min']:.0f}–{COHORT['age_max']:.0f}). (b) Sex ({sex_str}). (c) The ten most "
-    f"prevalent diagnosis categories, led by {top3_str}; categories overlap. The cohort is "
-    f"clinically referred, not a healthy community sample.",
+    f"patients). (a) Age. (b) Sex. (c) The ten most prevalent diagnosis categories (overlapping).",
         styles["Caption"]),
 ]))
 DX_RULES = [  # mirrors DIAG_CATEGORIES in build_dataset.py
@@ -898,18 +914,9 @@ story.append(KeepTogether([
     fig("figS3_post_ica_variance.png", 6.6 * inch),
     Paragraph(
     f"<b>Figure S2.</b> HEP variance before and after excluding the ECG-related ICA component, vs. "
-    f"a non-heartbeat-locked control (n = {S['post_ica_variance']['n_patients']:,} ICA patients with "
-    f"at least one well-covered site; {S['post_ica_variance']['n_patients_control']:,}-patient "
-    f"control subsample, Section 2.6; medians, log axis). (a) Four core electrodes "
-    f"({'/'.join(S['post_ica_variance']['core_electrodes'])}): median "
-    f"{S['post_ica_variance']['core_pre_median']:.2f} µV² pre-ICA, "
-    f"{S['post_ica_variance']['core_post_median']:.2f} µV² post-ICA "
-    f"({S['post_ica_variance']['core_pct_drop']:.0f}% drop), and "
-    f"{S['post_ica_variance']['core_non_locked_median']:.2f} µV² for the control (same windows "
-    f"re-epoched around random pseudo-events). (b) Per electrode, all six sites. (c) Spectral "
-    f"entropy (normalised Shannon entropy of the evoked Welch spectrum) of the same conditions, core "
-    f"electrodes (n = {S['post_ica_variance']['n_patients_entropy']:,}, separate subsample). (d) "
-    f"Spectral entropy per electrode.",
+    f"a non-heartbeat-locked control (medians, log axis). (a) Core electrodes "
+    f"({'/'.join(S['post_ica_variance']['core_electrodes'])}). (b) Per electrode. (c) Spectral "
+    f"entropy, core electrodes. (d) Spectral entropy per electrode.",
         styles["Caption"]),
 ]))
 story.append(Paragraph(
@@ -934,12 +941,9 @@ story.append(KeepTogether([
     fig("figS4_crosscorr_mi.png", 6.6 * inch),
     Paragraph(
     f"<b>Figure S3.</b> EEG-ECG cross-correlation and mutual information pre-ICA, post-ICA, and for "
-    f"a non-heartbeat-locked control (n = {CC['n_patients']:,} patients; separate subsample with "
-    f"ICA refitted; Section 2.6). The control re-epochs the pre-ICA EEG around random pseudo-events "
-    f"and correlates it with the R-peak-locked ECG average, giving the chance-level relationship. "
-    f"(a) Cross-correlation vs. lag between the core-electrode "
-    f"({'/'.join(CC['core_electrodes'])}) HEP average and the ECG average, sign-aligned per channel; "
-    f"mean ± SEM across patients. (b) Mean peak |cross-correlation| per electrode. (c) Mutual "
+    f"a non-heartbeat-locked control (n = {CC['n_patients']:,}). (a) Cross-correlation vs. lag, "
+    f"core electrodes ({'/'.join(CC['core_electrodes'])}); mean ± SEM. (b) Mean peak "
+    f"|cross-correlation| per electrode. (c) Mutual "
     f"information, core electrodes. (d) Mutual information per electrode.",
         styles["Caption"]),
 ]))
@@ -969,18 +973,20 @@ story.append(Paragraph(
 story.append(KeepTogether([
     fig("figS5_psd_comparison.png", 6.6 * inch, crop=False),
     Paragraph(
-    f"<b>Figure S4.</b> Power spectral density (Welch, dB) of the pre-ICA, post-ICA, "
-    f"non-heartbeat-locked control, and ECG evoked waveforms (n = {PSD['n_patients']:,}). (a) Core "
-    f"electrodes ({'/'.join(PSD['core_electrodes'])}), mean \u00b1 SEM. (b) Each of the six "
-    f"well-covered sites.",
+    f"<b>Figure S4.</b> Power spectral density (Welch, dB). (a) Continuous 10-min EEG of the "
+    f"Figure 4a example patient (C4): raw, after ECG-informed ICA, and after ICA+CFAR; dashed line, 1/f spectrum fit to "
+    f"ICA+CFAR over 1–40 Hz. (b, c) "
+    f"Pre-ICA, post-ICA, non-heartbeat-locked control, and ECG evoked waveforms "
+    f"(n = {PSD['n_patients']:,}): (b) core electrodes ({'/'.join(PSD['core_electrodes'])}), "
+    f"mean \u00b1 SEM; (c) each of the six well-covered sites.",
         styles["Caption"]),
 ]))
 story.append(Paragraph(
     "The ECG spectrum was broadband, dominated by the sharp QRS transient, which the non-locked "
     "control lacked. Pre-ICA and post-ICA EEG spectra lay between these references and closer to "
     "the ECG than the control, supporting Sections 3.3 and S3 in the spectral domain. Spectral shape "
-    "was similar across electrodes (panel b), so CFA varies across the scalp mainly in magnitude "
-    "(Figure 2c), not spectral content. Spectra end at 100 Hz, the upper edge of the analysis filter "
+    "was similar across electrodes (panel c), so CFA varies across the scalp mainly in magnitude "
+    "(Figure 2c), not spectral content. Spectra are shown up to 99 Hz, just below the 100 Hz upper edge of the analysis filter "
     "(Section 2.2).",
     styles["Body"]))
 
@@ -1001,8 +1007,8 @@ story.append(Paragraph(
 story.append(KeepTogether([
     fig("figS6_sex_bmi_confound.png", 4.5 * inch),
     Paragraph(
-    f"<b>Figure S5.</b> Male-versus-female CFA R² (outside QRS) OLS coefficient, without and with "
-    f"BMI adjustment (n = {CONF['n']:,}); points, coefficient; bars, 95% CI.",
+    f"<b>Figure S5.</b> Male-versus-female CFA R² coefficient without and with BMI adjustment "
+    f"(± 95% CI).",
         styles["Caption"]),
 ]))
 story.append(Paragraph(
@@ -1010,6 +1016,121 @@ story.append(Paragraph(
     f"BMI, so BMI does not explain the sex effect; sex and BMI were independently associated with "
     f"CFA.",
     styles["Body"]))
+
+CP = S.get("cfar_pipeline")
+if CP and os.path.exists(os.path.join(FIG_DIR, "figS10_cfar_pipeline.png")):
+    (tp, fn), (fp, tn) = CP["conf"]
+    story.append(Paragraph("S6. How CFAR works", styles["H2"]))
+    story.append(Paragraph(
+        f"CFAR (Section 2.8) is a single linear layer whose weights are learned from ECG-locked EEG. "
+        f"Training passes each patient's continuous EEG through R-peak epoching, averaging, and an SVD "
+        f"that returns the patient's CFA scalp pattern; patterns are sign-aligned and averaged with "
+        f"CFA R² weights into the population filter u. Inference needs no ECG: every EEG sample x is "
+        f"replaced by (I − u uᵀ) x. The filter converged quickly: with 100 training patients its median "
+        f"cosine similarity to held-out patients' own patterns was {CP['cos_at_100']:.2f}, against "
+        f"{CP['plateau_cos']:.2f} with the full training set (n = {CP['n_patterns']:,} patterns). "
+        f"Taking CFA as detected when a patient's R² exceeded the 95th percentile of the "
+        f"non-heartbeat-locked null (R² &gt; {CP['null_thr']:.2f}), CFA was detected in "
+        f"{CP['pct_detected_pre']:.0f}% of patients in raw EEG and {CP['pct_detected_post']:.0f}% "
+        f"after CFAR; CFAR cleared it in {CP['pct_detected_cleared']:.0f}% of patients in whom it was "
+        f"detected ({fn:,} of {tp + fn:,}), and {fp:,} patients without detected CFA rose above the "
+        f"threshold after cleaning.",
+        styles["Body"]))
+    story.append(KeepTogether([
+        fig("figS10_cfar_pipeline.png", 6.6 * inch, crop=False),
+        Paragraph(
+        f"<b>Figure S6.</b> How CFAR works. (a) Pipeline, with 4 s of the Figure 4a example patient: "
+        f"data in (six-channel EEG and ECG), training layers (orange; ECG used, {CD['n_folds']}-fold "
+        f"cross-fitting), the learned population filter u, and the inference layer (blue; no ECG) "
+        f"producing cleaned EEG. (b) Training curve: median |cosine| between the filter learned from n "
+        f"training patients and held-out patients' own CFA patterns (20 random draws per n; band, 95% "
+        f"range). (c) Weights of the projection layer I − u uᵀ. (d) Confusion matrix of patients with "
+        f"CFA detected (R² above the 95th percentile of the non-heartbeat-locked null) in raw EEG "
+        f"versus after CFAR (n = {tp + fn + fp + tn:,}).",
+            styles["Caption"]),
+    ]))
+
+WO = S["window_optimization"]
+WO_T = {r["minutes"]: r for r in WO["table"]}
+WO_LO, WO_HI = WO["lengths"][0], WO["lengths"][-1]
+story.append(Paragraph("S7. CFA R² across segment durations", styles["H2"]))
+story.append(Paragraph(
+    f"Extending Figure 3d, the full-cohort analysis was repeated at {', '.join(map(str, WO['lengths'][:-1]))} "
+    f"and {WO_HI} min. Each duration drew its own seeded random window, so duration and position in the "
+    f"night are not separated here. To keep differences in channel sets from appearing as duration "
+    f"effects, only patient-channel pairs present at every duration were used "
+    f"(n = {WO['n_complete_patients']:,} patients). Mean R² rose from {WO_T[WO_LO]['mean_r2']:.2f} at "
+    f"{WO_LO} min to {WO_T[WO_HI]['mean_r2']:.2f} at {WO_HI} min, with smaller gains at longer "
+    f"durations. Rank agreement with the {WO_HI}-min estimate rose from ρ = "
+    f"{WO_T[WO_LO]['rho_vs_longest']:.2f} ({WO_LO} min) to {WO_T[WO['lengths'][-2]]['rho_vs_longest']:.2f} "
+    f"({WO['lengths'][-2]} min), while the share of patients with a valid window fell from "
+    f"{100 * WO_T[WO_LO]['retention']:.0f}% to {100 * WO_T[WO_HI]['retention']:.0f}%. Because agreement "
+    f"with the longest duration always favours the duration closest to it, this comparison cannot by "
+    f"itself identify an optimal duration; Section S8 tests this directly.",
+    styles["Body"]))
+story.append(KeepTogether([
+    fig("figS8_window_optimization.png", 6.6 * inch, crop=False),
+    Paragraph(
+    f"<b>Figure S7.</b> CFA R² across segment durations (n = {WO['n_complete_patients']:,} patients with "
+    f"every duration). (a) Patient-mean R² per duration (box, IQR; line, mean). (b) Spearman rank "
+    f"agreement with the {WO_HI}-min estimate and with the next-longer duration. (c) Per-patient |ΔR²| "
+    f"between consecutive durations (median, IQR band). (d) Share of the 7,230-patient list with a "
+    f"QC-passing window. (e) Example patients whose R² changes differently with duration. "
+    f"(f) Rank agreement with the {WO_HI}-min estimate vs. retention.",
+        styles["Caption"]),
+]))
+
+WR = S["window_reliability"]
+WR_T = {r["window_minutes"]: r for r in WR["table"]}
+WR_L = sorted(WR_T)
+WR_SB = WR["spearman_brown_5min"]
+WR_SB90 = min((int(k) for k, v in WR_SB.items() if v >= 0.9), default=None)
+story.append(Paragraph("S8. Test-retest reliability and the optimal window length", styles["H2"]))
+story.append(Paragraph(
+    "To separate duration from position and to measure reliability, each recording was divided into "
+    "5-min blocks, and each block was checked with the same quality criteria as the main analysis "
+    "(Section 2.2). For each block, the R-peak-locked EEG and ECG epochs were summed. A window of L "
+    "minutes was then defined as L/5 contiguous QC-passing blocks, and its evoked average was the "
+    "pooled sum of those blocks divided by their total beat count. All durations were therefore "
+    "measured within the same night, with nested windows and as many non-overlapping repeats as the "
+    "recording allowed. CFA R² (outside QRS, mean across channels) was computed as in Section 2.3. "
+    "Reliability was the one-way random-effects ICC(1) across a patient's repeat windows (patients with "
+    "at least two windows; 95% CI from 200 patient bootstraps).",
+    styles["Body"]))
+story.append(Paragraph(
+    f"ICC rose steadily with duration, from {WR_T[WR_L[0]]['icc']:.2f} (95% CI "
+    f"{WR_T[WR_L[0]]['icc_lo']:.2f}–{WR_T[WR_L[0]]['icc_hi']:.2f}) at {WR_L[0]} min to "
+    f"{WR_T[10]['icc']:.2f} at 10 min and {WR_T[WR_L[-1]]['icc']:.2f} "
+    f"({WR_T[WR_L[-1]]['icc_lo']:.2f}–{WR_T[WR_L[-1]]['icc_hi']:.2f}) at {WR_L[-1]} min. No single "
+    f"duration reached 0.90. Window-to-window SD within patients fell only slightly "
+    f"({WR_T[WR_L[0]]['sd_within']:.3f} to {WR_T[WR_L[-1]]['sd_within']:.3f}), whereas between-patient "
+    f"SD grew ({WR_T[WR_L[0]]['sd_between']:.3f} to {WR_T[WR_L[-1]]['sd_between']:.3f}). In the same "
+    f"patients and night (n = {WR['bias_cohort_n']:,}), mean R² still rose with duration (panel c), "
+    f"so the duration effect in Figure 3d is at least partly an estimation effect: averaging more "
+    f"beats reduces residual EEG noise in the evoked average and raises its correlation with the ECG. "
+    f"Longer windows also cost patients: {WR_T[WR_L[-1]]['ret_ge1']:.0f}% had a QC-passing "
+    f"{WR_L[-1]}-min stretch, against {WR_T[30]['ret_ge1']:.0f}% at 30 min. The shortest duration "
+    f"whose ICC lower bound reached 0.75 was {WR['optimal_minutes']} min "
+    f"(ICC {WR_T[WR['optimal_minutes']]['icc']:.2f}, {WR_T[WR['optimal_minutes']]['ret_ge1']:.1f}% "
+    f"retained). The Spearman-Brown formula predicts that averaging separate {WR_L[0]}-min windows "
+    f"spread across the night would reach ICC 0.90 with {WR_SB90} min of data in total, which no single "
+    f"contiguous window achieved. This is a prediction that assumes independent windows and was not "
+    f"tested empirically.",
+    styles["Body"]))
+story.append(KeepTogether([
+    fig("figS9_window_reliability.png", 6.6 * inch, crop=False),
+    Paragraph(
+    f"<b>Figure S8.</b> Test-retest reliability of CFA R² vs. window length "
+    f"(n = {WR_T[WR_L[0]]['n_ge1']:,} patients; repeat windows from the same night). (a) ICC(1) across "
+    f"repeat windows (band, 95% bootstrap CI; dashed/dotted, 0.90/0.75). (b) Within-patient "
+    f"(window-to-window) and between-patient SD. (c) Mean R² in patients with a window at every "
+    f"duration (± 95% CI). (d) Patients with at least one / two windows of each duration. "
+    f"(e) Every repeat window of three example patients (low, median, and high {WR_L[0]}-min spread). "
+    f"(f) ICC of one contiguous window vs. the Spearman-Brown prediction for the mean of k separate "
+    f"{WR_L[0]}-min windows, against total minutes analysed; circle, the shortest single window "
+    f"reaching ICC lower bound 0.75.",
+        styles["Caption"]),
+]))
 
 # ---------------------------------------------------------------------
 # Acknowledgements

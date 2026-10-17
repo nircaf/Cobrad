@@ -7,6 +7,7 @@ and paper_stats.json["dose_response"] (window_stage_sensitivity_report.py).
 Run: venv/bin/python "paper utils/Paper CFA/make_fig3.py"
 """
 import json
+import math
 import os
 
 import matplotlib
@@ -14,6 +15,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from scipy.optimize import curve_fit
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PALETTE = ["#0072B2", "#D55E00", "#009E73", "#CC79A7", "#F0E442", "#56B4E9", "#E69F00", "#000000"]
@@ -28,7 +30,7 @@ with open(os.path.join(HERE, "paper_stats.json")) as f:
     S = json.load(f)
 dose = pd.DataFrame(S["dose_response"]["lengths"])
 dstrat = pd.DataFrame(S["dose_response"]["stratified_by_length"])
-TICKS = [5, 10, 20, 30, 45, 60]
+TICKS = [5, 10, 20, 30, 45, 60, 75, 90]
 YLAB = "Patient-mean CFA R² (outside QRS)"
 
 
@@ -60,20 +62,44 @@ ax.set_ylabel(YLAB)
 title(ax, f"CFA by sex (p = {S['stratified']['p_sex_mannwhitney']:.1e})")
 
 ax = axes[0, 2]
+rs = {}
 for sex, c in SEX_COLORS.items():
     g = bmi[bmi.sex == sex]
+    rs[sex] = (np.corrcoef(g.bmi, g.cfa_r2_excl_qrs)[0, 1], len(g))
     ax.scatter(g.bmi, g.cfa_r2_excl_qrs, s=5, alpha=0.12, color=c, edgecolor="none", rasterized=True)
     k, b = np.polyfit(g.bmi, g.cfa_r2_excl_qrs, 1)
     xs = np.linspace(g.bmi.min(), g.bmi.max(), 100)
-    ax.plot(xs, k * xs + b, color=c, lw=1.8, label=f"{sex} (n = {len(g):,})")
+    ax.plot(xs, k * xs + b, color=c, lw=1.8, label=f"{sex} (n = {len(g):,}; r = {rs[sex][0]:.2f})")
 ax.set_xlabel("BMI (kg/m²)")
 ax.set_ylabel(YLAB)
 ax.legend(frameon=False, fontsize=7.5)
-title(ax, f"CFA vs. BMI by sex (r = {np.corrcoef(bmi.bmi, bmi.cfa_r2_excl_qrs)[0, 1]:.2f})")
+# Fisher r-to-z test for difference between two independent correlations
+(r_f, n_f), (r_m, n_m) = rs["Female"], rs["Male"]
+z = (np.arctanh(r_f) - np.arctanh(r_m)) / math.sqrt(1 / (n_f - 3) + 1 / (n_m - 3))
+p_diff = math.erfc(abs(z) / math.sqrt(2))
+print(f"Fig 3c: r_female = {r_f:.3f} (n={n_f}), r_male = {r_m:.3f} (n={n_m}), Fisher z = {z:.2f}, p = {p_diff:.2e}")
+title(ax, f"CFA vs. BMI by sex (Δr p = {p_diff:.1e})")
 
 ax = axes[1, 0]
 ax.errorbar(dose.window_minutes, dose["mean"], yerr=1.96 * dose["sem"], marker="o", ms=4, capsize=3,
             color=PALETTE[0], lw=1.6)
+
+
+def sat(t, A, k, c):
+    """Saturating hyperbola: c at t = 0, half-way to the asymptote A at t = k."""
+    return c + (A - c) * t / (t + k)
+
+
+p, C = curve_fit(sat, dose.window_minutes, dose["mean"], p0=(0.45, 10, 0.2), sigma=dose["sem"], absolute_sigma=True)
+A, k, c = p
+A_ci = 1.96 * math.sqrt(C[0, 0])
+chi2 = float((((dose["mean"] - sat(dose.window_minutes, *p)) / dose["sem"]) ** 2).sum())
+print(f"Fig 3d fit: R2_inf = {A:.4f} ± {A_ci:.4f}, k = {k:.2f} min, c = {c:.4f}, chi2 = {chi2:.1f} (df {len(dose) - 3})")
+S["dose_fit"] = {"asymptote": A, "asymptote_ci_lo": A - A_ci, "asymptote_ci_hi": A + A_ci, "k_min": k, "c": c,
+                 "chi2": chi2, "df": len(dose) - 3, "pct_of_asymptote_at_10": 100 * sat(10, *p) / A,
+                 "pct_of_asymptote_at_max": 100 * sat(dose.window_minutes.max(), *p) / A}
+with open(os.path.join(HERE, "paper_stats.json"), "w") as f:
+    json.dump(S, f, indent=2)
 title(ax, f"CFA vs. segment duration (n = {S['dose_response']['n_common_patients']:,})")
 ax.set_ylabel("Mean CFA R² (± 95% CI)")
 
@@ -95,7 +121,7 @@ title(ax, "Duration effect by diagnosis")
 for ax in axes[1]:
     ax.set_xlabel("Segment duration (min)")
     ax.set_xticks(TICKS)
-    ax.set_xlim(2, 63)
+    ax.set_xlim(2, 93)
 
 fig.tight_layout(h_pad=2.2, w_pad=2.0)
 for ext in ("png", "pdf"):
