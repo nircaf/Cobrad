@@ -76,7 +76,7 @@ print(f"Across-length (same patient/stage, pooled over lengths+locations) SD: "
 # Part 2: full-cohort window-length dose-response (cohort-matched)
 # =============================================================================
 demo = pd.read_parquet(os.path.join(HERE, "demographics_combined.parquet"))
-length_files = {10: os.path.join(HERE, "cfa_combined.parquet")}
+length_files = {10: os.path.join(HERE, "cfa_combined_10min.parquet")}
 for path in glob.glob(os.path.join(HERE, "cfa_variance_explained_*min.parquet")):
     m = re.search(r"_(\d+)min\.parquet$", path)
     if m:
@@ -156,7 +156,7 @@ ax.legend(fontsize=7, frameon=False)
 
 ax = axes[2]
 ax.plot(strat.window_minutes, strat.any_dx_mean, marker="s", color=PALETTE[1], label="≥1 diagnosis")
-ax.plot(strat.window_minutes, strat.no_dx_mean, marker="s", color=PALETTE[2], label="No diagnosis")
+ax.plot(strat.window_minutes, strat.no_dx_mean, marker="s", color=PALETTE[2], label="Undiagnosed")
 ax.set_xlabel("Window length (min)")
 ax.set_ylabel("Mean CFA R²")
 ax.set_xticks([5, 10, 20, 30, 45, 60])

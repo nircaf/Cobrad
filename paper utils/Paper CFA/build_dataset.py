@@ -104,14 +104,21 @@ def assign_categories(dx_names: list[str]) -> list[str]:
     return sorted(cats)
 
 
+# Main analysis window. R² keeps rising with segment length up to ~45 min (Fig 3d, S8), so the paper's
+# main tables use 45-min windows; the 10-min tables are kept as *_10min.parquet for reference.
+MAIN_WINDOW_MIN = 45
+
+
 def main():
-    print("Combining CFA cache...")
-    cfa = combine_cache(HERE / "cfa_variance_explained_cache")
+    print(f"Loading {MAIN_WINDOW_MIN}-min CFA run...")
+    cfa = pd.read_parquet(HERE / f"cfa_variance_explained_{MAIN_WINDOW_MIN}min.parquet")
     print(f"  {len(cfa):,} rows, {cfa.patient_id.nunique():,} patients")
     cfa.to_parquet(HERE / "cfa_combined.parquet", index=False)
 
-    print("Combining ICA cache (job still running in background -- interim snapshot)...")
-    ica = combine_cache(HERE / "ica_ecg_component_variance_cache")
+    # ponytail: cfa/ica_combined_10min.parquet are frozen copies of the previous 10-min tables (the 10-min
+    # cache kept growing after that snapshot); window-length analyses use them as their 10-min point.
+    print(f"Combining {MAIN_WINDOW_MIN}-min ICA cache...")
+    ica = combine_cache(HERE / f"ica_ecg_component_variance_cache_{MAIN_WINDOW_MIN}min")
     print(f"  {len(ica):,} rows, {ica.patient_id.nunique():,} patients")
     ica.to_parquet(HERE / "ica_combined.parquet", index=False)
 

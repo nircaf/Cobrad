@@ -1,0 +1,41 @@
+{
+ "n_total": 78,
+ "n": 30,
+ "n_excluded": 48,
+ "n_bipolar": 23,
+ "n_referential": 7,
+ "r2_raw_median": 0.30235077494736795,
+ "r2_ica_median": 0.2730377912261038,
+ "r2_own_median": 0.15590712340108484,
+ "left_ica_median": 84.1133097202484,
+ "left_own_median": 24.07430113172598,
+ "hep_ica_median": 0.9961691078280295,
+ "hep_own_median": 0.40354561141990597,
+ "gain_ica_median": 1.1241916916362737,
+ "gain_own_median": 1.8189146019320916,
+ "p_left": 2.60770320892334e-08,
+ "p_hep": 3.725290298461914e-09,
+ "p_gain": 0.02084985189139843,
+ "pct_own_cleaner": 93.33333333333333,
+ "pct_own_higher_gain": 60.0,
+ "example": {
+  "patient_id": "0345-115",
+  "montage": "referential",
+  "channel": "O2",
+  "r2_raw": 0.8889198966649684,
+  "r2_ica": 0.8891373991494131,
+  "r2_own": 0.02075368602735044
+ },
+ "twave_power": {
+  "raw": 0.1955202577422738,
+  "ica": 0.13128265790315713,
+  "own": 0.040515224169928754
+ },
+ "cfa_free_pct_raw": 28.174603174603174,
+ "cfa_free_pct_ica": 30.95238095238095,
+ "cfa_free_pct_own": 48.80952380952381,
+ "p_free_own_vs_ica": 0.0051162883533505425,
+ "ref_mean_r2_raw": 0.31078779795534833,
+ "ref_mean_r2_ica": 0.29715123453422276,
+ "ref_mean_r2_own": 0.17498456572603535
+}

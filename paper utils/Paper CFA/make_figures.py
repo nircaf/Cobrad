@@ -396,18 +396,10 @@ if all(len(g) > 1 for g in dx_groups):
     _, p_dx = stats.mannwhitneyu(dx_groups[0], dx_groups[1])
 
 ax = axes[2]
-# Maximise measured-BMI coverage without duplicating patients: select each
-# patient's longest available CFA window (30, then 20, 10, and 5 min). The
-# longer windows are preferred because Figure 5 shows more stable CFA R² with
-# increasing duration. Each duration is reduced to the same six-site patient
-# mean before patient-level selection.
+# BMI uses the main-analysis windows (45 min; shorter windows underestimate CFA, Figure 3d), reduced to
+# the same six-site patient mean as elsewhere.
 bmi_duration_frames = []
-for window_minutes, filename in [
-    (30, "cfa_variance_explained_30min.parquet"),
-    (20, "cfa_variance_explained_20min.parquet"),
-    (10, "cfa_combined.parquet"),
-    (5, "cfa_variance_explained_5min.parquet"),
-]:
+for window_minutes, filename in [(45, "cfa_combined.parquet")]:
     duration_cfa = pd.read_parquet(os.path.join(HERE, filename))
     duration_cfa["canon"] = canonicalize(duration_cfa["eeg_channel"])
     duration_cfa = filter_min_coverage(

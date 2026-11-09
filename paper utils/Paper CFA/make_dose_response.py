@@ -38,7 +38,7 @@ plt.rcParams.update({
 
 demo = pd.read_parquet(os.path.join(HERE, "demographics_combined.parquet"))
 
-length_files = {10: os.path.join(HERE, "cfa_combined.parquet")}
+length_files = {10: os.path.join(HERE, "cfa_combined_10min.parquet")}
 for path in glob.glob(os.path.join(HERE, "cfa_variance_explained_*min.parquet")):
     m = re.search(r"_(\d+)min\.parquet$", path)
     if m:
@@ -113,7 +113,7 @@ ax = axes[1]
 ax.plot(strat.window_minutes, strat.male_mean, marker="o", color=PALETTE[0], label="Male")
 ax.plot(strat.window_minutes, strat.female_mean, marker="o", color=PALETTE[3], label="Female")
 ax.plot(strat.window_minutes, strat.any_dx_mean, marker="s", color=PALETTE[1], linestyle="--", label="≥1 diagnosis")
-ax.plot(strat.window_minutes, strat.no_dx_mean, marker="s", color=PALETTE[2], linestyle="--", label="No diagnosis")
+ax.plot(strat.window_minutes, strat.no_dx_mean, marker="s", color=PALETTE[2], linestyle="--", label="Undiagnosed")
 ax.set_xlabel("Window length (minutes)")
 ax.set_ylabel("Mean CFA R²")
 ax.set_title("b  Do sex/diagnosis gaps hold at every length?", loc="left", fontsize=10, fontweight="bold")

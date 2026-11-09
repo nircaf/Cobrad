@@ -73,8 +73,11 @@ EXAMPLE, EXAMPLE_SITE, EXAMPLE_T0 = "I0002150406452", "C4", 443.0
 # after CFAR, for the clearest ECG-shaped HEP (P-QRS-T) that CFAR flattens
 HEP_EXAMPLE, HEP_SITE = "I0002150007970", "F4"
 N_FOLDS, SEED, N_WORKERS = 5, 1, 64
+WINDOW_SEC = 45 * 60  # main-analysis window; must match cfa_combined.parquet (build_dataset.MAIN_WINDOW_MIN)
 INJECT_LAT, INJECT_SD, INJECT_UV = 0.30, 0.05, 2.0  # synthetic neural HEP (Gaussian)
 INJECT_W = np.array([1.0, 1.0, 0.7, 0.7, 0.3, 0.3])  # frontal > central > occipital
+V3 = bool(os.environ.get("CFA_V3"))  # v3 manuscript (NeuroImage): capital panel letters, separate file
+PL = str.upper if V3 else str
 
 
 def epoch_times(sfreq):
@@ -82,7 +85,7 @@ def epoch_times(sfreq):
 
 
 def load(job):
-    """10-min QC'd window (as in cfa_combined), standard 6-site montage only."""
+    """QC'd main-analysis window (WINDOW_SEC, as in cfa_combined), standard 6-site montage only."""
     pid, path, start = job
     try:
         raw = mne.io.read_raw_edf(path, preload=False, encoding="latin1", verbose="ERROR")
@@ -90,7 +93,7 @@ def load(job):
         canon = canonicalize(pd.Series(eeg_names)).tolist()
         if len(eeg_names) != 6 or sorted(canon) != sorted(SITES):
             return None
-        seg = raw.copy().pick(eeg_names + [ecg_name]).crop(start, start + 600, include_tmax=False)
+        seg = raw.copy().pick(eeg_names + [ecg_name]).crop(start, start + WINDOW_SEC, include_tmax=False)
         seg.load_data(verbose="ERROR")
         _, qc = quality(seg, eeg_names, ecg_name)
         sfreq = float(seg.info["sfreq"])
@@ -222,6 +225,10 @@ def evaluate(rec, u_pop, u_cov, seed):
     keep = np.abs(tt) > QRS_EXCLUDE_SEC
     ev_null = epoch_around_r_peaks(eeg, pseudo, sfreq).mean(0)
     r2_null = np.array([np.corrcoef(c[keep], ecg_ev[keep])[0, 1] ** 2 for c in ev_null])
+    # HEP SNR: heartbeat-locked evoked variance outside QRS vs the same average around pseudo-events
+    # (noise floor), before and after CFAR -> is there heartbeat-locked signal left after cleaning?
+    ev_null_clean = epoch_around_r_peaks(clean, pseudo, sfreq).mean(0)
+    hepvar = lambda ev: float(np.mean(ev[:, keep].var(1)))
     # synthetic neural HEP survives projection by 1 - (w.u)^2/|w|^2 exactly; measure it empirically
     wave = -INJECT_UV * np.exp(-0.5 * ((tt - INJECT_LAT) / INJECT_SD) ** 2)
     inj = np.zeros_like(eeg)
@@ -240,16 +247,19 @@ def evaluate(rec, u_pop, u_cov, seed):
            {"pre": eeg, "clean": clean, "own": own, **combos}.items()},
         "r2_pre": r2_pre.mean(), "r2_clean": r2_clean.mean(), "r2_own": r2_own.mean(),
         "r2_cov": r2_cov.mean(), "r2_null": r2_null.mean(),
+        "r2_null_clean": float(np.mean([np.corrcoef(c[keep], ecg_ev[keep])[0, 1] ** 2 for c in ev_null_clean])),
+        "hepvar_pre": hepvar(ev_pre), "hepvar_clean": hepvar(ev_clean),
+        "hepvar_null": hepvar(ev_null), "hepvar_null_clean": hepvar(ev_null_clean),
         "frac_pre": cardiac_fraction(eeg, peaks, sfreq), "frac_clean": cardiac_fraction(clean, peaks, sfreq),
         "frac_cov": cardiac_fraction(cov, peaks, sfreq),
         "hep_retained": float(np.sum(rec_inj * target) / np.sum(target * target)),
         "psd_change_db": float(np.median(10 * np.log10(p_clean[:, band] / p_pre[:, band]))),
-    }, {"eeg": eeg, "clean": clean, "ecg": ecg, "sfreq": sfreq, "peaks": peaks, "tt": tt,
+    }, {"eeg": eeg, "clean": clean, "own": own, "ecg": ecg, "sfreq": sfreq, "peaks": peaks, "tt": tt,
         "ev_pre": ev_pre, "ev_clean": ev_clean, "ev_own": ev_own, "r2_pre": r2_pre, "r2_clean": r2_clean}
 
 
 # Figure 4d pipelines from benchmark_ica_cfar.py: (column, label, uses ECG, color)
-BENCH = [("ica_iclabel", "ICA", False, PALETTE[5]), ("ica", "ECG-informed ICA", True, PALETTE[5]), ("ecgreg", "ECG regression", True, PALETTE[3]),
+BENCH = [("ica_iclabel", "ICLabel ICA", False, PALETTE[5]), ("ica", "ICA", True, PALETTE[5]), ("ecgreg", "ECG regression", True, PALETTE[3]),
          ("cfar", "CFAR", False, "black"), ("ica_cfar_raw", "ICA+CFAR", True, PALETTE[6]),
          ("cfar_ica", "CFAR+ICA", True, PALETTE[0]), ("cfar_ecgreg_dir", "CFAR+ECG regression", True, PALETTE[6]),
          ("own", "Patient-specific CFAR", True, PALETTE[2])]
@@ -266,7 +276,9 @@ def bench_summary(n_boot=2000):
     for k, *_ in BENCH:
         if f"pow_{k}" not in b:
             continue
-        for name, v in [("pow_pct", (b[f"pow_{k}"] / b.pow_raw * 100).to_numpy()), ("hep", b[f"hep_{k}"].to_numpy())]:
+        # gain: per-patient neural kept / cardiac left, i.e. neural:cardiac ratio relative to raw EEG
+        for name, v in [("pow_pct", (b[f"pow_{k}"] / b.pow_raw * 100).to_numpy()), ("hep", b[f"hep_{k}"].to_numpy()),
+                        ("gain", (b[f"hep_{k}"] * b.pow_raw / b[f"pow_{k}"]).to_numpy())]:
             boot = np.nanmedian(v[idx], axis=1)
             out[f"{k}_{name}"] = float(np.nanmedian(v))
             out[f"{k}_{name}_ci"] = [float(x) for x in np.percentile(boot, [2.5, 97.5])]
@@ -400,12 +412,12 @@ def plot(res, ex, u_pop, hx):
             ax.axvline((p - sl.start) / sf, color="0.75", lw=0.8, ls="--", zorder=0)
     ax.plot([], [], color="0.75", lw=0.8, ls="--", label="R-peak")
     ax.plot(t, ex["eeg"][i, sl], color=PALETTE[1], lw=1.1, label="Raw EEG")
-    ax.plot(t, ex["clean"][i, sl], color="black", lw=1.1, label="After CFAR (no ECG)")
+    ax.plot(t, ex["clean"][i, sl], color="black", lw=1.1, label="CFAR (no ECG)" if V3 else "After CFAR (no ECG)")
     ax.set_xlabel("Time (s)")
     ax.set_ylabel(f"{EXAMPLE_SITE} (µV)")
     ax.set_xlim(0, 5)
     ax.legend(frameon=False, fontsize=7.5, loc="upper center", ncol=3, bbox_to_anchor=(0.5, -0.18))
-    ax.set_title("a", loc="left", fontsize=10, fontweight="bold")
+    ax.set_title(PL("a"), loc="left", fontsize=10, fontweight="bold")
     pt = res.set_index("patient_id").loc[EXAMPLE]
     # R² is scale-free (shape match), so report patient-mean R² plus the amplitude drop shown here
     rms = np.sqrt(np.mean(ex["clean"][i, sl] ** 2) / np.mean(ex["eeg"][i, sl] ** 2))
@@ -423,12 +435,12 @@ def plot(res, ex, u_pop, hx):
     ax.plot(ms, hx["ev_pre"][j], color=PALETTE[1], lw=1.4,
             label=f"Raw EEG, R² {hx['r2_pre'][j]:.2f}")
     ax.plot(ms, hx["ev_clean"][j], color="black", lw=1.4,
-            label=f"After CFAR, R² {hx['r2_clean'][j]:.2f}")
+            label=("CFAR" if V3 else "After CFAR") + f", R² {hx['r2_clean'][j]:.2f}")
     ax.set_xlim(ms[0], ms[-1])
     ax.set_xlabel("Time from R-peak (ms)")
     ax.set_ylabel(f"{HEP_SITE} HEP (µV)")
     ax.legend(frameon=False, fontsize=7, loc="upper center", bbox_to_anchor=(0.5, -0.18))
-    ax.set_title("b", loc="left", fontsize=10, fontweight="bold")
+    ax.set_title(PL("b"), loc="left", fontsize=10, fontweight="bold")
     hp = res.set_index("patient_id").loc[HEP_EXAMPLE]
     bmi = f", BMI {hp.bmi:.1f}" if pd.notna(hp.bmi) else ""
     ax.set_title(f"HEP: {hp.sex.lower()}, {hp.age:.0f} y{bmi}\n({len(hx['peaks']):,} beats; "
@@ -439,17 +451,17 @@ def plot(res, ex, u_pop, hx):
     im = topo(ax, u_pop)
     cb = fig.colorbar(im, ax=ax, shrink=0.6, pad=0.02)
     cb.set_label("Weight (a.u.)", fontsize=7.5)
-    ax.set_title("c", loc="left", fontsize=10, fontweight="bold")
+    ax.set_title(PL("c"), loc="left", fontsize=10, fontweight="bold")
     ax.set_title("CFAR filter", fontsize=9)
 
     # d: cleaning trade-off as two side-by-side bar charts (ICA+CFAR, CFAR+ECG regression kept in stats, not plotted),
     # pipelines sorted by CFA left, most to least
     from matplotlib.patches import Patch
     B = bench_summary()
-    rows = sorted([b for b in BENCH if b[0] not in ("ica", "ica_cfar_raw", "cfar_ecgreg_dir")], key=lambda b: -B[f"{b[0]}_pow_pct"])
+    rows = sorted([b for b in BENCH if b[0] not in ("ica_iclabel", "ecgreg", "ica_cfar_raw", "cfar_ecgreg_dir")], key=lambda b: -B[f"{b[0]}_pow_pct"])
     x = np.arange(len(rows))
     dd = bot[0].subgridspec(1, 2, wspace=0.3)
-    for col, (metric, ylabel, scale) in enumerate([("pow_pct", "ECG-explained EEG variance left\n(% of raw EEG; lower = better)", 1),
+    for col, (metric, ylabel, scale) in enumerate([("pow_pct", ("ECG-explained HEP variance left\n(% of raw; lower = better)" if V3 else "ECG-explained EEG variance left\n(% of raw EEG; lower = better)"), 1),
                                                    ("hep", "Neural signal preserved\n(%; higher = better)", 100)]):
         ax = fig.add_subplot(dd[col])
         for xi, (k, label, ecg, color) in zip(x, rows):
@@ -465,31 +477,34 @@ def plot(res, ex, u_pop, hx):
         ax.set_ylabel(ylabel, fontsize=8)
         ax.set_ylim(0, 115 if metric == "hep" else max(B[f"{b[0]}_pow_pct_ci"][1] for b in rows) * 1.2)
         if col == 0:
-            ax.set_title("d", loc="left", fontsize=10, fontweight="bold")
+            ax.set_title(PL("d"), loc="left", fontsize=10, fontweight="bold")
             ax.legend(handles=[Patch(facecolor="0.35", label="No ECG"),
                                Patch(facecolor="0.35", hatch="///", edgecolor="white", lw=0, label="Uses ECG")],
                       frameon=False, fontsize=7.5, loc="upper center", ncol=2, bbox_to_anchor=(1.15, -0.25))
     fig.text(0.5 * (dd[0].get_position(fig).x0 + dd[1].get_position(fig).x1), dd[0].get_position(fig).y1 + 0.012,
              f"Cleaning pipelines (n = {B['n']:,} patients; median, 95% CI)", ha="center", fontsize=9)
 
-    # e: who needs cleaning: CFA by BMI, all patients, before (solid) and after (dashed)
+    # e: net cleaning gain: neural kept / cardiac left per patient (same pipelines, sorted by gain)
     ax = fig.add_subplot(bot[1])
-    edges = [15, 25, 30, 35, 40, 60]
-    for col, ls, color, tag in [("r2_pre", "-", PALETTE[1], "Raw EEG"), ("r2_clean", "--", "black", "After CFAR")]:
-        mid, m_, s_ = [], [], []
-        for lo, hi in zip(edges[:-1], edges[1:]):
-            b_ = res[(res.bmi >= lo) & (res.bmi < hi)][col]
-            if len(b_) >= 10:
-                mid.append((lo + hi) / 2); m_.append(b_.mean()); s_.append(b_.sem())
-        ax.errorbar(mid, m_, yerr=s_, color=color, ls=ls, marker="o", ms=4, capsize=2, lw=1.4, label=tag)
-    ax.set_xlabel("BMI (kg/m²)")
-    ax.set_ylabel("Mean CFA R² (± SEM)")
-    ax.legend(frameon=False, fontsize=7.5, ncol=2, loc="upper center", bbox_to_anchor=(0.5, -0.2))
-    ax.set_title("e", loc="left", fontsize=10, fontweight="bold")
-    ax.set_title(f"CFA by BMI\n(n = {res.bmi.notna().sum():,})", fontsize=9)
+    grow = sorted(rows, key=lambda b: B[f"{b[0]}_gain"])
+    for xi, (k, label, ecg, color) in enumerate(grow):
+        v = B[f"{k}_gain"]
+        err = np.abs(np.array(B[f"{k}_gain_ci"]) - v)[:, None]
+        ax.bar(xi, v, yerr=err, width=0.7, color=color, alpha=0.85, hatch="///" if ecg else None,
+               edgecolor="white" if ecg else color, lw=0, error_kw={"lw": 1, "capsize": 2})
+        ax.text(xi, v + err[1, 0], f"{v:.1f}×", ha="center", va="bottom", fontsize=7.5, fontweight="bold")
+    ax.axhline(1, color="0.5", ls="--", lw=0.8)
+    ax.text(len(grow) - 0.45, 1, "raw\nEEG", fontsize=7, color="0.4", va="center", ha="left")
+    ax.set_xticks(range(len(grow)))
+    ax.set_xticklabels([b[1].replace("-", "-\n").replace(" ", "\n") for b in grow], fontsize=7)
+    ax.set_ylabel("Neural ÷ cardiac signal\n(gain vs. raw EEG; median, 95% CI)", fontsize=8)
+    ax.set_ylim(0, max(B[f"{b[0]}_gain_ci"][1] for b in grow) * 1.15)
+    ax.set_title(PL("e"), loc="left", fontsize=10, fontweight="bold")
+    ax.set_title(f"Cleanest EEG (n = {B['n']:,})", fontsize=9)
 
-    fig.savefig(os.path.join(FIG_DIR, "fig5_cleaning_demo.png"), bbox_inches="tight")
-    fig.savefig(os.path.join(FIG_DIR, "fig5_cleaning_demo.pdf"), bbox_inches="tight")
+    fig.savefig(os.path.join(FIG_DIR, "fig2_v3_cleaning.png" if V3 else "fig5_cleaning_demo.png"), bbox_inches="tight")
+    if not V3:
+        fig.savefig(os.path.join(FIG_DIR, "fig5_cleaning_demo.pdf"), bbox_inches="tight")
     plt.close(fig)
 
 

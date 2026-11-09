@@ -10,6 +10,9 @@
 (d) Confusion matrix: patients with CFA detected (R^2 above the 95th percentile of the
     non-heartbeat-locked null, r2_null) in raw EEG vs after CFAR (cleaning_demo.parquet).
 
+Figure S7 is the same layout for patient-specific CFAR (filter = the patient's own u_i, r2_own):
+(b) becomes the histogram of |cos(u_i, u)| and (c) shows the example patient's I - u_i u_i^T.
+
 Per-patient patterns are cached in cfar_patterns.parquet (one EDF pass, same jobs as make_cleaning_demo.py).
 Run: venv/bin/python "paper utils/Paper CFA/make_cfar_pipeline_figure.py"
 """
@@ -99,7 +102,10 @@ def traces(ax, x, sf, color, title, ecg=None):
     ax.set_title(title, fontsize=8)
 
 
-def plot(P, w, curve, res, u_pop, ex):
+def plot(P, w, curve, res, u_pop, ex, u_ex=None):
+    """u_ex given -> Figure S7, patient-specific CFAR (filter = the patient's own u_i); else Figure S6."""
+    own = u_ex is not None
+    u = u_ex if own else u_pop
     plt.rcParams.update({"font.family": "sans-serif", "font.size": 8, "axes.spines.top": False,
                          "axes.spines.right": False, "figure.dpi": 300, "savefig.dpi": 300})
     fig = plt.figure(figsize=(13, 8.2))
@@ -110,26 +116,30 @@ def plot(P, w, curve, res, u_pop, ex):
     ax = fig.add_subplot(rows[0])
     ax.set_xlim(0, 1); ax.set_ylim(0, 1); ax.axis("off")
     ax.set_title("a", loc="left", fontsize=10, fontweight="bold")
-    ax.text(0.5, 1.0, "CFAR pipeline: train once with ECG, apply to any EEG without ECG", ha="center",
+    ax.text(0.5, 1.0, "Patient-specific CFAR: fit and apply on each patient's own EEG + ECG" if own else
+            "CFAR pipeline: train once with ECG, apply to any EEG without ECG", ha="center",
             fontsize=9, transform=ax.transAxes)
     ax.add_patch(FancyBboxPatch((0.17, 0.53), 0.62, 0.42, boxstyle="round,pad=0.005", fc="#FFF4E8",
                                 ec=PAL[1], lw=0.8, ls="--"))
-    ax.text(0.175, 0.93, f"TRAINING (ECG used; {cd.N_FOLDS}-fold cross-fitting, "
+    ax.text(0.175, 0.93, "FIT (ECG required; this patient's own recording, no training cohort)" if own else
+            f"TRAINING (ECG used; {cd.N_FOLDS}-fold cross-fitting, "
             f"~{int(len(P) * (cd.N_FOLDS - 1) / cd.N_FOLDS):,} patients per fold)",
             fontsize=7.5, color=PAL[1], va="top", fontweight="bold")
     ax.add_patch(FancyBboxPatch((0.17, 0.03), 0.62, 0.42, boxstyle="round,pad=0.005", fc="#EAF3FA",
                                 ec=PAL[0], lw=0.8, ls="--"))
-    ax.text(0.175, 0.07, "INFERENCE (no ECG; held-out patient)", fontsize=7.5, color=PAL[0], fontweight="bold")
-    layers = [("1. R-peak\nepoching\n(−200…+600 ms)", 0.19), ("2. Evoked\naverage\n(6 × T)", 0.315),
-              ("3. SVD:\n1st spatial\nvector uᵢ", 0.44), ("4. Sign-align,\nR²-weighted\nmean → u", 0.565)]
+    ax.text(0.175, 0.07, "APPLY (same recording the filter was fitted on)" if own else
+            "INFERENCE (no ECG; held-out patient)", fontsize=7.5, color=PAL[0], fontweight="bold")
+    layers = [(f"1. R-peak\nepoching\n({cd.HEP_TMIN * 1000:+.0f}…{cd.HEP_TMAX * 1000:+.0f} ms)", 0.19), ("2. Evoked\naverage\n(6 × T)", 0.315),
+              ("3. SVD:\n1st spatial\nvector uᵢ", 0.44),
+              ("4. Filter = uᵢ\n(no pooling\nacross patients)" if own else "4. Sign-align,\nR²-weighted\nmean → u", 0.565)]
     for text, x0 in layers:
         box(ax, (x0, 0.62), 0.1, 0.2, text, "white", ec=PAL[1])
     for (_, x0), (_, x1) in zip(layers[:-1], layers[1:]):
         arrow(ax, (x0 + 0.1, 0.72), (x1, 0.72), PAL[1])
-    box(ax, (0.36, 0.13), 0.22, 0.2, "5. Projection layer\nx_clean = (I − u uᵀ) x\napplied to every sample",
-        "white", ec=PAL[0], fs=8)
+    box(ax, (0.36, 0.13), 0.22, 0.2, "5. Projection layer\nx_clean = (I − uᵢ uᵢᵀ) x\napplied to every sample" if own
+        else "5. Projection layer\nx_clean = (I − u uᵀ) x\napplied to every sample", "white", ec=PAL[0], fs=8)
     arrow(ax, (0.665, 0.62), (0.58, 0.33), "0.3", "--")  # learned filter feeds the layer
-    ax.text(0.675, 0.47, "learned filter u", fontsize=7, ha="left", va="center")
+    ax.text(0.675, 0.47, "patient's filter uᵢ" if own else "learned filter u", fontsize=7, ha="left", va="center")
     arrow(ax, (0.155, 0.62), (0.19, 0.72), PAL[1])
     arrow(ax, (0.155, 0.38), (0.36, 0.23), PAL[0])
     arrow(ax, (0.58, 0.23), (0.83, 0.38), PAL[0])
@@ -140,26 +150,36 @@ def plot(P, w, curve, res, u_pop, ex):
     def inset(x0, y0, w_, h_):  # coordinates inside panel a -> figure
         return fig.add_axes([pos.x0 + x0 * pos.width, pos.y0 + y0 * pos.height, w_ * pos.width, h_ * pos.height])
     traces(inset(0.03, 0.08, 0.12, 0.8), ex["eeg"][:, sl], sf, PAL[1], "Data in: raw EEG + ECG", ex["ecg"][sl])
-    traces(inset(0.86, 0.08, 0.12, 0.8), ex["clean"][:, sl], sf, "black", "Data out: after CFAR")
+    traces(inset(0.86, 0.08, 0.12, 0.8), ex["own" if own else "clean"][:, sl], sf, "black",
+           "Data out: after patient-specific CFAR" if own else "Data out: after CFAR")
     ia = inset(0.69, 0.56, 0.08, 0.36)
-    cd.topo(ia, u_pop)
-    ia.set_title("u (population)", fontsize=7)
+    cd.topo(ia, u)
+    ia.set_title("uᵢ (this patient)" if own else "u (population)", fontsize=7)
 
-    # b: training curve
     ax = fig.add_subplot(bot[0])
-    ax.fill_between(curve[:, 0], curve[:, 2], curve[:, 3], color=PAL[0], alpha=0.2, lw=0)
-    ax.plot(curve[:, 0], curve[:, 1], "o-", color=PAL[0], ms=4, lw=1.4)
-    ax.set_xscale("log")
-    ax.set_xlabel("Training patients (n)")
-    ax.set_ylabel("Median |cos(u, held-out uᵢ)|")
-    ax.text(-0.3 if "b" != "b" else -0.18, 1.12, "b", transform=ax.transAxes, fontsize=10, fontweight="bold")
-    ax.set_title(f"Training curve (held-out n = {len(P) // 5:,};\n20 draws per n, 95% range)", fontsize=8.5)
-    ax.axhline(curve[-1, 1], color="0.6", ls="--", lw=0.8)
-    ax.text(curve[0, 0], curve[-1, 1] + 0.005, f"plateau {curve[-1, 1]:.2f}", fontsize=7, va="bottom")
+    ax.text(-0.18, 1.12, "b", transform=ax.transAxes, fontsize=10, fontweight="bold")
+    if own:  # b: no training curve for a per-patient filter; show how far each u_i sits from the population u
+        cos = np.abs(P @ u_pop)
+        ax.hist(cos, bins=np.linspace(0, 1, 51), color=PAL[0], alpha=0.8)
+        ax.axvline(np.median(cos), color="0.3", ls="--", lw=0.8)
+        ax.text(np.median(cos), ax.get_ylim()[1] * 0.97, f"median {np.median(cos):.2f} ", fontsize=7,
+                ha="right", va="top")
+        ax.set_xlabel("|cos(uᵢ, population u)|")
+        ax.set_ylabel("Patients")
+        ax.set_title(f"Patient filter vs. population filter\n(n = {len(P):,} patients)", fontsize=8.5)
+    else:  # b: training curve
+        ax.fill_between(curve[:, 0], curve[:, 2], curve[:, 3], color=PAL[0], alpha=0.2, lw=0)
+        ax.plot(curve[:, 0], curve[:, 1], "o-", color=PAL[0], ms=4, lw=1.4)
+        ax.set_xscale("log")
+        ax.set_xlabel("Training patients (n)")
+        ax.set_ylabel("Median |cos(u, held-out uᵢ)|")
+        ax.set_title(f"Training curve (held-out n = {len(P) // 5:,};\n20 draws per n, 95% range)", fontsize=8.5)
+        ax.axhline(curve[-1, 1], color="0.6", ls="--", lw=0.8)
+        ax.text(curve[0, 0], curve[-1, 1] + 0.005, f"plateau {curve[-1, 1]:.2f}", fontsize=7, va="bottom")
 
     # c: the projection layer's weights
     ax = fig.add_subplot(bot[1])
-    W = np.eye(len(SITES)) - np.outer(u_pop, u_pop)
+    W = np.eye(len(SITES)) - np.outer(u, u)
     im = ax.imshow(W, cmap="RdBu_r", vmin=-1, vmax=1)
     for i in range(len(SITES)):
         for j in range(len(SITES)):
@@ -170,13 +190,14 @@ def plot(P, w, curve, res, u_pop, ex):
     ax.set_xlabel("Input channel")
     ax.set_ylabel("Output channel")
     fig.colorbar(im, ax=ax, shrink=0.75, pad=0.03).ax.tick_params(labelsize=6)
-    ax.text(-0.3 if "c" != "b" else -0.18, 1.12, "c", transform=ax.transAxes, fontsize=10, fontweight="bold")
-    ax.set_title("Projection layer weights I − u uᵀ", fontsize=8.5)
+    ax.text(-0.3, 1.12, "c", transform=ax.transAxes, fontsize=10, fontweight="bold")
+    ax.set_title("Projection layer weights I − uᵢ uᵢᵀ\n(example patient)" if own else
+                 "Projection layer weights I − u uᵀ", fontsize=8.5)
 
     # d: confusion matrix, CFA detected before vs after
     ax = fig.add_subplot(bot[2])
     thr = float(np.percentile(res.r2_null, 95))
-    pre, post = res.r2_pre > thr, res.r2_clean > thr
+    pre, post = res.r2_pre > thr, res["r2_own" if own else "r2_clean"] > thr
     M = np.array([[(pre & post).sum(), (pre & ~post).sum()], [(~pre & post).sum(), (~pre & ~post).sum()]])
     ax.imshow(M / M.sum(), cmap="Blues", vmin=0, vmax=M.max() / M.sum() * 1.2)
     for i in range(2):
@@ -185,19 +206,23 @@ def plot(P, w, curve, res, u_pop, ex):
                     color="white" if M[i, j] / M.max() > 0.6 else "black")
     ax.set_xticks([0, 1], ["CFA", "No CFA"])
     ax.set_yticks([0, 1], ["CFA", "No CFA"])
-    ax.set_xlabel("After CFAR")
+    ax.set_xlabel("After patient-specific CFAR" if own else "After CFAR")
     ax.set_ylabel("Raw EEG")
     ax.spines[:].set_visible(False)
-    ax.text(-0.3 if "d" != "b" else -0.18, 1.12, "d", transform=ax.transAxes, fontsize=10, fontweight="bold")
+    ax.text(-0.3, 1.12, "d", transform=ax.transAxes, fontsize=10, fontweight="bold")
     ax.set_title(f"Patients with CFA detected\n(R² > {thr:.2f}, null 95th pct; n = {M.sum():,})", fontsize=8.5)
 
+    name = "figS11_cfar_own_pipeline" if own else "figS10_cfar_pipeline"
     for ext in ["png", "pdf"]:
-        fig.savefig(os.path.join(cd.FIG_DIR, f"figS10_cfar_pipeline.{ext}"), bbox_inches="tight")
+        fig.savefig(os.path.join(cd.FIG_DIR, f"{name}.{ext}"), bbox_inches="tight")
     plt.close(fig)
-    return {"n_patterns": int(len(P)), "plateau_cos": float(curve[-1, 1]),
-            "cos_at_100": float(curve[curve[:, 0] == 100, 1][0]), "null_thr": thr,
-            "conf": M.tolist(), "pct_detected_pre": float(pre.mean() * 100), "pct_detected_post": float(post.mean() * 100),
-            "pct_detected_cleared": float((pre & ~post).sum() / pre.sum() * 100)}
+    out = {"n_patterns": int(len(P)), "null_thr": thr, "conf": M.tolist(),
+           "pct_detected_pre": float(pre.mean() * 100), "pct_detected_post": float(post.mean() * 100),
+           "pct_detected_cleared": float((pre & ~post).sum() / pre.sum() * 100)}
+    if own:
+        return {**out, "cos_pop_median": float(np.median(np.abs(P @ u_pop))),
+                "cos_pop_iqr": np.percentile(np.abs(P @ u_pop), [25, 75]).tolist()}
+    return {**out, "plateau_cos": float(curve[-1, 1]), "cos_at_100": float(curve[curve[:, 0] == 100, 1][0])}
 
 
 def main():
@@ -209,9 +234,10 @@ def main():
     u_pop = np.array([S["cleaning_demo"]["u_pop"][s] for s in SITES])
     _, ex = cd.evaluate(cd.load(jobs()[cd.EXAMPLE]), u_pop, u_pop, 0)
     S["cfar_pipeline"] = plot(P, w, curve, res, u_pop, ex)
+    S["cfar_own_pipeline"] = plot(P, w, curve, res, u_pop, ex, u_ex=P[list(pids).index(cd.EXAMPLE)])
     with open(os.path.join(HERE, "paper_stats.json"), "w") as f:
         json.dump(S, f, indent=2)
-    print(json.dumps(S["cfar_pipeline"], indent=1))
+    print(json.dumps({k: S[k] for k in ["cfar_pipeline", "cfar_own_pipeline"]}, indent=1))
 
 
 if __name__ == "__main__":

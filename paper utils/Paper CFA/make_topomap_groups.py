@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Figure 5: scalp CFA topography, no-diagnosis reference vs. clinically obese,
+"""Figure 5: scalp CFA topography, undiagnosed reference vs. clinically obese,
 restricted to patients with a dense montage (>10 canonical 10-20 sites) so
 each site's per-patient average is well powered within each subgroup.
 
@@ -54,7 +54,7 @@ obesity_ids = set(demo[demo.patient_id.isin(dense_ids)]
                    .explode("diagnosis_categories")
                    .query("diagnosis_categories == 'Obesity'").patient_id)
 
-GROUPS = [("unknown", "No diagnosis on record", unknown_ids),
+GROUPS = [("unknown", "Undiagnosed on record", unknown_ids),
           ("obesity", "Clinical obesity", obesity_ids)]
 
 per_group = {}

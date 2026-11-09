@@ -1219,7 +1219,7 @@ def process_patients_n1_stage_hep(edf_root="EDF_Format/EDF", step_sec=5, n1_dura
                 def _edf_timeout(signum, frame):
                     raise TimeoutError("read_raw_edf timed out after 10 min")
                 _signal.signal(_signal.SIGALRM, _edf_timeout)
-                _signal.alarm(1200)
+                _signal.alarm(int(os.environ.get("HEP_EDF_READ_TIMEOUT_SEC", "1200")))
                 try:
                     print(f"  Loading EDF: {file_path}")
                     raw = mne.io.read_raw_edf(file_path, preload=True, encoding='latin1')

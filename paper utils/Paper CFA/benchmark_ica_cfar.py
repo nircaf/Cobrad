@@ -149,11 +149,15 @@ def main(only=None):
 
 
 FIG4D = ["raw", "ica", "ecgreg", "cfar", "cfar_ica", "own"]
+NO_CFAR = {"raw", "ica", "ica_iclabel", "ecgreg", "own"}  # pipelines that never use the cohort CFAR filter
 
 
 def pattern_job(job):
     rec = cd.load(job)
-    return None if rec is None else (job, cd.cfa_pattern(rec[1], rec[3], rec[4]))
+    if rec is None:
+        return None
+    _, eeg, ecg, peaks, sf = rec
+    return job, cd.cfa_pattern(eeg, peaks, sf), cd.cfa_r2(eeg, ecg, peaks, sf)[0].mean()
 
 
 def run_job(args):
@@ -167,15 +171,21 @@ def main_all(only=None):
     cfa = pd.read_parquet(os.path.join(cd.HERE, "cfa_combined.parquet"),
                           columns=["patient_id", "edf_path", "window_start_s"]).drop_duplicates("patient_id")
     cfa = cfa[cfa.patient_id.str.startswith("I0")]
-    with ProcessPoolExecutor(cd.N_WORKERS) as ex:
-        fitted = [r for r in ex.map(pattern_job, [(r.patient_id, r.edf_path, float(r.window_start_s))
-                                                  for r in cfa.itertuples()], chunksize=8) if r]
-    P = np.array([f[1] for f in fitted])
-    u_of = {}
-    for tr, te in KFold(cd.N_FOLDS, shuffle=True, random_state=cd.SEED).split(P):
-        u = cd.mean_pattern(P[tr])
-        for i in te:
-            u_of[i] = u
+    jobs = [(r.patient_id, r.edf_path, float(r.window_start_s)) for r in cfa.itertuples()]
+    if only and set(only) <= NO_CFAR:  # skip the filter-fitting EDF pass; unreadable EDFs drop out in run_job
+        fitted, u_of = [(j, None) for j in jobs], {i: None for i in range(len(jobs))}
+    else:
+        with ProcessPoolExecutor(cd.N_WORKERS) as ex:
+            fitted = [r for r in ex.map(pattern_job, jobs, chunksize=8) if r]
+        # same population pattern as make_cleaning_demo.py (and the Methods): sign-aligned, CFA-R²-weighted
+        P = np.array([f[1] for f in fitted])
+        P = P * np.sign(P @ cd.mean_pattern(P))[:, None]
+        w = np.array([f[2] for f in fitted])
+        u_of = {}
+        for tr, te in KFold(cd.N_FOLDS, shuffle=True, random_state=cd.SEED).split(P):
+            u = (w[tr] @ P[tr]) / np.linalg.norm(w[tr] @ P[tr])
+            for i in te:
+                u_of[i] = u
     with ProcessPoolExecutor(cd.N_WORKERS) as ex:
         rows = [r for r in ex.map(run_job, [(f[0], u_of[i], only or FIG4D) for i, f in enumerate(fitted)], chunksize=4) if r]
     res = pd.DataFrame(rows)

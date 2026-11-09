@@ -267,8 +267,10 @@ def main() -> int:
     parser.add_argument("--h-freq", type=float, default=100)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--retry-errors", action="store_true", help="Retry EDFs already stored in the error cache")
+    parser.add_argument("--edf-list", type=Path, help="text file, one EDF path per line (instead of walking --edf-root)")
     args = parser.parse_args()
-    paths = discover(args.edf_root, args.limit)
+    paths = ([Path(p).absolute() for p in args.edf_list.read_text().split("\n") if p.strip()][:args.limit]
+             if args.edf_list else discover(args.edf_root, args.limit))
     if not paths:
         parser.error(f"no EDF files found under {args.edf_root}")
     args.cache_dir.mkdir(parents=True, exist_ok=True)

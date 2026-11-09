@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Figures and stats for the v2 (general CFA-in-EEG) manuscript.
 
-  Figure 1  fig1_patient_examples.png  four example patients, 60-min MNE topomaps
-            of per-channel CFA R^2: a demographically matched pair with different
-            CFA and a demographically different pair with similar CFA.
+  Figure 1  fig1_patient_examples.png  high-CFA (male, high BMI) vs. low-CFA (female,
+            low BMI) patient of similar age, >10 electrodes, 60-min segment: per-site CFA R^2 topomap,
+            continuous EEG with ECG, and HEP with the ECG average.
   Figure 2  fig2_cfa_overview.png      old Figures 1 + 2 combined: R^2
             distribution, R^2 vs. ICA SNR, MNE scalp topomap of mean R^2
             per site, and the per-site distribution.
@@ -26,22 +26,23 @@ from scipy import stats
 from statsmodels.stats.multitest import multipletests
 
 from channel_utils import CHANNEL_ORDER, canonicalize
+from ica_ecg_component_variance import QRS_EXCLUDE_SEC, channel_names, quality
+from make_cleaning_demo import cfa_r2, epoch_times
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FIG_DIR = os.path.join(HERE, "figures")
 PALETTE = ["#0072B2", "#D55E00", "#009E73", "#CC79A7", "#F0E442", "#56B4E9", "#E69F00", "#000000"]
 MIN_PATIENTS = 500  # same site floor as make_topomap.py
 DURATION_FILES = {
-    5: "cfa_variance_explained_5min.parquet", 10: "cfa_combined.parquet",
+    5: "cfa_variance_explained_5min.parquet", 10: "cfa_combined_10min.parquet",
     20: "cfa_variance_explained_20min.parquet", 30: "cfa_variance_explained_30min.parquet",
     45: "cfa_variance_explained_45min.parquet", 60: "cfa_variance_explained_60min.parquet",
     75: "cfa_variance_explained_75min.parquet", 90: "cfa_variance_explained_90min.parquet",
 }
-# Figure 1 pairs, from the 60-min patients with BMI and >=12 electrodes:
-# row 1 matched on sex, age (+-2 y) and BMI (+-1) but with very different CFA;
-# row 2 differing in sex, age (>=35 y) and BMI (>=15) but with near-equal CFA.
-EXAMPLES = [("A", "I0002150035125"), ("B", "I0002150002994"),
-            ("C", "I0002150031792"), ("D", "I0002150006420")]
+# Figure 1 pair, from the 60-min patients with BMI and >10 electrodes: a high-CFA male with
+# high BMI and a low-CFA female with low BMI, ages within 2 y (largest CFA gap).
+EXAMPLES = [("High CFA", "I0002150028912"), ("Low CFA", "I0002150035125")]
+TRACE_T0, TRACE_SEC = 60.0, 5.0  # continuous-trace excerpt, s into the 60-min window
 
 plt.rcParams.update({
     "font.family": "sans-serif", "font.sans-serif": ["Arial", "Helvetica", "DejaVu Sans"],
@@ -73,33 +74,87 @@ for minutes, fname in DURATION_FILES.items():
     durations[minutes] = d
 
 # =============================================================================
-# Figure 1: four example patients, 60-min segment
+# Figure 1: high- vs. low-CFA patient, 60-min segment: topomap, EEG + ECG, HEP + ECG average
 # =============================================================================
 demo = pd.read_parquet(os.path.join(HERE, "demographics_combined.parquet"))
 bmi = pd.read_parquet(os.path.join(HERE, "bmi_combined.parquet"))
 minutes_all = sorted(DURATION_FILES)
-ROW_TITLES = ["Same sex, age and BMI, different CFA", "Different sex, age and BMI, similar CFA"]
-fig, axes = plt.subplots(2, 2, figsize=(5.6, 6.0))
+d60 = pd.read_parquet(os.path.join(HERE, DURATION_FILES[60]),
+                      columns=["patient_id", "edf_path", "window_start_s", "window_duration_s"])
+
+
+def load_window(path, start, dur):
+    """QC'd window as in cfa_variance_explained: {site: EEG}, ECG (uV), R-peaks, sfreq. Any montage."""
+    raw = mne.io.read_raw_edf(path, preload=False, encoding="latin1", verbose="ERROR")
+    eeg_names, ecg_name = channel_names(raw)
+    seg = raw.copy().pick(eeg_names + [ecg_name]).crop(start, start + dur, include_tmax=False)
+    seg.load_data(verbose="ERROR")
+    _, qc = quality(seg, eeg_names, ecg_name)
+    sf = float(seg.info["sfreq"])
+    seg.filter(1.0, min(100.0, sf / 2 - 0.5), verbose="ERROR")
+    data = seg.get_data() * 1e6
+    canon = canonicalize(pd.Series(eeg_names))
+    keep = [i for i, c in enumerate(canon) if isinstance(c, str)]
+    return [canon[i] for i in keep], data[keep], data[-1], np.asarray(qc["r_peak_samples"]), sf
+
+
+recs, hep = {}, {}
+for _, pid in EXAMPLES:
+    w = d60[d60.patient_id == pid].iloc[0]
+    recs[pid] = load_window(w.edf_path, float(w.window_start_s), float(w.window_duration_s))
+    sites, eeg, ecg, peaks, sf = recs[pid]
+    hep[pid] = cfa_r2(eeg, ecg, peaks, sf)
+hi_sites, lo_sites = recs[EXAMPLES[0][1]][0], recs[EXAMPLES[1][1]][0]
+site = max((s for s in hi_sites if s in lo_sites), key=lambda s: hep[EXAMPLES[0][1]][0][hi_sites.index(s)])
+fig, axes = plt.subplots(3, 2, figsize=(6.6, 7.4), gridspec_kw={"height_ratios": [1.4, 1, 1]})
+trace = lambda pid: recs[pid][1][recs[pid][0].index(site), int(TRACE_T0 * recs[pid][4]):int((TRACE_T0 + TRACE_SEC) * recs[pid][4])]
+eeg_lim = max(np.abs(trace(pid)).max() for _, pid in EXAMPLES)
+hep_lim = max(np.abs(hep[pid][1][recs[pid][0].index(site)]).max() for _, pid in EXAMPLES) * 1.15
 examples_meta = []
-d60 = durations[60]
-for i, (label, pid) in enumerate(EXAMPLES):
-    ax = axes.flat[i]
-    d = d60[d60.patient_id == pid].dropna(subset=["canon"])
-    d = d[d.recording_id == d.recording_id.iat[0]]
-    site_map = d.groupby("canon")["cfa_r2_excl_qrs"].mean().to_dict()
-    im = topo(ax, site_map, (0, 1), "Reds")
+for col, (label, pid) in enumerate(EXAMPLES):
+    sites, eeg, ecg, peaks, sf = recs[pid]
+    r2, ev, ecg_ev = hep[pid]
+    si = sites.index(site)
     p = demo[demo.patient_id == pid].iloc[0]
     p_bmi = float(bmi.loc[bmi.bdsp_patient_id == p.bdsp_patient_id, "bmi"].iat[0])
-    r2 = float(np.mean(list(site_map.values())))
-    ax.set_title(f"Patient {label}: {p.sex}, {p.age:.0f} y, BMI {p_bmi:.1f}\nmean R² = {r2:.2f}", fontsize=8.5)
+    im = topo(axes[0, col], dict(zip(sites, r2)), (0, 1), "Reds")
+    axes[0, col].set_title(f"{label}: {p.sex}, {p.age:.0f} y, BMI {p_bmi:.1f}\nmean R² = {r2.mean():.2f}", fontsize=8.5)
     examples_meta.append({"label": label, "sex": str(p.sex), "age": float(p.age), "bmi": p_bmi,
-                          "n_sites": len(site_map), "mean_r2": r2})
-fig.subplots_adjust(left=0.02, right=0.84, top=0.88, bottom=0.02, wspace=0.12, hspace=0.45)
-for row, title in enumerate(ROW_TITLES):
-    y = axes[row, 0].get_position().y1 + 0.075
-    fig.text(0.43, y, title, ha="center", fontsize=10, fontweight="bold")
-cb = fig.colorbar(im, cax=fig.add_axes([0.87, 0.2, 0.025, 0.55]))
-cb.set_label("CFA R² (outside QRS), 60 min", fontsize=8)
+                          "n_sites": len(sites), "mean_r2": float(r2.mean()), "site": site,
+                          "site_r2": float(r2[si]), "n_beats": int(len(peaks))})
+    s0, n = int(TRACE_T0 * sf), int(TRACE_SEC * sf)
+    for ax, t, x, y, lim, xlab, title in [
+        (axes[1, col], np.arange(n) / sf, eeg[si, s0:s0 + n], ecg[s0:s0 + n], eeg_lim, "Time (s)",
+         f"{label}: {site} EEG and ECG, {TRACE_SEC:.0f}-s excerpt"),
+        (axes[2, col], epoch_times(sf), ev[si], ecg_ev, hep_lim, "Time from R peak (s)",
+         f"{label}: {site} HEP and ECG average\n({len(peaks):,} beats)"),
+    ]:
+        ax.set_title(title, fontsize=8.5)
+        tw = ax.twinx()
+        if ax is axes[2, col]:  # on the ECG axis, behind both lines, so the QRS stays visible
+            tw.axvspan(-QRS_EXCLUDE_SEC, QRS_EXCLUDE_SEC, color="0.92", lw=0, zorder=0)
+        tw.plot(t, y, color="0.6", lw=0.7)
+        tw.set_yticks([])
+        tw.spines[["top", "right"]].set_visible(False)
+        ax.plot(t, x, color=PALETTE[0], lw=0.8)
+        ax.set_zorder(tw.get_zorder() + 1)
+        ax.patch.set_visible(False)
+        ax.set(ylim=(-lim, lim), xlim=(t[0], t[-1]), xlabel=xlab)
+    axes[2, col].text(0.02, 0.95, f"{site} R² = {r2[si]:.2f}", transform=axes[2, col].transAxes,
+                      va="top", fontsize=7.5)
+for row, name in [(1, "EEG"), (2, "HEP")]:
+    axes[row, 0].set_ylabel(f"{site} {name} (µV)", color=PALETTE[0])
+    axes[row, 1].set_yticklabels([])
+fig.subplots_adjust(left=0.1, right=0.86, top=0.93, bottom=0.07, wspace=0.12, hspace=0.6)
+for row, letter in enumerate("abc"):
+    fig.text(0.01, axes[row, 0].get_position().y1 + 0.01, letter, fontsize=11, fontweight="bold")
+cb = fig.colorbar(im, cax=fig.add_axes([0.89, axes[0, 1].get_position().y0, 0.02, axes[0, 1].get_position().height]))
+cb.set_label("CFA R² (outside QRS)", fontsize=8)
+y_mid = (axes[1, 1].get_position().y1 + axes[2, 1].get_position().y0) / 2
+fig.legend(handles=[plt.Line2D([], [], color=PALETTE[0], lw=1.2, label="EEG"),
+                    plt.Line2D([], [], color="0.6", lw=1.2, label="ECG (scaled)"),
+                    matplotlib.patches.Patch(color="0.92", label="QRS, excluded\nfrom R²")],
+           loc="center left", bbox_to_anchor=(0.87, y_mid), frameon=False, fontsize=8)
 fig.savefig(os.path.join(FIG_DIR, "fig1_patient_examples.png"), bbox_inches="tight")
 fig.savefig(os.path.join(FIG_DIR, "fig1_patient_examples.pdf"), bbox_inches="tight")
 plt.close(fig)
@@ -239,11 +294,11 @@ fig.savefig(os.path.join(FIG_DIR, "fig2_cfa_overview.png"), bbox_inches="tight")
 fig.savefig(os.path.join(FIG_DIR, "fig2_cfa_overview.pdf"), bbox_inches="tight")
 plt.close(fig)
 
-# Does heart rate (beats per window) explain the BMI association? 30-min
+# Does heart rate (beats per window) explain the BMI association? Main 45-min
 # windows, patient mean over the six well-covered sites, as in Figure 3c.
 import statsmodels.formula.api as smf
 from channel_utils import filter_min_coverage
-hr = pd.read_parquet(os.path.join(HERE, DURATION_FILES[30]),
+hr = pd.read_parquet(os.path.join(HERE, DURATION_FILES[45]),
                      columns=["patient_id", "eeg_channel", "cfa_r2_excl_qrs", "qc_ecg_bpm"])
 hr["canon"] = canonicalize(hr["eeg_channel"])
 hr = filter_min_coverage(hr.dropna(subset=["canon"]), "patient_id", "canon", min_frac=0.5)

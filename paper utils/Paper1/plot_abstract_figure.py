@@ -30,10 +30,11 @@ REPO = "/storage/pblab_shared_data2/Nir/Cobrad"
 OUT_DIR = os.path.join(REPO, "paper utils", "Paper1")
 FIG_DIR = os.path.join(OUT_DIR, "figures")
 os.makedirs(FIG_DIR, exist_ok=True)
-DATA_PKL = os.path.join(OUT_DIR, "abstract_data.pkl")
-BLENDER_SCRIPT = os.path.join(OUT_DIR, "eeg_brain_blender.py")
+DATA_PKL = os.environ.get("ABSTRACT_DATA_PKL", os.path.join(OUT_DIR, "abstract_data.pkl"))
+OUTPUT_STEM = os.environ.get("ABSTRACT_FIGURE_STEM", "abstract_3panel")
+BLENDER_SCRIPT = os.path.join(REPO, "utils", "eeg_brain_blender.py")
 BLENDER_BIN = "blender"
-BRAIN_CACHE = os.path.join(FIG_DIR, "abstract_brain_cache")
+BRAIN_CACHE = os.path.join(FIG_DIR, os.environ.get("ABSTRACT_BRAIN_CACHE", "abstract_brain_cache"))
 os.makedirs(BRAIN_CACHE, exist_ok=True)
 # Reds_r direction: low p (more significant) = red, high p (threshold) = light grey
 # (not pure white -- the render background is white, so a white brain would vanish).
@@ -207,7 +208,7 @@ def _brain_channels(channel_results):
     """Raw channel name -> display value (mirrors _montage_info_and_values'
     significant->q_value / else->threshold logic), restricted to labels the
     blender montage knows."""
-    sys.path.insert(0, OUT_DIR)
+    sys.path.insert(0, os.path.join(REPO, "utils"))
     from eeg_brain_blender import MONTAGE_POLAR
 
     channels = {}
@@ -314,8 +315,8 @@ def main():
     fig.legend(handles=legend_elems, loc="lower center", ncol=5, fontsize=FONT_LEGEND,
                frameon=False, bbox_to_anchor=(0.5, 0.02))
 
-    out_png = os.path.join(FIG_DIR, "abstract_3panel.png")
-    out_pdf = os.path.join(FIG_DIR, "abstract_3panel.pdf")
+    out_png = os.path.join(FIG_DIR, f"{OUTPUT_STEM}.png")
+    out_pdf = os.path.join(FIG_DIR, f"{OUTPUT_STEM}.pdf")
     fig.savefig(out_png, dpi=300, bbox_inches="tight")
     fig.savefig(out_pdf, bbox_inches="tight")
     plt.close(fig)

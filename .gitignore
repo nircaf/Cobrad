@@ -72,3 +72,10 @@ utils/blender-*/
 *.swo
 *~
 .a5c/
+
+# Local dashboard/runtime environments and generated process files
+.venv-dashboard/
+.venv-dashboard-isolated/
+node_modules/
+*.pid
+replot.err

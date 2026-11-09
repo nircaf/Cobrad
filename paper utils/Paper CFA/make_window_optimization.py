@@ -35,7 +35,7 @@ plt.rcParams.update({"font.family": "sans-serif", "font.sans-serif": ["Arial", "
                      "figure.dpi": 300, "savefig.dpi": 300})
 N_LIST = sum(1 for line in open(os.path.join(HERE, "figure5_7230_patients.txt")) if line.strip())
 
-files = {10: os.path.join(HERE, "cfa_combined.parquet")}
+files = {10: os.path.join(HERE, "cfa_combined_10min.parquet")}
 for p in glob.glob(os.path.join(HERE, "cfa_variance_explained_*min.parquet")):
     files[int(re.search(r"_(\d+)min\.parquet$", p).group(1))] = p
 L = sorted(files)

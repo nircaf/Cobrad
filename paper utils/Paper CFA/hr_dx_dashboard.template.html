@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CFAR HR and Diagnosis Dashboard</title>
+<style>
+:root{--bg:#fff;--fg:#1d2330;--mut:#667085;--card:#f6f7f9;--line:#e1e4ea;--raw:#4c78a8;--cf:#e4572e;--dl:#2a9d6f;--a:#c0392b;--b:#8e44ad}
+@media (prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#14171d;--fg:#e6e9ef;--mut:#98a2b3;--card:#1c2028;--line:#2c313c;--raw:#6fa0d6;--cf:#ff7a52;--dl:#43c08f;--a:#ff6b5a;--b:#b57edc}}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,sans-serif}
+main{max-width:1280px;margin:0 auto;padding:16px}
+h1{font-size:22px;margin:4px 0}h2{font-size:17px;margin:28px 0 4px;border-top:1px solid var(--line);padding-top:16px}
+p.n{color:var(--mut);margin:2px 0 10px;max-width:900px}
+.kpi{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin:12px 0}
+.kpi div{background:var(--card);border-radius:8px;padding:10px 12px}.kpi b{display:block;font-size:22px}.kpi span{color:var(--mut);font-size:12px}
+.row{display:grid;grid-template-columns:repeat(auto-fit,minmax(380px,1fr));gap:12px}
+.ctl{display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin:8px 0}
+.ctl label{color:var(--mut)}select,input{background:var(--card);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:4px 6px}
+.plot{min-height:340px}
+table{border-collapse:collapse;width:100%;font-size:13px}th,td{padding:4px 8px;border-bottom:1px solid var(--line);text-align:right}
+th:first-child,td:first-child{text-align:left}th{color:var(--mut);font-weight:600;position:sticky;top:0;background:var(--bg)}
+.tw{max-height:420px;overflow:auto}
+</style></head><body><main>
+<h1>Heart rate, diagnosis and the CFAR change in HEP R&sup2;</h1>
+<p class="n">HEP R&sup2; = share of the R-peak-locked EEG average explained by the ECG (cardiac field artifact, CFA). <b style="color:var(--raw)">Raw</b> = uncleaned EEG; <b style="color:var(--cf)">CFAR</b> = after ECG-free CFAR cleaning; <b style="color:var(--dl)">&Delta;R&sup2;</b> = raw &minus; CFAR (CFA removed). Held-out patients of the paper (Cafri et al., CFAR v2). HR = mean detected bpm over the patient's windows. Diagnoses are the 15 EHR categories; "alone" = that is the patient's only category.</p>
+<div class="kpi" id="kpi"></div>
+
+<h2>1 &middot; Heart rate vs HEP R&sup2;</h2>
+<p class="n">Scattered: every patient. Line = running mean (30 bpm-sorted bins). Grouped: HR split into low &rarr; high bins.</p>
+<div class="ctl"><label>HR bins <select id="nb"><option>2</option><option selected>3</option><option>5</option><option>10</option></select></label>
+<label>colour scatter by <select id="hrcol"><option value="none">none</option></select></label></div>
+<div class="row"><div id="hr_sc_raw" class="plot"></div><div id="hr_sc_cf" class="plot"></div></div>
+<div class="row"><div id="hr_sc_d" class="plot"></div><div id="hr_grp" class="plot"></div></div>
+<div class="row"><div id="hr_corr" class="plot"></div><div id="hr_dx" class="plot"></div></div>
+
+<h2>2 &middot; Diagnoses: where does CFAR change HEP R&sup2; most?</h2>
+<p class="n">Left: raw vs CFAR R&sup2; per diagnosis. Right: &Delta;R&sup2; of patients with the diagnosis minus the comparator (95% CI). "Any" = has the diagnosis (vs. patients without it); "alone" = only that diagnosis (vs. patients with no diagnosis).</p>
+<div class="ctl"><label>Subset <select id="mode"><option value="any">any (with dx)</option><option value="alone">alone (only dx)</option></select></label>
+<label>Sort by <select id="srt"><option value="eff">&Delta; difference</option><option value="d">&Delta;R&sup2;</option><option value="raw">raw R&sup2;</option></select></label></div>
+<div class="row"><div id="dx_bar" class="plot" style="min-height:520px"></div><div id="dx_eff" class="plot" style="min-height:520px"></div></div>
+
+<h2>3 &middot; Overlap of diagnoses</h2>
+<p class="n">Cell = patients with both diagnoses (diagonal = single diagnosis, any overlap). Hover shows n. Cells under the minimum n are blank.</p>
+<div class="ctl"><label>Metric <select id="hm"><option value="d">mean &Delta;R&sup2; (both)</option><option value="eff">&Delta;R&sup2; (both) &minus; &Delta;R&sup2; (neither)</option><option value="raw">mean raw R&sup2;</option><option value="cf">mean CFAR R&sup2;</option><option value="hr">mean HR</option></select></label>
+<label>min n <input id="minn" type="number" value="20" min="3" style="width:60px"></label></div>
+<div id="heat" class="plot" style="min-height:640px"></div>
+
+<h2>4 &middot; A vs B explorer</h2>
+<p class="n">Four groups by two diagnoses (default: obesity &times; heart transplant). "Neither" is the reference for the p-values (Welch, normal approx.).</p>
+<div class="ctl"><label>Dx A <select id="dA"></select></label><label>Dx B <select id="dB"></select></label>
+<label><input type="checkbox" id="excl"> exclude "neither" patients who have other diagnoses (strict control = no diagnosis)</label></div>
+<div class="row"><div id="ab_bar" class="plot"></div><div id="ab_hr" class="plot"></div></div>
+<div class="row"><div id="ab_sc" class="plot"></div><div id="ab_tab"></div></div>
+
+<h2>5 &middot; Ranking: biggest HEP R&sup2; change after CFAR</h2>
+<p class="n">Single diagnoses and pairs, ranked by &Delta;R&sup2; (group) &minus; &Delta;R&sup2; (patients with neither / without). Uses the min n above.</p>
+<div class="ctl"><label>Show <select id="rk"><option value="all">singles + pairs</option><option value="s">singles</option><option value="p">pairs</option></select></label>
+<label>Direction <select id="rkd"><option value="1">largest &Delta; first</option><option value="-1">smallest &Delta; first</option></select></label></div>
+<div class="tw" id="rank"></div>
+
+<h2>6 &middot; Patient-specific CFAR only (own-ECG removal)</h2>
+<p class="n">Same plots using only the patient-specific cleaning: the patient's own ECG-derived spatial pattern projected out of the EEG (the upper bound CFAR is compared to). &Delta;R&sup2;<sub>own</sub> = raw &minus; own-ECG R&sup2;. "Interesting" = significant after Bonferroni (p &lt; .05 / number of tests).</p>
+<div class="row"><div id="o_dx" class="plot" style="min-height:520px"></div><div id="o_bar" class="plot" style="min-height:520px"></div></div>
+<div class="ctl"><label>Heatmap <select id="ohm"><option value="eff">&Delta;R&sup2;<sub>own</sub> (both) &minus; (neither)</option><option value="d">mean &Delta;R&sup2;<sub>own</sub> (both)</option><option value="own">mean own-ECG R&sup2;</option></select></label>
+<label><input type="checkbox" id="osig" checked> ranking: only significant</label></div>
+<div class="row"><div id="o_heat" class="plot" style="min-height:640px"></div><div class="tw" id="o_rank" style="max-height:640px"></div></div>
+</main>
+<script>/*PLOTLY*/</script>
+<script>/*DATA*/</script>
+<script>
+const N=D.hr.length,NDX=D.dx.length,$=id=>document.getElementById(id);
+const COL={raw:'--raw',cf:'--cf',dl:'--dl',a:'--a',b:'--b'};
+const css=v=>getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+const C=()=>({raw:css('--raw'),cf:css('--cf'),dl:css('--dl'),a:css('--a'),b:css('--b'),fg:css('--fg'),mut:css('--mut'),line:css('--line'),
+  g4:[css('--a'),'#e69f00',css('--b'),'#8c96a3']});
+const DD=D.raw.map((r,i)=>r-D.cf[i]),DO=D.raw.map((r,i)=>r-D.own[i]);
+const has=(i,x)=>(D.mask[i]>>x)&1;
+const all=[...Array(N).keys()];
+// ---- stats
+const mean=a=>a.reduce((s,x)=>s+x,0)/(a.length||NaN);
+const sd=a=>{const m=mean(a);return Math.sqrt(a.reduce((s,x)=>s+(x-m)**2,0)/(a.length-1))};
+const se=a=>sd(a)/Math.sqrt(a.length);
+const erf=x=>{const t=1/(1+.3275911*Math.abs(x)),y=1-(((((1.061405429*t-1.453152027)*t)+1.421413741)*t-.284496736)*t+.254829592)*t*Math.exp(-x*x);return x>=0?y:-y};
+const welch=(a,b)=>{if(a.length<3||b.length<3)return{d:NaN,se:NaN,p:NaN};const d=mean(a)-mean(b),s=Math.sqrt(se(a)**2+se(b)**2);return{d,se:s,p:1-erf(Math.abs(d/s)/Math.SQRT2)}};
+const pearson=(x,y)=>{const mx=mean(x),my=mean(y);let sxy=0,sx=0,sy=0;x.forEach((v,i)=>{sxy+=(v-mx)*(y[i]-my);sx+=(v-mx)**2;sy+=(y[i]-my)**2});return sxy/Math.sqrt(sx*sy)};
+const rank=a=>{const o=a.map((v,i)=>[v,i]).sort((p,q)=>p[0]-q[0]),r=Array(a.length);o.forEach((p,k)=>r[p[1]]=k);return r};
+const spear=(x,y)=>pearson(rank(x),rank(y));
+const rci=(r,n)=>{if(n<5)return[NaN,NaN];const z=Math.atanh(r),s=1/Math.sqrt(n-3);return[Math.tanh(z-1.96*s),Math.tanh(z+1.96*s)]};
+const fp=p=>p<1e-300?'<1e-300':p<.001?p.toExponential(1):p.toFixed(3);
+const v=(arr,idx)=>idx.map(i=>arr[i]);
+const idxWith=x=>all.filter(i=>has(i,x)), idxWithout=x=>all.filter(i=>!has(i,x));
+const idxBoth=(x,y)=>all.filter(i=>has(i,x)&&has(i,y)), idxNeither=(x,y)=>all.filter(i=>!has(i,x)&&!has(i,y));
+const idxAlone=x=>all.filter(i=>D.k[i]==1&&has(i,x)), idxNone=all.filter(i=>D.k[i]==0);
+const f3=x=>isFinite(x)?x.toFixed(3):'–';
+function L(extra){const c=C();return Object.assign({paper_bgcolor:'rgba(0,0,0,0)',plot_bgcolor:'rgba(0,0,0,0)',font:{color:c.fg,size:12},margin:{l:55,r:15,t:40,b:50},
+  xaxis:{gridcolor:c.line,zerolinecolor:c.line},yaxis:{gridcolor:c.line,zerolinecolor:c.line},legend:{orientation:'h',y:-.2}},extra)}
+const show=(id,tr,lay)=>Plotly.react(id,tr,lay,{responsive:true,displaylogo:false});
+const short=s=>s.replace('Obstructive Sleep Apnea','OSA').replace('Cognitive Impairment / Dementia','Dementia').replace('Stroke / Cerebrovascular','Stroke').replace('Coronary Artery Disease','CAD').replace('Atrial Fibrillation','AFib');
+
+// ---- KPIs
+function kpi(){const r=pearson(D.hr,D.raw),r2=pearson(D.hr,D.cf),rd=pearson(D.hr,DD);
+  $('kpi').innerHTML=[[N,'patients'],[mean(D.hr).toFixed(1),'mean HR (bpm)'],[f3(mean(D.raw)),'mean raw R²'],[f3(mean(D.cf)),'mean CFAR R²'],
+  [f3(mean(DD)),'mean ΔR² (removed)'],[r.toFixed(3),'r(HR, raw R²)'],[r2.toFixed(3),'r(HR, CFAR R²)'],[rd.toFixed(3),'r(HR, ΔR²)']].map(([a,b])=>`<div><b>${a}</b><span>${b}</span></div>`).join('')}
+
+// ---- HR section
+function binned(x,y,nb){const o=all.slice().sort((a,b)=>x[a]-x[b]),k=Math.ceil(o.length/nb),xs=[],ys=[];
+  for(let s=0;s<o.length;s+=k){const g=o.slice(s,s+k);xs.push(mean(g.map(i=>x[i])));ys.push(mean(g.map(i=>y[i])))}return[xs,ys]}
+function hrScatter(id,y,name,color,ttl){const c=C(),r=pearson(D.hr,y),s=spear(D.hr,y),[lo,hi]=rci(r,N),[bx,by]=binned(D.hr,y,30);
+  const col=$('hrcol').value,tr=[];
+  if(col=='none')tr.push({type:'scatter',mode:'markers',x:D.hr,y,marker:{size:3,color,opacity:.35},name:'patients',hoverinfo:'skip'});
+  else{const x=+col;tr.push({type:'scatter',mode:'markers',x:v(D.hr,idxWithout(x)),y:v(y,idxWithout(x)),marker:{size:3,color:c.mut,opacity:.25},name:'without '+short(D.dx[x]),hoverinfo:'skip'});
+    tr.push({type:'scatter',mode:'markers',x:v(D.hr,idxWith(x)),y:v(y,idxWith(x)),marker:{size:4,color:c.a,opacity:.6},name:'with '+short(D.dx[x]),hoverinfo:'skip'})}
+  tr.push({x:bx,y:by,mode:'lines',line:{color:c.fg,width:3},name:'running mean'});
+  show(id,tr,L({title:{text:`${ttl}<br><sup>r=${r.toFixed(3)} [${lo.toFixed(3)},${hi.toFixed(3)}], Spearman ρ=${s.toFixed(3)}</sup>`,font:{size:13}},xaxis:{title:'HR (bpm)',gridcolor:c.line},yaxis:{title:name,gridcolor:c.line,zerolinecolor:c.line}}))}
+function hrGroups(){const c=C(),nb=+$('nb').value,o=all.slice().sort((a,b)=>D.hr[a]-D.hr[b]),k=Math.ceil(o.length/nb),g=[];
+  for(let s=0;s<o.length;s+=k)g.push(o.slice(s,s+k));
+  const lab=g.map((q,j)=>{const h=v(D.hr,q);return`${nb<=3?['low','mid','high'][nb==2?j*2:j]:'Q'+(j+1)}<br>${Math.min(...h).toFixed(0)}–${Math.max(...h).toFixed(0)} bpm<br>n=${q.length}`});
+  const bar=(arr,name,color)=>({type:'bar',name,x:lab,y:g.map(q=>mean(v(arr,q))),error_y:{type:'data',array:g.map(q=>1.96*se(v(arr,q))),color:c.mut},marker:{color}});
+  show('hr_grp',[bar(D.raw,'raw',c.raw),bar(D.cf,'CFAR',c.cf),bar(DD,'ΔR² removed',c.dl)],L({barmode:'group',title:{text:'Grouped by HR: low → high',font:{size:13}},yaxis:{title:'mean R² (95% CI)',gridcolor:c.line}}))}
+function hrCorrBars(){const c=C(),m=[['raw',D.raw,c.raw],['CFAR',D.cf,c.cf],['ΔR²',DD,c.dl],['raw power',D.praw,c.mut],['CFAR power',D.pcf,c.mut]];
+  const rr=m.map(([n,y])=>pearson(D.hr,y)),ss=m.map(([n,y])=>spear(D.hr,y));
+  show('hr_corr',[{type:'bar',name:'Pearson',x:m.map(a=>a[0]),y:rr,marker:{color:c.raw},error_y:{type:'data',array:rr.map(r=>tanhHi(r)),arrayminus:rr.map(r=>tanhLo(r)),color:c.mut}},
+    {type:'bar',name:'Spearman',x:m.map(a=>a[0]),y:ss,marker:{color:c.cf}}],L({barmode:'group',title:{text:'Correlation of HR with each measure',font:{size:13}},yaxis:{title:'r'}}))}
+const tanhHi=r=>rci(r,N)[1]-r,tanhLo=r=>r-rci(r,N)[0];
+function hrByDx(){const c=C(),rows=[];
+  for(let x=0;x<NDX;x++){const ix=idxWith(x),n=ix.length;if(n<30)continue;const h=v(D.hr,ix),r1=pearson(h,v(D.raw,ix)),r2=pearson(h,v(D.cf,ix)),r3=pearson(h,v(DD,ix));rows.push({x,n,r1,r2,r3})}
+  rows.sort((a,b)=>b.r3-a.r3);const lab=rows.map(r=>`${short(D.dx[r.x])} (${r.n})`);
+  show('hr_dx',[{type:'bar',name:'raw',x:lab,y:rows.map(r=>r.r1),marker:{color:c.raw}},{type:'bar',name:'CFAR',x:lab,y:rows.map(r=>r.r2),marker:{color:c.cf}},{type:'bar',name:'ΔR²',x:lab,y:rows.map(r=>r.r3),marker:{color:c.dl}}],
+    L({barmode:'group',title:{text:'r(HR, R²) inside each diagnosis',font:{size:13}},yaxis:{title:'Pearson r'},margin:{l:55,r:15,t:40,b:110},xaxis:{tickangle:-40}}))}
+function hrSection(){hrScatter('hr_sc_raw',D.raw,'raw R²',C().raw,'Raw HEP R² vs HR');hrScatter('hr_sc_cf',D.cf,'CFAR R²',C().cf,'CFAR-cleaned HEP R² vs HR');
+  hrScatter('hr_sc_d',DD,'ΔR² (raw − CFAR)',C().dl,'CFA removed (ΔR²) vs HR');hrGroups();hrCorrBars();hrByDx()}
+
+// ---- diagnosis section
+function dxSection(){const c=C(),alone=$('mode').value=='alone',rows=[];
+  for(let x=0;x<NDX;x++){const w=alone?idxAlone(x):idxWith(x),wo=alone?idxNone:idxWithout(x);if(w.length<5)continue;
+    const t=welch(v(DD,w),v(DD,wo));rows.push({x,n:w.length,raw:mean(v(D.raw,w)),cf:mean(v(D.cf,w)),d:mean(v(DD,w)),eff:t.d,se:t.se,p:t.p,hr:mean(v(D.hr,w))})}
+  const key=$('srt').value;rows.sort((a,b)=>b[key]-a[key]);const lab=rows.map(r=>`${short(D.dx[r.x])} (n=${r.n})`);
+  show('dx_bar',[{type:'bar',orientation:'h',name:'raw',y:lab,x:rows.map(r=>r.raw),marker:{color:c.raw}},{type:'bar',orientation:'h',name:'CFAR',y:lab,x:rows.map(r=>r.cf),marker:{color:c.cf}},
+    {type:'bar',orientation:'h',name:'ΔR²',y:lab,x:rows.map(r=>r.d),marker:{color:c.dl}}],L({barmode:'group',title:{text:`Mean R² by diagnosis (${alone?'alone':'any'})`,font:{size:13}},yaxis:{autorange:'reversed'},xaxis:{title:'R²',gridcolor:c.line},margin:{l:150,r:15,t:40,b:50}}));
+  show('dx_eff',[{type:'bar',orientation:'h',y:lab,x:rows.map(r=>r.eff),marker:{color:rows.map(r=>r.p<.05/NDX?c.a:c.mut)},error_x:{type:'data',array:rows.map(r=>1.96*r.se),color:c.fg},
+    customdata:rows.map(r=>[r.p,r.hr]),hovertemplate:'ΔR² diff %{x:.3f}<br>p=%{customdata[0]:.2g}<br>HR %{customdata[1]:.0f} bpm<extra></extra>'}],
+    L({title:{text:`ΔR² difference vs ${alone?'no-diagnosis patients':'patients without it'} (red = Bonferroni p<.05)`,font:{size:13}},yaxis:{autorange:'reversed'},xaxis:{title:'Δ(group) − Δ(comparator), 95% CI',gridcolor:c.line,zerolinecolor:c.fg},margin:{l:150,r:15,t:40,b:50}}))}
+
+// ---- overlap heatmap
+function groupStat(ix,ref){const t=welch(v(DD,ix),v(DD,ref)),o=welch(v(DO,ix),v(DO,ref));return{do:mean(v(DO,ix)),own:mean(v(D.own,ix)),eo:o.d,po:o.p,n:ix.length,raw:mean(v(D.raw,ix)),cf:mean(v(D.cf,ix)),d:mean(v(DD,ix)),hr:mean(v(D.hr,ix)),eff:t.d,p:t.p}}
+function heat(){const c=C(),m=$('hm').value,mn=+$('minn').value,z=[],txt=[],lab=D.dx.map(short);
+  for(let i=0;i<NDX;i++){const zr=[],tr=[];for(let j=0;j<NDX;j++){const ix=i==j?idxWith(i):idxBoth(i,j);
+      if(ix.length<mn){zr.push(null);tr.push(`${lab[i]} + ${lab[j]}<br>n=${ix.length} (< min)`);continue}
+      const s=groupStat(ix,i==j?idxWithout(i):idxNeither(i,j));zr.push(s[m]);
+      tr.push(`${lab[i]}${i==j?'':' + '+lab[j]}<br>n=${s.n}<br>raw ${f3(s.raw)} → CFAR ${f3(s.cf)}<br>Δ ${f3(s.d)}, vs neither ${f3(s.eff)} (p=${fp(s.p)})<br>HR ${s.hr.toFixed(0)}`)}
+    z.push(zr);txt.push(tr)}
+  const flat=z.flat().filter(x=>x!=null),div=m=='eff';
+  show('heat',[{type:'heatmap',x:lab,y:lab,z,text:txt,hoverinfo:'text',colorscale:div?'RdBu':'Viridis',reversescale:div,zmid:div?0:undefined,zmin:div?-Math.max(...flat.map(Math.abs)):Math.min(...flat),zmax:div?Math.max(...flat.map(Math.abs)):Math.max(...flat),colorbar:{title:m=='hr'?'bpm':'R²'}}],
+    L({yaxis:{autorange:'reversed'},margin:{l:90,r:15,t:20,b:110},xaxis:{tickangle:-40}}))}
+
+// ---- A vs B
+function ab(){const c=C(),A=+$('dA').value,B=+$('dB').value,strict=$('excl').checked;
+  if(A==B){$('ab_tab').innerHTML='<p class="n">Pick two different diagnoses.</p>';return}
+  let ne=idxNeither(A,B);if(strict)ne=ne.filter(i=>D.k[i]==0);
+  const g=[[`${short(D.dx[A])} + ${short(D.dx[B])}`,idxBoth(A,B)],[`${short(D.dx[A])} only (no ${short(D.dx[B])})`,all.filter(i=>has(i,A)&&!has(i,B))],[`${short(D.dx[B])} only (no ${short(D.dx[A])})`,all.filter(i=>has(i,B)&&!has(i,A))],[strict?'no diagnosis':'neither',ne]];
+  const lab=g.map(([n,ix])=>`${n}<br>n=${ix.length}`),bar=(arr,name,color)=>({type:'bar',name,x:lab,y:g.map(([n,ix])=>ix.length?mean(v(arr,ix)):null),error_y:{type:'data',array:g.map(([n,ix])=>ix.length>2?1.96*se(v(arr,ix)):0),color:c.mut},marker:{color}});
+  show('ab_bar',[bar(D.raw,'raw',c.raw),bar(D.cf,'CFAR',c.cf),bar(DD,'ΔR² CFAR',c.dl),bar(DO,'ΔR² own-ECG',c.b)],L({barmode:'group',title:{text:'HEP R² raw vs CFAR (95% CI)',font:{size:13}},yaxis:{title:'R²'},margin:{l:55,r:15,t:40,b:90}}));
+  show('ab_hr',g.map(([n,ix],j)=>({type:'box',name:n.split(' (')[0],y:v(D.hr,ix),marker:{color:c.g4[j]},boxmean:true})),L({title:{text:'HR by group (bpm)',font:{size:13}},showlegend:false,yaxis:{title:'HR'}}));
+  show('ab_sc',g.map(([n,ix],j)=>({type:'scatter',mode:'markers',name:n.split(' (')[0],x:v(D.hr,ix),y:v(DD,ix),marker:{size:j==3?3:6,color:c.g4[j],opacity:j==3?.25:.8}})),L({title:{text:'ΔR² (CFA removed) vs HR',font:{size:13}},xaxis:{title:'HR (bpm)',gridcolor:c.line},yaxis:{title:'ΔR²',gridcolor:c.line}}));
+  const ref=ne;$('ab_tab').innerHTML='<table><tr><th>group</th><th>n</th><th>HR</th><th>raw</th><th>CFAR</th><th>Δ</th><th>Δ vs ref</th><th>p</th><th>r(HR,Δ)</th></tr>'+g.map(([n,ix],j)=>{
+    if(ix.length<3)return`<tr><td>${n}</td><td>${ix.length}</td><td colspan=7>too few</td></tr>`;const s=groupStat(ix,ref);
+    return`<tr><td>${n}</td><td>${s.n}</td><td>${s.hr.toFixed(0)}</td><td>${f3(s.raw)}</td><td>${f3(s.cf)}</td><td>${f3(s.d)}</td><td>${j==3?'ref':f3(s.eff)}</td><td>${j==3?'':fp(s.p)}</td><td>${ix.length>4?f3(pearson(v(D.hr,ix),v(DD,ix))):'–'}</td></tr>`}).join('')+'</table>'}
+
+// ---- ranking
+function ranking(){const mn=+$('minn').value,mode=$('rk').value,dir=+$('rkd').value,rows=[];
+  for(let i=0;i<NDX;i++){if(mode!='p'){const ix=idxWith(i);if(ix.length>=mn)rows.push({name:D.dx[i],...groupStat(ix,idxWithout(i))})}
+    if(mode!='s')for(let j=i+1;j<NDX;j++){const ix=idxBoth(i,j);if(ix.length>=mn)rows.push({name:D.dx[i]+' + '+D.dx[j],...groupStat(ix,idxNeither(i,j))})}}
+  rows.sort((a,b)=>dir*(b.eff-a.eff));
+  $('rank').innerHTML='<table><tr><th>diagnosis</th><th>n</th><th>HR</th><th>raw R²</th><th>CFAR R²</th><th>ΔR²</th><th>Δ vs neither</th><th>p</th></tr>'+rows.slice(0,60).map(r=>`<tr><td>${r.name}</td><td>${r.n}</td><td>${r.hr.toFixed(0)}</td><td>${f3(r.raw)}</td><td>${f3(r.cf)}</td><td>${f3(r.d)}</td><td>${f3(r.eff)}</td><td>${fp(r.p)}</td></tr>`).join('')+'</table>'}
+
+// ---- patient-specific section
+function ownSection(){const c=C(),rows=[];
+  for(let x=0;x<NDX;x++){const w=idxWith(x),wo=idxWithout(x),a=welch(v(DO,w),v(DO,wo)),g=welch(v(DD,w),v(DD,wo));rows.push({x,n:w.length,eo:a.d,so:a.se,po:a.p,eg:g.d,sg:g.se,d:mean(v(DO,w)),own:mean(v(D.own,w)),raw:mean(v(D.raw,w))})}
+  rows.sort((a,b)=>b.eo-a.eo);const lab=rows.map(r=>`${short(D.dx[r.x])} (n=${r.n})`);
+  show('o_dx',[{type:'bar',orientation:'h',name:'patient-specific (own ECG)',y:lab,x:rows.map(r=>r.eo),error_x:{type:'data',array:rows.map(r=>1.96*r.so),color:c.mut},marker:{color:rows.map(r=>r.po<.05/NDX?c.b:c.mut)},customdata:rows.map(r=>r.po),hovertemplate:'%{x:.3f}, p=%{customdata:.2g}<extra></extra>'},
+    {type:'bar',orientation:'h',name:'generic CFAR',y:lab,x:rows.map(r=>r.eg),marker:{color:c.dl,opacity:.6}}],
+    L({barmode:'group',title:{text:'Patient-specific ΔR² difference: with dx − without (purple = Bonferroni p<.05)',font:{size:13}},yaxis:{autorange:'reversed'},xaxis:{title:'Δ(group) − Δ(without), 95% CI',gridcolor:c.line,zerolinecolor:c.fg},margin:{l:150,r:15,t:40,b:50}}));
+  const r2=rows.slice().sort((a,b)=>b.d-a.d),l2=r2.map(r=>`${short(D.dx[r.x])} (n=${r.n})`);
+  show('o_bar',[{type:'bar',orientation:'h',name:'raw',y:l2,x:r2.map(r=>r.raw),marker:{color:c.raw}},{type:'bar',orientation:'h',name:'own-ECG cleaned',y:l2,x:r2.map(r=>r.own),marker:{color:c.b}},{type:'bar',orientation:'h',name:'ΔR² own',y:l2,x:r2.map(r=>r.d),marker:{color:c.dl}}],
+    L({barmode:'group',title:{text:'Raw vs own-ECG-cleaned R² per diagnosis',font:{size:13}},yaxis:{autorange:'reversed'},xaxis:{title:'R²',gridcolor:c.line},margin:{l:150,r:15,t:40,b:50}}));
+  const m=$('ohm').value,mn=+$('minn').value,z=[],txt=[],lab2=D.dx.map(short),all2=[];
+  for(let i=0;i<NDX;i++){const zr=[],tr=[];for(let j=0;j<NDX;j++){const ix=i==j?idxWith(i):idxBoth(i,j);
+    if(ix.length<mn){zr.push(null);tr.push(`${lab2[i]} + ${lab2[j]}<br>n=${ix.length} (< min)`);continue}
+    const s=groupStat(ix,i==j?idxWithout(i):idxNeither(i,j)),val=m=='eff'?s.eo:s[m];zr.push(val);
+    tr.push(`${lab2[i]}${i==j?'':' + '+lab2[j]}<br>n=${s.n}<br>raw ${f3(s.raw)} → own ${f3(s.own)}<br>Δown ${f3(s.do)}, vs neither ${f3(s.eo)} (p=${fp(s.po)})`)}z.push(zr);txt.push(tr)}
+  const flat=z.flat().filter(x=>x!=null),div=m=='eff',mx=Math.max(...flat.map(Math.abs));
+  show('o_heat',[{type:'heatmap',x:lab2,y:lab2,z,text:txt,hoverinfo:'text',colorscale:div?'RdBu':'Viridis',reversescale:div,zmin:div?-mx:Math.min(...flat),zmax:div?mx:Math.max(...flat),colorbar:{title:'R²'}}],L({yaxis:{autorange:'reversed'},margin:{l:90,r:15,t:20,b:110},xaxis:{tickangle:-40}}));
+  const rk=[];for(let i=0;i<NDX;i++){let ix=idxWith(i);if(ix.length>=mn)rk.push({name:D.dx[i],...groupStat(ix,idxWithout(i))});
+    for(let j=i+1;j<NDX;j++){ix=idxBoth(i,j);if(ix.length>=mn)rk.push({name:D.dx[i]+' + '+D.dx[j],...groupStat(ix,idxNeither(i,j))})}}
+  const thr=.05/rk.length,sel=$('osig').checked?rk.filter(r=>r.po<thr):rk;sel.sort((a,b)=>Math.abs(b.eo)-Math.abs(a.eo));
+  $('o_rank').innerHTML=`<p class="n">${rk.length} groups tested; Bonferroni p &lt; ${thr.toExponential(1)}; ${rk.filter(r=>r.po<thr).length} significant.</p><table><tr><th>diagnosis</th><th>n</th><th>raw</th><th>own</th><th>Δown</th><th>vs neither</th><th>p</th><th>CFAR Δ vs neither</th></tr>`+sel.slice(0,60).map(r=>`<tr><td>${r.name}</td><td>${r.n}</td><td>${f3(r.raw)}</td><td>${f3(r.own)}</td><td>${f3(r.do)}</td><td>${f3(r.eo)}</td><td>${fp(r.po)}</td><td>${f3(r.eff)}</td></tr>`).join('')+'</table>'}
+
+// ---- wire
+D.dx.forEach((x,i)=>{['dA','dB'].forEach(id=>$(id).add(new Option(x,i)));$('hrcol').add(new Option('highlight '+x,i))});
+$('dA').value=D.dx.indexOf('Obesity');$('dB').value=D.dx.indexOf('Heart Transplant');
+const redraw=()=>{kpi();hrSection();dxSection();heat();ab();ranking();ownSection()};
+['nb','hrcol'].forEach(i=>$(i).onchange=hrSection);['mode','srt'].forEach(i=>$(i).onchange=dxSection);
+['hm'].forEach(i=>$(i).onchange=heat);$('minn').onchange=()=>{heat();ranking();ownSection()};['ohm','osig'].forEach(i=>$(i).onchange=ownSection);['dA','dB','excl'].forEach(i=>$(i).onchange=ab);['rk','rkd'].forEach(i=>$(i).onchange=ranking);
+matchMedia('(prefers-color-scheme:dark)').onchange=redraw;redraw();
+</script></body></html>

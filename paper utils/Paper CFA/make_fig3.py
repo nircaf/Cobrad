@@ -30,6 +30,27 @@ with open(os.path.join(HERE, "paper_stats.json")) as f:
     S = json.load(f)
 dose = pd.DataFrame(S["dose_response"]["lengths"])
 dstrat = pd.DataFrame(S["dose_response"]["stratified_by_length"])
+
+def dx_by_length():
+    """Mean CFA R2 of patients with exactly 0, exactly 1, and >=2 diagnoses at each length (common cohort)."""
+    import glob, re
+    files = {10: os.path.join(HERE, "cfa_combined_10min.parquet")}
+    for f in glob.glob(os.path.join(HERE, "cfa_variance_explained_*min.parquet")):
+        files[int(re.search(r"_(\d+)min\.parquet$", f).group(1))] = f
+    demo = pd.read_parquet(os.path.join(HERE, "demographics_combined.parquet"))[["patient_id", "age", "n_diagnoses"]]
+    dfs = {m: pd.read_parquet(f, columns=["patient_id", "cfa_r2_excl_qrs"]) for m, f in files.items()}
+    common = set.intersection(*[set(d.patient_id) for d in dfs.values()])
+    out = {"zero": ([], 0), "one": ([], 0), "two": ([], 0)}
+    for m in sorted(dfs):
+        pt = dfs[m][dfs[m].patient_id.isin(common)].groupby("patient_id", as_index=False).mean().merge(demo, on="patient_id").dropna(subset=["age"])
+        nd = pt.n_diagnoses.fillna(0)
+        for key, mask in [("zero", nd == 0), ("one", nd == 1), ("two", nd >= 2)]:
+            g = pt.loc[mask, "cfa_r2_excl_qrs"]
+            out[key][0].append(g.mean()); out[key] = (out[key][0], len(g))
+    return out
+
+
+DX = dx_by_length()
 TICKS = [5, 10, 20, 30, 45, 60, 75, 90]
 YLAB = "Patient-mean CFA R² (outside QRS)"
 
@@ -101,6 +122,14 @@ S["dose_fit"] = {"asymptote": A, "asymptote_ci_lo": A - A_ci, "asymptote_ci_hi":
 with open(os.path.join(HERE, "paper_stats.json"), "w") as f:
     json.dump(S, f, indent=2)
 title(ax, f"CFA vs. segment duration (n = {S['dose_response']['n_common_patients']:,})")
+# inset: same mean CFA, x = compute = minutes x mean channels per patient (channel-minutes)
+cm = dose.window_minutes * dose.n_rows / dose.n_patients
+ins = ax.inset_axes([0.5, 0.1, 0.46, 0.38])
+ins.errorbar(cm, dose["mean"], yerr=1.96 * dose["sem"], marker="o", ms=3, capsize=2, color=PALETTE[0], lw=1.2)
+ins.set_xscale("log")
+ins.set_xlabel("Compute (channel-min)", fontsize=6.5, labelpad=1)
+ins.set_ylabel("Mean CFA R²", fontsize=6.5, labelpad=1)
+ins.tick_params(labelsize=6, length=2)
 ax.set_ylabel("Mean CFA R² (± 95% CI)")
 
 ax = axes[1, 1]
@@ -112,8 +141,8 @@ ax.legend(frameon=False, fontsize=7.5)
 title(ax, "Duration effect by sex")
 
 ax = axes[1, 2]
-ax.plot(dstrat.window_minutes, dstrat.any_dx_mean, marker="s", ms=4, color=PALETTE[1], lw=1.6, label=f"≥1 diagnosis (n = {int(dstrat.n_any_dx.iloc[0]):,})")
-ax.plot(dstrat.window_minutes, dstrat.no_dx_mean, marker="s", ms=4, color=PALETTE[2], lw=1.6, label=f"No diagnosis (n = {int(dstrat.n_no_dx.iloc[0]):,})")
+for key, lab, c in [("zero", "Undiagnosed", PALETTE[2]), ("one", "1 diagnosis", PALETTE[1]), ("two", "2+ diagnoses", PALETTE[3])]:
+    ax.plot(dstrat.window_minutes, DX[key][0], marker="s", ms=4, color=c, lw=1.6, label=f"{lab} (n = {DX[key][1]:,})")
 ax.set_ylabel("Mean CFA R²")
 ax.legend(frameon=False, fontsize=7.5)
 title(ax, "Duration effect by diagnosis")
